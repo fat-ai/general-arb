@@ -2,25 +2,25 @@ import os
 import logging
 import spacy
 import numpy as np
-import pandas as pd  # <--- ADDED IMPORT
+import pandas as pd
 import scipy.optimize as opt
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 from typing import Dict, List, Tuple, Any
-import ray  # <--- ADDED IMPORT
-from ray import tune  # <--- ADDED IMPORT
-from ray.tune.schedulers import ASHAScheduler  # <--- ADDED IMPORT
-import dash  # <--- ADDED IMPORT
-from dash import dcc, html, Input, Output, State, callback  # <--- ADDED IMPORT
-import dash_bootstrap_components as dbc  # <--- ADDED IMPORT
-import plotly.graph_objects as go  # <--- ADDED IMPORT
-import sys # For command-line args
+import ray
+from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+import dash
+from dash import dcc, html, Input, Output, State, callback
+import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
+import sys
+import math # Used in Beta converter
 
 # ==============================================================================
 # --- Global Setup ---
 # ==============================================================================
 
-# Set up basic logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
@@ -49,8 +49,7 @@ def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tu
         return (1.0, 1.0)
     std_dev = (upper - lower) / 4.0
     if std_dev == 0:
-        log.info("Zero variance detected. Returning (inf, inf) as placeholder.")
-        return (float('inf'), float('inf'))
+        return (float('inf'), float('inf')) # Logical rule
     variance = std_dev ** 2
     inner = (mean * (1 - mean) / variance) - 1
     if inner <= 0:
@@ -71,7 +70,13 @@ class GraphManager:
     Component 1: The Knowledge Graph (Data Model)
     The single, production-ready class for all graph interactions.
     """
-    def __init__(self):
+    def __init__(self, is_mock=False):
+        self.is_mock = is_mock
+        if self.is_mock:
+            log.warning("GraphManager is running in MOCK mode. No database connection.")
+            self.vector_dim = 768
+            return
+
         self.uri = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
         self.user = os.getenv('NEO4J_USER', 'neo4j')
         self.password = os.getenv('NEO4J_PASSWORD')
@@ -88,11 +93,12 @@ class GraphManager:
             raise
 
     def close(self):
-        if self.driver:
+        if not self.is_mock and hasattr(self, 'driver'):
             self.driver.close()
 
     # --- Schema & Write Methods (C1) ---
     def setup_schema(self):
+        if self.is_mock: return
         log.info("Applying database schema: constraints and indexes...")
         with self.driver.session() as session:
             session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Contract) REQUIRE c.contract_id IS UNIQUE"))
@@ -102,6 +108,7 @@ class GraphManager:
         log.info("Schema setup complete.")
 
     def add_contract(self, contract_id: str, text: str, vector: list[float]):
+        if self.is_mock: return
         if len(vector) != self.vector_dim:
             raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {len(vector)}")
         with self.driver.session() as session:
@@ -121,6 +128,7 @@ class GraphManager:
 
     # --- Read/Write Methods for C2 ---
     def link_contract_to_entity(self, contract_id: str, entity_id: str, confidence: float):
+        if self.is_mock: return
         with self.driver.session() as session:
             session.execute_write(self._tx_link_contract, contract_id, entity_id, confidence)
         log.info(f"Linked Contract '{contract_id}' -> Entity '{entity_id}' with conf: {confidence}")
@@ -140,6 +148,12 @@ class GraphManager:
         )
     
     def get_contracts_by_status(self, status: str, limit: int = 10) -> list[dict]:
+        if self.is_mock: 
+             if status == 'PENDING_LINKING':
+                return [{'contract_id': 'MKT_902_SPACY_DEMO', 'text': "Will 'NeuroCorp' release the 'Viper'?", 'vector': [0.1]*768}]
+             if status == 'PENDING_ANALYSIS':
+                return [{'contract_id': 'MKT_903', 'text': 'Test contract for NeuroCorp', 'vector': [0.3]*768}]
+             return []
         with self.driver.session() as session:
             results = session.execute_read(self._tx_get_contracts_by_status, status=status, limit=limit)
         return results
@@ -155,6 +169,11 @@ class GraphManager:
         return [record.data() for record in result]
         
     def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
+        if self.is_mock: 
+            if alias_text == "NeuroCorp":
+                # Simulate finding the alias *after* the human fixed it
+                return {'entity_id': 'E_123', 'name': 'NeuroCorp, Inc.', 'confidence': 1.0}
+            return None
         # STUB: Using exact match. Prod needs APOC.
         with self.driver.session() as session:
             result = session.execute_read(self._tx_find_entity_exact, alias_text=alias_text).single()
@@ -169,6 +188,7 @@ class GraphManager:
         ).single()
 
     def update_contract_status(self, contract_id: str, status: str, metadata: dict = None):
+        if self.is_mock: return
         with self.driver.session() as session:
             session.execute_write(self._tx_update_status, contract_id, status, metadata)
         log.info(f"Updated status for {contract_id} to {status}")
@@ -184,6 +204,7 @@ class GraphManager:
 
     # --- Read/Write Methods for C3 ---
     def update_contract_prior(self, contract_id: str, p_internal: float, alpha: float, beta: float, source: str):
+        if self.is_mock: return
         with self.driver.session() as session:
             session.execute_write(self._tx_update_prior, contract_id, p_internal, alpha, beta, source)
         log.info(f"Updated prior for {contract_id} from {source}.")
@@ -204,7 +225,7 @@ class GraphManager:
             contract_id=contract_id, p_internal=p_internal, alpha=alpha, beta=beta, source=source
         )
 
-    # --- Read/Write Methods for C4 (Stubs) ---
+    # --- Read/Write Methods for C4 (Mocks) ---
     def get_all_resolved_trades_by_topic(self) -> pd.DataFrame:
         log.info("MockGraph: Fetching all resolved trades by topic (STUB)")
         mock_data = [
@@ -237,7 +258,7 @@ class GraphManager:
             'Wallet_CROWD_1': {'brier_biotech': 0.25, 'brier_geopolitics': 0.25},
         }
 
-    # --- Read/Write Methods for C5 (Stubs) ---
+    # --- Read/Write Methods for C5 (Mocks) ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
         log.info("MockGraph: Fetching contracts 'PENDING_FUSION' (STUB)")
         mock_data = [
@@ -259,7 +280,7 @@ class GraphManager:
         log.info(f"MockGraph: Updating {contract_id} with fused P_model={p_model:.4f} (STUB)")
         pass
 
-    # --- Read/Write Methods for C6 (Stubs) ---
+    # --- Read/Write Methods for C6 (Mocks) ---
     def get_active_entity_clusters(self) -> List[str]:
         log.info("MockGraph: Finding all active clusters (STUB)")
         return ["E_DUNE_3"]
@@ -278,16 +299,16 @@ class GraphManager:
             return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
         return {'type': 'NONE', 'p_joint': None}
 
-    # --- Read Methods for C7 (Stubs) ---
+    # --- Read Methods for C7 (Mocks) ---
     def get_historical_data_for_replay(self, start_date, end_date):
         log.info(f"MockGraph: Fetching historical data from {start_date} to {end_date} (STUB)")
         return [
-            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp...', 'vector': [...]}),
+            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp...', 'vector': [0.1]*768}),
             ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51}),
             ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
         ]
 
-    # --- Read Methods for C8 (Stubs) ---
+    # --- Read Methods for C8 (Mocks) ---
     def get_human_review_queue(self):
         log.info("MockGraph: Fetching 'NEEDS_HUMAN_REVIEW' queue (STUB)")
         return [
@@ -350,36 +371,38 @@ class RelationalLinker:
         log.info(f"Fast Path found {len(matches)} potential matches.")
         return matches
 
-    def process_new_contract(self, contract_id: str):
-        log.info(f"--- C2: Processing Contract: {contract_id} ---")
-        contract = self.graph.get_contracts_by_status('PENDING_LINKING', 1)
-        if not contract:
+    def process_pending_contracts(self):
+        """Worker loop to process one batch of pending contracts."""
+        log.info("--- C2: Checking for 'PENDING_LINKING' contracts ---")
+        contracts = self.graph.get_contracts_by_status('PENDING_LINKING', limit=10)
+        if not contracts:
             log.info("C2: No contracts to link.")
             return
-        
-        contract = contract[0]
-        contract_id = contract['contract_id']
-        contract_text = contract['text']
-        
-        extracted_entities = self._extract_entities(contract_text)
-        if not extracted_entities:
-            self.graph.update_contract_status(contract_id, 'NEEDS_HUMAN_REVIEW', {'reason': 'No entities found'})
-            return
 
-        fast_path_matches = self._run_fast_path(extracted_entities)
+        for contract in contracts:
+            contract_id = contract['contract_id']
+            log.info(f"--- C2: Processing Contract: {contract_id} ---")
+            contract_text = contract['text']
+            
+            extracted_entities = self._extract_entities(contract_text)
+            if not extracted_entities:
+                self.graph.update_contract_status(contract_id, 'NEEDS_HUMAN_REVIEW', {'reason': 'No entities found'})
+                continue
 
-        if len(fast_path_matches) >= 1:
-            log.info(f"{len(fast_path_matches)} Fast Path match(es) found. Linking all.")
-            for entity_id, (confidence, name) in fast_path_matches.items():
-                self.graph.link_contract_to_entity(contract_id, entity_id, confidence)
-        elif len(fast_path_matches) == 0:
-            log.info("No Fast Path matches. Flagging for human review.")
-            self.graph.update_contract_status(
-                contract_id, 
-                'NEEDS_HUMAN_REVIEW', 
-                {'reason': 'No alias match found', 'extracted_entities': list(extracted_entities)}
-            )
-        log.info(f"--- C2: Finished Processing: {contract_id} ---")
+            fast_path_matches = self._run_fast_path(extracted_entities)
+
+            if len(fast_path_matches) >= 1:
+                log.info(f"{len(fast_path_matches)} Fast Path match(es) found. Linking all.")
+                for entity_id, (confidence, name) in fast_path_matches.items():
+                    self.graph.link_contract_to_entity(contract_id, entity_id, confidence)
+            elif len(fast_path_matches) == 0:
+                log.info("No Fast Path matches. Flagging for human review.")
+                self.graph.update_contract_status(
+                    contract_id, 
+                    'NEEDS_HUMAN_REVIEW', 
+                    {'reason': 'No alias match found', 'extracted_entities': list(extracted_entities)}
+                )
+            log.info(f"--- C2: Finished Processing: {contract_id} ---")
 
 
 # ==============================================================================
@@ -407,7 +430,7 @@ class PriorManager:
         return False # Default to AI for this stub
 
     def process_pending_contracts(self):
-        log.info("C3: Checking for contracts 'PENDING_ANALYSIS'...")
+        log.info("--- C3: Checking for contracts 'PENDING_ANALYSIS' ---")
         contracts = self.graph.get_contracts_by_status('PENDING_ANALYSIS', limit=10)
         
         if not contracts:
@@ -418,7 +441,6 @@ class PriorManager:
             contract_id = contract['contract_id']
             log.info(f"C3: Processing {contract_id}")
             
-            # ** SYNTAX ERROR FIX: try/except block was outside method **
             try:
                 if self._is_hitl_required(contract):
                     self.graph.update_contract_status(
@@ -452,7 +474,7 @@ class HistoricalProfiler:
 
     def _calculate_brier_score(self, df_group: pd.DataFrame) -> float:
         if len(df_group) < self.min_trades:
-            return 0.25  # Default, uninformative score
+            return 0.25
         squared_errors = (df_group['bet_price'] - df_group['outcome']) ** 2
         return squared_errors.mean()
 
@@ -499,8 +521,7 @@ class LiveFeedHandler:
         numerator = (live_trades_df['trade_price'] * live_trades_df['weight']).sum()
         denominator = live_trades_df['weight'].sum()
         
-        if denominator == 0:
-            return None
+        if denominator == 0: return None
         p_market_experts = numerator / denominator
         log.info(f"C4: Calculated P_market_experts for {contract_id}: {p_market_experts:.4f}")
         return p_market_experts
@@ -519,8 +540,7 @@ class BeliefEngine:
         log.info(f"BeliefEngine initialized with k={self.k_brier_scale}.")
 
     def _impute_beta_from_point(self, mean: float, model_name: str) -> Tuple[float, float]:
-        if not (0 < mean < 1):
-            return (1.0, 1.0)
+        if not (0 < mean < 1): return (1.0, 1.0)
         brier_score = self.model_brier_scores.get(f'brier_{model_name}_model', 0.25)
         variance = self.k_brier_scale * brier_score
         if variance == 0: variance = 1e-9
@@ -534,17 +554,23 @@ class BeliefEngine:
     def _fuse_betas(self, beta_dists: List[Tuple[float, float]]) -> Tuple[float, float]:
         fused_alpha, fused_beta = 1.0, 1.0
         for alpha, beta in beta_dists:
+            if math.isinf(alpha) or math.isinf(beta):
+                log.warning("Found logical rule (inf). Skipping fusion.")
+                # This is a simplification; a real system would propagate this constraint
+                return (alpha, beta) # Pass the logical rule through
             fused_alpha += (alpha - 1.0)
             fused_beta += (beta - 1.0)
         return (max(fused_alpha, 1.0), max(fused_beta, 1.0))
 
     def _get_beta_stats(self, alpha: float, beta: float) -> Tuple[float, float]:
+        if math.isinf(alpha): return (1.0, 0.0)
+        if math.isinf(beta): return (0.0, 0.0)
         mean = alpha / (alpha + beta)
         variance = (alpha * beta) / ( (alpha + beta)**2 * (alpha + beta + 1) )
         return (mean, variance)
 
     def run_fusion_process(self):
-        log.info("C5: Checking for contracts 'PENDING_FUSION'...")
+        log.info("--- C5: Checking for contracts 'PENDING_FUSION' ---")
         contracts = self.graph.get_contracts_for_fusion(limit=10)
         if not contracts:
             log.info("C5: No new contracts to fuse.")
@@ -555,11 +581,16 @@ class BeliefEngine:
             log.info(f"C5: Fusing price for {contract_id}")
             try:
                 beta_internal = (contract['p_internal_alpha'], contract['p_internal_beta'])
-                beta_experts = self._impute_beta_from_point(contract['p_market_experts'], 'expert')
-                beta_crowd = self._impute_beta_from_point(contract['p_market_all'], 'crowd')
                 
-                (fused_alpha, fused_beta) = self._fuse_betas([beta_internal, beta_experts, beta_crowd])
-                (p_model, p_model_variance) = self._get_beta_stats(fused_alpha, fused_beta)
+                # Check for logical rule from C3
+                if math.isinf(beta_internal[0]) or math.isinf(beta_internal[1]):
+                    log.info(f"C5: Contract {contract_id} is a logical rule. Bypassing fusion.")
+                    (p_model, p_model_variance) = self._get_beta_stats(beta_internal[0], beta_internal[1])
+                else:
+                    beta_experts = self._impute_beta_from_point(contract['p_market_experts'], 'expert')
+                    beta_crowd = self._impute_beta_from_point(contract['p_market_all'], 'crowd')
+                    (fused_alpha, fused_beta) = self._fuse_betas([beta_internal, beta_experts, beta_crowd])
+                    (p_model, p_model_variance) = self._get_beta_stats(fused_alpha, fused_beta)
                 
                 log.info(f"C5: Fusion complete for {contract_id}: P_model={p_model:.4f}")
                 self.graph.update_contract_fused_price(contract_id, p_model, p_model_variance)
@@ -622,12 +653,26 @@ class HybridKellySolver:
         
         # 1. Generate Correlated Outcomes (I_k)
         std_devs = np.sqrt(np.diag(C))
+        # Add epsilon to prevent division by zero for logical rules (variance=0)
+        std_devs = np.where(std_devs == 0, 1e-9, std_devs) 
         Corr = C / np.outer(std_devs, std_devs)
         np.fill_diagonal(Corr, 1.0) 
         
-        sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr)
-        Z = sampler.random(self.k_samples)
+        # Cholesky decomposition for sampling
+        try:
+            L = np.linalg.cholesky(Corr)
+        except np.linalg.LinAlgError:
+            log.warning("Covariance matrix not positive definite. Using pseudo-inverse for sampling.")
+            # Fallback for non-positive-definite (less accurate)
+            # A better way is to "clean" the matrix, but for now we'll just use uncorrelated samples
+            L = np.eye(n) # Fallback: assume independence for sampling
+            
+        # Use QMC (Sobol) sampler
+        sampler = qmc.Sobol(d=n, scramble=True)
+        U_unif = sampler.random_base2(m=int(np.log2(self.k_samples))) # (K x n)
+        Z = norm.ppf(U_unif) @ L.T # Correlated standard normals
         U = norm.cdf(Z)
+        
         I_k = (U < M).astype(int) 
 
         # 2. Define the Objective Function
@@ -638,8 +683,8 @@ class HybridKellySolver:
             portfolio_returns = np.sum(R_k_matrix * np.abs(F), axis=1)
             W_k = 1.0 + portfolio_returns
             if np.any(W_k <= 1e-9):
-                return 1e9 # Massive penalty for bankruptcy
-            return -np.mean(np.log(W_k)) # Minimize negative log-wealth
+                return 1e9 
+            return -np.mean(np.log(W_k))
 
         # 3. Run the Optimizer
         initial_guess = F_analytical_guess
@@ -707,7 +752,6 @@ class PortfolioManager:
                 if abs(allocation) > 1e-5:
                     action = "BUY" if allocation > 0 else "SELL"
                     log.info(f"-> {action} {abs(allocation)*100:.2f}% on {contract['id']} (Edge: {contracts[i]['M'] - contracts[i]['Q']:.2f})")
-            # (STUB: Send to Execution Engine)
         log.info("--- C6: Optimization Cycle Complete ---")
 
 
@@ -723,7 +767,7 @@ class _MockC7FullPipeline:
         self.portfolio = {'cash': 10000.0, 'positions': {}}
         self.pnl_history = [10000.0]
         self.brier_scores = []
-        log.info(f"MockC7Pipeline initialized with config: k={config.get('k_brier_scale')}, edge_thresh={config.get('kelly_edge_thresh')}")
+        log.info(f"MockC7Pipeline initialized")
 
     def _detect_regime(self, event_timestamp) -> str:
         if "2023-01-03" in event_timestamp: return "HIGH_VOL"
@@ -772,18 +816,12 @@ class BacktestEngine:
     def __init__(self, graph_manager_stub: GraphManager):
         self.graph_stub = graph_manager_stub
         log.info("BacktestEngine (C7) initialized.")
-        if not ray.is_initialized():
-            ray.init(logging_level=logging.ERROR)
-
-    @staticmethod
-    def _run_single_backtest(config: Dict[str, Any]):
+        
+    def _run_single_backtest(self, config: Dict[str, Any]):
         log.debug(f"--- C7: Starting back-test run with config: {config} ---")
         try:
-            # For this stub, we use a new mock graph to get mock data
-            graph_stub = GraphManager()
+            graph_stub = GraphManager(is_mock=True) # Use mock graph
             data = graph_stub.get_historical_data_for_replay("2023-01-01", "2023-06-30")
-            
-            # This uses the *Mock* pipeline, not the real one
             pipeline = _MockC7FullPipeline(config, data) 
             pipeline.run_replay()
             metrics = pipeline.get_final_metrics()
@@ -794,6 +832,9 @@ class BacktestEngine:
             
     def run_tuning_job(self):
         log.info("--- C7: Starting Hyperparameter Tuning Job ---")
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
+            
         search_space = {
             "min_trades_threshold": tune.qrandint(5, 50, 5),
             "params_low_vol": {
@@ -816,6 +857,7 @@ class BacktestEngine:
         best_config = analysis.get_best_config(metric="irr", mode="max")
         log.info(f"--- C7: Tuning Job Complete ---")
         log.info(f"Best config found for max IRR: {best_config}")
+        ray.shutdown() # Shut down ray
         return best_config
 
 
@@ -823,114 +865,127 @@ class BacktestEngine:
 # ### COMPONENT 8: Operational Dashboard ###
 # ==============================================================================
 
-# We create a mock graph *just* for the dashboard to pull from
-mock_graph_c8 = GraphManager()
-mock_backtester_c8 = BacktestEngine(mock_graph_c8) # Pass stub
+# ** FIX: All C8 code (app definition, layouts, callbacks) must be
+# ** wrapped inside a function to prevent execution on import.
+def run_c8_demo():
+    """Launches the C8 Dashboard"""
+    log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
+    log.info("--- Launching Dash server on http://127.0.0.1:8050/ ---")
 
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-server = app.server
+    # We instantiate mocks *inside* the demo function
+    graph_stub_c8 = GraphManager(is_mock=True)
+    backtester_stub_c8 = BacktestEngine(graph_stub_c8)
 
-def build_header():
-    regime, params = mock_graph_c8.get_regime_status()
-    return dbc.NavbarSimple(
-        children=[
-            dbc.NavItem(dbc.NavLink("Analyst", href="/analyst")),
-            dbc.NavItem(dbc.NavLink("Portfolio Manager", href="/pm")),
-            dbc.NavItem(dbc.NavLink("Admin", href="/admin")),
-            dbc.Badge(f"Regime: {regime}", color="primary", className="ms-auto"),
-        ],
-        brand="QTE", color="dark", dark=True,
+    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+    server = app.server
+
+    def build_header():
+        regime, params = graph_stub_c8.get_regime_status()
+        return dbc.NavbarSimple(
+            children=[
+                dbc.NavItem(dbc.NavLink("Analyst", href="/analyst")),
+                dbc.NavItem(dbc.NavLink("Portfolio Manager", href="/pm")),
+                dbc.NavItem(dbc.NavLink("Admin", href="/admin")),
+                dbc.Badge(f"Regime: {regime}", color="primary", className="ms-auto"),
+            ],
+            brand="QTE", color="dark", dark=True,
+        )
+
+    def build_analyst_tab():
+        queue_items = graph_stub_c8.get_human_review_queue()
+        table_header = [html.Thead(html.Tr([html.Th("Contract"), html.Th("Reason"), html.Th("Details"), html.Th("Action")]))]
+        table_body = [html.Tbody([
+            html.Tr([
+                html.Td(item['id']), html.Td(item['reason']), html.Td(html.Code(item['details'])),
+                html.Td(dbc.Button("Resolve", id={'type': 'resolve-btn', 'index': item['id']}, size="sm")),
+            ]) for item in queue_items
+        ])]
+        return html.Div([
+            html.H2("Analyst Triage Queues"),
+            dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
+            dbc.Table(table_header + table_body, bordered=True, striped=True)
+        ])
+
+    def build_pm_tab():
+        state = graph_stub_c8.get_portfolio_state()
+        pnl_history = graph_stub_c8.get_pnl_history()
+        fig = go.Figure(data=go.Scatter(y=pnl_history, mode='lines', name='Total Value'))
+        fig.update_layout(title='Portfolio Value Over Time', yaxis_title='Total Value ($)')
+        return html.Div([
+            dbc.Row([
+                dbc.Col(dbc.Card([dbc.CardHeader("Portfolio Value"), dbc.CardBody(f"${state['total_value']:,.2f}", className="text-success fs-3")]), width=4),
+                dbc.Col(dbc.Card([dbc.CardHeader("Available Cash"), dbc.CardBody(f"${state['cash']:,.2f}", className="fs-3")]), width=4),
+                dbc.Col(dbc.Card([dbc.CardHeader("Active Positions"), dbc.CardBody(f"{len(state['positions'])}", className="fs-3")]), width=4),
+            ]),
+            dbc.Row(dcc.Graph(figure=fig), className="mt-4"),
+        ])
+
+    def build_admin_tab():
+        regime, params = graph_stub_c8.get_regime_status()
+        return html.Div([
+            html.H2("Admin & Tuning"),
+            dbc.Alert(id='admin-alert', is_open=False, duration=4000),
+            dbc.Row([
+                dbc.Col(dbc.Card([
+                    dbc.CardHeader("Hyperparameter Tuning"),
+                    dbc.CardBody([
+                        html.P("Launch a new job to tune all hyperparameters (C7)."),
+                        dbc.Button("Start New Tuning Job", id='start-tune-btn', color="danger", n_clicks=0)
+                    ]),
+                ]), width=6),
+                dbc.Col(dbc.Card([
+                    dbc.CardHeader("Current Regime & Parameters"),
+                    dbc.CardBody([html.H4(f"Regime: {regime}"), html.Code(str(params))]),
+                ]), width=6),
+            ]),
+        ])
+
+    app.layout = html.Div([
+        build_header(),
+        dcc.Location(id='url', refresh=False),
+        dbc.Container(id='page-content', fluid=True, className="mt-4")
+    ])
+
+    @callback(Output('page-content', 'children'), [Input('url', 'pathname')])
+    def display_page(pathname):
+        if pathname == '/pm': return build_pm_tab()
+        elif pathname == '/admin': return build_admin_tab()
+        else: return build_analyst_tab()
+
+    @callback(
+        Output('analyst-alert', 'children'), Output('analyst-alert', 'is_open'),
+        Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
+        prevent_initial_call=True
     )
+    def resolve_analyst_item(n_clicks):
+        ctx = dash.callback_context
+        if not ctx.triggered: return "", False
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        item_id = eval(button_id)['index']
+        success = graph_stub_c8.resolve_human_review_item(item_id, "MERGE_CONFIRMED")
+        if success: return f"Item {item_id} resolved!", True
+        else: return f"Failed to resolve {item_id}.", True
 
-def build_analyst_tab():
-    queue_items = mock_graph_c8.get_human_review_queue()
-    table_header = [html.Thead(html.Tr([html.Th("Contract"), html.Th("Reason"), html.Th("Details"), html.Th("Action")]))]
-    table_body = [html.Tbody([
-        html.Tr([
-            html.Td(item['id']), html.Td(item['reason']), html.Td(html.Code(item['details'])),
-            html.Td(dbc.Button("Resolve", id={'type': 'resolve-btn', 'index': item['id']}, size="sm")),
-        ]) for item in queue_items
-    ])]
-    return html.Div([
-        html.H2("Analyst Triage Queues"),
-        dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
-        dbc.Table(table_header + table_body, bordered=True, striped=True)
-    ])
-
-def build_pm_tab():
-    state = mock_graph_c8.get_portfolio_state()
-    pnl_history = mock_graph_c8.get_pnl_history()
-    fig = go.Figure(data=go.Scatter(y=pnl_history, mode='lines', name='Total Value'))
-    fig.update_layout(title='Portfolio Value Over Time', yaxis_title='Total Value ($)')
-    return html.Div([
-        dbc.Row([
-            dbc.Col(dbc.Card([dbc.CardHeader("Portfolio Value"), dbc.CardBody(f"${state['total_value']:,.2f}", className="text-success fs-3")]), width=4),
-            dbc.Col(dbc.Card([dbc.CardHeader("Available Cash"), dbc.CardBody(f"${state['cash']:,.2f}", className="fs-3")]), width=4),
-            dbc.Col(dbc.Card([dbc.CardHeader("Active Positions"), dbc.CardBody(f"{len(state['positions'])}", className="fs-3")]), width=4),
-        ]),
-        dbc.Row(dcc.Graph(figure=fig), className="mt-4"),
-    ])
-
-def build_admin_tab():
-    regime, params = mock_graph_c8.get_regime_status()
-    return html.Div([
-        html.H2("Admin & Tuning"),
-        dbc.Alert(id='admin-alert', is_open=False, duration=4000),
-        dbc.Row([
-            dbc.Col(dbc.Card([
-                dbc.CardHeader("Hyperparameter Tuning"),
-                dbc.CardBody([
-                    html.P("Launch a new job to tune all hyperparameters (C7)."),
-                    dbc.Button("Start New Tuning Job", id='start-tune-btn', color="danger", n_clicks=0)
-                ]),
-            ]), width=6),
-            dbc.Col(dbc.Card([
-                dbc.CardHeader("Current Regime & Parameters"),
-                dbc.CardBody([html.H4(f"Regime: {regime}"), html.Code(str(params))]),
-            ]), width=6),
-        ]),
-    ])
-
-app.layout = html.Div([
-    build_header(),
-    dcc.Location(id='url', refresh=False),
-    dbc.Container(id='page-content', fluid=True, className="mt-4")
-])
-
-@callback(Output('page-content', 'children'), [Input('url', 'pathname')])
-def display_page(pathname):
-    if pathname == '/pm': return build_pm_tab()
-    elif pathname == '/admin': return build_admin_tab()
-    else: return build_analyst_tab()
-
-@callback(
-    Output('analyst-alert', 'children'), Output('analyst-alert', 'is_open'),
-    Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
-    prevent_initial_call=True
-)
-def resolve_analyst_item(n_clicks):
-    ctx = dash.callback_context
-    if not ctx.triggered: return "", False
-    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    item_id = eval(button_id)['index']
-    success = mock_graph_c8.resolve_human_review_item(item_id, "MERGE_CONFIRMED")
-    if success: return f"Item {item_id} resolved!", True
-    else: return f"Failed to resolve {item_id}.", True
-
-@callback(
-    Output('admin-alert', 'children'), Output('admin-alert', 'is_open'),
-    Input('start-tune-btn', 'n_clicks'),
-    prevent_initial_call=True
-)
-def start_tuning_job(n_clicks):
-    log.warning("Admin clicked 'Start New Tuning Job'")
+    @callback(
+        Output('admin-alert', 'children'), Output('admin-alert', 'is_open'),
+        Input('start-tune-btn', 'n_clicks'),
+        prevent_initial_call=True
+    )
+    def start_tuning_job(n_clicks):
+        log.warning("Admin clicked 'Start New Tuning Job'")
+        try:
+            # Note: This is synchronous in the stub, will block the server
+            job_id = backtester_stub_c8.run_tuning_job() 
+            return f"Tuning job complete! Best config: {job_id}", True
+        except Exception as e:
+            log.error(f"Failed to start tuning job: {e}")
+            return f"Error: {e}", True
+            
     try:
-        # Use the global mock backtester
-        job_id = mock_backtester_c8.run_tuning_job() # This is synchronous for the stub
-        return f"Tuning job complete! Best config: {job_id}", True
+        app.run_server(debug=True, port=8050)
     except Exception as e:
-        log.error(f"Failed to start tuning job: {e}")
-        return f"Error: {e}", True
+        log.error(f"C8 Demo Failed: {e}")
+        if "dash" in str(e): log.info("Hint: Run 'pip install dash dash-bootstrap-components plotly pandas'")
 
 
 # ==============================================================================
@@ -941,7 +996,8 @@ def run_c1_c2_demo():
     """Runs the C1 -> C2 -> Human Fix -> C2 loop"""
     log.info("--- (DEMO) Running Component 1 & 2 Demo ---")
     try:
-        graph = GraphManager()
+        # Use a real graph connection
+        graph = GraphManager() 
         graph.setup_schema()
         linker = RelationalLinker(graph)
         
@@ -952,10 +1008,9 @@ def run_c1_c2_demo():
         graph.add_contract(contract_id, contract_text, vector)
         
         log.info("--- Running Linker (Pass 1) ---")
-        linker.process_new_contract(contract_id) # Will fail and flag
+        linker.process_pending_contracts() # Will fail and flag
         
         log.info("--- Simulating Human Fix ---")
-        # (This is a simplified version of the full add_entity/add_alias)
         with graph.driver.session() as session:
             session.execute_write(lambda tx: tx.run(
                 "MERGE (e:Entity {entity_id: 'E_123'}) SET e.canonical_name = 'NeuroCorp, Inc.' "
@@ -965,7 +1020,7 @@ def run_c1_c2_demo():
             
         log.info("--- Running Linker (Pass 2) ---")
         graph.update_contract_status(contract_id, 'PENDING_LINKING')
-        linker.process_new_contract(contract_id) # Will succeed
+        linker.process_pending_contracts() # Will succeed
         graph.close()
 
     except Exception as e:
@@ -977,11 +1032,10 @@ def run_c3_demo():
     """Runs the C3 Prior Engine demo"""
     log.info("--- (DEMO) Running Component 3 Demo ---")
     try:
-        graph = GraphManager()
+        graph = GraphManager() # Real connection
         ai = AIAnalyst()
         prior_manager = PriorManager(graph, ai)
         
-        # (Simulate C1/C2)
         graph.add_contract("MKT_903", "Test contract for NeuroCorp", [0.3] * graph.vector_dim)
         graph.update_contract_status("MKT_903", 'PENDING_ANALYSIS')
         
@@ -995,7 +1049,7 @@ def run_c4_demo():
     """Runs the C4 Market Intelligence demo"""
     log.info("--- (DEMO) Running Component 4 Demo ---")
     try:
-        graph = GraphManager() # Using all mock methods
+        graph = GraphManager(is_mock=True) # Use MOCK graph
         profiler = HistoricalProfiler(graph, min_trades_threshold=3)
         profiler.run_profiling()
         
@@ -1011,7 +1065,7 @@ def run_c5_demo():
     """Runs the C5 Belief Engine demo"""
     log.info("--- (DEMO) Running Component 5 Demo ---")
     try:
-        graph = GraphManager() # Using all mock methods
+        graph = GraphManager(is_mock=True) # Use MOCK graph
         engine = BeliefEngine(graph)
         engine.run_fusion_process()
         log.info("--- C5 Demo Complete. ---")
@@ -1023,8 +1077,8 @@ def run_c6_demo():
     """Runs the C6 Portfolio Manager demo"""
     log.info("--- (DEMO) Running Component 6 Demo ---")
     try:
-        graph = GraphManager() # Using all mock methods from C1 stub
-        solver = HybridKellySolver(num_samples_k=5000) # Use full solver
+        graph = GraphManager(is_mock=True) # Use MOCK graph
+        solver = HybridKellySolver(num_samples_k=5000)
         pm = PortfolioManager(graph, solver)
         pm.run_optimization_cycle()
         log.info("--- C6 Demo Complete. ---")
@@ -1036,47 +1090,36 @@ def run_c7_demo():
     """Runs the C7 Backtest/Tuning demo"""
     log.info("--- (DEMO) Running Component 7 Demo ---")
     try:
-        graph_stub = GraphManager() # Pass mock stub
+        graph_stub = GraphManager(is_mock=True) # Pass mock stub
         backtester = BacktestEngine(graph_stub)
         best_params = backtester.run_tuning_job()
         log.info(f"--- C7 Demo Complete. Best params: {best_params} ---")
         graph_stub.close()
-        ray.shutdown()
     except Exception as e:
         log.error(f"C7 Demo Failed: {e}")
         if "ray" in str(e): log.info("Hint: Run 'pip install \"ray[tune]\" pandas'")
 
-def run_c8_demo():
-    """Launches the C8 Dashboard"""
-    log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
-    log.info("--- Launching Dash server on http://127.0.0.1:8050/ ---")
-    try:
-        app.run_server(debug=True, port=8050)
-    except Exception as e:
-        log.error(f"C8 Demo Failed: {e}")
-        if "dash" in str(e): log.info("Hint: Run 'pip install dash dash-bootstrap-components plotly pandas'")
 
 if __name__ == "__main__":
     
+    # Simple CLI launcher
+    demos = {
+        "C1_C2": run_c1_c2_demo,
+        "C3": run_c3_demo,
+        "C4": run_c4_demo,
+        "C5": run_c5_demo,
+        "C6": run_c6_demo,
+        "C7": run_c7_demo,
+        "C8": run_c8_demo,
+    }
+    
     if len(sys.argv) > 1:
-        demo = sys.argv[1].upper()
-        if demo == 'C1_C2':
-            run_c1_c2_demo()
-        elif demo == 'C3':
-            run_c3_demo()
-        elif demo == 'C4':
-            run_c4_demo()
-        elif demo == 'C5':
-            run_c5_demo()
-        elif demo == 'C6':
-            run_c6_demo()
-        elif demo == 'C7':
-            run_c7_demo()
-        elif demo == 'C8':
-            run_c8_demo()
+        demo_name = sys.argv[1].upper()
+        if demo_name in demos:
+            demos[demo_name]()
         else:
-            log.error(f"Unknown demo: {demo}")
-            log.info("Usage: python full_system.py [C1_C2|C3|C4|C5|C6|C7|C8]")
+            log.error(f"Unknown demo: {demo_name}")
+            log.info(f"Usage: python full_system.py [{ '|'.join(demos.keys()) }]")
     else:
         log.info("No demo specified. Running C6 (Portfolio Manager) by default.")
         log.info("Try 'python full_system.py C8' to run the dashboard.")
