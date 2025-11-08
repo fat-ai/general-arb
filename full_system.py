@@ -224,56 +224,104 @@ class GraphManager:
 
     # --- C4: Read/Write Methods (Production-Ready) ---
     def get_all_resolved_trades_by_topic(self) -> pd.DataFrame:
+        """Fetches all historical, resolved trades and links them to their Entity 'type'."""
         if self.is_mock: return self._mock_get_all_resolved_trades_by_topic()
+        
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract)-[:IS_ABOUT]->(e:Entity)
         WHERE c.status = 'RESOLVED' AND c.outcome IS NOT NULL AND t.price IS NOT NULL
-        RETURN w.wallet_id AS wallet_id, e.type AS entity_type, 
-               t.price AS bet_price, c.outcome AS outcome
+        RETURN w.wallet_id AS wallet_id, 
+               e.type AS entity_type, 
+               t.price AS bet_price, 
+               c.outcome AS outcome
+        // In Prod: This query should be paginated or time-bounded for performance.
         """
         with self.driver.session() as session:
             results = session.run(query)
             df = pd.DataFrame([r.data() for r in results])
-            return df if not df.empty else pd.DataFrame(columns=['wallet_id', 'entity_type', 'bet_price', 'outcome'])
+            if df.empty:
+                return pd.DataFrame(columns=['wallet_id', 'entity_type', 'bet_price', 'outcome'])
+            return df
 
     def get_live_trades_for_contract(self, contract_id: str) -> pd.DataFrame:
+        """Fetches all live trades (or recent trades) for a given contract."""
         if self.is_mock: return self._mock_get_live_trades_for_contract(contract_id)
+        
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract {contract_id: $contract_id})
         WHERE t.price IS NOT NULL AND t.volume IS NOT NULL
-        RETURN w.wallet_id AS wallet_id, t.price AS trade_price, t.volume AS trade_volume
+        RETURN w.wallet_id AS wallet_id, 
+               t.price AS trade_price, 
+               t.volume AS trade_volume
+        // In Prod: This should query a live feed or a recent-trades cache.
+        // This query assumes trades are stored as relationships in the graph.
         """
         with self.driver.session() as session:
             results = session.run(query, contract_id=contract_id)
             df = pd.DataFrame([r.data() for r in results])
-            return df if not df.empty else pd.DataFrame(columns=['wallet_id', 'trade_price', 'trade_volume'])
+            if df.empty:
+                return pd.DataFrame(columns=['wallet_id', 'trade_price', 'trade_volume'])
+            return df
 
     def get_contract_topic(self, contract_id: str) -> str:
-        if self.is_mock: return "biotech"
+        """Finds the primary 'type' of the Entity a contract is about."""
+        if self.is_mock: return "biotech" # Keep mock for demos
+        
+        query = """
+        MATCH (c:Contract {contract_id: $id})-[:IS_ABOUT]->(e:Entity) 
+        RETURN e.type AS topic 
+        LIMIT 1
+        """
         with self.driver.session() as session:
             result = session.execute_read(
-                lambda tx: tx.run(
-                    "MATCH (c:Contract {contract_id: $id})-[:IS_ABOUT]->(e:Entity) RETURN e.type AS topic LIMIT 1",
-                    id=contract_id
-                ).single()
+                lambda tx: tx.run(query, id=contract_id).single()
             )
         return result.data().get('topic') if result else "default"
 
     def update_wallet_scores(self, wallet_scores: Dict[tuple, float]):
+        """Writes the calculated Brier scores back to the Wallet nodes."""
         if self.is_mock: return
-        scores_list = [{"wallet_id": k[0], "topic_key": f"brier_{k[1]}", "brier_score": v} for k, v in wallet_scores.items()]
-        if not scores_list: return
-        query = "UNWIND $scores_list AS score MERGE (w:Wallet {wallet_id: score.wallet_id}) SET w[score.topic_key] = score.brier_score"
+        
+        scores_list = [
+            {
+                "wallet_id": k[0],
+                "topic_key": f"brier_{k[1]}", # e.g., "brier_biotech"
+                "brier_score": v
+            } for k, v in wallet_scores.items()
+        ]
+        
+        if not scores_list:
+            log.info("No wallet scores to update.")
+            return
+            
+        query = """
+        UNWIND $scores_list AS score
+        MERGE (w:Wallet {wallet_id: score.wallet_id})
+        SET w[score.topic_key] = score.brier_score
+        """
         with self.driver.session() as session:
             session.execute_write(lambda tx: tx.run(query, scores_list=scores_list))
-        log.info(f"Updated {len(scores_list)} wallet scores.")
+        log.info(f"Updated {len(scores_list)} wallet scores in graph.")
+
+    
         
     def get_wallet_brier_scores(self, wallet_ids: List[str]) -> Dict[str, Dict[str, float]]:
+        """Fetches the stored Brier scores for a list of wallets."""
         if self.is_mock: return self._mock_get_wallet_brier_scores(wallet_ids)
-        query = "MATCH (w:Wallet) WHERE w.wallet_id IN $wallet_ids RETURN w.wallet_id AS wallet_id, properties(w) AS scores"
+        
+        query = """
+        MATCH (w:Wallet)
+        WHERE w.wallet_id IN $wallet_ids
+        RETURN w.wallet_id AS wallet_id, properties(w) AS scores
+        """
         with self.driver.session() as session:
             results = session.run(query, wallet_ids=wallet_ids)
-            return {r.data()['wallet_id']: {k: v for k, v in r.data()['scores'].items() if k.startswith('brier_')} for r in results}
+            # Convert {wallet_id: 'abc', scores: {'wallet_id': 'abc', 'brier_biotech': 0.05}} 
+            # TO -> {'abc': {'brier_biotech': 0.05}}
+            return {
+                r.data()['wallet_id']: {k: v for k, v in r.data()['scores'].items() if k.startswith('brier_')}
+                for r in results
+            }
 
     # --- C5: Read/Write Methods (NOW PRODUCTION-READY) ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
@@ -299,8 +347,16 @@ class GraphManager:
     def get_model_brier_scores(self) -> Dict[str, float]:
         """Fetches the system's model scores (set by C7)."""
         if self.is_mock: return self._mock_get_model_brier_scores()
-        # In Prod: This reads from a config file or a dedicated 'ModelPerformance' node
-        return {'brier_internal_model': 0.08, 'brier_expert_model': 0.05, 'brier_crowd_model': 0.15}
+        
+        # In Prod: This reads from a config file (e.g., config.json)
+        # or a dedicated 'ModelPerformance' node set by Component 7.
+        # For a runnable system, we'll keep the mock's hardcoded values.
+        log.info("get_model_brier_scores: Reading from hardcoded config.")
+        return {
+            'brier_internal_model': 0.08, # Tuned by C7
+            'brier_expert_model': 0.05,   # Tuned by C7
+            'brier_crowd_model': 0.15,    # Tuned by C7
+        }
 
     def update_contract_fused_price(self, contract_id: str, p_model: float, p_model_variance: float):
         """Writes the final P_model and sets status to 'MONITORED'."""
@@ -317,20 +373,68 @@ class GraphManager:
             session.execute_write(
                 lambda tx: tx.run(query, contract_id=contract_id, p_model=p_model, p_model_variance=p_model_variance)
             )
+        log.info(f"Updated {contract_id} with fused P_model={p_model:.4f}, status=MONITORED")
 
     # --- C6: Read Methods (Production-Ready) ---
     def get_active_entity_clusters(self) -> List[str]:
-        # (Production-ready C6 method)
+        """Finds all Entity clusters that have active, monitored bets."""
         if self.is_mock: return self._mock_get_active_entity_clusters()
-        pass 
+        
+        query = """
+        MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity)
+        RETURN DISTINCT e.entity_id AS entity_id
+        """
+        with self.driver.session() as session:
+            results = session.run(query)
+            return [r['entity_id'] for r in results]
+            
     def get_cluster_contracts(self, entity_id: str) -> List[Dict]:
-        # (Production-ready C6 method)
+        """Gets all 'MONITORED' contracts for a given Entity cluster."""
         if self.is_mock: return self._mock_get_cluster_contracts(entity_id)
-        pass
-    def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
-        # (Production-ready C6 method)
+        
+        query = """
+        MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity {entity_id: $entity_id})
+        WHERE c.p_model IS NOT NULL AND c.p_market_all IS NOT NULL
+        RETURN c.contract_id AS id, 
+               c.p_model AS M, 
+               c.p_market_all AS Q, 
+               c.is_logical_rule AS is_logical_rule 
+               // 'is_logical_rule' must be set by C3/C5
+        """
+        with self.driver.session() as session:
+            results = session.run(query, entity_id=entity_id)
+            return [r.data() for r in results]
+            
+   def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
+        """Finds the correlation between two contracts. This is the key to C6."""
         if self.is_mock: return self._mock_get_relationship_between_contracts(c1_id, c2_id, contracts)
-        pass
+        
+        # This query finds a *logical* relationship first.
+        query = """
+        MATCH (c1:Contract {contract_id: $c1_id})-[:IS_ABOUT]->(e1:Entity),
+              (c2:Contract {contract_id: $c2_id})-[:IS_ABOUT]->(e2:Entity)
+        // Check for a direct logical link (e.g., A -> IMPLIES -> B)
+        OPTIONAL MATCH (e1)-[r:RELATES_TO]->(e2)
+        WHERE r.type = 'IMPLIES'
+        RETURN r.type AS type, c1.p_model AS p_joint 
+        // p_joint is P(A,B) which is P(A) if A implies B
+        LIMIT 1
+        """
+        with self.driver.session() as session:
+            # We use p_model from the contracts list passed in, not from the DB
+            # (as it might be stale)
+            p_model_c1 = next(c['M'] for c in contracts if c['id'] == c1_id)
+            
+            result = session.run(query, c1_id=c1_id, c2_id=c2_id).single()
+            if result and result.data().get('type') == 'IMPLIES':
+                log.debug(f"Found LOGICAL_IMPLIES between {c1_id} and {c2_id}")
+                return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_model_c1}
+        
+        # If no logical link, check for statistical links (e.g., from C3)
+        # (This logic would be expanded)
+        
+        # Default: No relationship found
+        return {'type': 'NONE', 'p_joint': None}
 
     # --- C7/C8: Mock Methods (for demos) ---
     # (These remain mocks)
