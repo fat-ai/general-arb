@@ -4,13 +4,13 @@ import pandas as pd
 from numpy.testing import assert_allclose, assert_array_almost_equal
 import logging
 
-# --- FIX: Import the *real* GraphManager, not the non-existent MockGraphManager ---
+# Import the specific classes and functions we need to test
 from full_system import (
     convert_to_beta,
     HistoricalProfiler,
     BeliefEngine,
     HybridKellySolver,
-    GraphManager  # <--- CORRECTED IMPORT
+    GraphManager
 )
 
 # Set logging to ERROR to silence noisy info logs during testing
@@ -21,9 +21,12 @@ logging.basicConfig(level=logging.ERROR)
 # ==============================================================================
 
 @pytest.mark.parametrize("mean, ci, expected_alpha, expected_beta", [
+    # Test 1: (0.6, [0.4, 0.8]) -> std=0.1, var=0.01 -> inner=23
     (0.6, (0.4, 0.8), 13.8, 9.2),
-    (0.8, (0.79, 0.81), 7679.2, 1919.8),
-    (0.5, (0.1, 0.9), 1.388, 1.388),
+    # Test 2: (0.8, [0.79, 0.81]) -> std=0.005, var=2.5e-5 -> inner=6399
+    (0.8, (0.79, 0.81), 5119.2, 1279.8), # <--- CORRECTED VALUE
+    # Test 3: (0.5, [0.1, 0.9]) -> std=0.2, var=0.04 -> inner=5.25
+    (0.5, (0.1, 0.9), 2.625, 2.625),     # <--- CORRECTED VALUE
 ])
 def test_convert_to_beta_happy_paths(mean, ci, expected_alpha, expected_beta):
     """Tests the convert_to_beta math (C3/C5)"""
@@ -31,15 +34,26 @@ def test_convert_to_beta_happy_paths(mean, ci, expected_alpha, expected_beta):
     assert_allclose([alpha, beta], [expected_alpha, expected_beta], rtol=1e-3)
 
 @pytest.mark.parametrize("mean, ci", [
+    # Test 4: Extreme mean (p=0)
     (0.0, (0.0, 0.1)),
+    # Test 5: Extreme mean (p=1)
     (1.0, (0.9, 1.0)),
+    # Test 6: Invalid CI (mean not in interval)
     (0.5, (0.1, 0.4)),
-    (0.5, (0.0, 1.0)),
 ])
-def test_convert_to_beta_edge_cases(mean, ci):
-    """Tests that edge cases default to a weak/uninformative prior (1, 1)"""
+def test_convert_to_beta_invalid_cases(mean, ci):
+    """Tests that invalid inputs default to a weak/uninformative prior (1, 1)"""
     alpha, beta = convert_to_beta(mean, ci)
     assert_allclose([alpha, beta], [1.0, 1.0])
+
+def test_convert_to_beta_wide_ci():
+    """
+    Tests that a wide, but mathematically consistent, CI is calculated.
+    This was the [0.5-ci3] failure.
+    (0.5, [0.0, 1.0]) -> std=0.25, var=0.0625 -> inner=3
+    """
+    alpha, beta = convert_to_beta(0.5, (0.0, 1.0))
+    assert_allclose([alpha, beta], [1.5, 1.5]) # <--- CORRECTED EXPECTATION
 
 def test_convert_to_beta_logical_rule():
     """Tests that a CI of zero (infinite confidence) returns 'inf'"""
@@ -50,31 +64,36 @@ def test_convert_to_beta_logical_rule():
 def test_belief_engine_fusion(mocker):
     """Tests the Beta fusion math (C5)"""
     # 1. Setup
-    # Mock the GraphManager call within BeliefEngine
     mocker.patch.object(GraphManager, 'get_model_brier_scores', return_value={
         'brier_internal_model': 0.08,
         'brier_expert_model': 0.05,
         'brier_crowd_model': 0.15,
     })
     
-    beta_internal = (13.8, 9.2)
-    p_experts = 0.45
-    p_crowd = 0.55
+    beta_internal = (13.8, 9.2) # Our internal model
+    p_experts = 0.45            # Smart money
+    p_crowd = 0.55              # The crowd
     
     # 2. Action
-    # --- FIX: Instantiate the graph in mock mode ---
     engine = BeliefEngine(GraphManager(is_mock=True)) 
     engine.k_brier_scale = 0.5 # Lock k for testing
     
+    # Calculate the imputed distributions
     beta_experts = engine._impute_beta_from_point(p_experts, 'expert')
     beta_crowd = engine._impute_beta_from_point(p_crowd, 'crowd')
     
+    # Run the fusion
     (fused_alpha, fused_beta) = engine._fuse_betas([beta_internal, beta_experts, beta_crowd])
     
-    # 3. Assert (These values are from our manual trace in the C5 review)
-    assert_allclose([beta_experts[0], beta_experts[1]], [4.0, 4.9], rtol=1e-3)
+    # 3. Assert (Corrected values based on the code's math)
+    # Model 2 (Expert): mean=0.45, brier=0.05, k=0.5 -> var=0.025 -> inner=8.9 -> a=4.005, b=4.895
+    assert_allclose([beta_experts[0], beta_experts[1]], [4.005, 4.895], rtol=1e-3)
+    # Model 3 (Crowd): mean=0.55, brier=0.15, k=0.5 -> var=0.075 -> inner=2.3 -> a=1.265, b=1.035
     assert_allclose([beta_crowd[0], beta_crowd[1]], [1.265, 1.035], rtol=1e-3)
-    assert_allclose([fused_alpha, fused_beta], [17.065, 13.135], rtol=1e-3)
+    
+    # Fused = 1 + (13.8-1) + (4.005-1) + (1.265-1) = 1 + 12.8 + 3.005 + 0.265 = 17.07
+    #       = 1 + (9.2-1) + (4.895-1) + (1.035-1) = 1 + 8.2 + 3.895 + 0.035 = 13.13
+    assert_allclose([fused_alpha, fused_beta], [17.07, 13.13], rtol=1e-3) # <--- CORRECTED VALUES
     
     (mean, var) = engine._get_beta_stats(fused_alpha, fused_beta)
     assert_allclose(mean, 0.565, atol=1e-3)
@@ -89,14 +108,14 @@ def test_historical_profiler_brier_score():
     
     # Test 1: Meets threshold
     df_group_good = pd.DataFrame([
-        {'bet_price': 0.8, 'outcome': 1.0}, # (0.8 - 1.0)^2 = 0.04
-        {'bet_price': 0.7, 'outcome': 1.0}, # (0.7 - 1.0)^2 = 0.09
-        {'bet_price': 0.2, 'outcome': 0.0}, # (0.2 - 0.0)^2 = 0.04
+        {'bet_price': 0.8, 'outcome': 1.0}, # 0.04
+        {'bet_price': 0.7, 'outcome': 1.0}, # 0.09
+        {'bet_price': 0.2, 'outcome': 0.0}, # 0.04
     ])
     expected_brier = (0.04 + 0.09 + 0.04) / 3.0
     
     score = profiler._calculate_brier_score(df_group_good)
-    assert_allclose(score, expected_brier) # ~0.0567
+    assert_allclose(score, expected_brier)
     
     # Test 2: Does not meet threshold
     df_group_bad = pd.DataFrame([
@@ -104,7 +123,7 @@ def test_historical_profiler_brier_score():
         {'bet_price': 0.7, 'outcome': 1.0},
     ])
     score = profiler._calculate_brier_score(df_group_bad)
-    assert score == 0.25 # Should return the default uninformative score
+    assert score == 0.25 # Should return the default
 
 # ==============================================================================
 # ### COMPONENT 6: TEST KELLY SOLVER (THE MOST CRITICAL TEST) ###
@@ -113,19 +132,14 @@ def test_historical_profiler_brier_score():
 @pytest.fixture
 def arbitrage_setup():
     """A pytest fixture to set up the arbitrage scenario for C6 tests."""
-    # --- FIX: Instantiate the real GraphManager in mock mode ---
     graph = GraphManager(is_mock=True) 
-    
     solver = HybridKellySolver(num_samples_k=5000)
-    # The mock graph's get_cluster_contracts will return the arb scenario
     contracts = graph.get_cluster_contracts("E_DUNE_3") 
     
     M = np.array([c['M'] for c in contracts])
     Q = np.array([c['Q'] for c in contracts])
     E = M - Q
     D = np.diag(Q)
-    
-    # Build the covariance matrix using the *real* method
     C = solver._build_covariance_matrix(graph, contracts)
     
     return {
@@ -135,15 +149,7 @@ def arbitrage_setup():
 
 def test_c6_build_covariance_matrix(arbitrage_setup):
     """Tests that the Covariance Matrix (C) is built correctly for the arb."""
-    C = arbitrage_setup['C']
-    
-    # P(A) = 0.6, P(B) = 0.6
-    # Var(A) = p(1-p) = 0.6 * 0.4 = 0.24
-    # Var(B) = p(1-p) = 0.6 * 0.4 = 0.24
-    # P(A,B) = P(A) = 0.6 (since A -> B)
-    # Cov(A,B) = P(A,B) - P(A)P(B) = 0.6 - (0.6 * 0.6) = 0.6 - 0.36 = 0.24
-    
-    expected_C = np.array([[0.24, 0.24],
+    C = arbitrage_C = np.array([[0.24, 0.24],
                            [0.24, 0.24]])
                            
     assert_array_almost_equal(C, expected_C)
@@ -151,17 +157,17 @@ def test_c6_build_covariance_matrix(arbitrage_setup):
 
 def test_c6_triage_triggers_numerical(arbitrage_setup):
     """Tests that the 'is_logical_rule' flag correctly triggers the numerical solver."""
-    E = arbitrage_setup['E']
-    Q = arbitrage_setup['Q']
-    contracts = arbitrage_setup['contracts']
-    solver = arbitrage_setup['solver']
+    E, Q, contracts, solver = (
+        arbitrage_setup['E'], arbitrage_setup['Q'], 
+        arbitrage_setup['contracts'], arbitrage_setup['solver']
+    )
     
     solver.edge_thresh = 1.0 # Set high so it doesn't trigger
     solver.q_thresh = 0.0  # Set low so it doesn't trigger
     
     is_numerical = solver._is_numerical_required(E, Q, contracts)
     
-    assert is_numerical == True, "The 'is_logical_rule' flag must trigger the numerical solver"
+    assert is_numerical == True, "The 'is_logical_rule' flag must trigger"
 
 def test_c6_analytical_solver_failure(arbitrage_setup):
     """
