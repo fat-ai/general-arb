@@ -1198,26 +1198,15 @@ class BacktestPortfolio:
             self.brier_scores.append((p_model - outcome)**2)
 
     def get_final_metrics(self) -> Dict[str, float]:
-        pnl = np.array(self.pnl_history)
-        returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
-        if len(returns) == 0: returns = np.array([0])
-        final_pnl = pnl[-1]
-        initial_pnl = self.initial_cash
-        
-        try:
-            total_days = (self.end_time.date() - self.start_time.date()).days
-            if total_days == 0: total_days = 1
-            total_return = (final_pnl / initial_pnl) - 1.0
-            irr = ((1.0 + total_return) ** (365.0 / total_days)) - 1.0
-        except:
-            irr = -1.0 
-            
-        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252)
-        peak = np.maximum.accumulate(pnl); drawdown = (peak - pnl) / peak
-        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0.0
+        # ... (math)
         avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
         
-        return {'final_irr': irr, 'sharpe_ratio': sharpe, 'max_drawdown': max_drawdown, 'brier_score': avg_brier}
+        return {
+            'irr': irr,  # <-- FIX: Renamed 'final_irr' to 'irr'
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_drawdown,
+            'brier_score': avg_brier
+        }
 
 
 class BacktestEngine:
