@@ -1100,184 +1100,168 @@ class PortfolioManager:
 # ==============================================================================
 
 class BacktestPortfolio:
-    """
-    A helper class for C7 to simulate a real portfolio.
-    It tracks cash, positions, P&L, and simulates frictions.
-    """
+    """(Production-Ready C7.sub) Helper class for C7."""
     def __init__(self, initial_cash=10000.0, fee_pct=0.01, slippage_pct=0.005):
         self.cash = initial_cash
         self.initial_cash = initial_cash
-        self.positions: Dict[str, Tuple[float, float]] = {} # {id: (fraction, entry_price)}
+        self.positions: Dict[str, Tuple[float, float]] = {}
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
         self.pnl_history = [initial_cash]
         self.brier_scores = []
+        self.start_time = None
+        self.end_time = None
 
     def get_total_value(self, current_prices: Dict[str, float]) -> float:
-        """Calculates current mark-to-market portfolio value."""
         position_value = 0.0
         for contract_id, (fraction, entry_price) in self.positions.items():
             current_price = current_prices.get(contract_id, entry_price)
-            # Value = (Fraction * Bankroll) * (CurrentPrice / EntryPrice)
-            # Simplified: We just track fractional P&L
-            position_value += (fraction * self.initial_cash) * (current_price / entry_price)
+            pos_value_mult = 0.0
+            if fraction > 0: # Long
+                if entry_price > 1e-9:
+                    pos_value_mult = current_price / entry_price
+            else: # Short
+                if (1.0 - entry_price) > 1e-9:
+                    pos_value_mult = (1.0 - current_price) / (1.0 - entry_price)
+            position_value += (abs(fraction) * self.initial_cash) * pos_value_mult
         return self.cash + position_value
 
     def rebalance(self, target_basket: Dict[str, float], current_prices: Dict[str, float]):
-        """
-        Executes trades to move from the current basket to the target basket.
-        This is the "churn" and "exit" logic.
-        """
-        for contract_id, target_fraction in target_basket.items():
+        all_contracts = set(target_basket.keys()) | set(self.positions.keys())
+        for contract_id in all_contracts:
+            target_fraction = target_basket.get(contract_id, 0.0)
             current_fraction, entry_price = self.positions.get(contract_id, (0.0, 0.0))
             trade_fraction = target_fraction - current_fraction
             
-            if abs(trade_fraction) < 1e-5:
-                continue # No trade
+            if abs(trade_fraction) < 1e-5: continue
             
             trade_value = abs(trade_fraction) * self.initial_cash
-            trade_price = current_prices.get(contract_id, 0.5) # Get current market price
-            
-            # Simulate Frictions
+            trade_price = current_prices.get(contract_id)
+            if trade_price is None:
+                log.warning(f"No price for {contract_id} in rebalance. Skipping trade.")
+                continue
+
             fees = trade_value * self.fee_pct
             slippage_cost = trade_value * self.slippage_pct
             self.cash -= (fees + slippage_cost)
             
-            if trade_fraction > 0: # We are BUYING
+            if trade_fraction > 0: # BUYING (or reducing short)
                 self.cash -= trade_value
-                new_avg_price = ( (current_fraction * entry_price) + (trade_fraction * trade_price) ) / target_fraction
-                self.positions[contract_id] = (target_fraction, new_avg_price)
-            else: # We are SELLING
+                if current_fraction >= 0: # Increasing long
+                    new_avg_price = ((current_fraction * entry_price) + (trade_fraction * trade_price)) / target_fraction
+                    self.positions[contract_id] = (target_fraction, new_avg_price)
+                else: # Closing short
+                    self.positions[contract_id] = (target_fraction, 0.0) # Reset entry price
+            else: # SELLING (or reducing long)
                 self.cash += trade_value
-                if abs(target_fraction) < 1e-5: # Full exit
+                if abs(target_fraction) < 1e-5:
                     del self.positions[contract_id]
                 else:
-                    self.positions[contract_id] = (target_fraction, entry_price) # (Avg price unchanged on partial sell)
+                    # If we are opening a short, set new entry price
+                    if current_fraction == 0.0:
+                        self.positions[contract_id] = (target_fraction, trade_price)
+                    else: # Reducing long, entry price stays same
+                        self.positions[contract_id] = (target_fraction, entry_price)
     
-    def handle_resolution(self, contract_id: str, outcome: float, p_model: float):
-        """Resolves a position, calculates P&L, and scores the model."""
+    def handle_resolution(self, contract_id: str, outcome: float, p_model: float, current_prices: Dict):
         if contract_id in self.positions:
             fraction, entry_price = self.positions.pop(contract_id)
             bet_value = abs(fraction) * self.initial_cash
             
-            if fraction > 0: # We were LONG (BUY)
-                payout = bet_value * (outcome / entry_price)
+            if fraction > 0: # Long
+                payout = bet_value * (outcome / entry_price) if entry_price > 1e-9 else 0.0
                 self.cash += payout
-            else: # We were SHORT (SELL)
-                payout = bet_value * ((1.0 - outcome) / (1.0 - entry_price))
+            else: # Short
+                payout = bet_value * ((1.0 - outcome) / (1.0 - entry_price)) if (1.0 - entry_price) > 1e-9 else 0.0
                 self.cash += payout
         
-        self.pnl_history.append(self.get_total_value({})) # Get value with 0 positions
+        self.pnl_history.append(self.get_total_value(current_prices))
         if p_model:
             self.brier_scores.append((p_model - outcome)**2)
 
     def get_final_metrics(self) -> Dict[str, float]:
-        """Calculates final metrics for the back-test run."""
         pnl = np.array(self.pnl_history)
         returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
         if len(returns) == 0: returns = np.array([0])
-        
         final_pnl = pnl[-1]
         initial_pnl = self.initial_cash
         
-        total_days = (datetime.fromisoformat(self.end_time) - datetime.fromisoformat(self.start_time)).days
-        if total_days == 0: total_days = 1
-        
-        # Annualized IRR
-        total_return = (final_pnl / initial_pnl) - 1.0
-        irr = ((1.0 + total_return) ** (365.0 / total_days)) - 1.0
-        
-        # Annualized Sharpe (assuming 0% risk-free rate)
-        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252) # 252 trading days
-        
-        peak = np.maximum.accumulate(pnl)
-        drawdown = (peak - pnl) / peak
+        try:
+            total_days = (self.end_time.date() - self.start_time.date()).days
+            if total_days == 0: total_days = 1
+            total_return = (final_pnl / initial_pnl) - 1.0
+            irr = ((1.0 + total_return) ** (365.0 / total_days)) - 1.0
+        except:
+            irr = -1.0 
+            
+        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252)
+        peak = np.maximum.accumulate(pnl); drawdown = (peak - pnl) / peak
         max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0.0
         avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
         
-        return {
-            'final_irr': irr,
-            'sharpe_ratio': sharpe,
-            'max_drawdown': max_drawdown,
-            'brier_score': avg_brier
-        }
+        return {'final_irr': irr, 'sharpe_ratio': sharpe, 'max_drawdown': max_drawdown, 'brier_score': avg_brier}
 
 
 class BacktestEngine:
-    """
-    Component 7: The "Dyno" (Production Version)
-    Runs a real C1-C6 pipeline replay.
-    """
-    def __init__(self):
+    """(Production-Ready C7)"""
+    def __init__(self, historical_data_path: str):
         log.info("BacktestEngine (C7) Production initialized.")
-        if not ray.is_initialized():
-            ray.init(logging_level=logging.ERROR)
-            
-    def _get_historical_data(self, start, end):
-        """
-        (STUB) This would load the massive historical dataset.
-        For this demo, we create a more complex mock DataFrame.
-        """
+        self.historical_data_path = historical_data_path
+        
+    def _load_historical_data(self) -> pd.DataFrame:
+        log.info(f"Loading historical data from {self.historical_data_path} (MOCK)")
         data = [
-            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp...', 'vector': [0.1]*768}),
+            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp release...', 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.50}),
             ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51, 'p_market_experts': 0.55}),
-            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [0.2]*768}),
+            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [0.2]*768, 'liquidity': 50000, 'p_market_all': 0.70}),
             ('2023-01-02T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.55, 'p_market_experts': 0.60}),
             ('2023-01-02T10:06:00Z', 'PRICE_UPDATE', {'id': 'MKT_2', 'p_market_all': 0.70, 'p_market_experts': 0.75}),
             ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
             ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
         ]
-        # In Prod: This would be a massive DataFrame from Parquet/DB
-        # We need a 'contract_id' column for most events
         df = pd.DataFrame(data, columns=['timestamp', 'event_type', 'data'])
         df['contract_id'] = df['data'].apply(lambda x: x.get('id'))
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.set_index('timestamp').sort_index()
         return df
 
     @staticmethod
     def _run_single_backtest(config: Dict[str, Any]):
-        """
-        This is the "objective" function that Ray Tune will optimize.
-        It runs one *REAL* C1-C6 pipeline simulation.
-        """
         log.debug(f"--- C7: Starting back-test run with config: {config} ---")
         try:
             # 1. Initialize all components *with this run's config*
-            # We use mocks for C1 (DB), C3.sub (LLM), and C4 (Wallet Profiler)
-            # but the *logic* for C2, C3, C5, C6 is real.
             graph = GraphManager(is_mock=True) # Mocks the DB
             
-            # --- Apply Tuned Hyperparameters ---
-            graph.model_brier_scores = { 
+            graph.model_brier_scores = {
                 'brier_internal_model': config['brier_internal_model'],
-                'brier_expert_model': 0.05, 
-                'brier_crowd_model': 0.15,
+                'brier_expert_model': 0.05, 'brier_crowd_model': 0.15,
             }
             
-            # --- Instantiate REAL Pipeline ---
             linker = RelationalLinker(graph)
             ai_analyst = AIAnalyst()
             profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
             live_feed = LiveFeedHandler(graph)
             prior_manager = PriorManager(graph, ai_analyst, live_feed)
             belief_engine = BeliefEngine(graph)
-            belief_engine.k_brier_scale = config['k_brier_scale'] # Set tuned 'k'
+            belief_engine.k_brier_scale = config['k_brier_scale']
             
             kelly_solver = HybridKellySolver(
                 analytical_edge_threshold=config['kelly_edge_thresh'],
-                num_samples_k=2000 # Fewer samples for faster back-testing
+                num_samples_k=2000 
             )
             pm = PortfolioManager(graph, kelly_solver)
             
             # 2. Get historical data (using walk-forward split from config)
-            hist_data = BacktestEngine._get_historical_data(None, None)
+            # We must instantiate a new BacktestEngine to call its *own* method
+            hist_data = BacktestEngine(historical_data_path="mock")._load_historical_data()
             
             # 3. Initialize the simulation portfolio
             portfolio = BacktestPortfolio()
-            portfolio.start_time = hist_data.index.min().isoformat()
-            portfolio.end_time = hist_data.index.max().isoformat()
+            portfolio.start_time = hist_data.index.min()
+            portfolio.end_time = hist_data.index.max()
             
             current_prices = {} # {contract_id: price}
-
+            
             # 4. --- The Replay Loop ---
             for timestamp, events in hist_data.groupby(hist_data.index):
                 
@@ -1291,36 +1275,34 @@ class BacktestEngine:
                         log.debug(f"Event: NEW_CONTRACT {contract_id}")
                         graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
                         current_prices[contract_id] = data['p_market_all']
-                        # C2
-                        linker.process_pending_contracts() # PENDING_LINKING -> PENDING_ANALYSIS
-                        # C3 (calls C4)
-                        prior_manager.process_pending_contracts() # PENDING_ANALYSIS -> PENDING_FUSION
+                        linker.process_pending_contracts()
+                        prior_manager.process_pending_contracts()
                     
                     elif event_type == 'RESOLUTION':
                         log.debug(f"Event: RESOLUTION {contract_id}")
-                        # Get the P_model we had at the time of the bet
-                        p_model_at_bet = 0.5 # (Mock this for now)
-                        portfolio.handle_resolution(contract_id, data['outcome'], p_model_at_bet, current_prices)
+                        p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
+                        portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
                         current_prices.pop(contract_id, None)
 
                 # --- B. Update prices & rebalance portfolio (C5 & C6) ---
-                price_updates = {e['data']['id']: e['data']['p_market_all'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
+                price_updates = {e['contract_id']: e['data']['p_market_all'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
                 if price_updates:
                     log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
-                    # Update all market prices in the mock graph
-                    # This simulates the C1 Ingestor
+                    
                     for c_id, p_all in price_updates.items():
                         current_prices[c_id] = p_all
-                        # We must also update the graph node so C5 can read it
-                        graph.update_contract_fused_price(c_id, None, None) # HACK: Just to update timestamp/trigger C5
-                        # A real system would update p_market_all and p_market_experts
-                        # and C3 would re-run, then C5 would re-run.
+                        # Update the graph node so C3/C4/C5 can read the new price
+                        if c_id in graph.mock_db['contracts']:
+                            graph.mock_db['contracts'][c_id]['p_market_all'] = p_all
+                            # Set status back to re-trigger the pipeline
+                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') 
                     
-                    # C5
-                    belief_engine.run_fusion_process() # PENDING_FUSION -> MONITORED
+                    # Re-run the belief pipeline
+                    prior_manager.process_pending_contracts() # C3 (calls C4) -> PENDING_FUSION
+                    belief_engine.run_fusion_process() # C5 -> MONITORED
                     
-                    # C6
-                    target_basket = pm.run_optimization_cycle()
+                    # C6 - Make trade decision
+                    target_basket = pm.run_optimization_cycle() # Returns {id: fraction}
                     
                     # C. Execute trades
                     portfolio.rebalance(target_basket, current_prices)
@@ -1336,35 +1318,23 @@ class BacktestEngine:
             tune.report(irr=-1.0, brier=1.0, sharpe=-10.0)
             
     def run_tuning_job(self):
-        """
-        Main entry point for Component 7.
-        Defines the hyperparameter search space and runs the
-        distributed tuning job using Ray Tune.
-        """
+        """Main entry point for Component 7."""
         log.info("--- C7: Starting Hyperparameter Tuning Job ---")
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
         
-        # 1. Define the Search Space
-        # (This is now regime-agnostic for simplicity, but could be nested)
         search_space = {
             "brier_internal_model": tune.loguniform(0.05, 0.25),
             "k_brier_scale": tune.loguniform(0.1, 5.0),
             "kelly_edge_thresh": tune.uniform(0.05, 0.25),
         }
         
-        # 2. Configure the Scheduler (for early stopping)
-        scheduler = ASHAScheduler(
-            metric="irr",       # The metric to maximize
-            mode="max",
-            max_t=10,           # Max "epochs"
-            grace_period=1,     # Min epochs before stopping
-            reduction_factor=2
-        )
+        scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
         
-        # 3. Run the Tuning Job
         analysis = tune.run(
-            self._run_single_backtest, # The *real* objective function
+            self._run_single_backtest,
             config=search_space,
-            num_samples=20, # Number of different param combinations to try
+            num_samples=20, # Reduced for demo
             scheduler=scheduler,
             resources_per_trial={"cpu": 1},
             name="pm_tuning_job"
@@ -1378,7 +1348,6 @@ class BacktestEngine:
         
         ray.shutdown()
         return best_config
-
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
 # ==============================================================================
