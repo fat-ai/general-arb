@@ -1288,36 +1288,52 @@ class BacktestEngine:
 
     def _download_and_load_data(self) -> (pd.DataFrame, pd.DataFrame):
         """
-        Downloads and loads the Polymarket CSVs into pandas DataFrames.
+        Downloads (if needed) and loads the Polymarket CSVs into pandas DataFrames.
         This is the "Extract" phase.
         """
+        
         # --- 1. Load Markets Data ---
         markets_file = os.path.join(self.historical_data_path, "markets.csv.gz")
+        
+        # --- FIX: Check if file exists. If not, download it. ---
         if not os.path.exists(markets_file):
             log.info(f"Downloading markets.csv.gz from {self.markets_url}...")
-            r = requests.get(self.markets_url)
-            r.raise_for_status()
-            with open(markets_file, 'wb') as f:
-                f.write(r.content)
+            try:
+                r = requests.get(self.markets_url)
+                r.raise_for_status() # Will raise an error if download fails
+                with open(markets_file, 'wb') as f:
+                    f.write(r.content)
+                log.info("Download complete.")
+            except Exception as e:
+                log.error(f"FATAL: Failed to download {self.markets_url}: {e}")
+                log.error("Please download the file manually and place it in the project folder.")
+                raise
         
         log.info(f"Loading {markets_file} into DataFrame...")
-        with gzip.open(markets_file, 'rt') as f:
+        with gzip.open(markets_file, 'rt', encoding='utf-8') as f:
             df_markets = pd.read_csv(f)
         
         # --- 2. Load Trades Data ---
         trades_file = os.path.join(self.historical_data_path, "trades.csv.gz")
+        
         if not os.path.exists(trades_file):
             log.info(f"Downloading trades.csv.gz from {self.trades_url}...")
-            r = requests.get(self.trades_url)
-            r.raise_for_status()
-            with open(trades_file, 'wb') as f:
-                f.write(r.content)
+            try:
+                r = requests.get(self.trades_url)
+                r.raise_for_status()
+                with open(trades_file, 'wb') as f:
+                    f.write(r.content)
+                log.info("Download complete.")
+            except Exception as e:
+                log.error(f"FATAL: Failed to download {self.trades_url}: {e}")
+                log.error("Please download the file manually and place it in the project folder.")
+                raise
                 
         log.info(f"Loading {trades_file} into DataFrame...")
-        with gzip.open(trades_file, 'rt') as f:
+        with gzip.open(trades_file, 'rt', encoding='utf-8') as f:
             df_trades = pd.read_csv(f)
             
-        log.info("Data loading complete.")
+        log.info(f"Data loading complete. Markets: {len(df_markets)}, Trades: {len(df_trades)}")
         return df_markets, df_trades
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
