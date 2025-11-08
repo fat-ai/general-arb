@@ -1,0 +1,24 @@
+# --- Core System & Math (C1, C3, C5, C6) ---
+neo4j         # Component 1: Neo4j Python driver
+numpy         # For all numerical operations (Kelly, vectors)
+scipy         # For optimization (C6) and QMC/stats (C6)
+pandas        # For data handling (C4) and P&L (C7)
+
+# --- NLP (C2) ---
+spacy         # For entity extraction. (Requires model download, see below)
+
+# --- Back-testing & Tuning (C7) ---
+ray[tune]     # For distributed back-testing and hyperparameter tuning
+
+# --- Dashboard (C8) ---
+dash                      # The core web framework
+dash-bootstrap-components # For UI layout and components
+plotly                    # For creating interactive charts
+
+# --- Development & Testing (From our unit test plan) ---
+pytest
+
+# --- Optional / Stubbed Dependencies ---
+# Uncomment these when you implement the "real" AI Analyst (C3)
+# openai
+# anthropic
