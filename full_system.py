@@ -871,12 +871,28 @@ class HybridKellySolver:
         np.fill_diagonal(Corr, 1.0) 
         
         try:
-            # ** FIX: Add jitter for stability **
+            # ** Add jitter for stability **
             Corr_jitter = Corr + np.eye(n) * 1e-9 
             L = np.linalg.cholesky(Corr_jitter)
         except np.linalg.LinAlgError:
-            log.warning("Cov matrix not positive definite even with jitter. Falling back to independence.")
-            L = np.eye(n) # Fallback
+            log.warning("Cov matrix not positive definite. Using MVN sampler directly (slower).")
+            sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr_jitter)
+            Z = sampler.random(self.k_samples)
+            U = norm.cdf(Z)
+            I_k = (U < M).astype(int)
+            log.warning("Cov matrix not positive definite. Using MVN sampler directly.")
+            sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr_jitter)
+            Z = sampler.random(self.k_samples)
+            L = None # Signal to skip the Cholesky path
+            
+        if L is not None: # Standard Cholesky path
+            sampler = qmc.Sobol(d=n, scramble=True)
+            m_power = int(math.ceil(math.log2(self.k_samples)))
+            U_unif = sampler.random_base2(m=m_power)[:self.k_samples]
+            Z = norm.ppf(U_unif) @ L.T
+
+        U = norm.cdf(Z)
+        I_k = (U < M).astype(int)
             
         sampler = qmc.Sobol(d=n, scramble=True)
         m_power = int(math.ceil(math.log2(self.k_samples)))
@@ -1127,68 +1143,84 @@ class BacktestEngine:
             graph = GraphManager(is_mock=True) # Mocks the DB
             
             # --- Apply Tuned Hyperparameters ---
-            graph.model_brier_scores = { # Pass Brier scores from config
+            graph.model_brier_scores = { 
                 'brier_internal_model': config['brier_internal_model'],
-                'brier_expert_model': 0.05, # (Can also be tuned)
+                'brier_expert_model': 0.05, 
                 'brier_crowd_model': 0.15,
             }
             
+            # --- Instantiate REAL Pipeline ---
             linker = RelationalLinker(graph)
-            ai_analyst = AIAnalyst() # Stub
-            prior_manager = PriorManager(graph, ai_analyst)
+            ai_analyst = AIAnalyst()
+            profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
+            live_feed = LiveFeedHandler(graph)
+            prior_manager = PriorManager(graph, ai_analyst, live_feed)
             belief_engine = BeliefEngine(graph)
             belief_engine.k_brier_scale = config['k_brier_scale'] # Set tuned 'k'
             
             kelly_solver = HybridKellySolver(
                 analytical_edge_threshold=config['kelly_edge_thresh'],
-                num_samples_k=2000 # Use fewer samples for faster back-testing
+                num_samples_k=2000 # Fewer samples for faster back-testing
             )
             pm = PortfolioManager(graph, kelly_solver)
             
             # 2. Get historical data (using walk-forward split from config)
-            # For this stub, we just use the mock data.
             hist_data = BacktestEngine._get_historical_data(None, None)
             
             # 3. Initialize the simulation portfolio
             portfolio = BacktestPortfolio()
-            portfolio.start_time = hist_data['timestamp'].min()
-            portfolio.end_time = hist_data['timestamp'].max()
+            portfolio.start_time = hist_data.index.min().isoformat()
+            portfolio.end_time = hist_data.index.max().isoformat()
+            
+            current_prices = {} # {contract_id: price}
 
             # 4. --- The Replay Loop ---
-            # Group by timestamp to process events in order
-            for timestamp, events in hist_data.groupby('timestamp'):
+            for timestamp, events in hist_data.groupby(hist_data.index):
                 
                 # --- A. Process all non-trade events first ---
-                # (NEW_CONTRACT, RESOLUTION, etc.)
                 for _, event in events.iterrows():
                     data = event['data']
                     event_type = event['event_type']
                     contract_id = event['contract_id']
                     
                     if event_type == 'NEW_CONTRACT':
-                        graph.add_contract(data['id'], data['text'], data['vector'])
-                        linker.process_pending_contracts() # C2
-                        prior_manager.process_pending_contracts() # C3
+                        log.debug(f"Event: NEW_CONTRACT {contract_id}")
+                        graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
+                        current_prices[contract_id] = data['p_market_all']
+                        # C2
+                        linker.process_pending_contracts() # PENDING_LINKING -> PENDING_ANALYSIS
+                        # C3 (calls C4)
+                        prior_manager.process_pending_contracts() # PENDING_ANALYSIS -> PENDING_FUSION
                     
                     elif event_type == 'RESOLUTION':
-                        p_model = graph.get_cluster_contracts('E_NEUROCORP')[0]['M'] # Mock get P_model
-                        portfolio.handle_resolution(contract_id, data['outcome'], p_model)
+                        log.debug(f"Event: RESOLUTION {contract_id}")
+                        # Get the P_model we had at the time of the bet
+                        p_model_at_bet = 0.5 # (Mock this for now)
+                        portfolio.handle_resolution(contract_id, data['outcome'], p_model_at_bet, current_prices)
+                        current_prices.pop(contract_id, None)
 
                 # --- B. Update prices & rebalance portfolio (C5 & C6) ---
                 price_updates = {e['data']['id']: e['data']['p_market_all'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
                 if price_updates:
+                    log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
                     # Update all market prices in the mock graph
+                    # This simulates the C1 Ingestor
                     for c_id, p_all in price_updates.items():
-                        # (This is a simplified C4/C5 update)
-                        p_exp = events[events['contract_id'] == c_id]['data'].iloc[0]['p_market_experts']
-                        graph.update_contract_fused_price(c_id, (p_exp*0.7 + p_all*0.3), 0.01) # Mock C5
-
-                    # Now that prices are updated, run C6
-                    target_basket = pm.run_optimization_cycle() # {id: fraction, ...}
+                        current_prices[c_id] = p_all
+                        # We must also update the graph node so C5 can read it
+                        graph.update_contract_fused_price(c_id, None, None) # HACK: Just to update timestamp/trigger C5
+                        # A real system would update p_market_all and p_market_experts
+                        # and C3 would re-run, then C5 would re-run.
+                    
+                    # C5
+                    belief_engine.run_fusion_process() # PENDING_FUSION -> MONITORED
+                    
+                    # C6
+                    target_basket = pm.run_optimization_cycle()
                     
                     # C. Execute trades
-                    portfolio.rebalance(target_basket, price_updates)
-
+                    portfolio.rebalance(target_basket, current_prices)
+            
             # 5. Get final metrics from the simulated run
             metrics = portfolio.get_final_metrics()
             
