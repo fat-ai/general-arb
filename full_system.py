@@ -1348,6 +1348,7 @@ class BacktestEngine:
         
         ray.shutdown()
         return best_config
+        
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
 # ==============================================================================
@@ -1421,8 +1422,8 @@ def build_analyst_tab():
         html.H2("Analyst Triage Queues"),
         dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
         dbc.Table(table_header + table_body, bordered=True, striped=True),
-        dcc.Store(id='modal-data-store'), # Hidden store to hold data for the modal
-        analyst_modal # Add the modal to the layout
+        dcc.Store(id='modal-data-store'),
+        analyst_modal
     ])
 
 def build_pm_tab():
@@ -1482,35 +1483,37 @@ def display_page(pathname):
 def start_tuning_job_callback(n_clicks):
     log.warning("Admin clicked 'Start New Tuning Job'")
     try:
-        # Call the ASYNC method
         pid = backtest_engine.run_tuning_job_async() 
         return f"Tuning job started in background (PID: {pid})! See Ray Dashboard for progress.", True
     except Exception as e:
-        log.error(f"Failed to start tuning job: {e}")
+        log.warning(f"Failed to start tuning job: {e}")
         return f"Error: {e}", True
 
 # --- C8: Analyst Callbacks (Modal) ---
 @callback(
     Output('analyst-modal', 'is_open'),
     Output('modal-data-store', 'data'),
+    Output('modal-item-id', 'children'),
+    Output('modal-item-reason', 'children'),
+    Output('modal-item-details', 'children'),
     Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
     prevent_initial_call=True
 )
 def open_analyst_modal(n_clicks):
-    """Opens the modal and stores the item's data."""
+    """Opens the modal and populates it with the correct data."""
     ctx = dash.callback_context
-    if not any(n_clicks): return False, {}
+    if not any(n_clicks): return False, {}, "", "", ""
     
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
     item_id = json.loads(button_id)['index']
     
-    # Get the item's data from the mock queue
     queue = graph_manager.get_human_review_queue()
     item_data = next((item for item in queue if item['id'] == item_id), None)
     
     if item_data:
-        return True, item_data # Open modal, store data
-    return False, {}
+        details_str = json.dumps(item_data.get('details', {}), indent=2)
+        return True, item_data, item_id, item_data.get('reason'), details_str
+    return False, {}, "", "", ""
 
 @callback(
     Output('analyst-alert', 'children'),
@@ -1522,22 +1525,17 @@ def open_analyst_modal(n_clicks):
     prevent_initial_call=True
 )
 def submit_analyst_resolution(n_clicks, item_data, resolution_data):
-    """Handles the 'Submit' button click inside the modal."""
     if not item_data:
         return "Error: No item data found.", True, False
-    
     item_id = item_data.get('id')
     log.warning(f"Analyst is resolving {item_id} with data: {resolution_data}")
     
-    # In prod, we'd pass this to a real function:
-    # e.g., relational_linker.resolve_human_task(item_id, resolution_data)
     success = graph_manager.resolve_human_review_item(item_id, "SUBMITTED", resolution_data)
     
     if success:
-        return f"Item {item_id} resolved! Refreshing...", True, False # Close modal
+        return f"Item {item_id} resolved! Refreshing...", True, False
     else:
-        return f"Failed to resolve {item_id}.", True, True # Keep modal open
-
+        return f"Failed to resolve {item_id}.", True, True
 
 # ==============================================================================
 # --- MAIN LAUNCHER ---
