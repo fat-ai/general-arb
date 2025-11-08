@@ -1202,7 +1202,7 @@ class BacktestPortfolio:
         pnl = np.array(self.pnl_history)
         returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
         if len(returns) == 0: returns = np.array([0])
-        final_pnl = self.portfolio['cash']
+        final_pnl = self.cash
         initial_pnl = self.pnl_history[0]
         
         # Simplified IRR (total return)
