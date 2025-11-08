@@ -168,6 +168,7 @@ class GraphManager:
         if self.is_mock: return self._mock_get_contracts_by_status(status)
         with self.driver.session() as session:
             return session.execute_read(self._tx_get_contracts_by_status, status, limit)
+            
     @staticmethod
     def _tx_get_contracts_by_status(tx, status, limit):
         result = tx.run(
@@ -178,13 +179,82 @@ class GraphManager:
             status=status, limit=limit
         )
         return [record.data() for record in result]
-    def find_entity_by_alias_fuzzy(self, alias_text, threshold=0.9):
-        # (Production C2 method stub)
+        
+    def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
+        """Finds the single best Entity match for an alias using fuzzy matching (APOC)."""
         if self.is_mock: return self._mock_find_entity_by_alias_fuzzy(alias_text)
-        pass 
-    def find_similar_contracts_by_vector(self, contract_id, vector, k=3):
+        
+        # PRODUCTION IMPLEMENTATION: Requires APOC plugin
+        # This query uses an APOC procedure to do a fast fuzzy match.
+        # It's an approximation of Levenshtein, but much faster.
+        # We also add a direct Levenshtein check for accuracy.
+        query = """
+            CALL apoc.index.search('aliases', $text) YIELD node AS a, properties
+            WITH a, properties.text AS matched_text
+            WITH a, matched_text, apoc.text.levenshteinSimilarity(matched_text, $text) AS confidence
+            WHERE confidence >= $threshold
+            ORDER BY confidence DESC
+            LIMIT 1
+            MATCH (a)-[:POINTS_TO]->(e:Entity)
+            RETURN e.entity_id AS entity_id, 
+                   e.canonical_name AS name, 
+                   confidence
+        """
+        
+        fallback_query = """
+            MATCH (a:Alias)
+            WITH a, apoc.text.levenshteinSimilarity(a.text, $text) AS confidence
+            WHERE confidence >= $threshold
+            MATCH (a)-[:POINTS_TO]->(e:Entity)
+            RETURN e.entity_id AS entity_id, e.canonical_name AS name, confidence
+            ORDER BY confidence DESC
+            LIMIT 1
+        """
+
+        with self.driver.session() as session:
+            try:
+                # Try the fast index-backed query first
+                result = session.run(query, text=alias_text, threshold=threshold).single()
+                if result:
+                    return result.data()
+                
+                # If no index hit (or index missing), try the full scan fallback
+                result = session.run(fallback_query, text=alias_text, threshold=threshold).single()
+                return result.data() if result else None
+                
+            except ClientError as e:
+                log.warning(f"APOC fuzzy query failed (is APOC plugin installed?): {e}. Falling back to exact match.")
+                # Final fallback to exact match if APOC is not installed
+                result = session.execute_read(self._tx_find_entity_exact, alias_text).single()
+                return result.data() if result else None
+
+    @staticmethod
+    def _tx_find_entity_exact(tx, alias_text):
+        """Transaction function for exact match fallback."""
+        return tx.run(
+            "MATCH (a:Alias {text: $alias_text})-[:POINTS_TO]->(e:Entity) "
+            "RETURN e.entity_id AS entity_id, e.canonical_name AS name, 1.0 AS confidence LIMIT 1",
+            alias_text=alias_text
+        ).single()
+        
+    def find_similar_contracts_by_vector(self, contract_id: str, vector: List[float], k: int = 5) -> List[Dict]:
+        """(NEW) Finds the top 'k' similar contracts using the vector index."""
         if self.is_mock: return []
-        pass
+        
+        # This query calls the vector index we created in setup_schema
+        query = """
+            CALL db.index.vector.queryNodes('contract_vector_index', $k, $vector) YIELD node, similarity
+            // Exclude the contract itself from the results
+            WHERE node.contract_id <> $contract_id
+            RETURN node.contract_id AS id, node.text AS text, similarity
+        """
+        with self.driver.session() as session:
+            try:
+                results = session.run(query, k=k, vector=vector, contract_id=contract_id)
+                return [r.data() for r in results]
+            except ClientError as e:
+                log.warning(f"Vector KNN query failed (is index 'contract_vector_index' built?): {e}")
+                return []
     def update_contract_status(self, contract_id, status, metadata=None):
         if self.is_mock: return
         with self.driver.session() as session:
