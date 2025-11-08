@@ -1136,14 +1136,12 @@ class PortfolioManager:
 
 class BacktestPortfolio:
     """
-    (Production-Ready C7.sub)
-    A helper class for C7 to simulate a real portfolio.
-    It tracks cash, positions, P&L, and simulates frictions.
+    (Production-Ready C7.sub) Helper class for C7.
+    Tracks cash, positions, P&L, and simulates frictions.
     """
     def __init__(self, initial_cash=10000.0, fee_pct=0.01, slippage_pct=0.005):
         self.cash = initial_cash
         self.initial_cash = initial_cash
-        # {contract_id: (fraction_of_bankroll, entry_price)}
         self.positions: Dict[str, Tuple[float, float]] = {} 
         self.fee_pct = fee_pct
         self.slippage_pct = slippage_pct
@@ -1153,101 +1151,72 @@ class BacktestPortfolio:
         self.end_time = None
 
     def get_total_value(self, current_prices: Dict[str, float]) -> float:
-        """Calculates current mark-to-market portfolio value."""
         position_value = 0.0
         for contract_id, (fraction, entry_price) in self.positions.items():
             current_price = current_prices.get(contract_id, entry_price)
             pos_value_mult = 0.0
-            
-            # We must use 1e-9 to avoid division by zero
-            if fraction > 0: # Long position
-                if entry_price > 1e-9:
-                    # Mark-to-market value of a long position
-                    pos_value_mult = current_price / entry_price
-            else: # Short position
-                if (1.0 - entry_price) > 1e-9:
-                    # Mark-to-market value of a short position
-                    pos_value_mult = (1.0 - current_price) / (1.0 - entry_price)
-                    
+            if fraction > 0: # Long
+                if entry_price > 1e-9: pos_value_mult = current_price / entry_price
+            else: # Short
+                if (1.0 - entry_price) > 1e-9: pos_value_mult = (1.0 - current_price) / (1.0 - entry_price)
             position_value += (abs(fraction) * self.initial_cash) * pos_value_mult
-            
         return self.cash + position_value
 
     def rebalance(self, target_basket: Dict[str, float], current_prices: Dict[str, float]):
-        """
-        Executes trades to move from the current basket to the target basket.
-        This is the "churn" and "exit" logic.
-        """
-        # We must trade out of old positions first
         all_contracts = set(target_basket.keys()) | set(self.positions.keys())
-        
         for contract_id in all_contracts:
             target_fraction = target_basket.get(contract_id, 0.0)
             current_fraction, entry_price = self.positions.get(contract_id, (0.0, 0.0))
-            
             trade_fraction = target_fraction - current_fraction
             
-            if abs(trade_fraction) < 1e-5: # Avoid tiny trades
-                continue
+            if abs(trade_fraction) < 1e-5: continue
             
             trade_value = abs(trade_fraction) * self.initial_cash
             trade_price = current_prices.get(contract_id)
-            
             if trade_price is None:
                 log.warning(f"No price for {contract_id} in rebalance. Skipping trade.")
                 continue
 
-            # Simulate Frictions
             fees = trade_value * self.fee_pct
             slippage_cost = trade_value * self.slippage_pct
             self.cash -= (fees + slippage_cost)
             
-            if trade_fraction > 0: # We are BUYING (or reducing a short)
-                self.cash -= trade_value # Spend cash
-                
-                if current_fraction >= 0: # We are adding to a long position
-                    # Calculate new weighted-average entry price
-                    new_avg_price = ((current_fraction * entry_price) + (trade_fraction * trade_price)) / target_fraction
+            if trade_fraction > 0: # BUYING
+                self.cash -= trade_value
+                if current_fraction >= 0: # Increasing long
+                    new_avg_price = ((current_fraction * entry_price) + (trade_fraction * trade_price)) / target_fraction if target_fraction != 0 else trade_price
                     self.positions[contract_id] = (target_fraction, new_avg_price)
-                else: # We are closing/reducing a short
-                    self.positions[contract_id] = (target_fraction, 0.0) # Reset entry price
-            
-            else: # We are SELLING (or reducing a long)
-                self.cash += trade_value # Receive cash
-                
+                else: # Closing short
+                    self.positions[contract_id] = (target_fraction, trade_price) 
+            else: # SELLING
+                self.cash += trade_value
                 if abs(target_fraction) < 1e-5: # Full exit
-                    if contract_id in self.positions:
-                        del self.positions[contract_id]
+                    if contract_id in self.positions: del self.positions[contract_id]
                 else:
-                    if current_fraction == 0.0: # We are opening a new short
+                    if current_fraction == 0.0: # Opening new short
                         self.positions[contract_id] = (target_fraction, trade_price)
-                    else: # Reducing a long, entry price stays the same
+                    else: 
                         self.positions[contract_id] = (target_fraction, entry_price)
     
     def handle_resolution(self, contract_id: str, outcome: float, p_model: float, current_prices: Dict):
-        """Resolves a position, calculates P&L, and scores the model."""
         if contract_id in self.positions:
             fraction, entry_price = self.positions.pop(contract_id)
             bet_value = abs(fraction) * self.initial_cash
             
-            if fraction > 0: # We were LONG (BUY)
+            if fraction > 0: # Long
                 payout = bet_value * (outcome / entry_price) if entry_price > 1e-9 else 0.0
-                self.cash += payout
-            else: # We were SHORT (SELL)
+            else: # Short
                 payout = bet_value * ((1.0 - outcome) / (1.0 - entry_price)) if (1.0 - entry_price) > 1e-9 else 0.0
-                self.cash += payout
+            self.cash += payout
         
-        # Record P&L
         self.pnl_history.append(self.get_total_value(current_prices))
         if p_model is not None:
             self.brier_scores.append((p_model - outcome)**2)
 
     def get_final_metrics(self) -> Dict[str, float]:
-        """Calculates final metrics for the back-test run."""
         pnl = np.array(self.pnl_history)
         returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
         if len(returns) == 0: returns = np.array([0])
-        
         final_pnl = pnl[-1]
         initial_pnl = self.initial_cash
         
@@ -1255,26 +1224,338 @@ class BacktestPortfolio:
             total_days = (self.end_time.date() - self.start_time.date()).days
             if total_days == 0: total_days = 1
             total_return = (final_pnl / initial_pnl) - 1.0
-            # Annualized IRR
             irr = ((1.0 + total_return) ** (365.0 / total_days)) - 1.0
         except Exception:
-            irr = (final_pnl / initial_pnl) - 1.0 # Fallback to total return
+            irr = (final_pnl / initial_pnl) - 1.0
             
-        # Annualized Sharpe (assuming 0% risk-free rate)
-        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252) # 252 trading days
-        
-        peak = np.maximum.accumulate(pnl)
-        drawdown = (peak - pnl) / peak
-        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0.0
+        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252)
+        max_drawdown = np.max((np.maximum.accumulate(pnl) - pnl) / np.maximum.accumulate(pnl)) if len(pnl) > 0 else 0.0
         avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
         
-        return {
-            'irr': irr,
-            'sharpe_ratio': sharpe,
-            'max_drawdown': max_drawdown,
-            'brier_score': avg_brier
-        }
+        return {'irr': irr, 'sharpe_ratio': sharpe, 'max_drawdown': max_drawdown, 'brier_score': avg_brier}
 
+
+class BacktestEngine:
+    """
+    (Production-Ready C7)
+    Loads and transforms REAL Polymarket data from Dune Analytics
+    and runs the full C1-C6 pipeline replay.
+    """
+    def __init__(self, historical_data_path: str):
+        log.info("BacktestEngine (C7) Production initialized.")
+        self.dune = DuneClient(os.environ.get("DUNE_API_KEY"))
+        self.historical_data_path = historical_data_path # Local path to cache results
+        
+        # Public, free-to-use Dune queries that get the data we need.
+        # Source: https://dune.com/queries/3450463 (Polymarket - Markets)
+        self.markets_query_id = 3450463
+        # Source: https://dune.com/queries/3450537 (Polymarket - CLOB Trades)
+        self.trades_query_id = 3450537 
+
+        if not self.dune.api_key:
+            log.warning("DUNE_API_KEY not set. BacktestEngine cannot fetch new data and will rely on cache.")
+            
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
+
+    def _load_polymarket_data(self) -> (pd.DataFrame, pd.DataFrame):
+        """
+        Downloads (if needed) and loads Polymarket data from Dune into pandas DataFrames.
+        This is the "Extract" phase.
+        """
+        markets_file = os.path.join(self.historical_data_path, "dune_markets_cache.parquet")
+        trades_file = os.path.join(self.historical_data_path, "dune_trades_cache.parquet")
+
+        # --- 1. Load Markets Data (from Dune or Cache) ---
+        if not os.path.exists(markets_file):
+            log.info(f"Querying Dune for markets (Query ID: {self.markets_query_id})... (This may take a minute)")
+            if not self.dune.api_key: raise ValueError("DUNE_API_KEY is missing. Cannot download data.")
+            try:
+                markets_query = Query(query_id=self.markets_query_id)
+                results = self.dune.run_query(markets_query)
+                df_markets = pd.DataFrame(results.result.rows)
+                df_markets.to_parquet(markets_file)
+                log.info(f"Successfully loaded and cached {len(df_markets)} markets.")
+            except Exception as e:
+                log.error(f"FATAL: Failed to query Dune for markets: {e}")
+                raise
+        else:
+            log.info(f"Loading cached markets data from {markets_file}...")
+            df_markets = pd.read_parquet(markets_file)
+
+        # --- 2. Load Trades Data (from Dune or Cache) ---
+        if not os.path.exists(trades_file):
+            log.info(f"Querying Dune for trades (Query ID: {self.trades_query_id})... (This may take several minutes)")
+            if not self.dune.api_key: raise ValueError("DUNE_API_KEY is missing. Cannot download data.")
+            try:
+                trades_query = Query(query_id=self.trades_query_id)
+                results = self.dune.run_query(trades_query)
+                df_trades = pd.DataFrame(results.result.rows)
+                df_trades.to_parquet(trades_file)
+                log.info(f"Successfully loaded and cached {len(df_trades)} trades.")
+            except Exception as e:
+                log.error(f"FATAL: Failed to query Dune for trades: {e}")
+                raise
+        else:
+            log.info(f"Loading cached trades data from {trades_file}...")
+            df_trades = pd.read_parquet(trades_file)
+            
+        log.info(f"Data loading complete. Markets: {len(df_markets)}, Trades: {len(df_trades)}")
+        return df_markets, df_trades
+
+    def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
+        """
+        This is the "Transform" phase.
+        It creates two crucial DataFrames:
+        1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
+        2. event_log: The time-series log for the C7 replay harness.
+        """
+        log.info("Transforming raw data into event log...")
+        
+        # --- 1. Prepare Market Data (for lookups) ---
+        df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date_iso'], errors='coerce')
+        df_markets['created_at'] = pd.to_datetime(df_markets['created_at'])
+        
+        # Filter for resolved, binary markets (outcome is 0 or 1)
+        df_markets = df_markets[df_markets['outcome'].isin([0.0, 1.0])].copy()
+        market_outcomes = df_markets.set_index('condition_id')['outcome'].to_dict()
+        market_questions = df_markets.set_index('market_id')['question'].to_dict()
+        market_start_price = df_markets.set_index('market_id')['start_price'].to_dict()
+        
+        # Mock embeddings (C2) and liquidity (C3)
+        market_vectors = {mid: [0.1]*768 for mid in market_questions} 
+        market_liquidity = {mid: np.random.uniform(5000, 100000) for mid in market_questions}
+
+        # --- 2. Create the Profiler DataFrame (for C4) ---
+        log.info("Building profiler data...")
+        # Map trades to their outcomes
+        df_trades['outcome'] = df_trades['condition_id'].map(market_outcomes)
+        
+        trades_maker = df_trades[['maker', 'price', 'outcome', 'market_id']].rename(columns={'maker': 'wallet_id', 'price': 'bet_price'})
+        trades_taker = df_trades[['taker', 'price', 'outcome', 'market_id']].rename(columns={'taker': 'wallet_id', 'price': 'bet_price'})
+        
+        profiler_data = pd.concat([trades_maker, trades_taker]).dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+        # In a real system, we'd run C2 here to get the *real* topic.
+        profiler_data['entity_type'] = 'default_topic'
+        
+        # --- 3. Create the Event Log (for C7) ---
+        log.info("Building event log...")
+        events = []
+        
+        # a) Create NEW_CONTRACT events
+        for _, row in df_markets.iterrows():
+            market_id = row['market_id']
+            if not market_id or pd.isna(row['created_at']): continue
+            events.append((
+                row['created_at'],
+                'NEW_CONTRACT',
+                {
+                    'id': market_id,
+                    'text': market_questions.get(market_id, "Missing Question"),
+                    'vector': market_vectors.get(market_id, [0.1]*768),
+                    'liquidity': market_liquidity.get(market_id, 0),
+                    'p_market_all': market_start_price.get(market_id, 0.5)
+                }
+            ))
+            
+        # b) Create RESOLUTION events
+        for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
+            events.append((
+                row['resolution_timestamp'],
+                'RESOLUTION',
+                {'id': row['market_id'], 'outcome': row['outcome']}
+            ))
+            
+        # c) Create PRICE_UPDATE events from trades
+        df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
+        for _, row in df_trades.dropna(subset=['timestamp']).iterrows():
+            events.append((
+                row['timestamp'],
+                'PRICE_UPDATE',
+                {
+                    'id': row['market_id'],
+                    'p_market_all': row['price'],
+                    # Pass the raw trade data for C4 to process
+                    'wallet_id': row['taker'], # Taker is the "active" trader
+                    'price': row['price'],
+                    'volume': float(row['size']) * float(row['price']) # size * price
+                }
+            ))
+
+        # --- 4. Sort and return the final event log ---
+        event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
+        event_log = event_log.set_index('timestamp').sort_index()
+        
+        log.info(f"ETL complete. {len(profiler_data)} trades for profiler, {len(event_log)} total events.")
+        return event_log, profiler_data
+
+    @staticmethod
+    def _run_single_backtest(config: Dict[str, Any], historical_data: pd.DataFrame, profiler_data: pd.DataFrame):
+        """
+        This is the "objective" function that Ray Tune will optimize.
+        It runs one *REAL* C1-C6 pipeline simulation.
+        """
+        log.debug(f"--- C7: Starting back-test run with config: {config} ---")
+        try:
+            # 1. Initialize all components *with this run's config*
+            graph = GraphManager(is_mock=True) # Mocks the DB
+            
+            graph.model_brier_scores = {
+                'brier_internal_model': config['brier_internal_model'],
+                'brier_expert_model': 0.05, 
+                'brier_crowd_model': 0.15,
+            }
+            
+            # --- Instantiate REAL Pipeline ---
+            linker = RelationalLinker(graph)
+            ai_analyst = AIAnalyst()
+            
+            # --- ** NEW: Pre-train the Profiler ** ---
+            profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
+            graph.mock_db['profiler_data'] = profiler_data 
+            profiler.run_profiling() # This populates the mock_db['wallets']
+            
+            live_feed = LiveFeedHandler(graph)
+            prior_manager = PriorManager(graph, ai_analyst, live_feed)
+            belief_engine = BeliefEngine(graph)
+            belief_engine.k_brier_scale = config['k_brier_scale']
+            
+            kelly_solver = HybridKellySolver(
+                analytical_edge_threshold=config['kelly_edge_thresh'],
+                num_samples_k=2000 
+            )
+            pm = PortfolioManager(graph, kelly_solver)
+            
+            # 2. Initialize the simulation portfolio
+            portfolio = BacktestPortfolio()
+            portfolio.start_time = historical_data.index.min()
+            portfolio.end_time = historical_data.index.max()
+            
+            current_prices = {} # {contract_id: price}
+            
+            # 3. --- The Replay Loop ---
+            for timestamp, events in historical_data.groupby(historical_data.index):
+                
+                # --- A. Process all non-trade events first ---
+                for _, event in events.iterrows():
+                    data = event['data']
+                    event_type = event['event_type']
+                    contract_id = event['contract_id']
+                    
+                    if event_type == 'NEW_CONTRACT':
+                        log.debug(f"Event: NEW_CONTRACT {contract_id}")
+                        graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
+                        current_prices[contract_id] = data['p_market_all']
+                        linker.process_pending_contracts()
+                        prior_manager.process_pending_contracts()
+                    
+                    elif event_type == 'RESOLUTION':
+                        log.debug(f"Event: RESOLUTION {contract_id}")
+                        p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
+                        portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
+                        current_prices.pop(contract_id, None)
+                        graph.update_contract_status(contract_id, 'RESOLVED', {'outcome': data['outcome']})
+
+                # --- B. Process price updates & rebalance ---
+                price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
+                if price_updates:
+                    log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
+                    
+                    for c_id, data in price_updates.items():
+                        current_prices[c_id] = data['p_market_all']
+                        if c_id in graph.mock_db['contracts']:
+                            graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
+                            graph.mock_db['contracts'][c_id]['p_market_experts'] = data['p_market_experts']
+                            graph.mock_db['live_trades'] = [data] # C4 will use this
+                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger
+                    
+                    prior_manager.process_pending_contracts() 
+                    belief_engine.run_fusion_process()
+                    target_basket = pm.run_optimization_cycle()
+                    portfolio.rebalance(target_basket, current_prices)
+            
+            # 4. Get final metrics
+            metrics = portfolio.get_final_metrics()
+            
+            # 5. Report to Ray Tune
+            tune.report(metrics)
+            
+        except Exception as e:
+            log.error(f"Back-test run failed: {e}", exc_info=True)
+            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0})
+            
+    def run_tuning_job(self):
+        """Main entry point for Component 7."""
+        log.info("--- C7: Starting Hyperparameter Tuning Job ---")
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
+        
+        # --- THIS IS THE NEW ETL STEP ---
+        try:
+            df_markets, df_trades = self._load_polymarket_data()
+            event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
+        except Exception as e:
+            log.error(f"FATAL: Failed to load or transform Polymarket data: {e}")
+            log.error("Please check the URLs, file paths, or network connection.")
+            return None
+        
+        # "Curry" the real data into the objective function
+        trainable_with_data = tune.with_parameters(
+            self._run_single_backtest,
+            historical_data=event_log,
+            profiler_data=profiler_data
+        )
+        
+        search_space = {
+            "brier_internal_model": tune.loguniform(0.05, 0.25),
+            "k_brier_scale": tune.loguniform(0.1, 5.0),
+            "kelly_edge_thresh": tune.uniform(0.05, 0.25),
+            "min_trades_threshold": tune.qrandint(5, 50, 5)
+        }
+        
+        scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
+        
+        analysis = tune.run(
+            trainable_with_data,
+            config=search_space,
+            num_samples=20, # Reduced for demo
+            scheduler=scheduler,
+            resources_per_trial={"cpu": 1},
+            name="pm_tuning_job"
+        )
+        
+        best_config = analysis.get_best_config(metric="irr", mode="max")
+        
+        log.info(f"--- C7: Tuning Job Complete ---")
+        log.info(f"Best config found for max IRR:")
+        log.info(best_config)
+        
+        ray.shutdown()
+        return best_config
+
+    def run_tuning_job_async(self):
+        """Launches the tuning job in a separate process."""
+        log.info("--- C7: Spawning asynchronous tuning job... ---")
+        
+        def run_job():
+            if not ray.is_initialized():
+                ray.init(logging_level=logging.ERROR)
+            
+            backtester = BacktestEngine(
+                historical_data_path=".", # Path to store/read cache
+                markets_url=os.getenv("POLY_MARKETS_URL", "httpsGuest/markets.csv.gz"), # Use env vars for URLs
+                trades_url=os.getenv("POLY_TRADES_URL", "httpsGuest/trades.csv.gz")
+            )
+            best_config = backtester.run_tuning_job()
+            log.info(f"--- C7: Async Tuning Job Complete. Best config: {best_config} ---")
+            ray.shutdown()
+
+        p = multiprocessing.Process(target=run_job)
+        p.start()
+        log.info(f"--- C7: Job process started with PID {p.pid} ---")
+        return p.pid
+        
 class BacktestEngine:
     """
     (Production-Ready C7)
