@@ -1401,7 +1401,7 @@ portfolio_manager = PortfolioManager(graph_manager, kelly_solver)
 backtest_engine = BacktestEngine(historical_data_path="mock_data.parquet")
 
 # --- Dash App Definition ---
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 server = app.server
 
 # --- Analyst Triage Modal (Popup) ---
