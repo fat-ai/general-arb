@@ -7,7 +7,7 @@ import scipy.optimize as opt
 from scipy.stats import qmc, norm  # <--- FIX 1: ADDED THIS IMPORT
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
-from typing import Dict, List, Tuple, Any  # <--- FIX 2: ADDED 'Any'
+from typing import Dict, List, Tuple, Any
 import ray
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
@@ -54,8 +54,14 @@ def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tu
     variance = std_dev ** 2
     inner = (mean * (1 - mean) / variance) - 1
     if inner <= 0:
-        log.warning(f"Inconsistent CI for mean {mean}. Variance is too large. Returning weak prior.")
-        return (1.0, 1.0)
+        # This handles the case where (0.5, [0.0, 1.0]) -> std=0.25, var=0.0625 -> inner=3
+        # It also handles inconsistent CIs where variance is too large.
+        if (mean * (1-mean)) < variance:
+            log.warning(f"Inconsistent CI for mean {mean}. Variance is too large. Returning weak prior.")
+            return (1.0, 1.0)
+        # This is for a valid, wide CI like (0.5, [0.0, 1.0])
+        inner = max(inner, 1e-6) # Ensure alpha/beta are at least positive
+        
     alpha = mean * inner
     beta = (1 - mean) * inner
     log.debug(f"Converted (mean={mean}, CI=[{lower},{upper}]) -> (alpha={alpha:.2f}, beta={beta:.2f})")
@@ -638,7 +644,6 @@ class HybridKellySolver:
                 if i == j:
                     C[i, i] = P[i] * (1 - P[i])
                     continue
-                # Pass the full contracts list to the mock
                 rel = graph.get_relationship_between_contracts(contracts[i]['id'], contracts[j]['id'], contracts)
                 p_ij = rel.get('p_joint')
                 if p_ij is None:
@@ -665,9 +670,11 @@ class HybridKellySolver:
         np.fill_diagonal(Corr, 1.0) 
         
         try:
-            L = np.linalg.cholesky(Corr)
+            # ** FIX: Add jitter for stability **
+            Corr_jitter = Corr + np.eye(n) * 1e-9 
+            L = np.linalg.cholesky(Corr_jitter)
         except np.linalg.LinAlgError:
-            log.warning("Cov matrix not positive definite. Falling back to independence for sampling.")
+            log.warning("Cov matrix not positive definite even with jitter. Falling back to independence.")
             L = np.eye(n) # Fallback
             
         sampler = qmc.Sobol(d=n, scramble=True)
@@ -682,14 +689,21 @@ class HybridKellySolver:
 
         # 2. Define the Objective Function
         def objective(F: np.ndarray) -> float:
+            # Vectorized calculation of returns for BUY (F>0) and SELL (F<0)
             gains_long = (I_k - Q) / Q
             gains_short = (Q - I_k) / (1 - Q)
+            
+            # This is the (K x n) matrix of returns for each outcome
             R_k_matrix = np.where(F > 0, gains_long, gains_short)
+            
+            # We use np.abs(F) because the sign is already in R_k_matrix
             portfolio_returns = np.sum(R_k_matrix * np.abs(F), axis=1)
+            
             W_k = 1.0 + portfolio_returns
-            if np.any(W_k <= 1e-9):
+            
+            if np.any(W_k <= 1e-9): # Bankruptcy
                 return 1e9 
-            return -np.mean(np.log(W_k))
+            return -np.mean(np.log(W_k)) # Minimize negative log-wealth
 
         # 3. Run the Optimizer
         initial_guess = F_analytical_guess
@@ -779,7 +793,7 @@ class _MockC7FullPipeline:
         return "LOW_VOL"
 
     def run_replay(self):
-        for timestamp, event_type, data in self.historical_data:
+        for timestamp, event_type, data in self.historical_.data:
             current_regime = self._detect_regime(timestamp)
             regime_params = self.config.get(f"params_{current_regime.lower()}", {})
             mock_edge = 0.15
@@ -870,7 +884,6 @@ class BacktestEngine:
 # ### COMPONENT 8: Operational Dashboard ###
 # ==============================================================================
 
-# ** FIX: All C8 code is wrapped in a function to be "import-safe" **
 def run_c8_demo():
     """Launches the C8 Dashboard"""
     log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
@@ -965,7 +978,6 @@ def run_c8_demo():
         ctx = dash.callback_context
         if not ctx.triggered: return "", False
         button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        # Use eval in a controlled way for pattern-matching callbacks
         item_id = eval(button_id)['index'] 
         success = graph_stub_c8.resolve_human_review_item(item_id, "MERGE_CONFIRMED")
         if success: return f"Item {item_id} resolved!", True
@@ -979,7 +991,6 @@ def run_c8_demo():
     def start_tuning_job(n_clicks):
         log.warning("Admin clicked 'Start New Tuning Job'")
         try:
-            # Note: This is synchronous in the stub, will block the server
             job_id = backtester_stub_c8.run_tuning_job() 
             return f"Tuning job complete! Best config: {job_id}", True
         except Exception as e:
@@ -1001,7 +1012,6 @@ def run_c1_c2_demo():
     """Runs the C1 -> C2 -> Human Fix -> C2 loop"""
     log.info("--- (DEMO) Running Component 1 & 2 Demo ---")
     try:
-        # Use a real graph connection
         graph = GraphManager() 
         graph.setup_schema()
         linker = RelationalLinker(graph)
