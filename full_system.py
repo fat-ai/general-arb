@@ -432,16 +432,19 @@ class GraphManager:
 
     # --- C5: Read/Write Methods ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
-        if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
-            return self._mock_get_contracts_by_status('PENDING_FUSION', limit)
+        """Gets all raw data needed for C5 fusion."""
+        if self.is_mock: return self._mock_get_contracts_for_fusion() # <-- FIX: Call the correct mock
         
         query = """
         MATCH (c:Contract {status: 'PENDING_FUSION'})
-        WHERE c.p_internal_alpha IS NOT NULL AND c.p_market_experts IS NOT NULL AND c.p_market_all IS NOT NULL
+        WHERE c.p_internal_alpha IS NOT NULL 
+          AND c.p_market_experts IS NOT NULL 
+          AND c.p_market_all IS NOT NULL
         RETURN c.contract_id AS contract_id,
-               c.p_internal_alpha AS p_internal_alpha, c.p_internal_beta AS p_internal_beta,
-               c.p_market_experts AS p_market_experts, c.p_market_all AS p_market_all
+               c.p_internal_alpha AS p_internal_alpha,
+               c.p_internal_beta AS p_internal_beta,
+               c.p_market_experts AS p_market_experts,
+               c.p_market_all AS p_market_all
         LIMIT $limit
         """
         with self.driver.session() as session:
@@ -559,6 +562,103 @@ class GraphManager:
         log.warning(f"MockGraph: Resolving {item_id} with action '{action}' and data: {data}")
         self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != item_id]
         # (In prod, this would trigger C2 linker to re-run on this contract_id)
+        return True
+
+    # --- MOCK IMPLEMENTATIONS (Called if is_mock=True) ---
+    
+    def _mock_get_contracts_by_status(self, status: str, limit: int = 10):
+         if status == 'PENDING_LINKING':
+             return [{'contract_id': 'MKT_902_SPACY_DEMO', 'text': "Will 'NeuroCorp' release the 'Viper'?", 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': []}]
+         if status == 'PENDING_ANALYSIS':
+            return [{'contract_id': 'MKT_903', 'text': 'Test contract for NeuroCorp', 'vector': [0.3]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': ['E_123']}]
+         if status == 'PENDING_FUSION':
+            return [{'contract_id': 'MKT_FUSE_001', 'p_internal_alpha': 13.8, 'p_internal_beta': 9.2, 'p_market_experts': 0.45, 'p_market_all': 0.55, 'status': 'PENDING_FUSION'}]
+         return []
+         
+    def _mock_find_entity_by_alias_fuzzy(self, alias_text: str):
+        if alias_text == "NeuroCorp": return {'entity_id': 'E_123', 'name': 'NeuroCorp, Inc.', 'confidence': 1.0}
+        return None
+        
+    def _mock_get_all_resolved_trades_by_topic(self):
+        return pd.DataFrame([
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.2, 'outcome': 0.0},
+            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
+        ])
+        
+    def _mock_get_live_trades_for_contract(self, contract_id):
+        return pd.DataFrame([
+            {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
+            {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
+        ])
+        
+    def _mock_get_wallet_brier_scores(self, wallet_ids):
+        return { 'Wallet_ABC': {'brier_biotech': 0.0567}, 'Wallet_CROWD_1': {'brier_biotech': 0.25} }
+        
+    def _mock_get_contracts_for_fusion(self):
+        return [c for c in self.mock_db['contracts'].values() if c['status'] == 'PENDING_FUSION']
+        
+    def _mock_get_model_brier_scores(self): 
+        return self.model_brier_scores
+        
+    def _mock_get_active_entity_clusters(self): 
+        clusters = set()
+        for c in self.mock_db['contracts'].values():
+            if c.get('status') == 'MONITORED':
+                for eid in c.get('entity_ids', []): clusters.add(eid)
+        return list(clusters) if clusters else ["E_DUNE_3_MOCK"] # Default for demo
+            
+    def _mock_get_cluster_contracts(self, entity_id):
+        if entity_id == "E_DUNE_3_MOCK":
+            return [{'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True}, {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}]
+        
+        res = []
+        for cid, data in self.mock_db['contracts'].items():
+            if data.get('status') == 'MONITORED' and entity_id in data.get('entity_ids', []):
+                res.append({
+                    'id': cid,
+                    'M': data.get('p_model'),
+                    'Q': data.get('p_market_all'),
+                    'is_logical_rule': data.get('is_logical_rule', False)
+                })
+        return res
+            
+    def _mock_get_relationship_between_contracts(self, c1_id, c2_id, contracts):
+        if c1_id == 'MKT_A' and c2_id == 'MKT_B':
+            p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
+            return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
+        return {'type': 'NONE', 'p_joint': None}
+        
+    def _mock_get_historical_data_for_replay(self, s, e):
+        df = pd.DataFrame([
+            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp release...', 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.50}),
+            ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51, 'p_market_experts': 0.55}),
+            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [0.2]*768, 'liquidity': 50000, 'p_market_all': 0.70}),
+            ('2023-01-02T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.55, 'p_market_experts': 0.60}),
+            ('2023-01-02T10:06:00Z', 'PRICE_UPDATE', {'id': 'MKT_2', 'p_market_all': 0.70, 'p_market_experts': 0.75}),
+            ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
+            ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
+        ], columns=['timestamp', 'event_type', 'data'])
+        df['contract_id'] = df['data'].apply(lambda x: x.get('id'))
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.set_index('timestamp').sort_index()
+        return df
+        
+    def _mock_get_human_review_queue(self): 
+        return self.mock_db['review_queue']
+        
+    def _mock_get_portfolio_state(self): 
+        return {'cash': 8500.0, 'positions': [], 'total_value': 8500.0}
+        
+    def _mock_get_pnl_history(self): 
+        return pd.Series(np.random.normal(0, 1, 100).cumsum() + 10000)
+        
+    def _mock_get_regime_status(self): 
+        return "LOW_VOL", {"k": 1.5, "edge": 0.1}
+        
+    def _mock_resolve_human_review_item(self, id, action, data): 
+        self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != id]
         return True
 
 # ==============================================================================
