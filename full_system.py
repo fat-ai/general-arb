@@ -1336,7 +1336,7 @@ class BacktestEngine:
             metrics = portfolio.get_final_metrics()
             
             # 6. Report to Ray Tune
-            tune.report(irr=metrics['final_irr'], brier=metrics['brier_score'], sharpe=metrics['sharpe_ratio'])
+            tune.report(metrics)
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
@@ -1347,12 +1347,6 @@ class BacktestEngine:
         log.info("--- C7: Starting Hyperparameter Tuning Job ---")
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
-        
-        # --- THIS IS THE FIX ---
-        # We do NOT pass data in. The _run_single_backtest function
-        # is static and will load its own data.
-        # hist_data = self._load_historical_data()
-        # trainable_with_data = tune.with_parameters(self._run_single_backtest, historical_data=hist_data)
         
         search_space = {
             "brier_internal_model": tune.loguniform(0.05, 0.25),
