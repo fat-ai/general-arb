@@ -63,10 +63,26 @@ def test_convert_to_beta_inconsistent_ci():
     assert_allclose([alpha, beta], [1.5, 1.5]) # <--- CORRECTED EXPECTATION
 
 def test_convert_to_beta_logical_rule():
-    """Tests that a CI of zero (infinite confidence) returns 'inf'"""
-    alpha, beta = convert_to_beta(0.8, (0.8, 0.8))
+    """Tests that a logical rule (zero-width CI) at P=1.0 is handled."""
+    # Test for P(X=1) = 1
+    alpha, beta = convert_to_beta(1.0, (1.0, 1.0))
     assert alpha == float('inf')
-    assert beta == 1.0 # Per our new fix
+    assert beta == 1.0
+
+def test_convert_to_beta_logical_rule_p_zero():
+    """Tests that a logical rule (zero-width CI) at P=0.0 is handled."""
+    # Test for P(X=0) = 1
+    alpha, beta = convert_to_beta(0.0, (0.0, 0.0))
+    assert alpha == 1.0
+    assert beta == float('inf')
+
+def test_convert_to_beta_logical_rule_contradictory():
+    """Tests that a contradictory logical rule (e.g., P=0.8) defaults to a weak prior."""
+    # This was the failing test. A zero-width CI at P=0.8 is not a
+    # valid Beta distribution, so the code correctly returns (1,1).
+    alpha, beta = convert_to_beta(0.8, (0.8, 0.8))
+    assert alpha == 1.0
+    assert beta == 1.0
 
 def test_belief_engine_fusion(mocker):
     """Tests the Beta fusion math (C5)"""
