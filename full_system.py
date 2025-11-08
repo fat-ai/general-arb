@@ -24,6 +24,9 @@ import requests # For downloading files
 import gzip     # For decompressing .gz files
 import io       # For reading in-memory bytes
 from datetime import datetime # For parsing timestamps
+from dune_client.types import QueryParameter
+from dune_client.client import DuneClient
+from dune_client.query import Query
 
 # ==============================================================================
 # --- Global Setup & Helpers ---
@@ -1275,66 +1278,319 @@ class BacktestPortfolio:
 class BacktestEngine:
     """
     (Production-Ready C7)
-    Loads and transforms real Polymarket data and runs
-    the full C1-C6 pipeline replay to find optimal parameters.
+    Loads and transforms REAL Polymarket data from Dune Analytics
+    and runs the full C1-C6 pipeline replay.
     """
-    def __init__(self, historical_data_path: str, markets_url: str, trades_url: str):
+    def __init__(self, historical_data_path: str): # historical_data_path can now be a cache path
         log.info("BacktestEngine (C7) Production initialized.")
-        self.historical_data_path = historical_data_path # Local path to save/read data
-        self.markets_url = markets_url
-        self.trades_url = trades_url
+        self.dune = DuneClient(os.environ["DUNE_API_KEY"]) # Requires DUNE_API_KEY env var
+        self.data_path = historical_data_path
+        
+        # This is the Query ID for a known query that fetches Polymarket v2 trades
+        # Query: "Polymarket - CLOB Trades"
+        # We can create our own, but this is a good starting point
+        self.trades_query_id = 3450537 
+        
+        # This is the Query ID for "Polymarket - Markets"
+        self.markets_query_id = 3450463 
+
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
 
-    def _download_and_load_data(self) -> (pd.DataFrame, pd.DataFrame):
+    def _load_polymarket_data(self) -> (pd.DataFrame, pd.DataFrame):
         """
-        Downloads (if needed) and loads the Polymarket CSVs into pandas DataFrames.
+        Downloads and loads the Polymarket data from Dune Analytics.
         This is the "Extract" phase.
         """
-        
-        # --- 1. Load Markets Data ---
-        markets_file = os.path.join(self.historical_data_path, "markets.csv.gz")
-        
-        # --- FIX: Check if file exists. If not, download it. ---
+        markets_file = os.path.join(self.data_path, "dune_markets_cache.parquet")
+        trades_file = os.path.join(self.data_path, "dune_trades_cache.parquet")
+
+        # --- 1. Load Markets Data (from Dune) ---
         if not os.path.exists(markets_file):
-            log.info(f"Downloading markets.csv.gz from {self.markets_url}...")
+            log.info("Querying Dune for all markets... (This may take a while)")
             try:
-                r = requests.get(self.markets_url)
-                r.raise_for_status() # Will raise an error if download fails
-                with open(markets_file, 'wb') as f:
-                    f.write(r.content)
-                log.info("Download complete.")
+                markets_query = Query(query_id=self.markets_query_id)
+                results = self.dune.run_query(markets_query)
+                df_markets = pd.DataFrame(results.result.rows)
+                df_markets.to_parquet(markets_file)
+                log.info(f"Successfully loaded and cached {len(df_markets)} markets.")
             except Exception as e:
-                log.error(f"FATAL: Failed to download {self.markets_url}: {e}")
-                log.error("Please download the file manually and place it in the project folder.")
+                log.error(f"FATAL: Failed to query Dune for markets: {e}")
                 raise
-        
-        log.info(f"Loading {markets_file} into DataFrame...")
-        with gzip.open(markets_file, 'rt', encoding='utf-8') as f:
-            df_markets = pd.read_csv(f)
-        
-        # --- 2. Load Trades Data ---
-        trades_file = os.path.join(self.historical_data_path, "trades.csv.gz")
-        
+        else:
+            log.info(f"Loading cached markets data from {markets_file}...")
+            df_markets = pd.read_parquet(markets_file)
+
+        # --- 2. Load Trades Data (from Dune) ---
         if not os.path.exists(trades_file):
-            log.info(f"Downloading trades.csv.gz from {self.trades_url}...")
+            log.info("Querying Dune for all trades... (This may take a *very* long time)")
             try:
-                r = requests.get(self.trades_url)
-                r.raise_for_status()
-                with open(trades_file, 'wb') as f:
-                    f.write(r.content)
-                log.info("Download complete.")
+                trades_query = Query(query_id=self.trades_query_id)
+                results = self.dune.run_query(trades_query)
+                df_trades = pd.DataFrame(results.result.rows)
+                df_trades.to_parquet(trades_file)
+                log.info(f"Successfully loaded and cached {len(df_trades)} trades.")
             except Exception as e:
-                log.error(f"FATAL: Failed to download {self.trades_url}: {e}")
-                log.error("Please download the file manually and place it in the project folder.")
+                log.error(f"FATAL: Failed to query Dune for trades: {e}")
                 raise
-                
-        log.info(f"Loading {trades_file} into DataFrame...")
-        with gzip.open(trades_file, 'rt', encoding='utf-8') as f:
-            df_trades = pd.read_csv(f)
+        else:
+            log.info(f"Loading cached trades data from {trades_file}...")
+            df_trades = pd.read_parquet(trades_file)
             
         log.info(f"Data loading complete. Markets: {len(df_markets)}, Trades: {len(df_trades)}")
         return df_markets, df_trades
+
+    def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
+        """
+        This is the "Transform" phase.
+        It creates two crucial DataFrames:
+        1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
+        2. event_log: The time-series log for the C7 replay harness.
+        """
+        log.info("Transforming raw data into event log...")
+        
+        # --- 1. Prepare Market Data (for lookups) ---
+        df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date_iso'], errors='coerce')
+        df_markets['created_at'] = pd.to_datetime(df_markets['created_at'])
+        
+        # Filter for resolved, binary markets (outcome is 0 or 1)
+        df_markets = df_markets[df_markets['outcome'].isin([0.0, 1.0])].copy()
+        market_outcomes = df_markets.set_index('condition_id')['outcome'].to_dict()
+        market_questions = df_markets.set_index('market_id')['question'].to_dict()
+        market_id_to_cond_id = df_markets.set_index('market_id')['condition_id'].to_dict()
+        
+        # Mock embeddings (C2) and liquidity (C3)
+        market_vectors = {mid: [0.1]*768 for mid in market_questions} 
+        market_liquidity = {mid: 100 + np.random.rand() * 50000 for mid in market_questions}
+
+        # --- 2. Create the Profiler DataFrame (for C4) ---
+        log.info("Building profiler data...")
+        # Map trades to their outcomes
+        df_trades['outcome'] = df_trades['condition_id'].map(market_outcomes)
+        
+        # We must use *both* maker and taker wallets
+        trades_maker = df_trades[['maker', 'price', 'outcome', 'market_id']].rename(columns={'maker': 'wallet_id', 'price': 'bet_price'})
+        trades_taker = df_trades[['taker', 'price', 'outcome', 'market_id']].rename(columns={'taker': 'wallet_id', 'price': 'bet_price'})
+        
+        profiler_data = pd.concat([trades_maker, trades_taker]).dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+        # In a real system, we'd run C2 here to get the *real* topic.
+        profiler_data['entity_type'] = 'default_topic' # For now, all trades are one topic
+        
+        # --- 3. Create the Event Log (for C7) ---
+        log.info("Building event log...")
+        events = []
+        
+        # a) Create NEW_CONTRACT events
+        for _, row in df_markets.iterrows():
+            events.append((
+                row['created_at'],
+                'NEW_CONTRACT',
+                {
+                    'id': row['market_id'],
+                    'condition_id': row['condition_id'],
+                    'text': row['question'],
+                    'vector': market_vectors[row['market_id']],
+                    'liquidity': market_liquidity[row['market_id']],
+                    'p_market_all': row['start_price']
+                }
+            ))
+            
+        # b) Create RESOLUTION events
+        for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
+            events.append((
+                row['resolution_timestamp'],
+                'RESOLUTION',
+                {'id': row['market_id'], 'outcome': row['outcome_numeric']}
+            ))
+            
+        # c) Create PRICE_UPDATE events from trades
+        df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
+        for _, row in df_trades.iterrows():
+            events.append((
+                row['timestamp'],
+                'PRICE_UPDATE',
+                {
+                    'id': row['market_id'],
+                    'p_market_all': row['price'],
+                    'wallet_id': row['taker'], # Taker is the "active" trader
+                    'price': row['price'],
+                    'volume': float(row['size']) * float(row['price']) # size * price
+                }
+            ))
+
+        # --- 4. Sort and return the final event log ---
+        event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
+        event_log = event_log.set_index('timestamp').sort_index()
+        
+        log.info(f"ETL complete. {len(profiler_data)} trades for profiler, {len(event_log)} total events.")
+        return event_log, profiler_data
+
+    @staticmethod
+    def _run_single_backtest(config: Dict[str, Any], historical_data: pd.DataFrame, profiler_data: pd.DataFrame):
+        """
+        This is the "objective" function that Ray Tune will optimize.
+        It runs one *REAL* C1-C6 pipeline simulation.
+        """
+        log.debug(f"--- C7: Starting back-test run with config: {config} ---")
+        try:
+            # 1. Initialize all components *with this run's config*
+            graph = GraphManager(is_mock=True) # Mocks the DB
+            
+            graph.model_brier_scores = {
+                'brier_internal_model': config['brier_internal_model'],
+                'brier_expert_model': 0.05, 
+                'brier_crowd_model': 0.15,
+            }
+            
+            # --- Instantiate REAL Pipeline ---
+            linker = RelationalLinker(graph)
+            ai_analyst = AIAnalyst()
+            
+            # --- ** NEW: Pre-train the Profiler ** ---
+            profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
+            graph.mock_db['profiler_data'] = profiler_data # Inject the real data
+            profiler.run_profiling() # This populates the mock_db['wallets']
+            
+            live_feed = LiveFeedHandler(graph)
+            prior_manager = PriorManager(graph, ai_analyst, live_feed)
+            belief_engine = BeliefEngine(graph)
+            belief_engine.k_brier_scale = config['k_brier_scale']
+            
+            kelly_solver = HybridKellySolver(
+                analytical_edge_threshold=config['kelly_edge_thresh'],
+                num_samples_k=2000 
+            )
+            pm = PortfolioManager(graph, kelly_solver)
+            
+            # 2. Initialize the simulation portfolio
+            portfolio = BacktestPortfolio()
+            portfolio.start_time = historical_data.index.min()
+            portfolio.end_time = historical_data.index.max()
+            
+            current_prices = {} # {contract_id: price}
+            
+            # 3. --- The Replay Loop ---
+            for timestamp, events in historical_data.groupby(historical_data.index):
+                
+                # --- A. Process all non-trade events first ---
+                for _, event in events.iterrows():
+                    data = event['data']
+                    event_type = event['event_type']
+                    contract_id = event['contract_id']
+                    
+                    if event_type == 'NEW_CONTRACT':
+                        log.debug(f"Event: NEW_CONTRACT {contract_id}")
+                        graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
+                        current_prices[contract_id] = data['p_market_all']
+                        linker.process_pending_contracts()
+                        prior_manager.process_pending_contracts()
+                    
+                    elif event_type == 'RESOLUTION':
+                        log.debug(f"Event: RESOLUTION {contract_id}")
+                        p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
+                        portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
+                        current_prices.pop(contract_id, None)
+                        graph.update_contract_status(contract_id, 'RESOLVED', {'outcome': data['outcome']})
+
+                # --- B. Process price updates & rebalance ---
+                price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
+                if price_updates:
+                    log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
+                    
+                    for c_id, data in price_updates.items():
+                        current_prices[c_id] = data['p_market_all']
+                        if c_id in graph.mock_db['contracts']:
+                            graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
+                            # Add the trade to the mock_db for C4 to find
+                            graph.mock_db['live_trades'] = [data] 
+                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger
+                    
+                    prior_manager.process_pending_contracts() 
+                    belief_engine.run_fusion_process()
+                    target_basket = pm.run_optimization_cycle()
+                    portfolio.rebalance(target_basket, current_prices)
+            
+            # 4. Get final metrics
+            metrics = portfolio.get_final_metrics()
+            
+            # 5. Report to Ray Tune
+            tune.report(metrics)
+            
+        except Exception as e:
+            log.error(f"Back-test run failed: {e}", exc_info=True)
+            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0})
+            
+    def run_tuning_job(self):
+        """Main entry point for Component 7."""
+        log.info("--- C7: Starting Hyperparameter Tuning Job ---")
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
+        
+        # --- THIS IS THE NEW ETL STEP ---
+        try:
+            df_markets, df_trades = self._download_and_load_data()
+            event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
+        except Exception as e:
+            log.error(f"FATAL: Failed to load or transform Polymarket data: {e}")
+            log.error("Please check the URLs, file paths, or network connection.")
+            return None
+        
+        # "Curry" the real data into the objective function
+        trainable_with_data = tune.with_parameters(
+            self._run_single_backtest,
+            historical_data=event_log,
+            profiler_data=profiler_data
+        )
+        
+        search_space = {
+            "brier_internal_model": tune.loguniform(0.05, 0.25),
+            "k_brier_scale": tune.loguniform(0.1, 5.0),
+            "kelly_edge_thresh": tune.uniform(0.05, 0.25),
+            "min_trades_threshold": tune.qrandint(5, 50, 5)
+        }
+        
+        scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
+        
+        analysis = tune.run(
+            trainable_with_data,
+            config=search_space,
+            num_samples=20, # Reduced for demo
+            scheduler=scheduler,
+            resources_per_trial={"cpu": 1},
+            name="pm_tuning_job"
+        )
+        
+        best_config = analysis.get_best_config(metric="irr", mode="max")
+        
+        log.info(f"--- C7: Tuning Job Complete ---")
+        log.info(f"Best config found for max IRR:")
+        log.info(best_config)
+        
+        ray.shutdown()
+        return best_config
+
+    def run_tuning_job_async(self):
+        """Launches the tuning job in a separate process."""
+        log.info("--- C7: Spawning asynchronous tuning job... ---")
+        
+        def run_job():
+            if not ray.is_initialized():
+                ray.init(logging_level=logging.ERROR)
+            
+            backtester = BacktestEngine(
+                historical_data_path=".", 
+                markets_url=os.getenv("POLY_MARKETS_URL", "https://clob-static.polymarket.com/markets.csv.gz"),
+                trades_url=os.getenv("POLY_TRADES_URL", "https://clob-static.polymarket.com/trades.csv.gz")
+            )
+            best_config = backtester.run_tuning_job()
+            log.info(f"--- C7: Async Tuning Job Complete. Best config: {best_config} ---")
+            ray.shutdown()
+
+        p = multiprocessing.Process(target=run_job)
+        p.start()
+        log.info(f"--- C7: Job process started with PID {p.pid} ---")
+        return p.pid
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
