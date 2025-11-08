@@ -1085,7 +1085,7 @@ def run_c6_demo():
         graph = GraphManager(is_mock=True) # Use MOCK graph
         solver = HybridKellySolver(num_samples_k=5000)
         pm = PortfolioManager(graph, solver)
-        pm..run_optimization_cycle()
+        pm.run_optimization_cycle()
         log.info("--- C6 Demo Complete. ---")
         graph.close()
     except Exception as e:
