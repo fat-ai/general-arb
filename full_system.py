@@ -1244,127 +1244,194 @@ class BacktestEngine:
         return best_config
 
 # ==============================================================================
-# ### COMPONENT 8: Operational Dashboard ###
+# ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
 # ==============================================================================
 
-def run_c8_demo():
-    """Launches the C8 Dashboard"""
-    log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
-    log.info("--- Launching Dash server on http://127.0.0.1:8050/ ---")
+# --- Global Instantiation (Import-Safe) ---
+# Use mock mode so 'pytest' can import this file without a DB connection
+IS_PROD_MODE = os.getenv("PROD_MODE", "false").lower() == "true"
+graph_manager = GraphManager(is_mock=not IS_PROD_MODE)
 
-    # We instantiate mocks *inside* the demo function
-    graph_stub_c8 = GraphManager(is_mock=True)
-    backtester_stub_c8 = BacktestEngine(graph_stub_c8)
+# Instantiate all other components with the GraphManager
+ai_analyst = AIAnalyst()
+live_feed_handler = LiveFeedHandler(graph_manager)
+relational_linker = RelationalLinker(graph_manager)
+prior_manager = PriorManager(graph_manager, ai_analyst, live_feed_handler)
+historical_profiler = HistoricalProfiler(graph_manager)
+belief_engine = BeliefEngine(graph_manager)
+kelly_solver = HybridKellySolver()
+portfolio_manager = PortfolioManager(graph_manager, kelly_solver)
+backtest_engine = BacktestEngine(historical_data_path="mock_data.parquet")
 
-    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
-    server = app.server
+# --- Dash App Definition ---
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+server = app.server
 
-    def build_header():
-        regime, params = graph_stub_c8.get_regime_status()
-        return dbc.NavbarSimple(
-            children=[
-                dbc.NavItem(dbc.NavLink("Analyst", href="/analyst")),
-                dbc.NavItem(dbc.NavLink("Portfolio Manager", href="/pm")),
-                dbc.NavItem(dbc.NavLink("Admin", href="/admin")),
-                dbc.Badge(f"Regime: {regime}", color="primary", className="ms-auto"),
-            ],
-            brand="QTE", color="dark", dark=True,
-        )
+# --- Analyst Triage Modal (Popup) ---
+analyst_modal = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Resolve Analyst Item")),
+        dbc.ModalBody([
+            html.P("Item ID:"),
+            html.Code(id='modal-item-id'),
+            html.P("Reason:", className="mt-3"),
+            html.Code(id='modal-item-reason'),
+            html.P("Details:", className="mt-3"),
+            html.Code(id='modal-item-details'),
+            html.Hr(),
+            html.P("Enter Resolution Data (e.g., new Entity ID, or 'MERGE')"),
+            dbc.Input(id='modal-input-data', placeholder="e.g., E_123 or MERGE"),
+        ]),
+        dbc.ModalFooter(
+            dbc.Button("Submit Resolution", id='modal-submit-btn', color="primary")
+        ),
+    ],
+    id='analyst-modal',
+    is_open=False,
+)
 
-    def build_analyst_tab():
-        queue_items = graph_stub_c8.get_human_review_queue()
-        table_header = [html.Thead(html.Tr([html.Th("Contract"), html.Th("Reason"), html.Th("Details"), html.Th("Action")]))]
-        table_body = [html.Tbody([
-            html.Tr([
-                html.Td(item['id']), html.Td(item['reason']), html.Td(html.Code(item['details'])),
-                html.Td(dbc.Button("Resolve", id={'type': 'resolve-btn', 'index': item['id']}, size="sm")),
-            ]) for item in queue_items
-        ])]
-        return html.Div([
-            html.H2("Analyst Triage Queues"),
-            dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
-            dbc.Table(table_header + table_body, bordered=True, striped=True)
-        ])
+# --- App Layout ---
+def build_header():
+    regime, params = graph_manager.get_regime_status()
+    return dbc.NavbarSimple(
+        children=[
+            dbc.NavItem(dbc.NavLink("Analyst", href="/analyst")),
+            dbc.NavItem(dbc.NavLink("Portfolio Manager", href="/pm")),
+            dbc.NavItem(dbc.NavLink("Admin", href="/admin")),
+            dbc.Badge(f"Regime: {regime}", color="primary", className="ms-auto"),
+        ],
+        brand="QTE", color="dark", dark=True,
+    )
 
-    def build_pm_tab():
-        state = graph_stub_c8.get_portfolio_state()
-        pnl_history = graph_stub_c8.get_pnl_history()
-        fig = go.Figure(data=go.Scatter(y=pnl_history, mode='lines', name='Total Value'))
-        fig.update_layout(title='Portfolio Value Over Time', yaxis_title='Total Value ($)')
-        return html.Div([
-            dbc.Row([
-                dbc.Col(dbc.Card([dbc.CardHeader("Portfolio Value"), dbc.CardBody(f"${state['total_value']:,.2f}", className="text-success fs-3")]), width=4),
-                dbc.Col(dbc.Card([dbc.CardHeader("Available Cash"), dbc.CardBody(f"${state['cash']:,.2f}", className="fs-3")]), width=4),
-                dbc.Col(dbc.Card([dbc.CardHeader("Active Positions"), dbc.CardBody(f"{len(state['positions'])}", className="fs-3")]), width=4),
-            ]),
-            dbc.Row(dcc.Graph(figure=fig), className="mt-4"),
-        ])
-
-    def build_admin_tab():
-        regime, params = graph_stub_c8.get_regime_status()
-        return html.Div([
-            html.H2("Admin & Tuning"),
-            dbc.Alert(id='admin-alert', is_open=False, duration=4000),
-            dbc.Row([
-                dbc.Col(dbc.Card([
-                    dbc.CardHeader("Hyperparameter Tuning"),
-                    dbc.CardBody([
-                        html.P("Launch a new job to tune all hyperparameters (C7)."),
-                        dbc.Button("Start New Tuning Job", id='start-tune-btn', color="danger", n_clicks=0)
-                    ]),
-                ]), width=6),
-                dbc.Col(dbc.Card([
-                    dbc.CardHeader("Current Regime & Parameters"),
-                    dbc.CardBody([html.H4(f"Regime: {regime}"), html.Code(str(params))]),
-                ]), width=6),
-            ]),
-        ])
-
-    app.layout = html.Div([
-        build_header(),
-        dcc.Location(id='url', refresh=False),
-        dbc.Container(id='page-content', fluid=True, className="mt-4")
+def build_analyst_tab():
+    queue_items = graph_manager.get_human_review_queue()
+    table_header = [html.Thead(html.Tr([html.Th("Item ID"), html.Th("Reason"), html.Th("Action")]))]
+    table_body = [html.Tbody([
+        html.Tr([
+            html.Td(item['id']), html.Td(item['reason']),
+            html.Td(dbc.Button("Resolve", id={'type': 'resolve-btn', 'index': item['id']}, n_clicks=0, size="sm")),
+        ]) for item in queue_items
+    ])]
+    return html.Div([
+        html.H2("Analyst Triage Queues"),
+        dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
+        dbc.Table(table_header + table_body, bordered=True, striped=True),
+        dcc.Store(id='modal-data-store'), # Hidden store to hold data for the modal
+        analyst_modal # Add the modal to the layout
     ])
 
-    @callback(Output('page-content', 'children'), [Input('url', 'pathname')])
-    def display_page(pathname):
-        if pathname == '/pm': return build_pm_tab()
-        elif pathname == '/admin': return build_admin_tab()
-        else: return build_analyst_tab()
+def build_pm_tab():
+    state = graph_manager.get_portfolio_state()
+    pnl_history = graph_manager.get_pnl_history()
+    fig = go.Figure(data=go.Scatter(y=pnl_history, mode='lines', name='Total Value'))
+    fig.update_layout(title='Portfolio Value Over Time', yaxis_title='Total Value ($)')
+    return html.Div([
+        dbc.Row([
+            dbc.Col(dbc.Card([dbc.CardHeader("Portfolio Value"), dbc.CardBody(f"${state['total_value']:,.2f}", className="text-success fs-3")]), width=4),
+            dbc.Col(dbc.Card([dbc.CardHeader("Available Cash"), dbc.CardBody(f"${state['cash']:,.2f}", className="fs-3")]), width=4),
+            dbc.Col(dbc.Card([dbc.CardHeader("Active Positions"), dbc.CardBody(f"{len(state['positions'])}", className="fs-3")]), width=4),
+        ]),
+        dbc.Row(dcc.Graph(figure=fig), className="mt-4"),
+    ])
 
-    @callback(
-        Output('analyst-alert', 'children'), Output('analyst-alert', 'is_open'),
-        Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
-        prevent_initial_call=True
-    )
-    def resolve_analyst_item(n_clicks):
-        ctx = dash.callback_context
-        if not ctx.triggered: return "", False
-        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        item_id = eval(button_id)['index'] 
-        success = graph_stub_c8.resolve_human_review_item(item_id, "MERGE_CONFIRMED")
-        if success: return f"Item {item_id} resolved!", True
-        else: return f"Failed to resolve {item_id}.", True
+def build_admin_tab():
+    regime, params = graph_manager.get_regime_status()
+    return html.Div([
+        html.H2("Admin & Tuning"),
+        dbc.Alert(id='admin-alert', is_open=False, duration=4000),
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Hyperparameter Tuning (C7)"),
+                dbc.CardBody([
+                    html.P("Launch a new async job to tune all hyperparameters."),
+                    dbc.Button("Start New Tuning Job", id='start-tune-btn', color="danger", n_clicks=0)
+                ]),
+            ]), width=6),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Current Regime & Parameters"),
+                dbc.CardBody([html.H4(f"Regime: {regime}"), html.Code(str(params))]),
+            ]), width=6),
+        ]),
+    ])
 
-    @callback(
-        Output('admin-alert', 'children'), Output('admin-alert', 'is_open'),
-        Input('start-tune-btn', 'n_clicks'),
-        prevent_initial_call=True
-    )
-    def start_tuning_job(n_clicks):
-        log.warning("Admin clicked 'Start New Tuning Job'")
-        try:
-            job_id = backtester_stub_c8.run_tuning_job() 
-            return f"Tuning job complete! Best config: {job_id}", True
-        except Exception as e:
-            log.error(f"Failed to start tuning job: {e}")
-            return f"Error: {e}", True
-            
+app.layout = html.Div([
+    build_header(),
+    dcc.Location(id='url', refresh=False),
+    dbc.Container(id='page-content', fluid=True, className="mt-4")
+])
+
+# --- Main Page-Routing Callback ---
+@callback(Output('page-content', 'children'), [Input('url', 'pathname')])
+def display_page(pathname):
+    if pathname == '/pm': return build_pm_tab()
+    elif pathname == '/admin': return build_admin_tab()
+    else: return build_analyst_tab()
+
+# --- C8: Admin Callback (Async) ---
+@callback(
+    Output('admin-alert', 'children'),
+    Output('admin-alert', 'is_open'),
+    Input('start-tune-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def start_tuning_job_callback(n_clicks):
+    log.warning("Admin clicked 'Start New Tuning Job'")
     try:
-        app.run_server(debug=True, port=8050)
+        # Call the ASYNC method
+        pid = backtest_engine.run_tuning_job_async() 
+        return f"Tuning job started in background (PID: {pid})! See Ray Dashboard for progress.", True
     except Exception as e:
-        log.error(f"C8 Demo Failed: {e}")
-        if "dash" in str(e): log.info("Hint: Run 'pip install dash dash-bootstrap-components plotly pandas'")
+        log.error(f"Failed to start tuning job: {e}")
+        return f"Error: {e}", True
+
+# --- C8: Analyst Callbacks (Modal) ---
+@callback(
+    Output('analyst-modal', 'is_open'),
+    Output('modal-data-store', 'data'),
+    Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
+    prevent_initial_call=True
+)
+def open_analyst_modal(n_clicks):
+    """Opens the modal and stores the item's data."""
+    ctx = dash.callback_context
+    if not any(n_clicks): return False, {}
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    item_id = json.loads(button_id)['index']
+    
+    # Get the item's data from the mock queue
+    queue = graph_manager.get_human_review_queue()
+    item_data = next((item for item in queue if item['id'] == item_id), None)
+    
+    if item_data:
+        return True, item_data # Open modal, store data
+    return False, {}
+
+@callback(
+    Output('analyst-alert', 'children'),
+    Output('analyst-alert', 'is_open'),
+    Output('analyst-modal', 'is_open', allow_duplicate=True),
+    Input('modal-submit-btn', 'n_clicks'),
+    State('modal-data-store', 'data'),
+    State('modal-input-data', 'value'),
+    prevent_initial_call=True
+)
+def submit_analyst_resolution(n_clicks, item_data, resolution_data):
+    """Handles the 'Submit' button click inside the modal."""
+    if not item_data:
+        return "Error: No item data found.", True, False
+    
+    item_id = item_data.get('id')
+    log.warning(f"Analyst is resolving {item_id} with data: {resolution_data}")
+    
+    # In prod, we'd pass this to a real function:
+    # e.g., relational_linker.resolve_human_task(item_id, resolution_data)
+    success = graph_manager.resolve_human_review_item(item_id, "SUBMITTED", resolution_data)
+    
+    if success:
+        return f"Item {item_id} resolved! Refreshing...", True, False # Close modal
+    else:
+        return f"Failed to resolve {item_id}.", True, True # Keep modal open
 
 
 # ==============================================================================
