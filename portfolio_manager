@@ -1,0 +1,282 @@
+import os
+import logging
+import numpy as np
+import scipy.optimize as opt
+from scipy.stats import qmc, norm  # For QMC and Copula
+from typing import Dict, List, Tuple
+
+# Set up basic logging
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+# ==============================================================================
+# (STUBS) - Mocked C1 & C5 data for this component to run
+# ==============================================================================
+
+class MockGraphManager:
+    """(STUB) Mocks the GraphManager (C1) to provide data for C6."""
+    
+    def get_active_entity_clusters(self) -> List[str]:
+        log.info("MockGraph: Finding all active clusters...")
+        return ["E_DUNE_3"]
+
+    def get_cluster_contracts(self, entity_id: str) -> List[Dict]:
+        """
+        MOCK: Provides the exact risk-free arbitrage scenario.
+        Market (Q) is mispriced: P(B) < P(A)
+        Our Model (M) has corrected this: P_model(B) >= P_model(A)
+        """
+        log.info(f"MockGraph: Getting contracts for cluster {entity_id}...")
+        return [
+            {
+                'id': 'MKT_A', # Dune 3 > $1B
+                'M': 0.60,     # P_model (Our "fair" price)
+                'Q': 0.60,     # P_market_all (The crowd price)
+                'is_logical_rule': True # Flag for the numerical solver
+            },
+            {
+                'id': 'MKT_B', # Dune 3 > $500M
+                'M': 0.60,     # P_model (Corrected by C5 to be >= A)
+                'Q': 0.50,     # P_market_all (The mispricing!)
+                'is_logical_rule': True
+            }
+        ]
+
+    def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
+        """MOCK: Finds the correlation. P_model(A) = 0.6"""
+        if c1_id == 'MKT_A' and c2_id == 'MKT_B':
+            # A -> IMPLIES -> B. 
+            # P(A, B) = P(A). We use our P_model for P(A).
+            p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
+            return {
+                'type': 'LOGICAL_IMPLIES',
+                'p_joint': p_A  # P(A, B) = P_model(A)
+            }
+        return {'type': 'NONE', 'p_joint': None}
+
+    def close(self): pass
+
+# ==============================================================================
+# COMPONENT 6: Production-Ready Implementation
+# ==============================================================================
+
+class HybridKellySolver:
+    """
+    Component 6.sub: The "Hybrid Kelly" mathematical solver.
+    Implements both the analytical approximation and the precise
+    numerical log-utility optimization.
+    """
+    def __init__(self, analytical_edge_threshold=0.2, analytical_q_threshold=0.1, num_samples_k=10000):
+        self.edge_thresh = analytical_edge_threshold
+        self.q_thresh = analytical_q_threshold
+        self.k_samples = num_samples_k
+        log.info(f"HybridKellySolver initialized (Edge Tresh: {self.edge_thresh}, QMC Samples: {self.k_samples})")
+
+    def _is_numerical_required(self, E: np.ndarray, Q: np.ndarray, contracts: List[Dict]) -> bool:
+        """TRIBUTES: Triage logic, now with the logical rule check."""
+        if np.any(np.abs(E) > self.edge_thresh):
+            log.warning("Numerical solver triggered: Large edge detected.")
+            return True
+        if np.any(Q < self.q_thresh) or np.any(Q > (1 - self.q_thresh)):
+            log.warning("Numerical solver triggered: Extreme probabilities detected.")
+            return True
+        # **REFINEMENT:** If any contract is part of a logical rule,
+        # the analytical approximation is invalid.
+        if any(c.get('is_logical_rule', False) for c in contracts):
+            log.warning("Numerical solver triggered: Logical rule (arbitrage) detected.")
+            return True
+        return False
+
+    def _build_covariance_matrix(self, graph: MockGraphManager, contracts: List[Dict]) -> np.ndarray:
+        """Builds the n x n Covariance Matrix 'C' based on P_model."""
+        n = len(contracts)
+        C = np.zeros((n, n))
+        P = np.array([c['M'] for c in contracts]) # P_model vector
+        
+        for i in range(n):
+            for j in range(i, n):
+                c1_id = contracts[i]['id']
+                c2_id = contracts[j]['id']
+                
+                if i == j:
+                    # Variance: p * (1-p)
+                    C[i, i] = P[i] * (1 - P[i])
+                    continue
+                
+                # Get the joint probability P(i, j)
+                rel = graph.get_relationship_between_contracts(c1_id, c2_id, contracts)
+                p_ij = rel.get('p_joint')
+                
+                if p_ij is None: # Case C: No link. Assume independent.
+                    p_ij = P[i] * P[j]
+                
+                # Cov(i, j) = P(i, j) - P(i)P(j)
+                cov = p_ij - P[i] * P[j]
+                C[i, j] = cov
+                C[j, i] = cov # Matrix is symmetric
+                
+        return C
+
+    def _solve_analytical(self, C: np.ndarray, D: np.ndarray, E: np.ndarray) -> np.ndarray:
+        """Solves F* = D * C_inv * E"""
+        log.info("Solving with Analytical (Fast Path)...")
+        # Use Moore-Penrose pseudo-inverse for numerical stability
+        C_inv = np.linalg.pinv(C) 
+        F_star = D @ C_inv @ E
+        return F_star
+
+    def _solve_numerical(self, M: np.ndarray, Q: np.ndarray, C: np.ndarray, F_analytical_guess: np.ndarray) -> np.ndarray:
+        """
+        Solves max(E[log(W)]) using a numerical optimizer and QMC.
+        This is the *production* implementation.
+        """
+        log.info("Solving with Numerical (Precise Path)...")
+        n = len(M)
+        
+        # --- 1. Generate Correlated Outcomes (I_k) ---
+        # Use Gaussian Copula with Quasi-Monte Carlo (Sobol sequence)
+        
+        # Convert Covariance to Correlation Matrix
+        std_devs = np.sqrt(np.diag(C))
+        Corr = C / np.outer(std_devs, std_devs)
+        np.fill_diagonal(Corr, 1.0) # Clean up floating point
+        
+        # Use QMC sampler for better space-filling
+        sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr)
+        Z = sampler.random(self.k_samples) # K x n samples
+        
+        # Convert to uniform distribution
+        U = norm.cdf(Z)
+        
+        # Convert to correlated Bernoulli outcomes using our P_model (M)
+        # I_k is a (K_samples x n) matrix of [1, 0, 1, ...] outcomes
+        I_k = (U < M).astype(int) 
+
+        # --- 2. Define the Objective Function ---
+        def objective(F: np.ndarray) -> float:
+            """Calculates the negative expected log-wealth."""
+            
+            # We must calculate the return R_i for each bet *given the sign of F_i*
+            # W_k = 1 + sum(f_i * R_i)
+            # This is slow, so we vectorize:
+            
+            # `gains` is a (K x n) matrix.
+            # R_long = (I_k - Q) / Q
+            # R_short = (Q - I_k) / (1 - Q)
+            gains_long = (I_k - Q) / Q
+            gains_short = (Q - I_k) / (1 - Q)
+            
+            # R_k_matrix[k, i] = gains_long[k, i] if F[i] > 0 else gains_short[k, i]
+            R_k_matrix = np.where(F > 0, gains_long, gains_short)
+            
+            # F_broadcast = np.tile(F, (self.k_samples, 1)) # (K x n)
+            
+            # Portfolio return for each of the K simulations
+            # We use np.abs(F) because the *sign* was already handled
+            # in the R_k_matrix (gains_long vs gains_short)
+            portfolio_returns = np.sum(R_k_matrix * np.abs(F), axis=1) # (K x 1)
+            
+            # Wealth for each simulation
+            W_k = 1.0 + portfolio_returns
+            
+            # --- CRITICAL: Handle Bankruptcy Risk ---
+            # If any W_k is <= 0, log(W_k) is -inf. This is a bankrupt
+            # portfolio and must be penalized with a huge negative number.
+            if np.any(W_k <= 1e-9):
+                return 1e9 # Return a massive penalty
+            
+            log_wealth = np.log(W_k)
+            
+            # We MINIMIZE the NEGATIVE mean log wealth
+            return -np.mean(log_wealth)
+
+        # --- 3. Run the Optimizer ---
+        initial_guess = F_analytical_guess
+        
+        # Constraints: sum(|F|) <= 0.8 (Total allocation)
+        constraints = ({'type': 'ineq', 'fun': lambda F: 0.8 - np.sum(np.abs(F))})
+        bounds = [(-0.5, 0.5)] * n # F_i between -50% and +50%
+        
+        result = opt.minimize(
+            objective,
+            initial_guess,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'ftol': 1e-6, 'disp': False}
+        )
+        
+        if not result.success:
+            log.warning(f"Numerical solver failed: {result.message}. Falling back to analytical guess.")
+            return initial_guess
+        
+        log.info(f"Numerical solver converged. Final E[log(W)] = {-result.fun:.6f}")
+        return result.x
+
+    def solve_basket(self, graph: MockGraphManager, contracts: List[Dict]) -> np.ndarray:
+        """Main entry point to solve for an optimal basket F*."""
+        
+        n = len(contracts)
+        M = np.array([c['M'] for c in contracts]) # P_model vector
+        Q = np.array([c['Q'] for c in contracts]) # P_market vector
+        E = M - Q                                # Edge vector
+        D = np.diag(Q)                           
+        
+        C = self._build_covariance_matrix(graph, contracts)
+        
+        F_analytical = self._solve_analytical(C, D, E)
+        
+        if self._is_numerical_required(E, Q, contracts):
+            F_star = self._solve_numerical(M, Q, C, F_analytical)
+        else:
+            F_star = F_analytical
+            
+        return F_star
+
+
+class PortfolioManager:
+    """
+    Component 6: The "Conductor"
+    Runs the main optimization loop.
+    """
+    
+    def __init__(self, graph_manager: MockGraphManager, solver: HybridKellySolver):
+        self.graph = graph_manager
+        self.solver = solver
+        self.max_event_exposure = 0.15
+        log.info(f"PortfolioManager initialized (Max Exposure: {self.max_event_exposure})")
+
+    def _apply_constraints(self, F_star: np.ndarray) -> np.ndarray:
+        """Applies final portfolio-wide constraints."""
+        total_exposure = np.sum(np.abs(F_star))
+        if total_exposure > self.max_event_exposure:
+            log.warning(f"Capping exposure: {total_exposure:.2f} > {self.max_event_exposure}")
+            scale_factor = self.max_event_exposure / total_exposure
+            return F_star * scale_factor
+        return F_star
+
+    def run_optimization_cycle(self):
+        """Main worker loop for Component 6."""
+        log.info("--- PM: Starting Optimization Cycle ---")
+        
+        active_clusters = self.graph.get_active_entity_clusters()
+        
+        for cluster_id in active_clusters:
+            log.info(f"--- Solving Cluster: {cluster_id} ---")
+            
+            contracts = self.graph.get_cluster_contracts(cluster_id)
+            if len(contracts) < 1: # Can run on 1
+                continue
+            
+            F_star_unconstrained = self.solver.solve_basket(self.graph, contracts)
+            
+            F_star_final = self._apply_constraints(F_star_unconstrained)
+            
+            log.info(f"--- Final Basket for {cluster_id} ---")
+            for i, contract in enumerate(contracts):
+                allocation = F_star_final[i]
+                if abs(allocation) > 1e-5: # Only log non-zero trades
+                    action = "BUY" if allocation > 0 else "SELL"
+                    log.info(f"-> {action} {abs(allocation)*100:.2f}% on {contract['id']} (Edge: {contracts[i]['M'] - contracts[i]['Q']:.2f})")
+
+        log.info("--- PM: Optimization Cycle Complete ---")
