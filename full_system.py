@@ -17,6 +17,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import sys
 import math
+import json
 
 # ==============================================================================
 # --- Global Setup ---
@@ -941,13 +942,14 @@ class HybridKellySolver:
         self.k_samples = num_samples_k
         log.info(f"HybridKellySolver initialized (Edge Tresh: {self.edge_thresh}, QMC Samples: {self.k_samples})")
         
-    def _nearest_psd(A):
-        """Find the nearest positive semi-definite matrix to A."""
+    def _nearest_psd(self, A):  # <-- Added 'self'
+        """Find the nearest positive semi-definite correlation matrix."""
         eigval, eigvec = np.linalg.eigh(A)
-        # Clamp negative eigenvalues to a small positive number
-        eigval[eigval < 0] = 1e-8 
-        # Reconstruct the matrix
-        return eigvec @ np.diag(eigval) @ eigvec.T
+        eigval[eigval < 0] = 1e-8
+        A_psd = eigvec @ np.diag(eigval) @ eigvec.T
+        # Enforce unit diagonal for correlation matrices
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(A_psd)))
+        return D_sqrt_inv @ A_psd @ D_sqrt_inv
         
     def _is_numerical_required(self, E: np.ndarray, Q: np.ndarray, contracts: List[Dict]) -> bool:
         if np.any(np.abs(E) > self.edge_thresh):
