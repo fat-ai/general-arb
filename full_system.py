@@ -40,32 +40,44 @@ def cosine_similarity(v1, v2):
     return dot_product / (norm_v1 * norm_v2)
 
 def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tuple[float, float]:
-    if not (0 < mean < 1):
-        log.warning(f"Mean {mean} is at an extreme. Returning a weak prior.")
-        return (1.0, 1.0)
+    if not (0 <= mean <= 1):
+         log.warning(f"Mean {mean} is outside [0, 1]. Returning weak prior.")
+         return (1.0, 1.0)
+
+    # --- FIX 1: Handle Logical Rules (P0.3) ---
+    if mean == 0.0:
+        return (1.0, float('inf')) # P(X=0) = 1
+    if mean == 1.0:
+        return (float('inf'), 1.0) # P(X=1) = 1
+    
     lower, upper = confidence_interval
     if not (0 <= lower <= mean <= upper <= 1.0):
         log.warning("Invalid confidence interval. Returning a weak prior.")
         return (1.0, 1.0)
+        
     std_dev = (upper - lower) / 4.0
+    
     if std_dev == 0:
-        return (float('inf'), float('inf')) # Logical rule
+        # This is a logical rule not at 0 or 1, which is contradictory.
+        # But if it's for 1.0 or 0.0, we handle it.
+        if mean == 1.0: return (float('inf'), 1.0)
+        if mean == 0.0: return (1.0, float('inf'))
+        log.warning(f"CI has zero width but mean is {mean}. Treating as weak prior.")
+        return (1.0, 1.0)
+
     variance = std_dev ** 2
     inner = (mean * (1 - mean) / variance) - 1
-    if inner <= 0:
-        # This handles the case where (0.5, [0.0, 1.0]) -> std=0.25, var=0.0625 -> inner=3
-        # It also handles inconsistent CIs where variance is too large.
-        if (mean * (1-mean)) < variance:
-            log.warning(f"Inconsistent CI for mean {mean}. Variance is too large. Returning weak prior.")
-            return (1.0, 1.0)
-        # This is for a valid, wide CI like (0.5, [0.0, 1.0])
-        inner = max(inner, 1e-6) # Ensure alpha/beta are at least positive
-        
+    
+    if (mean * (1-mean)) < variance:
+        log.warning(f"Inconsistent CI for mean {mean}. Variance is too large. Returning weak prior.")
+        return (1.0, 1.0)
+    if inner <= 0: inner = 1e-6
+    
     alpha = mean * inner
     beta = (1 - mean) * inner
     log.debug(f"Converted (mean={mean}, CI=[{lower},{upper}]) -> (alpha={alpha:.2f}, beta={beta:.2f})")
     return (alpha, beta)
-
+    
 # ==============================================================================
 # ### COMPONENT 1: GraphManager (Upgraded for C5) ###
 # ==============================================================================
@@ -176,13 +188,14 @@ class GraphManager:
         if self.is_mock: return
         with self.driver.session() as session:
             session.execute_write(self._tx_update_status, contract_id, status, metadata)
+            
     @staticmethod
     def _tx_update_status(tx, contract_id, status, metadata):
         query = "MATCH (c:Contract {contract_id: $contract_id}) SET c.status = $status, c.updated_at = timestamp()"
         params = {'contract_id': contract_id, 'status': status}
         if metadata:
             query += " SET c.review_metadata = $metadata"
-            params['metadata'] = str(metadata)
+            params['metadata'] = json.dumps(metadata)
         tx.run(query, **params)
     
     # --- C3: Read/Write Methods (Production-Ready) ---
@@ -927,7 +940,15 @@ class HybridKellySolver:
         self.q_thresh = analytical_q_threshold
         self.k_samples = num_samples_k
         log.info(f"HybridKellySolver initialized (Edge Tresh: {self.edge_thresh}, QMC Samples: {self.k_samples})")
-
+        
+    def _nearest_psd(A):
+        """Find the nearest positive semi-definite matrix to A."""
+        eigval, eigvec = np.linalg.eigh(A)
+        # Clamp negative eigenvalues to a small positive number
+        eigval[eigval < 0] = 1e-8 
+        # Reconstruct the matrix
+        return eigvec @ np.diag(eigval) @ eigvec.T
+        
     def _is_numerical_required(self, E: np.ndarray, Q: np.ndarray, contracts: List[Dict]) -> bool:
         if np.any(np.abs(E) > self.edge_thresh):
             log.warning("Numerical solver triggered: Large edge detected.")
@@ -975,58 +996,42 @@ class HybridKellySolver:
         np.fill_diagonal(Corr, 1.0) 
         
         try:
-            # ** Add jitter for stability **
-            Corr_jitter = Corr + np.eye(n) * 1e-9 
-            L = np.linalg.cholesky(Corr_jitter)
+            # --- FIX 3: Proper PSD calculation for Cholesky (P0.1) ---
+            # Don't just add jitter, find the nearest valid correlation matrix
+            Corr_psd = self._nearest_psd(Corr)
+            L = np.linalg.cholesky(Corr_psd)
         except np.linalg.LinAlgError:
-            log.warning("Cov matrix not positive definite. Using MVN sampler directly (slower).")
-            sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr_jitter)
-            Z = sampler.random(self.k_samples)
-            U = norm.cdf(Z)
-            I_k = (U < M).astype(int)
-            log.warning("Cov matrix not positive definite. Using MVN sampler directly.")
-            sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr_jitter)
-            Z = sampler.random(self.k_samples)
-            L = None # Signal to skip the Cholesky path
+            # This should almost never happen now, but as a final fallback...
+            log.error("Cholesky decomposition failed *even after* finding nearest PSD matrix. This is critical.")
+            # Fallback to MVN sampler which can handle it
+            try:
+                sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr)
+                Z = sampler.random(self.k_samples)
+                L = None # Signal to skip Cholesky path
+            except Exception as e:
+                log.error(f"FATAL: MVN sampler also failed: {e}. Falling back to independence.")
+                L = np.eye(n) # Last resort
             
-        if L is not None: # Standard Cholesky path
+        if L is not None: # Standard (now robust) Cholesky path
             sampler = qmc.Sobol(d=n, scramble=True)
             m_power = int(math.ceil(math.log2(self.k_samples)))
             U_unif = sampler.random_base2(m=m_power)[:self.k_samples]
             Z = norm.ppf(U_unif) @ L.T
-
-        U = norm.cdf(Z)
-        I_k = (U < M).astype(int)
             
-        sampler = qmc.Sobol(d=n, scramble=True)
-        m_power = int(math.ceil(math.log2(self.k_samples)))
-        U_unif = sampler.random_base2(m=m_power)
-        if len(U_unif) > self.k_samples:
-            U_unif = U_unif[:self.k_samples]
-            
-        Z = norm.ppf(U_unif) @ L.T
         U = norm.cdf(Z)
         I_k = (U < M).astype(int) 
 
-        # 2. Define the Objective Function
+        # 2. Define the Objective Function (Unchanged)
         def objective(F: np.ndarray) -> float:
-            # Vectorized calculation of returns for BUY (F>0) and SELL (F<0)
             gains_long = (I_k - Q) / Q
             gains_short = (Q - I_k) / (1 - Q)
-            
-            # This is the (K x n) matrix of returns for each outcome
             R_k_matrix = np.where(F > 0, gains_long, gains_short)
-            
-            # We use np.abs(F) because the sign is already in R_k_matrix
             portfolio_returns = np.sum(R_k_matrix * np.abs(F), axis=1)
-            
             W_k = 1.0 + portfolio_returns
-            
-            if np.any(W_k <= 1e-9): # Bankruptcy
-                return 1e9 
-            return -np.mean(np.log(W_k)) # Minimize negative log-wealth
+            if np.any(W_k <= 1e-9): return 1e9 
+            return -np.mean(np.log(W_k))
 
-        # 3. Run the Optimizer
+        # 3. Run the Optimizer (Unchanged)
         initial_guess = F_analytical_guess
         constraints = ({'type': 'ineq', 'fun': lambda F: 0.8 - np.sum(np.abs(F))})
         bounds = [(-0.5, 0.5)] * n
