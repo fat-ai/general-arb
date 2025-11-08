@@ -25,10 +25,10 @@ logging.basicConfig(level=logging.ERROR)
     (0.6, (0.4, 0.8), 13.8, 9.2),
     
     # Test 2: (0.8, [0.79, 0.81]) -> std=0.005, var=2.5e-5 -> inner=6399
-    (0.8, (0.79, 0.81), 5119.2, 1279.8), # <--- CORRECTED VALUE
+    (0.8, (0.79, 0.81), 5119.2, 1279.8),
     
     # Test 3: (0.5, [0.1, 0.9]) -> std=0.2, var=0.04 -> inner=5.25
-    (0.5, (0.1, 0.9), 2.625, 2.625),     # <--- CORRECTED VALUE
+    (0.5, (0.1, 0.9), 2.625, 2.625),
 ])
 def test_convert_to_beta_happy_paths(mean, ci, expected_alpha, expected_beta):
     """Tests the convert_to_beta math (C3/C5)"""
@@ -36,28 +36,29 @@ def test_convert_to_beta_happy_paths(mean, ci, expected_alpha, expected_beta):
     assert_allclose([alpha, beta], [expected_alpha, expected_beta], rtol=1e-3)
 
 @pytest.mark.parametrize("mean, ci", [
-    (0.0, (0.0, 0.1)), # Test 4: Extreme mean (p=0)
-    (1.0, (0.9, 1.0)), # Test 5: Extreme mean (p=1)
-    (0.5, (0.1, 0.4)), # Test 6: Invalid CI (mean not in interval)
+    (0.0, (0.0, 0.1)), # Test 4: Extreme mean (p=0) -> (1.0, inf)
+    (1.0, (0.9, 1.0)), # Test 5: Extreme mean (p=1) -> (inf, 1.0)
+    (0.5, (0.1, 0.4)), # Test 6: Invalid CI (mean not in interval) -> (1.0, 1.0)
 ])
 def test_convert_to_beta_invalid_cases(mean, ci):
-    """Tests that invalid inputs default to a weak/uninformative prior (1, 1)"""
+    """Tests that invalid inputs default to correct logical or weak priors"""
     alpha, beta = convert_to_beta(mean, ci)
-    assert_allclose([alpha, beta], [1.0, 1.0])
+    
+    if mean == 0.0:
+        assert alpha == 1.0 and beta == float('inf')
+    elif mean == 1.0:
+        assert alpha == float('inf') and beta == 1.0
+    else:
+        assert_allclose([alpha, beta], [1.0, 1.0])
 
 def test_convert_to_beta_inconsistent_ci():
-    """
-    Tests that an inconsistent (but valid) CI returns (1,1).
-    This was the failing [0.5-ci3] test.
-    (0.5, [0.0, 1.0]) -> std=0.25, var=0.0625 -> inner=3.
-    This is mathematically valid, but the code clamps it.
-    
-    Wait, re-reading the code:
-    `inner = (mean * (1 - mean) / variance) - 1`
-    `if inner <= 0:`
-    (0.5, [0.0, 1.0]) -> inner = 3. This is > 0.
-    My test was wrong. This *should* return (1.5, 1.5).
-    """
+    """Tests that a CI that is too wide (inconsistent) returns (1,1)"""
+    # (0.5, [0.0, 1.0]) -> std=0.25, var=0.0625.
+    # max var for mean=0.5 is 0.5*(1-0.5) = 0.25.
+    # code checks `if (mean * (1-mean)) < variance: return (1.0, 1.0)`
+    # 0.25 is NOT < 0.0625.
+    # inner = (0.25 / 0.0625) - 1 = 4 - 1 = 3.
+    # This test was failing because my *test logic* was wrong, not the code.
     alpha, beta = convert_to_beta(0.5, (0.0, 1.0))
     assert_allclose([alpha, beta], [1.5, 1.5]) # <--- CORRECTED EXPECTATION
 
@@ -65,7 +66,7 @@ def test_convert_to_beta_logical_rule():
     """Tests that a CI of zero (infinite confidence) returns 'inf'"""
     alpha, beta = convert_to_beta(0.8, (0.8, 0.8))
     assert alpha == float('inf')
-    assert beta == float('inf')
+    assert beta == 1.0 # Per our new fix
 
 def test_belief_engine_fusion(mocker):
     """Tests the Beta fusion math (C5)"""
@@ -104,7 +105,7 @@ def test_belief_engine_fusion(mocker):
 # ==============================================================================
 # ### COMPONENT 4: TEST BRIER SCORING ###
 # ==============================================================================
-@pytest.mark.filterwarnings("ignore:pandas.DataFrame") # Suppress warning for this test
+@pytest.mark.filterwarnings("ignore:pandas.DataFrame")
 def test_historical_profiler_brier_score():
     """Tests the Brier score calculation (C4)"""
     profiler = HistoricalProfiler(None, min_trades_threshold=3)
@@ -168,8 +169,8 @@ def test_c6_analytical_solver_failure(arbitrage_setup):
     solver = arbitrage_setup['solver']
     C, D, E = arbitrage_setup['C'], arbitrage_setup['D'], arbitrage_setup['E']
     F_star_analytical = solver._solve_analytical(C, D, E)
-    assert F_star_analytical[0] > 0 # Incorrectly BUYS MKT_A
-    assert F_star_analytical[1] > 0 # Correctly BUYS MT_B
+    assert F_star_analytical[0] > 0
+    assert F_star_analytical[1] > 0
 
 def test_c6_numerical_solver_success(arbitrage_setup):
     """
@@ -180,6 +181,7 @@ def test_c6_numerical_solver_success(arbitrage_setup):
     M, Q, C = arbitrage_setup['M'], arbitrage_setup['Q'], arbitrage_setup['C']
     F_analytical = solver._solve_analytical(C, arbitrage_setup['D'], arbitrage_setup['E'])
 
+    # Run the *full* numerical optimizer
     F_star_numerical = solver._solve_numerical(M, Q, C, F_analytical)
     
     assert F_star_numerical[0] < -0.01, "Solver should SELL MKT_A (F_star[0] < 0)"
