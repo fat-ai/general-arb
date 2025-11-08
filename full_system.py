@@ -1198,7 +1198,25 @@ class BacktestPortfolio:
             self.brier_scores.append((p_model - outcome)**2)
 
     def get_final_metrics(self) -> Dict[str, float]:
-        # ... (math)
+        """Calculates final metrics for this back-test run."""
+        pnl = np.array(self.pnl_history)
+        returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
+        if len(returns) == 0: returns = np.array([0])
+        final_pnl = self.portfolio['cash']
+        initial_pnl = self.pnl_history[0]
+        
+        # Simplified IRR (total return)
+        irr = (final_pnl / initial_pnl) - 1.0
+        
+        # Sharpe Ratio (mocked, as we need risk-free rate)
+        sharpe = np.mean(returns) / (np.std(returns) + 1e-9)
+        
+        # Max Drawdown
+        peak = np.maximum.accumulate(pnl)
+        drawdown = (peak - pnl) / peak
+        max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
+        
+        # Brier Score
         avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
         
         return {
