@@ -6,6 +6,10 @@ from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 import scipy.optimize as opt
 from typing import Dict, List, Tuple
+import dash
+from dash import dcc, html, Input, Output, State, callback
+import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -388,6 +392,153 @@ class GraphManager:
         return {'type': 'NONE', 'p_joint': None}
 
     def close(self): pass
+
+    class MockGraphManager:
+    """(STUB) Mocks the GraphManager (C1)"""
+    def get_historical_data_for_replay(self, start_date, end_date):
+        log.info(f"MockGraph: Fetching historical data from {start_date} to {end_date}...")
+        # A real implementation would return a generator of (timestamp, event_type, data)
+        # We'll return a mock list of events.
+        return [
+            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp...', 'vector': [...]}),
+            ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51}),
+            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [...]}),
+            ('2023-01-02T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.55}),
+            ('2023-01-02T10:06:00Z', 'PRICE_UPDATE', {'id': 'MKT_2', 'p_market_all': 0.70}),
+            ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
+            ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
+        ]
+    def close(self): pass
+
+    class MockFullPipeline:
+        """
+        (STUB) Mocks the *entire* C1-C6 pipeline.
+        This is what the back-tester will run.
+        """
+        def __init__(self, config: Dict[str, Any], historical_data: List[Tuple]):
+            self.config = config
+            self.historical_data = historical_data
+            self.portfolio = {'cash': 10000.0, 'positions': {}}
+            self.pnl_history = [10000.0]
+            self.brier_scores = []
+            log.info(f"MockPipeline initialized with config: k={config.get('k_brier_scale')}, edge_thresh={config.get('kelly_edge_thresh')}")
+    
+        def _detect_regime(self, event_timestamp) -> str:
+            """(STUB) Implements the regime classifier."""
+            # In prod, this would analyze volatility. Here, we just mock it.
+            if "2023-01-03" in event_timestamp:
+                return "HIGH_VOL"
+            return "LOW_VOL"
+    
+        def run_replay(self):
+            """
+            Simulates the full C1-C6 pipeline 'replaying' historical data.
+            """
+            for timestamp, event_type, data in self.historical_data:
+                
+                # 1. (C1-C2) Ingest and Link (Mocked)
+                # 2. (C3-C5) Price Fusion (Mocked)
+                # We'll just generate a mock edge
+                
+                current_regime = self._detect_regime(timestamp)
+                
+                # Use the correct params for the *current* regime
+                if current_regime == "HIGH_VOL":
+                    regime_params = self.config.get("params_high_vol", {})
+                else:
+                    regime_params = self.config.get("params_low_vol", {})
+                
+                mock_edge = 0.15 # A 15% edge
+                
+                # 3. (C6) Portfolio Manager Decision (Mocked)
+                # Use the tuned edge threshold for this regime
+                if mock_edge > regime_params.get("kelly_edge_thresh", 0.1):
+                    # Simulate making a bet
+                    bet_size = 100.0 # Bet $100
+                    self.portfolio['cash'] -= bet_size
+                    self.portfolio['positions'][data.get('id', 'MKT_X')] = bet_size
+                
+                # 4. Handle Resolution
+                if event_type == 'RESOLUTION':
+                    contract_id = data['id']
+                    if contract_id in self.portfolio['positions']:
+                        bet = self.portfolio['positions'].pop(contract_id)
+                        # Use the tuned 'k' param to affect the P&L (simulating a better model)
+                        k_scale = regime_params.get("k_brier_scale", 1.0)
+                        
+                        if data['outcome'] == 1.0:
+                            payout = bet * (1 / 0.5) # Mock 50c price
+                            self.portfolio['cash'] += payout * k_scale # Better model = bigger win
+                        else:
+                            self.portfolio['cash'] -= bet * 0.1 # Mock loss
+                        
+                        self.pnl_history.append(self.portfolio['cash'])
+                        # Mock a brier score calculation
+                        self.brier_scores.append(0.25 / k_scale)
+    
+        def get_final_metrics(self) -> Dict[str, float]:
+            """Calculates final metrics for this back-test run."""
+            pnl = np.array(self.pnl_history)
+            returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
+            
+            final_pnl = self.portfolio['cash']
+            initial_pnl = self.pnl_history[0]
+            
+            # Simplified IRR (total return)
+            irr = (final_pnl / initial_pnl) - 1.0
+            
+            # Sharpe Ratio (mocked, as we need risk-free rate)
+            sharpe = np.mean(returns) / (np.std(returns) + 1e-9)
+            
+            # Max Drawdown
+            peak = np.maximum.accumulate(pnl)
+            drawdown = (peak - pnl) / peak
+            max_drawdown = np.max(drawdown)
+            
+            # Brier Score
+            avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
+            
+            return {
+                'final_irr': irr,
+                'sharpe_ratio': sharpe,
+                'max_drawdown': max_drawdown,
+                'brier_score': avg_brier
+            }
+
+class MockGraphManager:
+    def get_human_review_queue(self):
+        log.info("MockGraph: Fetching 'NEEDS_HUMAN_REVIEW' queue...")
+        return [
+            {'id': 'MKT_902_SPACY', 'reason': 'No alias match found', 'details': "{'entities': ['NeuroCorp']}"},
+            {'id': 'MKT_905_MERGE', 'reason': 'Potential duplicate Entity', 'details': "{'e1': 'E_123', 'e2': 'E_456'}"}
+        ]
+    def get_portfolio_state(self):
+        log.info("MockGraph: Fetching current portfolio...")
+        return {
+            'cash': 8500.0,
+            'positions': [
+                {'id': 'MKT_A', 'fraction': -0.075, 'pnl': 50.21},
+                {'id': 'MKT_B', 'fraction': 0.075, 'pnl': -12.33}
+            ],
+            'total_value': 8537.88
+        }
+    def get_pnl_history(self):
+        log.info("MockGraph: Fetching P&L history...")
+        return pd.Series([10000, 10021, 10015, 10030, 10025, 10050, 10045, 10060, 10055, 10075, 10070, 10085, 10080, 10095, 10100, 10090, 10110, 10105, 10120, 10115, 10130, 10125, 10140, 10135, 10150, 10145, 10160, 10155, 10170, 10165, 10180, 10175, 10190, 10185, 10200, 10195, 10210, 10205, 10220, 10215, 10230, 10225, 10240, 10235, 10250, 10245, 10260, 10255, 10270, 10265, 10280, 10275, 10290, 10285, 10300, 10295, 10310, 10305, 10320, 10315, 10330, 10325, 10340, 10335, 10350, 10345, 10360, 10355, 10370, 10365, 10380, 10375, 10390, 10385, 10400, 10395, 10410, 10405, 10420, 10415, 10430, 10425, 10440, 10435, 10450, 10445, 10460, 10455, 10470, 10465, 10480, 10475, 10490, 10485, 10500, 10495, 10510, 10505, 10520, 10515, 10530, 10525, 10540, 10535, 10550, 10545, 10560, 10555, 10570, 10565, 10580, 10575, 10590, 10585, 10600, 10595, 10610, 10605, 10620, 10615, 10630, 10625, 10640, 10635, 10650, 10645, 10660, 10655, 10670, 10665, 10680, 10675, 10690, 10685, 10700, 10695, 10710, 10705, 10720, 10715, 10730, 10725, 10740, 10735, 10750, 10745, 10760, 10755, 10770, 10765, 10780, 10775, 10790, 10785, 10800, 10795, 10810, 10805, 10820, 10815, 10830, 10825, 10840, 10835, 10850, 10845, 10860, 10855, 10870, 10865, 10880, 10875, 10890, 10885, 10900, 10895, 10910, 10905, 10920, 10915, 10930, 10925, 10940, 10935, 10950, 10945, 10960, 10955, 10970, 10965, 10980, 10975, 10990, 10985, 11000])
+
+    def get_regime_status(self):
+        log.info("MockGraph: Fetching regime status...")
+        return "LOW_VOL", {"k_brier_scale": 1.5, "kelly_edge_thresh": 0.1}
+        
+    def resolve_human_review_item(self, item_id, action):
+        log.warning(f"MockGraph: Resolving {item_id} with action '{action}'")
+        return True
+
+class MockBacktestEngine:
+    def run_tuning_job_async(self):
+        log.warning("MockBacktester: Firing async tuning job...")
+        # In Prod: This would call ray.tune.run(..., detached=True)
+        return "tune_job_123"
         
 # ==============================================================================
 # REFINED COMPONENT 2: RelationalLinker (now using spaCy)
@@ -1078,3 +1229,295 @@ class HybridKellySolver:
             F_star = F_analytical
             
         return F_star
+
+# ==============================================================================
+# NEW COMPONENT 7: Back-Testing & Hyperparameter Tuning
+# ==============================================================================
+
+class BacktestEngine:
+    """
+    Component 7: The "Dyno"
+    Runs historical data replays to validate strategies and
+    tune hyperparameters using Ray Tune.
+    """
+    
+    def __init__(self, graph_manager: MockGraphManager):
+        self.graph = graph_manager
+        log.info("BacktestEngine (C7) initialized.")
+        if not ray.is_initialized():
+            ray.init(logging_level=logging.ERROR)
+
+    @staticmethod
+    def _run_single_backtest(config: Dict[str, Any]):
+        """
+        This is the "objective" function that Ray Tune will optimize.
+        It runs one full back-test simulation with a given set of
+        hyperparameters (the 'config').
+        
+        Args:
+            config (dict): A dict of hyperparameters provided by Ray Tune.
+        """
+        log.debug(f"--- Starting back-test run with config: {config} ---")
+        
+        try:
+            # 1. Get historical data (using walk-forward split from config)
+            # In a real system, we'd use the dates from the config
+            # start_date, end_date = config['start_date'], config['end_date']
+            # For this stub, we just re-use the mock data.
+            graph = MockGraphManager()
+            data = graph.get_historical_data_for_replay("2023-01-01", "2023-06-30")
+
+            # 2. Initialize the *entire* C1-C6 pipeline *with this run's config*
+            pipeline = MockFullPipeline(config, data)
+
+            # 3. Run the "replay"
+            pipeline.run_replay()
+            
+            # 4. Get final metrics from the simulated run
+            metrics = pipeline.get_final_metrics()
+            
+            # 5. Report metrics back to Ray Tune
+            # We use `tune.report()` to allow for early stopping
+            tune.report(irr=metrics['final_irr'], brier=metrics['brier_score'], sharpe=metrics['sharpe_ratio'])
+            
+            log.debug(f"--- Finished run. Final IRR: {metrics['final_irr']:.4f} ---")
+        
+        except Exception as e:
+            log.error(f"Back-test run failed: {e}")
+            tune.report(irr=-1.0, brier=1.0, sharpe=-10.0) # Report failure
+            
+    def run_tuning_job(self):
+        """
+        Main entry point for Component 7.
+        Defines the hyperparameter search space and runs the
+        distributed tuning job using Ray Tune.
+        """
+        log.info("--- Starting Hyperparameter Tuning Job ---")
+        
+        # 1. Define the "Regime-Aware" Search Space
+        # We are tuning parameters for two different regimes
+        search_space = {
+            # Global Params (from C4)
+            "min_trades_threshold": tune.qrandint(5, 50, 5),
+            
+            # Regime-Aware Params (from C5 & C6)
+            "params_low_vol": {
+                "k_brier_scale": tune.loguniform(0.1, 2.0),
+                "kelly_edge_thresh": tune.uniform(0.05, 0.15),
+            },
+            "params_high_vol": {
+                "k_brier_scale": tune.loguniform(0.5, 5.0),
+                "kelly_edge_thresh": tune.uniform(0.1, 0.3),
+            },
+        }
+        
+        # 2. Configure the Scheduler (for early stopping)
+        # ASHA: Asynchronous Successive Halving Algorithm
+        scheduler = ASHAScheduler(
+            metric="irr",       # The metric to maximize
+            mode="max",
+            max_t=10,           # Max "epochs" (e.g., # of reports)
+            grace_period=1,     # Min epochs before stopping
+            reduction_factor=2
+        )
+        
+        # 3. Run the Tuning Job
+        analysis = tune.run(
+            self._run_single_backtest, # The objective function
+            config=search_space,
+            num_samples=50, # Number of different param combinations to try
+            scheduler=scheduler,
+            resources_per_trial={"cpu": 1}, # Use 1 CPU per trial
+            name="pm_tuning_job"
+        )
+        
+        best_config = analysis.get_best_config(metric="irr", mode="max")
+        
+        log.info(f"--- Tuning Job Complete ---")
+        log.info(f"Best config found for max IRR:")
+        log.info(best_config)
+        
+        # 4. (STUB) Save best_config to production
+        # In Prod: This would write the `best_config` JSON to a
+        # production config file or DB for Component 6 to load.
+        # self.save_config_to_production(best_config)
+        
+        return best_config
+
+# --- Initialize Global Mocks ---
+# These are the "singletons" our UI will call
+graph = MockGraphManager()
+backtester = MockBacktestEngine()
+
+# ==============================================================================
+# NEW COMPONENT 8: Operational Dashboard
+# ==============================================================================
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+server = app.server
+
+# --- 1. Header & Status Bar ---
+def build_header():
+    regime, params = graph.get_regime_status()
+    return dbc.NavbarSimple(
+        children=[
+            dbc.NavItem(dbc.NavLink("Analyst", href="/analyst")),
+            dbc.NavItem(dbc.NavLink("Portfolio Manager", href="/pm")),
+            dbc.NavItem(dbc.NavLink("Admin", href="/admin")),
+            dbc.Badge(f"Regime: {regime}", color="primary", className="ms-auto"),
+        ],
+        brand="Quantitative Trading Engine",
+        color="dark",
+        dark=True,
+    )
+
+# --- 2. Analyst Tab Layout ---
+def build_analyst_tab():
+    log.info("Building Analyst Tab...")
+    queue_items = graph.get_human_review_queue()
+    
+    table_header = [
+        html.Thead(html.Tr([
+            html.Th("Contract/Item ID"),
+            html.Th("Reason"),
+            html.Th("Details"),
+            html.Th("Action")
+        ]))
+    ]
+    table_body = [
+        html.Tbody([
+            html.Tr([
+                html.Td(item['id']),
+                html.Td(item['reason']),
+                html.Td(html.Code(item['details'])),
+                html.Td(dbc.Button("Resolve", id={'type': 'resolve-btn', 'index': item['id']}, size="sm")),
+            ]) for item in queue_items
+        ])
+    ]
+    
+    return html.Div([
+        dbc.Row(dbc.Col(html.H2("Analyst Triage Queues"), width=12)),
+        dbc.Row(dbc.Col(
+            dbc.Alert(id='analyst-alert', is_open=False, duration=4000),
+            width=12
+        )),
+        dbc.Row(dbc.Col(
+            dbc.Table(table_header + table_body, bordered=True, striped=True, hover=True),
+            width=12
+        ))
+    ])
+
+# --- 3. Portfolio Manager (PM) Tab Layout ---
+def build_pm_tab():
+    log.info("Building PM Tab...")
+    state = graph.get_portfolio_state()
+    pnl_history = graph.get_pnl_history()
+    
+    fig = go.Figure(data=go.Scatter(y=pnl_history, mode='lines', name='Total Value'))
+    fig.update_layout(title='Portfolio Value Over Time', yaxis_title='Total Value ($)')
+
+    return html.Div([
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Portfolio Value"),
+                dbc.CardBody(f"${state['total_value']:,.2f}", className="text-success fs-3")
+            ]), width=4),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Available Cash"),
+                dbc.CardBody(f"${state['cash']:,.2f}", className="fs-3")
+            ]), width=4),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Active Positions"),
+                dbc.CardBody(f"{len(state['positions'])}", className="fs-3")
+            ]), width=4),
+        ]),
+        dbc.Row(dbc.Col(dcc.Graph(figure=fig), width=12), className="mt-4"),
+        dbc.Row(dbc.Col(html.H3("What-If Simulator (Stub)"), width=12), className="mt-4"),
+        # (Stub for the "What-If" simulator inputs)
+    ])
+
+# --- 4. Admin Tab Layout ---
+def build_admin_tab():
+    log.info("Building Admin Tab...")
+    regime, params = graph.get_regime_status()
+    
+    return html.Div([
+        dbc.Row(dbc.Col(html.H2("Admin & Tuning"), width=12)),
+        dbc.Row(dbc.Col(
+            dbc.Alert(id='admin-alert', is_open=False, duration=4000),
+            width=12
+        )),
+        dbc.Row([
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Hyperparameter Tuning"),
+                dbc.CardBody([
+                    html.P("Launch a new job to tune all hyperparameters (C7) based on the latest data."),
+                    dbc.Button("Start New Tuning Job", id='start-tune-btn', color="danger", n_clicks=0)
+                ]),
+            ]), width=6),
+            dbc.Col(dbc.Card([
+                dbc.CardHeader("Current Regime & Parameters"),
+                dbc.CardBody([
+                    html.H4(f"Regime: {regime}"),
+                    html.Code(str(params))
+                ]),
+            ]), width=6),
+        ]),
+    ])
+
+# --- Main App Layout & URL Routing ---
+app.layout = html.Div([
+    build_header(),
+    dcc.Location(id='url', refresh=False),
+    dbc.Container(id='page-content', fluid=True, className="mt-4")
+])
+
+@callback(Output('page-content', 'children'), [Input('url', 'pathname')])
+def display_page(pathname):
+    if pathname == '/pm':
+        return build_pm_tab()
+    elif pathname == '/admin':
+        return build_admin_tab()
+    else:
+        # Default to Analyst view
+        return build_analyst_tab()
+
+# --- Callback for Analyst Triage Button ---
+@callback(
+    Output('analyst-alert', 'children'),
+    Output('analyst-alert', 'is_open'),
+    Input({'type': 'resolve-btn', 'index': dash.ALL}, 'n_clicks'),
+    prevent_initial_call=True
+)
+def resolve_analyst_item(n_clicks):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return "", False
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    item_id = eval(button_id)['index']
+    
+    log.warning(f"Attempting to resolve item: {item_id}")
+    success = graph.resolve_human_review_item(item_id, "MERGE_CONFIRMED") # Mock action
+    
+    if success:
+        return f"Item {item_id} resolved successfully! Refreshing...", True
+    else:
+        return f"Failed to resolve item {item_id}.", True
+
+# --- Callback for Admin Tuning Button ---
+@callback(
+    Output('admin-alert', 'children'),
+    Output('admin-alert', 'is_open'),
+    Input('start-tune-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def start_tuning_job(n_clicks):
+    log.warning("Admin clicked 'Start New Tuning Job'")
+    
+    try:
+        job_id = backtester.run_tuning_job_async()
+        return f"Tuning job '{job_id}' started successfully! See Ray Dashboard for progress.", True
+    except Exception as e:
+        log.error(f"Failed to start tuning job: {e}")
+        return f"Error starting tuning job: {e}", True
