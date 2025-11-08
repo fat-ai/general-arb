@@ -1176,6 +1176,9 @@ class BacktestEngine:
             pm = PortfolioManager(graph, kelly_solver)
             
             # 2. Get historical data
+            # --- THIS IS THE FIX ---
+            # We cannot pass data to this function. We must load it inside.
+            # We instantiate a *temporary* BacktestEngine just to use its loader.
             hist_data = BacktestEngine(historical_data_path="mock")._load_historical_data()
             
             # 3. Initialize the simulation portfolio
@@ -1184,8 +1187,9 @@ class BacktestEngine:
             portfolio.end_time = hist_data.index.max()
             
             current_prices = {} # {contract_id: price}
-            
+
             # 4. --- The Replay Loop ---
+            # (Rest of the function is identical)
             for timestamp, events in hist_data.groupby(hist_data.index):
                 
                 # --- A. Process all non-trade events first ---
@@ -1217,7 +1221,9 @@ class BacktestEngine:
                         if c_id in graph.mock_db['contracts']:
                             graph.mock_db['contracts'][c_id]['p_market_all'] = p_all
                             # Update p_market_experts from the event data
-                            graph.mock_db['contracts'][c_id]['p_market_experts'] = events[events['contract_id'] == c_id]['data'].iloc[0]['p_market_experts']
+                            # FIX: Need to check if 'p_market_experts' exists in the event data
+                            if 'p_market_experts' in events[events['contract_id'] == c_id]['data'].iloc[0]:
+                                graph.mock_db['contracts'][c_id]['p_market_experts'] = events[events['contract_id'] == c_id]['data'].iloc[0]['p_market_experts']
                             graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger pipeline
                     
                     prior_manager.process_pending_contracts() # C3 (calls C4) -> PENDING_FUSION
@@ -1242,26 +1248,36 @@ class BacktestEngine:
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
         
-        hist_data = self._load_historical_data()
-        trainable_with_data = tune.with_parameters(self._run_single_backtest, historical_data=hist_data)
+        # --- THIS IS THE FIX ---
+        # We do NOT pass data in. The _run_single_backtest function
+        # is static and will load its own data.
+        # hist_data = self._load_historical_data()
+        # trainable_with_data = tune.with_parameters(self._run_single_backtest, historical_data=hist_data)
         
         search_space = {
             "brier_internal_model": tune.loguniform(0.05, 0.25),
             "k_brier_scale": tune.loguniform(0.1, 5.0),
             "kelly_edge_thresh": tune.uniform(0.05, 0.25),
-            "min_trades_threshold": tune.qrandint(5, 50, 5)
+            "min_trades_threshold": tune.qrandint(5, 50, 5) # Added C4 param
         }
         
         scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
         
         analysis = tune.run(
-            trainable_with_data, config=search_space,
-            num_samples=20, scheduler=scheduler,
-            resources_per_trial={"cpu": 1}, name="pm_tuning_job"
+            self._run_single_backtest, # Pass the static function directly
+            config=search_space,
+            num_samples=20, # Reduced for demo
+            scheduler=scheduler,
+            resources_per_trial={"cpu": 1},
+            name="pm_tuning_job"
         )
         
         best_config = analysis.get_best_config(metric="irr", mode="max")
-        log.info(f"--- C7: Tuning Job Complete --- Best config: {best_config}")
+        
+        log.info(f"--- C7: Tuning Job Complete ---")
+        log.info(f"Best config found for max IRR:")
+        log.info(best_config)
+        
         ray.shutdown()
         return best_config
         
