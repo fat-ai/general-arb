@@ -1587,10 +1587,19 @@ historical_profiler = HistoricalProfiler(graph_manager)
 belief_engine = BeliefEngine(graph_manager)
 kelly_solver = HybridKellySolver()
 portfolio_manager = PortfolioManager(graph_manager, kelly_solver)
-backtest_engine = BacktestEngine(historical_data_path="mock_data.parquet")
+
+# --- FIX: Provide all required arguments for the global instance ---
+# We provide mock URLs or read from env vars for the C8 dashboard demo
+POLY_MARKETS_URL = os.getenv("POLY_MARKETS_URL", "https://clob-static.polymarket.com/markets.csv.gz")
+POLY_TRADES_URL = os.getenv("POLY_TRADES_URL", "https://clob-static.polymarket.com/trades.csv.gz")
+backtest_engine = BacktestEngine(
+    historical_data_path=".", # Save to current directory
+    markets_url=POLY_MARKETS_URL,
+    trades_url=POLY_TRADES_URL
+)
 
 # --- Dash App Definition ---
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
 server = app.server
 
 # --- Analyst Triage Modal (Popup) ---
