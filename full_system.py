@@ -15,7 +15,7 @@ from dash import dcc, html, Input, Output, State, callback
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import sys
-import math # Used in Beta converter
+import math
 
 # ==============================================================================
 # --- Global Setup ---
@@ -153,6 +153,14 @@ class GraphManager:
                 return [{'contract_id': 'MKT_902_SPACY_DEMO', 'text': "Will 'NeuroCorp' release the 'Viper'?", 'vector': [0.1]*768}]
              if status == 'PENDING_ANALYSIS':
                 return [{'contract_id': 'MKT_903', 'text': 'Test contract for NeuroCorp', 'vector': [0.3]*768}]
+             if status == 'PENDING_FUSION':
+                return [
+                    {
+                        'contract_id': 'MKT_FUSE_001',
+                        'p_internal_alpha': 13.8, 'p_internal_beta': 9.2,
+                        'p_market_experts': 0.45, 'p_market_all': 0.55,
+                    }
+                ]
              return []
         with self.driver.session() as session:
             results = session.execute_read(self._tx_get_contracts_by_status, status=status, limit=limit)
@@ -261,14 +269,13 @@ class GraphManager:
     # --- Read/Write Methods for C5 (Mocks) ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
         log.info("MockGraph: Fetching contracts 'PENDING_FUSION' (STUB)")
-        mock_data = [
+        return [
             {
                 'contract_id': 'MKT_FUSE_001',
                 'p_internal_alpha': 13.8, 'p_internal_beta': 9.2,
                 'p_market_experts': 0.45, 'p_market_all': 0.55,
             }
         ]
-        return mock_data
 
     def get_model_brier_scores(self) -> Dict[str, float]:
         log.info("MockGraph: Fetching model Brier scores (STUB)")
@@ -287,11 +294,10 @@ class GraphManager:
 
     def get_cluster_contracts(self, entity_id: str) -> List[Dict]:
         log.info(f"MockGraph: Getting contracts for cluster {entity_id} (STUB)")
-        mock_contracts = [
+        return [
             {'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True},
             {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}
         ]
-        return mock_contracts
 
     def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
         if c1_id == 'MKT_A' and c2_id == 'MKT_B':
@@ -555,9 +561,9 @@ class BeliefEngine:
         fused_alpha, fused_beta = 1.0, 1.0
         for alpha, beta in beta_dists:
             if math.isinf(alpha) or math.isinf(beta):
-                log.warning("Found logical rule (inf). Skipping fusion.")
-                # This is a simplification; a real system would propagate this constraint
-                return (alpha, beta) # Pass the logical rule through
+                log.warning("Found logical rule (inf). Bypassing fusion.")
+                # Pass the logical rule through
+                return (alpha, beta) 
             fused_alpha += (alpha - 1.0)
             fused_beta += (beta - 1.0)
         return (max(fused_alpha, 1.0), max(fused_beta, 1.0))
@@ -582,7 +588,6 @@ class BeliefEngine:
             try:
                 beta_internal = (contract['p_internal_alpha'], contract['p_internal_beta'])
                 
-                # Check for logical rule from C3
                 if math.isinf(beta_internal[0]) or math.isinf(beta_internal[1]):
                     log.info(f"C5: Contract {contract_id} is a logical rule. Bypassing fusion.")
                     (p_model, p_model_variance) = self._get_beta_stats(beta_internal[0], beta_internal[1])
@@ -632,6 +637,7 @@ class HybridKellySolver:
                 if i == j:
                     C[i, i] = P[i] * (1 - P[i])
                     continue
+                # ** FIX: Pass the contracts list to the mock graph manager **
                 rel = graph.get_relationship_between_contracts(contracts[i]['id'], contracts[j]['id'], contracts)
                 p_ij = rel.get('p_joint')
                 if p_ij is None:
@@ -653,26 +659,24 @@ class HybridKellySolver:
         
         # 1. Generate Correlated Outcomes (I_k)
         std_devs = np.sqrt(np.diag(C))
-        # Add epsilon to prevent division by zero for logical rules (variance=0)
         std_devs = np.where(std_devs == 0, 1e-9, std_devs) 
         Corr = C / np.outer(std_devs, std_devs)
         np.fill_diagonal(Corr, 1.0) 
         
-        # Cholesky decomposition for sampling
         try:
             L = np.linalg.cholesky(Corr)
         except np.linalg.LinAlgError:
-            log.warning("Covariance matrix not positive definite. Using pseudo-inverse for sampling.")
-            # Fallback for non-positive-definite (less accurate)
-            # A better way is to "clean" the matrix, but for now we'll just use uncorrelated samples
-            L = np.eye(n) # Fallback: assume independence for sampling
+            log.warning("Cov matrix not positive definite. Falling back to independence for sampling.")
+            L = np.eye(n) # Fallback
             
-        # Use QMC (Sobol) sampler
         sampler = qmc.Sobol(d=n, scramble=True)
-        U_unif = sampler.random_base2(m=int(np.log2(self.k_samples))) # (K x n)
-        Z = norm.ppf(U_unif) @ L.T # Correlated standard normals
+        m_power = int(math.ceil(math.log2(self.k_samples)))
+        U_unif = sampler.random_base2(m=m_power) # (K x n)
+        if len(U_unif) > self.k_samples:
+            U_unif = U_unif[:self.k_samples]
+            
+        Z = norm.ppf(U_unif) @ L.T
         U = norm.cdf(Z)
-        
         I_k = (U < M).astype(int) 
 
         # 2. Define the Objective Function
@@ -865,8 +869,6 @@ class BacktestEngine:
 # ### COMPONENT 8: Operational Dashboard ###
 # ==============================================================================
 
-# ** FIX: All C8 code (app definition, layouts, callbacks) must be
-# ** wrapped inside a function to prevent execution on import.
 def run_c8_demo():
     """Launches the C8 Dashboard"""
     log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
@@ -1119,8 +1121,8 @@ if __name__ == "__main__":
             demos[demo_name]()
         else:
             log.error(f"Unknown demo: {demo_name}")
-            log.info(f"Usage: python full_system.py [{ '|'.join(demos.keys()) }]")
+            log.info(f"Usage: python {sys.argv[0]} [{ '|'.join(demos.keys()) }]")
     else:
-        log.info("No demo specified. Running C6 (Portfolio Manager) by default.")
-        log.info("Try 'python full_system.py C8' to run the dashboard.")
+        log.info(f"No demo specified. Running C6 (Portfolio Manager) by default.")
+        log.info(f"Try 'python {sys.argv[0]} C8' to run the dashboard.")
         run_c6_demo()
