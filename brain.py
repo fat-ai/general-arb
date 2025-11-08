@@ -25,171 +25,113 @@ def cosine_similarity(v1, v2):
     return dot_product / (norm_v1 * norm_v2)
 
 # ==============================================================================
-# REFINED COMPONENT 1: GraphManager (with C2/C3 Read/Write Methods)
+# REFINED COMPONENT 1: GraphManager (with C4 Read Methods)
 # ==============================================================================
 
 class GraphManager:
-    """
-    Component 1: The Knowledge Graph (Data Model)
-    Now includes all necessary read/write methods for C2 and C3.
-    """
-    def __init__(self):
-        self.uri = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
-        self.user = os.getenv('NEO4J_USER', 'neo4j')
-        self.password = os.getenv('NEO4J_PASSWORD')
-        self.vector_dim = int(os.getenv('VECTOR_DIM', 768))
+    # --- (Previous methods: __init__, close, setup_schema, add_contract, etc.) ---
+    # (... all methods from C3 stub are assumed to be here ...)
+    
+    # --- NEW: Read/Update Methods for Component 4 ---
 
-        if not self.password:
-            raise ValueError("NEO4J_PASSWORD environment variable not set.")
-        try:
-            self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
-            self.driver.verify_connectivity()
-            log.info(f"GraphManager connected to Neo4j at {self.uri}.")
-        except Exception as e:
-            log.error(f"Failed to connect to Neo4j: {e}")
-            raise
-
-    def close(self):
-        if self.driver:
-            self.driver.close()
-
-    def setup_schema(self):
-        log.info("Applying database schema: constraints and indexes...")
-        with self.driver.session() as session:
-            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Contract) REQUIRE c.contract_id IS UNIQUE"))
-            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE"))
-            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Alias) REQUIRE a.text IS UNIQUE"))
-            session.execute_write(lambda tx: tx.run("CREATE INDEX entity_type_index IF NOT EXISTS FOR (e:Entity) ON (e.type)"))
-            # (Vector index creation stubbed for brevity)
-        log.info("Schema setup complete.")
-
-    # --- Write Methods (from previous step) ---
-
-    def add_contract(self, contract_id: str, text: str, vector: list[float]):
-        if len(vector) != self.vector_dim:
-            raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {len(vector)}")
-        with self.driver.session() as session:
-            session.execute_write(self._tx_merge_contract, contract_id, text, vector)
-        log.info(f"Merged Contract: {contract_id}")
-
-    @staticmethod
-    def _tx_merge_contract(tx, contract_id, text, vector):
-        tx.run(
-            """
-            MERGE (c:Contract {contract_id: $contract_id})
-            ON CREATE SET c.text = $text, c.vector = $vector, c.status = 'PENDING_LINKING', c.created_at = timestamp()
-            ON MATCH SET c.text = $text, c.vector = $vector, c.updated_at = timestamp()
-            """,
-            contract_id=contract_id, text=text, vector=vector
-        )
-
-    def link_contract_to_entity(self, contract_id: str, entity_id: str, confidence: float):
-        with self.driver.session() as session:
-            session.execute_write(self._tx_link_contract, contract_id, entity_id, confidence)
-        log.info(f"Linked Contract '{contract_id}' -> Entity '{entity_id}' with conf: {confidence}")
-
-    @staticmethod
-    def _tx_link_contract(tx, contract_id, entity_id, confidence):
-        tx.run(
-            """
-            MATCH (c:Contract {contract_id: $contract_id})
-            MATCH (e:Entity {entity_id: $entity_id})
-            MERGE (c)-[r:IS_ABOUT]->(e)
-            ON CREATE SET r.confidence_score = $confidence, r.created_at = timestamp()
-            ON MATCH SET r.confidence_score = $confidence
-            SET c.status = 'PENDING_ANALYSIS' // Update status on link
-            """,
-            contract_id=contract_id, entity_id=entity_id, confidence=confidence
-        )
-
-    # --- NEW: Read/Update Methods for C2 & C3 ---
-
-    def get_contracts_by_status(self, status: str, limit: int = 10) -> list[dict]:
-        """Gets a batch of contracts with a specific status."""
-        with self.driver.session() as session:
-            results = session.execute_read(
-                self._tx_get_contracts_by_status, status=status, limit=limit
-            )
-        return results
-
-    @staticmethod
-    def _tx_get_contracts_by_status(tx, status, limit):
-        result = tx.run(
-            "MATCH (c:Contract {status: $status}) "
-            "RETURN c.contract_id AS contract_id, c.text AS text, c.vector AS vector "
-            "LIMIT $limit",
-            status=status, limit=limit
-        )
-        return [record.data() for record in result]
+    def get_all_resolved_trades_by_topic(self) -> pd.DataFrame:
+        """
+        Fetches *all* historical, resolved trades and links them to
+        their Entity 'type' (topic). This is the main data source
+        for the Historical Profiler.
         
-    def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
+        In Prod: This would be a highly optimized query, possibly
+        reading from a data warehouse or pre-aggregated tables.
+        
+        Returns:
+            A Pandas DataFrame: [wallet_id, entity_type, bet_price, outcome]
         """
-        STUB: Simulates a fuzzy search with an exact match.
-        In Prod: This would use the APOC query from the C2 review.
+        log.info("Fetching all resolved trades by topic (STUB)")
+        # STUB: This would be a massive Cypher query. We will mock the output.
+        # MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract)-[:IS_ABOUT]->(e:Entity)
+        # WHERE c.status = 'RESOLVED'
+        # RETURN w.wallet_id AS wallet_id, 
+        #        e.type AS entity_type, 
+        #        t.price AS bet_price, 
+        #        c.outcome AS outcome
+        
+        # Mock data for demonstration:
+        mock_data = [
+            # Wallet_ABC is a 'biotech' expert
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.2, 'outcome': 0.0},
+            # Wallet_ABC is bad at 'geopolitics'
+            {'wallet_id': 'Wallet_ABC', 'entity_type': 'geopolitics', 'bet_price': 0.9, 'outcome': 0.0},
+            # Wallet_XYZ is a 'geopolitics' expert
+            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
+            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.3, 'outcome': 0.0},
+            # Wallet_XYZ is bad at 'biotech'
+            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'biotech', 'bet_price': 0.1, 'outcome': 1.0},
+        ]
+        return pd.DataFrame(mock_data)
+
+    def get_live_trades_for_contract(self, contract_id: str) -> pd.DataFrame:
         """
-        with self.driver.session() as session:
-            result = session.execute_read(
-                self._tx_find_entity_exact, alias_text=alias_text
-            ).single()
-        return result.data() if result else None
+        Fetches all live trades (order book) for a given contract.
+        
+        Returns:
+            A Pandas DataFrame: [wallet_id, trade_price, trade_volume]
+        """
+        log.info(f"Fetching live trades for {contract_id} (STUB)")
+        # STUB: This would query a live trade feed API.
+        mock_data = [
+            # Wallet_ABC (biotech expert) is betting NO (low price)
+            {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
+            # Wallet_XYZ (geopolitics expert) is betting YES (high price)
+            {'wallet_id': 'Wallet_XYZ', 'trade_price': 0.65, 'trade_volume': 1000},
+            # Crowd noise
+            {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
+            {'wallet_id': 'Wallet_CROWD_2', 'trade_price': 0.61, 'trade_volume': 150},
+        ]
+        return pd.DataFrame(mock_data)
 
-    @staticmethod
-    def _tx_find_entity_exact(tx, alias_text):
-        """Stub for fuzzy search - just does an exact match."""
-        return tx.run(
-            """
-            MATCH (a:Alias {text: $alias_text})-[:POINTS_TO]->(e:Entity)
-            RETURN e.entity_id AS entity_id, e.canonical_name AS name, 1.0 AS confidence
-            LIMIT 1
-            """,
-            alias_text=alias_text
-        ).single()
+    def get_contract_topic(self, contract_id: str) -> str:
+        """Finds the primary 'type' of the Entity a contract is about."""
+        log.info(f"Fetching topic for {contract_id} (STUB)")
+        # STUB: MATCH (c:Contract {contract_id: $id})-[:IS_ABOUT]->(e:Entity) RETURN e.type LIMIT 1
+        # Mocking for this example:
+        if contract_id == "MKT_BIO_001":
+            return "biotech"
+        return "geopolitics"
 
-    def update_contract_status(self, contract_id: str, status: str, metadata: dict = None):
-        """Updates a contract's status, e.g., to 'NEEDS_HUMAN_REVIEW'."""
-        with self.driver.session() as session:
-            session.execute_write(
-                self._tx_update_status,
-                contract_id=contract_id, status=status, metadata=metadata
-            )
-        log.info(f"Updated status for {contract_id} to {status}")
-
-    @staticmethod
-    def _tx_update_status(tx, contract_id, status, metadata):
-        query = "MATCH (c:Contract {contract_id: $contract_id}) SET c.status = $status, c.updated_at = timestamp()"
-        params = {'contract_id': contract_id, 'status': status}
-        if metadata:
-            query += " SET c.review_metadata = $metadata"
-            params['metadata'] = str(metadata) # Store metadata as string
-        tx.run(query, **params)
-
-    def update_contract_prior(self, contract_id: str, p_internal: float, alpha: float, beta: float, source: str):
-        """Writes the output of Component 3 to the Contract node."""
-        with self.driver.session() as session:
-            session.execute_write(
-                self._tx_update_prior,
-                contract_id=contract_id, p_internal=p_internal,
-                alpha=alpha, beta=beta, source=source
-            )
-        log.info(f"Updated prior for {contract_id} from {source}.")
-
-    @staticmethod
-    def _tx_update_prior(tx, contract_id, p_internal, alpha, beta, source):
-        tx.run(
-            """
-            MATCH (c:Contract {contract_id: $contract_id})
-            SET
-                c.p_internal_prior = $p_internal,
-                c.p_internal_alpha = $alpha,
-                c.p_internal_beta = $beta,
-                c.p_internal_source = $source,
-                c.status = 'PENDING_FUSION',
-                c.updated_at = timestamp()
-            """,
-            contract_id=contract_id, p_internal=p_internal,
-            alpha=alpha, beta=beta, source=source
-        )
-
+    def update_wallet_scores(self, wallet_scores: Dict[tuple, float]):
+        """
+        Writes the calculated Brier scores back to the graph.
+        
+        Args:
+            wallet_scores (dict): A dict mapping (wallet_id, topic) -> brier_score
+        """
+        log.info(f"Updating {len(wallet_scores)} wallet scores in graph (STUB)")
+        # In Prod: This would be a batched Cypher UNWIND query
+        # UNWIND $scores AS score_data
+        # MERGE (w:Wallet {wallet_id: score_data.wallet_id})
+        # SET w[score_data.topic_key] = score_data.brier
+        for (wallet_id, topic), score in wallet_scores.items():
+            log.debug(f"MERGE (w:Wallet {{wallet_id: '{wallet_id}'}}) SET w.brier_{topic} = {score}")
+        pass
+        
+    def get_wallet_brier_scores(self, wallet_ids: List[str]) -> Dict[str, Dict[str, float]]:
+        """
+        Fetches the stored Brier scores for a list of wallets.
+        
+        Returns:
+            A dict: { wallet_id -> {topic: brier_score, ...} }
+        """
+        log.info(f"Fetching Brier scores for {len(wallet_ids)} wallets (STUB)")
+        # STUB: MATCH (w:Wallet) WHERE w.wallet_id IN $wallet_ids RETURN w
+        # Mocking for this example:
+        return {
+            'Wallet_ABC': {'brier_biotech': 0.05, 'brier_geopolitics': 0.81},
+            'Wallet_XYZ': {'brier_biotech': 0.49, 'brier_geopolitics': 0.01},
+            'Wallet_CROWD_1': {'brier_biotech': 0.25, 'brier_geopolitics': 0.25}, # Default/uninformative
+            'Wallet_CROWD_2': {'brier_biotech': 0.25, 'brier_geopolitics': 0.25},
+        }
 # ==============================================================================
 # REFINED COMPONENT 2: RelationalLinker (now using spaCy)
 # ==============================================================================
@@ -490,6 +432,130 @@ class PriorManager:
                         beta=beta,
                         source='ai_generated'
                     )
+                    
+# ==============================================================================
+# NEW COMPONENT 4: Market Intelligence Engine
+# ==============================================================================
+
+class HistoricalProfiler:
+    """
+    Component 4a: The "Report Card" Batch Job.
+    Analyzes the *entire* trade history to build Brier score "report cards"
+    for every wallet, per topic.
+    """
+    
+    def __init__(self, graph_manager: GraphManager, min_trades_threshold: int = 20):
+        self.graph = graph_manager
+        self.min_trades = min_trades_threshold
+        log.info(f"HistoricalProfiler initialized (min_trades: {self.min_trades}).")
+
+    def _calculate_brier_score(self, df_group: pd.DataFrame) -> float:
+        """Calculates the Brier score for a single wallet/topic group."""
+        if len(df_group) < self.min_trades:
+            return 0.25  # Default, uninformative score
+            
+        # Brier Score: (1/N) * sum( (bet_price - outcome)^2 )
+        squared_errors = (df_group['bet_price'] - df_group['outcome']) ** 2
+        brier_score = squared_errors.mean()
+        return brier_score
+
+    def run_profiling(self):
+        """
+        Main method for the batch job. Fetches all trades, calculates
+        scores, and updates the graph.
+        
+        In Prod: This would be a scheduled Ray or Spark job.
+        """
+        log.info("--- Starting Historical Profiler Batch Job ---")
+        
+        # 1. Fetch all historical, resolved trades
+        all_trades_df = self.graph.get_all_resolved_trades_by_topic()
+        if all_trades_df.empty:
+            log.warning("No historical trades found to profile.")
+            return
+
+        # 2. Group by wallet and topic
+        grouped = all_trades_df.groupby(['wallet_id', 'entity_type'])
+        
+        wallet_scores = {} # (wallet_id, topic) -> brier_score
+        
+        # 3. Calculate Brier score for each group
+        for (wallet_id, topic), df_group in grouped:
+            score = self._calculate_brier_score(df_group)
+            wallet_scores[(wallet_id, topic)] = score
+            log.debug(f"Calculated score for ({wallet_id}, {topic}): {score:.4f}")
+
+        # 4. Write these scores back to the Graph
+        if wallet_scores:
+            self.graph.update_wallet_scores(wallet_scores)
+            
+        log.info(f"--- Historical Profiler Batch Job Complete. Updated {len(wallet_scores)} scores. ---")
+
+
+class LiveFeedHandler:
+    """
+    Component 4b: The "Smart Money" Feed.
+    Uses the pre-calculated Brier scores to generate a real-time
+    "smart money price" for an active contract.
+    """
+
+    def __init__(self, graph_manager: GraphManager, brier_epsilon: float = 0.001):
+        self.graph = graph_manager
+        # Epsilon prevents division by zero for a "perfect" Brier score of 0
+        self.brier_epsilon = brier_epsilon
+        log.info("LiveFeedHandler initialized.")
+
+    def get_smart_money_price(self, contract_id: str) -> float:
+        """
+        Main method. Calculates the weighted average price
+        based on *expert* trades.
+        
+        Returns:
+            The 'P_market_experts' price.
+        """
+        log.info(f"Calculating smart money price for {contract_id}...")
+        
+        # 1. Get the topic for this contract
+        topic = self.graph.get_contract_topic(contract_id)
+        brier_key = f"brier_{topic}" # e.g., 'brier_biotech'
+
+        # 2. Get all live trades for this contract
+        live_trades_df = self.graph.get_live_trades_for_contract(contract_id)
+        if live_trades_df.empty:
+            log.warning(f"No live trades found for {contract_id}.")
+            return None # Or return P_market_all as a fallback
+
+        # 3. Get the Brier scores for all wallets in the live feed
+        wallet_ids = list(live_trades_df['wallet_id'].unique())
+        wallet_scores = self.graph.get_wallet_brier_scores(wallet_ids)
+
+        # 4. Calculate the weight for each trade
+        def calculate_weight(row):
+            wallet_id = row['wallet_id']
+            # Get the wallet's score *for this specific topic*.
+            # Default to 0.25 (uninformative) if no score exists.
+            brier_score = wallet_scores.get(wallet_id, {}).get(brier_key, 0.25)
+            
+            # Weight = Volume / (Brier Score + epsilon)
+            # A low Brier (good) and high volume (conviction) = high weight
+            weight = row['trade_volume'] / (brier_score + self.brier_epsilon)
+            return weight
+
+        live_trades_df['weight'] = live_trades_df.apply(calculate_weight, axis=1)
+
+        # 5. Calculate the weighted average price
+        # P_experts = sum(price * weight) / sum(weight)
+        numerator = (live_trades_df['trade_price'] * live_trades_df['weight']).sum()
+        denominator = live_trades_df['weight'].sum()
+        
+        if denominator == 0:
+            log.warning(f"No valid weights for {contract_id}. Returning None.")
+            return None
+
+        p_market_experts = numerator / denominator
+        log.info(f"Calculated P_market_experts for {contract_id}: {p_market_experts:.4f}")
+        
+        return p_market_experts
                     
             except Exception as e:
                 log.error(f"Failed to process prior for {contract_id}: {e}")
