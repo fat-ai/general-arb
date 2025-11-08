@@ -560,3 +560,142 @@ class LiveFeedHandler:
             except Exception as e:
                 log.error(f"Failed to process prior for {contract_id}: {e}")
                 self.graph.update_contract_status(contract_id, 'PRIOR_FAILED', {'error': str(e)})
+
+# ==============================================================================
+# NEW COMPONENT 5: The Belief Engine (Synthesis)
+# ==============================================================================
+
+class BeliefEngine:
+    """
+    Component 5: The "Synthesizer"
+    Fuses all priors (Internal, Expert, Crowd) into one "ultimate"
+    fair price (P_model) using Bayesian Model Averaging.
+    """
+
+    def __init__(self, graph_manager: GraphManager):
+        self.graph = graph_manager
+        # This 'k' factor scales Brier scores to variance.
+        # It is a key hyperparameter to be tuned by Component 7.
+        self.k_brier_scale = float(os.getenv('BRIER_K_SCALE', 0.5))
+        
+        # Load the historical performance of our models
+        self.model_brier_scores = self.graph.get_model_brier_scores()
+        log.info(f"BeliefEngine initialized with k={self.k_brier_scale} and model scores.")
+
+    def _impute_beta_from_point(self, mean: float, model_name: str) -> Tuple[float, float]:
+        """
+        Converts a point-price estimate (e.g., P_market_experts) into a
+        Beta(α, β) distribution.
+        
+        The variance is *imputed* from the model's historical Brier score.
+        """
+        if not (0 < mean < 1):
+            log.warning(f"Mean {mean} for {model_name} is at an extreme. Returning weak prior.")
+            return (1.0, 1.0) # Uninformative prior
+            
+        brier_score = self.model_brier_scores.get(f'brier_{model_name}_model', 0.25)
+        
+        # Core Logic: variance = k * Brier_score
+        # A high Brier (bad performance) = high variance (low confidence)
+        variance = self.k_brier_scale * brier_score
+        
+        # Prevent division by zero or math errors
+        if variance == 0:
+            variance = 1e-9
+        if variance >= (mean * (1 - mean)):
+            # This implies the model is worse than random.
+            # Clamp variance to just below the max possible (for Beta(1,1)).
+            variance = (mean * (1 - mean)) - 1e-9
+
+        # Convert (mean, variance) to (alpha, beta)
+        # (This is the same math from Component 3)
+        inner = (mean * (1 - mean) / variance) - 1
+        
+        if inner <= 0:
+            log.warning(f"Inconsistent variance for {model_name} (mean={mean}, var={variance}). Returning weak prior.")
+            return (1.0, 1.0)
+            
+        alpha = mean * inner
+        beta = (1 - mean) * inner
+        
+        log.debug(f"Imputed Beta for {model_name}: (α={alpha:.2f}, β={beta:.2f})")
+        return (alpha, beta)
+
+    def _fuse_betas(self, beta_dists: List[Tuple[float, float]]) -> Tuple[float, float]:
+        """
+        Fuses multiple Beta distributions by multiplying their PDFs.
+        This is a conjugate update.
+        
+        We use: Beta_fused ~ Beta(1 + sum(α_i - 1), 1 + sum(β_i - 1))
+        This assumes a uniform Beta(1,1) prior.
+        """
+        fused_alpha = 1.0
+        fused_beta = 1.0
+        
+        for alpha, beta in beta_dists:
+            fused_alpha += (alpha - 1.0)
+            fused_beta += (beta - 1.0)
+            
+        # Ensure alpha/beta are at least 1 (to be a valid distribution)
+        fused_alpha = max(fused_alpha, 1.0)
+        fused_beta = max(fused_beta, 1.0)
+        
+        return (fused_alpha, fused_beta)
+
+    def _get_beta_stats(self, alpha: float, beta: float) -> Tuple[float, float]:
+        """Calculates the mean and variance of a Beta distribution."""
+        mean = alpha / (alpha + beta)
+        variance = (alpha * beta) / ( (alpha + beta)**2 * (alpha + beta + 1) )
+        return (mean, variance)
+
+    def run_fusion_process(self):
+        """
+        Main worker loop for Component 5.
+        Finds contracts 'PENDING_FUSION' and synthesizes P_model.
+        """
+        log.info("BeliefEngine: Checking for contracts 'PENDING_FUSION'...")
+        contracts = self.graph.get_contracts_for_fusion(limit=10)
+        
+        if not contracts:
+            log.info("BeliefEngine: No new contracts to fuse.")
+            return
+
+        for contract in contracts:
+            contract_id = contract['contract_id']
+            log.info(f"BeliefEngine: Fusing price for {contract_id}")
+            
+            try:
+                # 1. Get Model 1 (Internal Prior)
+                # This was already stored as (α, β) by Component 3
+                beta_internal = (contract['p_internal_alpha'], contract['p_internal_beta'])
+
+                # 2. Get Model 2 (Expert Prior)
+                # We must impute this from its point-price and Brier score
+                p_experts = contract['p_market_experts']
+                beta_experts = self._impute_beta_from_point(p_experts, 'expert')
+
+                # 3. Get Model 3 (Crowd Prior)
+                # We impute this as well, expecting it to have a high Brier (low confidence)
+                p_crowd = contract['p_market_all']
+                beta_crowd = self._impute_beta_from_point(p_crowd, 'crowd')
+
+                # 4. Fuse all three models
+                all_betas = [beta_internal, beta_experts, beta_crowd]
+                (fused_alpha, fused_beta) = self._fuse_betas(all_betas)
+                
+                # 5. Calculate the final P_model and variance
+                (p_model, p_model_variance) = self._get_beta_stats(fused_alpha, fused_beta)
+                
+                log.info(f"Fusion complete for {contract_id}: P_model={p_model:.4f}, Var={p_model_variance:.4f}")
+
+                # 6. Write the final fused price back to the graph
+                self.graph.update_contract_fused_price(
+                    contract_id,
+                    p_model,
+                    p_model_variance
+                )
+                
+            except Exception as e:
+                log.error(f"Failed to fuse prior for {contract_id}: {e}")
+                # (In Prod: update status to 'FUSION_FAILED')
+
