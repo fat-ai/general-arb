@@ -1347,7 +1347,7 @@ class BacktestEngine:
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
-            tune.report(irr=-1.0, brier=1.0, sharpe=-10.0)
+            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0})
             
     def run_tuning_job(self):
         """Main entry point for Component 7."""
