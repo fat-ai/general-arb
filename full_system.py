@@ -16,6 +16,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import sys
 import math
+from scipy.stats import qmc, norm
 
 # ==============================================================================
 # --- Global Setup ---
