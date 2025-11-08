@@ -1674,7 +1674,7 @@ def run_c8_demo():
     log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
     log.info("--- Launching Dash server on http://127.0.0.1:8050/ ---")
     try:
-        app.run_server(debug=True, port=8050)
+        app.run(debug=True, port=8050)
     except Exception as e:
         log.error(f"C8 Demo Failed: {e}", exc_info=True)
 
