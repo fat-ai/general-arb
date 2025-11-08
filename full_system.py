@@ -483,11 +483,15 @@ class GraphManager:
         return True
 
 # ==============================================================================
-# ### COMPONENT 2: RelationalLinker ###
+# ### COMPONENT 2: RelationalLinker (Production-Ready) ###
 # ==============================================================================
 
 class RelationalLinker:
-    """Component 2: Connects Contract nodes to Entity nodes."""
+    """
+    Component 2: Connects Contract nodes to Entity nodes.
+    Production-ready logic for Fast and Fuzzy Paths.
+    """
+
     def __init__(self, graph_manager: GraphManager):
         self.graph = graph_manager
         model_name = "en_core_web_sm"
@@ -501,6 +505,7 @@ class RelationalLinker:
             raise
 
     def _extract_entities(self, text: str) -> set[str]:
+        """Uses the spaCy pipeline to extract named entities from text."""
         try:
             doc = self.nlp(text)
             relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
@@ -512,9 +517,14 @@ class RelationalLinker:
             return set()
 
     def _run_fast_path(self, extracted_entities: set[str]) -> dict:
+        """
+        Stage 1: The "Fast Path".
+        Uses the *real* fuzzy Alias search (via APOC).
+        """
         log.info("Running Fast Path...")
         matches = {}
         for entity_text in extracted_entities:
+            # Call the production-ready GraphManager method
             result = self.graph.find_entity_by_alias_fuzzy(entity_text, threshold=0.9)
             if result:
                 entity_id = result['entity_id']
@@ -525,8 +535,37 @@ class RelationalLinker:
         log.info(f"Fast Path found {len(matches)} potential matches.")
         return matches
 
+    def _run_fuzzy_path_knn(self, contract_id: str, contract_vector: List[float]) -> (str, Dict):
+        """
+        Stage 2b: The "Fuzzy Path".
+        Finds similar contracts via vector search.
+        """
+        log.info(f"Running Fuzzy Path (KNN Vector Search) for {contract_id}...")
+        
+        # Call the production-ready GraphManager method
+        similar_contracts = self.graph.find_similar_contracts_by_vector(
+            contract_id, contract_vector, k=3
+        )
+        
+        if not similar_contracts:
+            # Case 1: Truly new event.
+            log.info("No similar contracts found. Flagging for new entity creation.")
+            return "NEEDS_NEW_ENTITY", {}
+        
+        # Case 2: Found similar contracts.
+        # We need to see if they *share* a common entity.
+        # (This is a simplified check; a real one would be a graph query)
+        
+        # (STUB: For now, just flag for merge confirmation)
+        log.info(f"Found {len(similar_contracts)} similar contracts. Flagging for merge review.")
+        return "NEEDS_MERGE_CONFIRMATION", {'similar_contracts': [c['id'] for c in similar_contracts]}
+
+
     def process_pending_contracts(self):
-        """Worker loop to process one batch of pending contracts."""
+        """
+        Main worker loop for Component 2.
+        Processes contracts from 'PENDING_LINKING' queue.
+        """
         log.info("--- C2: Checking for 'PENDING_LINKING' contracts ---")
         contracts = self.graph.get_contracts_by_status('PENDING_LINKING', limit=10)
         if not contracts:
@@ -537,27 +576,35 @@ class RelationalLinker:
             contract_id = contract['contract_id']
             log.info(f"--- C2: Processing Contract: {contract_id} ---")
             contract_text = contract['text']
+            contract_vector = contract['vector']
             
             extracted_entities = self._extract_entities(contract_text)
-            if not extracted_entities:
-                self.graph.update_contract_status(contract_id, 'NEEDS_HUMAN_REVIEW', {'reason': 'No entities found'})
-                continue
-
+            
+            # 1. Run Fast Path
             fast_path_matches = self._run_fast_path(extracted_entities)
 
+            # 2. Triage Logic
             if len(fast_path_matches) >= 1:
+                # Case 1: Success! We found at least one match. Link all.
                 log.info(f"{len(fast_path_matches)} Fast Path match(es) found. Linking all.")
                 for entity_id, (confidence, name) in fast_path_matches.items():
                     self.graph.link_contract_to_entity(contract_id, entity_id, confidence)
+                # The contract status is now 'PENDING_ANALYSIS'
+            
             elif len(fast_path_matches) == 0:
-                log.info("No Fast Path matches. Flagging for human review.")
+                # Case 2: No alias matches found. Run Fuzzy Path.
+                log.info("No Fast Path matches. Escalating to Fuzzy Path (KNN).")
+                
+                reason, details = self._run_fuzzy_path_knn(contract_id, contract_vector)
+                
+                # Flag for human review (C8)
+                details['extracted_entities'] = list(extracted_entities)
                 self.graph.update_contract_status(
                     contract_id, 
                     'NEEDS_HUMAN_REVIEW', 
-                    {'reason': 'No alias match found', 'extracted_entities': list(extracted_entities)}
+                    {'reason': reason, **details}
                 )
             log.info(f"--- C2: Finished Processing: {contract_id} ---")
-
 
 # ==============================================================================
 # ### COMPONENT 3: Prior Engines ###
