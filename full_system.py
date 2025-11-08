@@ -896,44 +896,82 @@ class HybridKellySolver:
         C_inv = np.linalg.pinv(C); F_star = D @ C_inv @ E
         return F_star
 
-    def _solve_numerical(self, M, Q, C, F_analytical_guess):
+    def _solve_numerical(self, M: np.ndarray, Q: np.ndarray, C: np.ndarray, F_analytical_guess: np.ndarray) -> np.ndarray:
         log.info("Solving with Numerical (Precise Path)...")
-        n = len(M); std_devs = np.sqrt(np.diag(C)); std_devs = np.where(std_devs == 0, 1e-9, std_devs)
-        Corr = C / np.outer(std_devs, std_devs); np.fill_diagonal(Corr, 1.0)
+        n = len(M)
         
-        L = None # <-- FIX R1: Initialize L
+        # 1. Generate Correlated Outcomes (I_k)
+        std_devs = np.sqrt(np.diag(C))
+        std_devs = np.where(std_devs == 0, 1e-9, std_devs) 
+        Corr = C / np.outer(std_devs, std_devs)
+        np.fill_diagonal(Corr, 1.0) 
+        
+        L = None # Flag to track which path we took
         try:
-            # --- FIX 3: Proper PSD calculation for Cholesky (P0.1) ---
-            Corr_psd = self._nearest_psd(Corr)
-            L = np.linalg.cholesky(Corr_psd)
+            # Try the fast Cholesky path first
+            Corr_jitter = Corr + np.eye(n) * 1e-9 
+            L = np.linalg.cholesky(Corr_jitter)
         except np.linalg.LinAlgError:
+            # --- THIS IS THE FIX ---
+            # If Cholesky fails (e.g., perfect correlation),
+            # fall back to the slower but more robust MVN sampler.
             log.warning("Cov matrix not positive definite. Using MVN sampler (slower).")
             try:
-                sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr + np.eye(n) * 1e-9)
+                # We must sample from the COVARIANCE matrix C, not the CORRELATION matrix
+                # Add jitter to C to ensure it's positive semi-definite for the sampler
+                C_jitter = C + np.eye(n) * 1e-9
+                sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=C_jitter)
+                # We use 'Z' here just for variable name consistency
                 Z = sampler.random(self.k_samples)
-                L = None # Signal to skip Cholesky path
+                # We skip Cholesky, so Z is already our correlated samples
+                
             except Exception as e:
                 log.error(f"FATAL: MVN sampler also failed: {e}. Falling back to independence.")
                 L = np.eye(n) # Last resort
             
         if L is not None:
-            sampler = qmc.Sobol(d=n, scramble=True); m_power = int(math.ceil(math.log2(self.k_samples)))
-            U_unif = sampler.random_base2(m=m_power)[:self.k_samples]; Z = norm.ppf(U_unif) @ L.T
+            # Standard (fast) Cholesky path
+            sampler = qmc.Sobol(d=n, scramble=True)
+            m_power = int(math.ceil(math.log2(self.k_samples)))
+            U_unif = sampler.random_base2(m=m_power)[:self.k_samples]
+            Z = norm.ppf(U_unif) @ L.T
             
-        U = norm.cdf(Z); I_k = (U < M).astype(int)
+        # Convert correlated standard normals (Z) to uniforms (U)
+        U = norm.cdf(Z) 
         
-        def objective(F):
-            gains_long = (I_k - Q) / Q; gains_short = (Q - I_k) / (1 - Q)
-            R_k = np.where(F > 0, gains_long, gains_short)
-            W_k = 1.0 + np.sum(R_k * np.abs(F), axis=1)
-            if np.any(W_k <= 1e-9): return 1e9
-            return -np.mean(np.log(W_k))
-        
+        # Convert uniforms to correlated Bernoulli outcomes
+        I_k = (U < M).astype(int) 
+
+        # 2. Define the Objective Function (Unchanged)
+        def objective(F: np.ndarray) -> float:
+            # Calculate returns for long and short positions
+            # We add epsilon to Q to prevent division by zero if Q=0 or Q=1
+            Q_safe = np.clip(Q, 1e-9, 1.0 - 1e-9)
+            gains_long = (I_k - Q_safe) / Q_safe
+            gains_short = (Q_safe - I_k) / (1.0 - Q_safe)
+            
+            R_k_matrix = np.where(F > 0, gains_long, gains_short)
+            portfolio_returns = np.sum(R_k_matrix * np.abs(F), axis=1)
+            W_k = 1.0 + portfolio_returns
+            
+            if np.any(W_k <= 1e-9): # Bankruptcy
+                return 1e9 # Massive penalty
+            return -np.mean(np.log(W_k)) # Minimize negative log-wealth
+
+        # 3. Run the Optimizer (Unchanged)
+        initial_guess = F_analytical_guess
         constraints = ({'type': 'ineq', 'fun': lambda F: 0.8 - np.sum(np.abs(F))})
         bounds = [(-0.5, 0.5)] * n
-        result = opt.minimize(objective, F_analytical_guess, method='SLSQP', bounds=bounds, constraints=constraints, options={'ftol': 1e-6, 'disp': False})
         
-        if not result.success: log.warning(f"Numerical solver failed: {result.message}"); return F_analytical_guess
+        result = opt.minimize(
+            objective, initial_guess, method='SLSQP',
+            bounds=bounds, constraints=constraints, options={'ftol': 1e-6, 'disp': False}
+        )
+        
+        if not result.success:
+            log.warning(f"Numerical solver failed: {result.message}. Falling back.")
+            return initial_guess
+        
         log.info(f"Numerical solver converged. Final E[log(W)] = {-result.fun:.6f}")
         return result.x
 
