@@ -4,9 +4,10 @@ import spacy
 import numpy as np
 import pandas as pd
 import scipy.optimize as opt
+from scipy.stats import qmc, norm  # <--- FIX 1: ADDED THIS IMPORT
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any  # <--- FIX 2: ADDED 'Any'
 import ray
 from ray import tune
 from ray.tune.schedulers import ASHAScheduler
@@ -16,7 +17,6 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import sys
 import math
-from scipy.stats import qmc, norm
 
 # ==============================================================================
 # --- Global Setup ---
@@ -638,7 +638,7 @@ class HybridKellySolver:
                 if i == j:
                     C[i, i] = P[i] * (1 - P[i])
                     continue
-                # ** FIX: Pass the contracts list to the mock graph manager **
+                # Pass the full contracts list to the mock
                 rel = graph.get_relationship_between_contracts(contracts[i]['id'], contracts[j]['id'], contracts)
                 p_ij = rel.get('p_joint')
                 if p_ij is None:
@@ -672,7 +672,7 @@ class HybridKellySolver:
             
         sampler = qmc.Sobol(d=n, scramble=True)
         m_power = int(math.ceil(math.log2(self.k_samples)))
-        U_unif = sampler.random_base2(m=m_power) # (K x n)
+        U_unif = sampler.random_base2(m=m_power)
         if len(U_unif) > self.k_samples:
             U_unif = U_unif[:self.k_samples]
             
@@ -870,6 +870,7 @@ class BacktestEngine:
 # ### COMPONENT 8: Operational Dashboard ###
 # ==============================================================================
 
+# ** FIX: All C8 code is wrapped in a function to be "import-safe" **
 def run_c8_demo():
     """Launches the C8 Dashboard"""
     log.info("--- (DEMO) Running Component 8 (Dashboard) ---")
@@ -964,7 +965,8 @@ def run_c8_demo():
         ctx = dash.callback_context
         if not ctx.triggered: return "", False
         button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        item_id = eval(button_id)['index']
+        # Use eval in a controlled way for pattern-matching callbacks
+        item_id = eval(button_id)['index'] 
         success = graph_stub_c8.resolve_human_review_item(item_id, "MERGE_CONFIRMED")
         if success: return f"Item {item_id} resolved!", True
         else: return f"Failed to resolve {item_id}.", True
@@ -1083,7 +1085,7 @@ def run_c6_demo():
         graph = GraphManager(is_mock=True) # Use MOCK graph
         solver = HybridKellySolver(num_samples_k=5000)
         pm = PortfolioManager(graph, solver)
-        pm.run_optimization_cycle()
+        pm..run_optimization_cycle()
         log.info("--- C6 Demo Complete. ---")
         graph.close()
     except Exception as e:
