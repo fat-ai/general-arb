@@ -7,6 +7,9 @@ pandas        # For data handling (C4) and P&L (C7)
 # --- NLP (C2) ---
 spacy         # For entity extraction. (Requires model download, see below)
 
+# --- AI Analyst (C3) ---
+google-generativeai
+
 # --- Back-testing & Tuning (C7) ---
 ray[tune]     # For distributed back-testing and hyperparameter tuning
 
