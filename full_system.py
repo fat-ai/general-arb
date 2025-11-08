@@ -1606,8 +1606,8 @@ portfolio_manager = PortfolioManager(graph_manager, kelly_solver)
 
 # --- FIX: Provide all required arguments for the global instance ---
 # We provide mock URLs or read from env vars for the C8 dashboard demo
-POLY_MARKETS_URL = os.getenv("POLY_MARKETS_URL", "https://clob-static.polymarket.com/markets.csv.gz")
-POLY_TRADES_URL = os.getenv("POLY_TRADES_URL", "https://clob-static.polymarket.com/trades.csv.gz")
+POLY_MARKETS_URL = os.getenv("POLY_MARKETS_URL", "https://clob.polymarket.com/markets.csv.gz")
+POLY_TRADES_URL = os.getenv("POLY_TRADES_URL", "https://clob.polymarket.com/trades.csv.gz")
 backtest_engine = BacktestEngine(
     historical_data_path=".", # Save to current directory
     markets_url=POLY_MARKETS_URL,
