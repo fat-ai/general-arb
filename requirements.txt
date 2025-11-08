@@ -9,7 +9,7 @@ spacy         # For entity extraction. (Requires model download, see below)
 
 # --- AI Analyst (C3) ---
 google-generativeai
-
+dune-client
 # --- Back-testing & Tuning (C7) ---
 ray[tune]     # For distributed back-testing and hyperparameter tuning
 
