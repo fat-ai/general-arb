@@ -25,15 +25,14 @@ def cosine_similarity(v1, v2):
     return dot_product / (norm_v1 * norm_v2)
 
 # ==============================================================================
-# REFINED COMPONENT 1: GraphManager (with new read/update methods)
+# REFINED COMPONENT 1: GraphManager (with C2/C3 Read/Write Methods)
 # ==============================================================================
 
 class GraphManager:
     """
-    Component 1: The Knowledge Graph (Data Model) - Refined Version
-    Includes write, update, and read methods needed by Component 2.
+    Component 1: The Knowledge Graph (Data Model)
+    Now includes all necessary read/write methods for C2 and C3.
     """
-
     def __init__(self):
         self.uri = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
         self.user = os.getenv('NEO4J_USER', 'neo4j')
@@ -42,7 +41,6 @@ class GraphManager:
 
         if not self.password:
             raise ValueError("NEO4J_PASSWORD environment variable not set.")
-
         try:
             self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
             self.driver.verify_connectivity()
@@ -54,28 +52,19 @@ class GraphManager:
     def close(self):
         if self.driver:
             self.driver.close()
-            log.info("GraphManager connection closed.")
 
-    # --- Schema (as before) ---
     def setup_schema(self):
         log.info("Applying database schema: constraints and indexes...")
         with self.driver.session() as session:
-            session.execute_write(
-                lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Contract) REQUIRE c.contract_id IS UNIQUE")
-            )
-            session.execute_write(
-                lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE")
-            )
-            session.execute_write(
-                lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Alias) REQUIRE a.text IS UNIQUE")
-            )
-            session.execute_write(
-                lambda tx: tx.run("CREATE INDEX entity_type_index IF NOT EXISTS FOR (e:Entity) ON (e.type)")
-            )
+            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Contract) REQUIRE c.contract_id IS UNIQUE"))
+            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE"))
+            session.execute_write(lambda tx: tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Alias) REQUIRE a.text IS UNIQUE"))
+            session.execute_write(lambda tx: tx.run("CREATE INDEX entity_type_index IF NOT EXISTS FOR (e:Entity) ON (e.type)"))
             # (Vector index creation stubbed for brevity)
         log.info("Schema setup complete.")
 
-    # --- Write/Update Methods (as before) ---
+    # --- Write Methods (from previous step) ---
+
     def add_contract(self, contract_id: str, text: str, vector: list[float]):
         if len(vector) != self.vector_dim:
             raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {len(vector)}")
@@ -88,12 +77,8 @@ class GraphManager:
         tx.run(
             """
             MERGE (c:Contract {contract_id: $contract_id})
-            ON CREATE SET
-                c.text = $text, c.vector = $vector, c.p_market_all = null,
-                c.p_model = null, c.p_model_variance = null,
-                c.status = 'PENDING_LINKING', c.created_at = timestamp(), c.updated_at = timestamp()
-            ON MATCH SET
-                c.text = $text, c.vector = $vector, c.updated_at = timestamp()
+            ON CREATE SET c.text = $text, c.vector = $vector, c.status = 'PENDING_LINKING', c.created_at = timestamp()
+            ON MATCH SET c.text = $text, c.vector = $vector, c.updated_at = timestamp()
             """,
             contract_id=contract_id, text=text, vector=vector
         )
@@ -110,51 +95,38 @@ class GraphManager:
             MATCH (c:Contract {contract_id: $contract_id})
             MATCH (e:Entity {entity_id: $entity_id})
             MERGE (c)-[r:IS_ABOUT]->(e)
-            ON CREATE SET
-                r.confidence_score = $confidence, r.created_at = timestamp()
-            ON MATCH SET
-                r.confidence_score = $confidence
+            ON CREATE SET r.confidence_score = $confidence, r.created_at = timestamp()
+            ON MATCH SET r.confidence_score = $confidence
             SET c.status = 'PENDING_ANALYSIS' // Update status on link
             """,
             contract_id=contract_id, entity_id=entity_id, confidence=confidence
         )
 
-    # --- NEW: Read/Update Methods for Component 2 ---
+    # --- NEW: Read/Update Methods for C2 & C3 ---
 
-    def get_contract_details(self, contract_id: str) -> dict:
-        """Fetches the text and vector for a contract."""
+    def get_contracts_by_status(self, status: str, limit: int = 10) -> list[dict]:
+        """Gets a batch of contracts with a specific status."""
         with self.driver.session() as session:
-            result = session.execute_read(
-                lambda tx: tx.run(
-                    "MATCH (c:Contract {contract_id: $contract_id}) RETURN c.text AS text, c.vector AS vector",
-                    contract_id=contract_id
-                ).single()
+            results = session.execute_read(
+                self._tx_get_contracts_by_status, status=status, limit=limit
             )
-        return result.data() if result else None
+        return results
 
+    @staticmethod
+    def _tx_get_contracts_by_status(tx, status, limit):
+        result = tx.run(
+            "MATCH (c:Contract {status: $status}) "
+            "RETURN c.contract_id AS contract_id, c.text AS text, c.vector AS vector "
+            "LIMIT $limit",
+            status=status, limit=limit
+        )
+        return [record.data() for record in result]
+        
     def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
         """
-        Finds the single best Entity match for an alias using fuzzy matching.
-        NOTE: This is a STUB. Real fuzzy search requires the APOC plugin.
-        We will simulate it with a simple exact match for this stub.
+        STUB: Simulates a fuzzy search with an exact match.
+        In Prod: This would use the APOC query from the C2 review.
         """
-        # --- PRODUCTION IMPLEMENTATION (Conceptual) ---
-        # query = """
-        # CALL apoc.cypher.run(
-        #     'MATCH (a:Alias) WHERE apoc.text.levenshteinSimilarity(a.text, $text) >= $threshold
-        #     RETURN a, apoc.text.levenshteinSimilarity(a.text, $text) AS score
-        #     ORDER BY score DESC LIMIT 1',
-        #     {text: $alias_text, threshold: $threshold}
-        # )
-        # YIELD value
-        # MATCH (value.a)-[:POINTS_TO]->(e:Entity)
-        # RETURN e.entity_id AS entity_id, e.canonical_name AS name, value.score AS confidence
-        # """
-        # with self.driver.session() as session:
-        #     result = session.run(query, alias_text=alias_text, threshold=threshold).single()
-        # return result.data() if result else None
-        
-        # --- STUB IMPLEMENTATION (Simple exact match for testing) ---
         with self.driver.session() as session:
             result = session.execute_read(
                 self._tx_find_entity_exact, alias_text=alias_text
@@ -184,14 +156,39 @@ class GraphManager:
 
     @staticmethod
     def _tx_update_status(tx, contract_id, status, metadata):
-        query = """
-            MATCH (c:Contract {contract_id: $contract_id})
-            SET c.status = $status, c.updated_at = timestamp()
-        """
+        query = "MATCH (c:Contract {contract_id: $contract_id}) SET c.status = $status, c.updated_at = timestamp()"
+        params = {'contract_id': contract_id, 'status': status}
         if metadata:
             query += " SET c.review_metadata = $metadata"
-        tx.run(query, contract_id=contract_id, status=status, metadata=metadata)
+            params['metadata'] = str(metadata) # Store metadata as string
+        tx.run(query, **params)
 
+    def update_contract_prior(self, contract_id: str, p_internal: float, alpha: float, beta: float, source: str):
+        """Writes the output of Component 3 to the Contract node."""
+        with self.driver.session() as session:
+            session.execute_write(
+                self._tx_update_prior,
+                contract_id=contract_id, p_internal=p_internal,
+                alpha=alpha, beta=beta, source=source
+            )
+        log.info(f"Updated prior for {contract_id} from {source}.")
+
+    @staticmethod
+    def _tx_update_prior(tx, contract_id, p_internal, alpha, beta, source):
+        tx.run(
+            """
+            MATCH (c:Contract {contract_id: $contract_id})
+            SET
+                c.p_internal_prior = $p_internal,
+                c.p_internal_alpha = $alpha,
+                c.p_internal_beta = $beta,
+                c.p_internal_source = $source,
+                c.status = 'PENDING_FUSION',
+                c.updated_at = timestamp()
+            """,
+            contract_id=contract_id, p_internal=p_internal,
+            alpha=alpha, beta=beta, source=source
+        )
 
 # ==============================================================================
 # REFINED COMPONENT 2: RelationalLinker (now using spaCy)
@@ -329,93 +326,171 @@ class RelationalLinker:
 
 
 # ==============================================================================
-# Example Usage
+# NEW COMPONENT 3: Prior Engines (Internal Belief)
 # ==============================================================================
-if __name__ == "__main__":
-    # Set environment variables in your shell before running
-    # export NEO4J_URI="bolt://localhost:7687"
-    # export NEO4J_USER="neo4j"
-    # export NEO4J_PASSWORD="your_password"
-    # export VECTOR_DIM="384" 
-    # NOTE: Using 384, as en_core_web_sm vectors are 384-dim if we use nlp.vocab.vectors
-    # For this stub, we'll just use a placeholder.
-    
-    # We'll use a 384-dim placeholder vector to match spaCy's "md" models
-    # Or just keep 768 as our standard and use a different model.
-    # For this demo, we'll assume the ingestor uses a 768-dim S-BERT.
-    # The spaCy model *only* does NER, it doesn't provide the vector.
-    os.environ['VECTOR_DIM'] = "768" # Re-set for clarity
-    
-    try:
-        log.info("--- Component 1 & 2 Integration Test ---")
-        
-        # 1. Initialize Component 1
-        graph = GraphManager()
-        graph.setup_schema()
-        
-        # 2. Initialize Component 2
-        # This will load the spaCy model.
-        linker = RelationalLinker(graph)
-        
-        # 3. Simulate Ingestion Feed (add a contract)
-        contract_id = "MKT_902_SPACY"
-        contract_text = "Will the 'Viper' AI Chipset from NeuroCorp be released by Q2 2026?"
-        # The ingestion feed would generate this 768-dim vector
-        vector_768d = [0.1] * 768 
-        
-        graph.add_contract(
-            contract_id=contract_id,
-            text=contract_text,
-            vector=vector_768d
-        )
-        
-        # 4. Run the linker on the new contract
-        # The NER will extract "NeuroCorp".
-        # The Fast Path will fail (no Alias for "NeuroCorp" exists yet).
-        # It will be flagged for human review.
-        linker.process_new_contract(contract_id)
-        
-        # 5. Simulate the Human (Component 8) creating the missing links
-        log.info("--- Simulating Human-in-the-Loop (Component 8) ---")
-        # The human sees the review queue item:
-        # "No alias match found for {'extracted_entities': ['NeuroCorp']}"
-        # The human creates the new Entity and Alias:
-        
-        # Create the canonical Entity
-        graph.driver.execute_write(
-            lambda tx: tx.run(
-                "MERGE (e:Entity {entity_id: 'E_123'}) "
-                "SET e.canonical_name = 'NeuroCorp, Inc.', e.type = 'Organization', e.vector = $vec",
-                vec=[0.2] * 768
-            )
-        )
-        # Create the Alias
-        graph.driver.execute_write(
-            lambda tx: tx.run(
-                "MATCH (e:Entity {entity_id: 'E_123'}) "
-                "MERGE (a:Alias {text: 'NeuroCorp'}) "
-                "MERGE (a)-[:POINTS_TO]->(e)"
-            )
-        )
-        log.info("Human created Entity 'E_123' and Alias 'NeuroCorp'.")
 
-        # 6. Re-run the linker on the *same* contract
-        # (This is what would happen after the human resolves the ticket)
-        log.info("--- Re-running linker post-human-fix ---")
-        
-        # First, we set the status back so the worker "finds" it
-        graph.update_contract_status(contract_id, 'PENDING_LINKING')
-        
-        linker.process_new_contract(contract_id)
-        
-        # This time, the NER extracts "NeuroCorp".
-        # The Fast Path *succeeds* finding the Alias.
-        # The contract is successfully linked to Entity E_123.
-        # Its status is set to 'PENDING_ANALYSIS'.
-        
-        graph.close()
+def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tuple[float, float]:
+    """
+    Converts a human-readable probability and confidence interval
+    into the Alpha and Beta parameters of a Beta distribution.
+    
+    Args:
+        mean (float): The estimated probability (e.g., 0.65).
+        confidence_interval (tuple): The (lower, upper) bounds of a ~95% CI.
 
-    except Exception as e:
-        log.error(f"Failed to run main example: {e}")
-        if "spacy" in str(e):
-            log.error("Please run: python -m spacy download en_core_web_sm")
+    Returns:
+        tuple[float, float]: The (alpha, beta) parameters.
+    """
+    if not (0 < mean < 1):
+        log.warning(f"Mean {mean} is at an extreme. Returning a weak prior.")
+        return (1.0, 1.0) # Return Beta(1,1) - a uniform (uninformative) prior
+
+    lower, upper = confidence_interval
+    if not (0 <= lower <= mean <= upper <= 1.0):
+        log.warning("Invalid confidence interval. Returning a weak prior.")
+        return (1.0, 1.0)
+
+    # Approx std_dev from 95% CI (4 std deviations total)
+    std_dev = (upper - lower) / 4.0
+    
+    if std_dev == 0:
+        # Infinite confidence (logical rule)
+        log.info("Zero variance detected. Returning (inf, inf) as placeholder.")
+        # In practice, the system should treat this as a fixed logical constraint
+        return (float('inf'), float('inf'))
+
+    variance = std_dev ** 2
+    
+    # This is the core math
+    # variance = (alpha * beta) / ((alpha + beta)**2 * (alpha + beta + 1))
+    # mean = alpha / (alpha + beta)
+    # We simplify: alpha = mean * n, beta = (1-mean) * n
+    # n = (mean * (1-mean) / variance) - 1
+    
+    inner = (mean * (1 - mean) / variance) - 1
+    
+    if inner <= 0:
+        # This means the stated variance is *larger* than a uniform distribution,
+        # which is mathematically inconsistent for a Beta distribution.
+        log.warning(f"Inconsistent CI for mean {mean}. Variance is too large. Returning weak prior.")
+        return (1.0, 1.0)
+        
+    alpha = mean * inner
+    beta = (1 - mean) * inner
+    
+    log.debug(f"Converted (mean={mean}, CI=[{lower},{upper}]) -> (alpha={alpha:.2f}, beta={beta:.2f})")
+    return (alpha, beta)
+
+
+class AIAnalyst:
+    """
+    (STUB) Simulates the AI Analyst (80% Solution).
+    In production, this would wrap an OpenAI/Claude/etc. API call.
+    """
+    def __init__(self):
+        log.info("AI Analyst (Stub) initialized.")
+        # In Prod: self.client = OpenAI(api_key=...)
+
+    def get_prior(self, contract_text: str) -> dict:
+        """
+        Simulates the 'superforecasting' prompt and returns a
+        JSON-like response.
+        """
+        log.info(f"AI Analyst processing: '{contract_text[:50]}...'")
+        
+        # --- PROMPT (Conceptual) ---
+        # "You are a panel of 5 expert analysts...
+        # 1. Outside View: What is the base rate for this event type?
+        # 2. Inside View: What are the specific pro/con factors?
+        # 3. Synthesize: Output a JSON with 'probability' and 'confidence_interval' (95% CI)."
+        
+        # Mocking the AI's response based on the text
+        if "NeuroCorp" in contract_text:
+            mock_response = {
+                'probability': 0.65,
+                'confidence_interval': [0.55, 0.75],
+                'reasoning': 'NeuroCorp has a strong track record, but chipset releases often slip one quarter.'
+            }
+        else:
+            mock_response = {
+                'probability': 0.50,
+                'confidence_interval': [0.40, 0.60],
+                'reasoning': 'Defaulting to a neutral stance due to lack of specific data.'
+            }
+            
+        return mock_response
+
+
+class PriorManager:
+    """
+    Component 3: Manages the generation of internal priors.
+    """
+    def __init__(self, graph_manager: GraphManager, ai_analyst: AIAnalyst):
+        self.graph = graph_manager
+        self.ai = ai_analyst
+        self.hitl_liquidity_threshold = 10000 # Example: Flag any $10k+ market for a human
+
+    def _is_hitl_required(self, contract: dict) -> bool:
+        """
+        Checks if a contract meets the criteria for a
+        mandatory human review (the 20% solution).
+        """
+        # (Stub: In prod, we'd fetch liquidity from the ingestor)
+        # if contract.get('expected_liquidity', 0) > self.hitl_liquidity_threshold:
+        #    return True
+            
+        # (Stub: In prod, we'd check if it's a new, unknown domain)
+        # if contract.get('domain_is_new', False):
+        #    return True
+
+        return False # Default to AI
+
+    def process_pending_contracts(self):
+        """
+        Main worker loop for Component 3.
+        Finds contracts 'PENDING_ANALYSIS' and generates a prior.
+        """
+        log.info("PriorManager: Checking for contracts 'PENDING_ANALYSIS'...")
+        contracts = self.graph.get_contracts_by_status('PENDING_ANALYSIS', limit=10)
+        
+        if not contracts:
+            log.info("PriorManager: No new contracts to analyze.")
+            return
+
+        for contract in contracts:
+            contract_id = contract['contract_id']
+            log.info(f"PriorManager: Processing {contract_id}")
+            
+            try:
+                if self._is_hitl_required(contract):
+                    # 1. Flag for Human
+                    self.graph.update_contract_status(
+                        contract_id,
+                        'NEEDS_HUMAN_PRIOR',
+                        {'reason': 'High value or new domain.'}
+                    )
+                else:
+                    # 2. Use AI Analyst
+                    prior_data = self.ai.get_prior(contract['text'])
+                    
+                    mean = prior_data['probability']
+                    ci = (prior_data['confidence_interval'][0], prior_data['confidence_interval'][1])
+                    
+                    (alpha, beta) = convert_to_beta(mean, ci)
+                    
+                    if alpha == float('inf'):
+                        log.warning(f"{contract_id} has a logical (inf) prior. Handling as fixed rule.")
+                        # (Special handling for logical rules can be added here)
+                    
+                    # 3. Save to Graph
+                    self.graph.update_contract_prior(
+                        contract_id=contract_id,
+                        p_internal=mean,
+                        alpha=alpha,
+                        beta=beta,
+                        source='ai_generated'
+                    )
+                    
+            except Exception as e:
+                log.error(f"Failed to process prior for {contract_id}: {e}")
+                self.graph.update_contract_status(contract_id, 'PRIOR_FAILED', {'error': str(e)})
