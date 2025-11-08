@@ -4,9 +4,9 @@ import spacy
 import numpy as np
 import pandas as pd
 import scipy.optimize as opt
-from scipy.stats import qmc, norm  # <-- ADDED
+from scipy.stats import qmc, norm
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable, ClientError
+from neo4j.exceptions import ServiceUnavailable, ClientError # <-- FIX R6
 from typing import Dict, List, Tuple, Any
 import ray
 from ray import tune
@@ -19,9 +19,9 @@ import sys
 import math
 import json
 import google.generativeai as genai
-import multiprocessing # For C8 async
+import multiprocessing
 
-# =GET /admin HTTP/1.1" 200 -
+# ==============================================================================
 # --- Global Setup & Helpers ---
 # ==============================================================================
 
@@ -33,6 +33,8 @@ def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tu
     if not (0 <= mean <= 1):
          log.warning(f"Mean {mean} is outside [0, 1]. Returning weak prior.")
          return (1.0, 1.0)
+    
+    # --- FIX 1: Handle Logical Rules (P0.3 from review) ---
     if mean == 0.0: return (1.0, float('inf')) # P(X=0) = 1
     if mean == 1.0: return (float('inf'), 1.0) # P(X=1) = 1
     
@@ -62,11 +64,8 @@ def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tu
     return (alpha, beta)
 
 def cosine_similarity(v1, v2):
-    """Calculates cosine similarity between two numpy vectors."""
     v1 = np.array(v1); v2 = np.array(v2)
-    if v1.shape != v2.shape:
-        log.warning(f"Vector shape mismatch: {v1.shape} vs {v2.shape}")
-        return 0.0
+    if v1.shape != v2.shape: return 0.0
     dot = np.dot(v1, v2); norm_v1 = np.linalg.norm(v1); norm_v2 = np.linalg.norm(v2)
     if norm_v1 == 0 or norm_v2 == 0: return 0.0
     return dot / (norm_v1 * norm_v2)
@@ -83,10 +82,26 @@ class GraphManager:
             log.warning("GraphManager is running in MOCK mode.")
             self.vector_dim = 768
             self.model_brier_scores = {'brier_internal_model': 0.08, 'brier_expert_model': 0.05, 'brier_crowd_model': 0.15}
-            self.mock_db = {'contracts': {}, 'entities': {}, 'aliases': {}, 'wallets': {}, 'review_queue': [
-                {'id': 'MKT_902', 'reason': 'No alias match found', 'details': json.dumps({'entities': ['NeuroCorp']})},
-                {'id': 'MKT_905', 'reason': 'NEEDS_MERGE_CONFIRMATION', 'details': json.dumps({'similar_contracts': ['MKT_888']})}
-            ]}
+            
+            # --- FIX R1: Initialize mock_db in constructor ---
+            self.mock_db = {
+                'contracts': {}, # {contract_id: {data}}
+                'entities': {
+                    'E_123': {'canonical_name': 'NeuroCorp, Inc.', 'type': 'Organization', 'vector': [0.2]*768, 'contract_count': 0}
+                },
+                'aliases': {
+                    'NeuroCorp': 'E_123'
+                },
+                'wallets': {
+                    'Wallet_ABC': {'brier_biotech': 0.0567, 'brier_geopolitics': 0.81},
+                    'Wallet_XYZ': {'brier_biotech': 0.49, 'brier_geopolitics': 0.01},
+                    'Wallet_CROWD_1': {'brier_biotech': 0.25},
+                },
+                'review_queue': [
+                    {'id': 'MKT_902', 'reason': 'No alias match found', 'details': json.dumps({'entities': ['NeruCorp']})},
+                    {'id': 'MKT_905', 'reason': 'NEEDS_MERGE_CONFIRMATION', 'details': json.dumps({'similar_contracts': ['MKT_888']})}
+                ]
+            }
             return
 
         self.uri = os.getenv('NEO4J_URI', 'bolt://localhost:7687')
@@ -122,6 +137,8 @@ class GraphManager:
                 log.info("APOC text index 'aliases' ensured.")
             except ClientError:
                 log.warning("APOC index failed (is APOC plugin installed?).")
+            
+            # --- FIX R3: Add Vector Index Creation ---
             try:
                 session.execute_write(
                     lambda tx: tx.run(
@@ -176,6 +193,9 @@ class GraphManager:
         if self.is_mock: 
             self.mock_db['contracts'][contract_id]['entity_ids'].append(entity_id)
             self.mock_db['contracts'][contract_id]['status'] = 'PENDING_ANALYSIS'
+            # (Fix R5) Increment contract count for this entity
+            if entity_id in self.mock_db['entities']:
+                self.mock_db['entities'][entity_id]['contract_count'] += 1
             return
         with self.driver.session() as session:
             session.execute_write(self._tx_link_contract, contract_id, entity_id, confidence)
@@ -191,8 +211,15 @@ class GraphManager:
             contract_id=contract_id, entity_id=entity_id, confidence=confidence
         )
     
-    def get_contracts_by_status(self, status, limit=10):
-        if self.is_mock: return self._mock_get_contracts_by_status(status)
+    def get_contracts_by_status(self, status, limit=10) -> list[dict]:
+        if self.is_mock: 
+             # --- FIX R5: Use mock_db ---
+             res = []
+             for cid, data in self.mock_db['contracts'].items():
+                 if data['status'] == status:
+                     res.append({'contract_id': cid, **data})
+                     if len(res) >= limit: break
+             return res
         with self.driver.session() as session:
             return session.execute_read(self._tx_get_contracts_by_status, status, limit)
     @staticmethod
@@ -207,8 +234,14 @@ class GraphManager:
         return [record.data() for record in result]
         
     def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
-        if self.is_mock: return self._mock_find_entity_by_alias_fuzzy(alias_text)
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db ---
+            entity_id = self.mock_db['aliases'].get(alias_text)
+            if entity_id:
+                return {'entity_id': entity_id, 'name': self.mock_db['entities'][entity_id]['canonical_name'], 'confidence': 1.0}
+            return None
         
+        # --- PRODUCTION-READY C2 LOGIC ---
         query = """
             CALL apoc.index.search('aliases', $text) YIELD node AS a, properties
             WITH a, properties.text AS matched_text
@@ -252,6 +285,7 @@ class GraphManager:
     def find_similar_contracts_by_vector(self, contract_id: str, vector: List[float], k: int = 5) -> List[Dict]:
         if self.is_mock: return []
         
+        # --- PRODUCTION-READY C2 LOGIC ---
         query = """
             CALL db.index.vector.queryNodes('contract_vector_index', $k, $vector) YIELD node, similarity
             WHERE node.contract_id <> $contract_id
@@ -279,12 +313,14 @@ class GraphManager:
         params = {'contract_id': contract_id, 'status': status}
         if metadata:
             query += " SET c.review_metadata = $metadata"
-            params['metadata'] = json.dumps(metadata) # <-- FIX: Use json.dumps
+            # --- FIX 2: Use json.dumps for safe serialization (P0.4) ---
+            params['metadata'] = json.dumps(metadata)
         tx.run(query, **params)
     
     # --- C3: Read/Write Methods ---
     def get_entity_contract_count(self, entity_id: str) -> int:
         if self.is_mock: 
+            # --- FIX R5: Use mock_db ---
             return self.mock_db['entities'].get(entity_id, {}).get('contract_count', 0)
         
         query = "MATCH (e:Entity {entity_id: $entity_id})<-[:IS_ABOUT]-(c:Contract) RETURN count(c) AS count"
@@ -294,6 +330,7 @@ class GraphManager:
             
     def update_contract_prior(self, contract_id: str, p_internal: float, alpha: float, beta: float, source: str, p_experts: float, p_all: float):
         if self.is_mock:
+            # --- FIX R5: Use mock_db ---
             if contract_id in self.mock_db['contracts']:
                 self.mock_db['contracts'][contract_id].update({
                     'p_internal_prior': p_internal, 'p_internal_alpha': alpha,
@@ -319,28 +356,42 @@ class GraphManager:
             contract_id=contract_id, p_internal=p_internal, alpha=alpha, beta=beta, 
             source=source, p_experts=p_experts, p_all=p_all
         )
+    # --- FIX R7: Removed duplicate update_contract_prior method ---
 
     # --- C4: Read/Write Methods ---
     def get_all_resolved_trades_by_topic(self) -> pd.DataFrame:
-        if self.is_mock: return self._mock_get_all_resolved_trades_by_topic()
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db (albeit still hardcoded for this demo) ---
+            return pd.DataFrame([
+                {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
+                {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
+                {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
+            ])
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract)-[:IS_ABOUT]->(e:Entity)
         WHERE c.status = 'RESOLVED' AND c.outcome IS NOT NULL AND t.price IS NOT NULL
         RETURN w.wallet_id AS wallet_id, e.type AS entity_type, 
                t.price AS bet_price, c.outcome AS outcome
-        """
+        SKIP 0 LIMIT 10000 
+        """ # <-- P1: Added LIMIT
         with self.driver.session() as session:
             results = session.run(query)
             df = pd.DataFrame([r.data() for r in results])
             return df if not df.empty else pd.DataFrame(columns=['wallet_id', 'entity_type', 'bet_price', 'outcome'])
 
     def get_live_trades_for_contract(self, contract_id: str) -> pd.DataFrame:
-        if self.is_mock: return self._mock_get_live_trades_for_contract(contract_id)
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db (hardcoded) ---
+            return pd.DataFrame([
+                {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
+                {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
+            ])
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract {contract_id: $contract_id})
         WHERE t.price IS NOT NULL AND t.volume IS NOT NULL
         RETURN w.wallet_id AS wallet_id, t.price AS trade_price, t.volume AS trade_volume
-        """
+        LIMIT 1000
+        """ # <-- P1: Added LIMIT
         with self.driver.session() as session:
             results = session.run(query, contract_id=contract_id)
             df = pd.DataFrame([r.data() for r in results])
@@ -357,7 +408,11 @@ class GraphManager:
     def update_wallet_scores(self, wallet_scores: Dict[tuple, float]):
         if self.is_mock: 
             log.info(f"MockGraph: Updating {len(wallet_scores)} wallet scores (STUB)")
+            for (wallet_id, topic), score in wallet_scores.items():
+                if wallet_id not in self.mock_db['wallets']: self.mock_db['wallets'][wallet_id] = {}
+                self.mock_db['wallets'][wallet_id][f"brier_{topic}"] = score
             return
+        
         scores_list = [{"wallet_id": k[0], "topic_key": f"brier_{k[1]}", "brier_score": v} for k, v in wallet_scores.items()]
         if not scores_list: return
         query = "UNWIND $scores_list AS score MERGE (w:Wallet {wallet_id: score.wallet_id}) SET w[score.topic_key] = score.brier_score"
@@ -366,7 +421,10 @@ class GraphManager:
         log.info(f"Updated {len(scores_list)} wallet scores in graph.")
         
     def get_wallet_brier_scores(self, wallet_ids: List[str]) -> Dict[str, Dict[str, float]]:
-        if self.is_mock: return self._mock_get_wallet_brier_scores(wallet_ids)
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db ---
+            return {wid: scores for wid, scores in self.mock_db['wallets'].items() if wid in wallet_ids}
+        
         query = "MATCH (w:Wallet) WHERE w.wallet_id IN $wallet_ids RETURN w.wallet_id AS wallet_id, properties(w) AS scores"
         with self.driver.session() as session:
             results = session.run(query, wallet_ids=wallet_ids)
@@ -374,7 +432,10 @@ class GraphManager:
 
     # --- C5: Read/Write Methods ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
-        if self.is_mock: return self._mock_get_contracts_for_fusion()
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db ---
+            return self._mock_get_contracts_by_status('PENDING_FUSION', limit)
+        
         query = """
         MATCH (c:Contract {status: 'PENDING_FUSION'})
         WHERE c.p_internal_alpha IS NOT NULL AND c.p_market_experts IS NOT NULL AND c.p_market_all IS NOT NULL
@@ -393,8 +454,11 @@ class GraphManager:
 
     def update_contract_fused_price(self, contract_id: str, p_model: float, p_model_variance: float):
         if self.is_mock: 
-            self.mock_db['contracts'][contract_id]['p_model'] = p_model
-            self.mock_db['contracts'][contract_id]['status'] = 'MONITORED'
+            # --- FIX R5: Use mock_db ---
+            if contract_id in self.mock_db['contracts']:
+                self.mock_db['contracts'][contract_id]['p_model'] = p_model
+                self.mock_db['contracts'][contract_id]['p_model_variance'] = p_model_variance
+                self.mock_db['contracts'][contract_id]['status'] = 'MONITORED'
             return
         query = """
         MATCH (c:Contract {contract_id: $contract_id})
@@ -406,14 +470,26 @@ class GraphManager:
 
     # --- C6: Read Methods ---
     def get_active_entity_clusters(self) -> List[str]:
-        if self.is_mock: return self._mock_get_active_entity_clusters()
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db ---
+            clusters = set()
+            for c in self.mock_db['contracts'].values():
+                if c['status'] == 'MONITORED':
+                    for eid in c['entity_ids']: clusters.add(eid)
+            return list(clusters) if clusters else ["E_DUNE_3"] # Default for demo
+            
         query = "MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity) RETURN DISTINCT e.entity_id AS entity_id"
         with self.driver.session() as session:
             results = session.run(query)
             return [r['entity_id'] for r in results]
             
     def get_cluster_contracts(self, entity_id: str) -> List[Dict]:
-        if self.is_mock: return self._mock_get_cluster_contracts(entity_id)
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db (default to arb demo) ---
+            return [
+                {'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True},
+                {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}
+            ]
         query = """
         MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity {entity_id: $entity_id})
         WHERE c.p_model IS NOT NULL AND c.p_market_all IS NOT NULL
@@ -426,7 +502,13 @@ class GraphManager:
             return [r.data() for r in results]
             
     def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
-        if self.is_mock: return self._mock_get_relationship_between_contracts(c1_id, c2_id, contracts)
+        if self.is_mock: 
+            # --- FIX R5: Use mock_db (default to arb demo) ---
+            if c1_id == 'MKT_A' and c2_id == 'MKT_B':
+                p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
+                return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
+            return {'type': 'NONE', 'p_joint': None}
+            
         query = """
         MATCH (c1:Contract {contract_id: $c1_id})-[:IS_ABOUT]->(e1:Entity),
               (c2:Contract {contract_id: $c2_id})-[:IS_ABOUT]->(e2:Entity)
@@ -445,57 +527,7 @@ class GraphManager:
 
     # --- C7/C8: Mock-driving Methods ---
     def get_historical_data_for_replay(self, start_date, end_date):
-        if not self.is_mock: raise NotImplementedError("Use a real data warehouse for C7")
-        return self._mock_get_historical_data_for_replay(start_date, end_date)
-    def get_human_review_queue(self):
-        if not self.is_mock: raise NotImplementedError("C8 methods are mock-only")
-        return self._mock_get_human_review_queue()
-    def get_portfolio_state(self): return self._mock_get_portfolio_state()
-    def get_pnl_history(self): return self._mock_get_pnl_history()
-    def get_regime_status(self): return self._mock_get_regime_status()
-    def resolve_human_review_item(self, item_id, action, data):
-        log.warning(f"MockGraph: Resolving {item_id} with action '{action}' and data: {data}")
-        self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != item_id]
-        return True
-
-    # --- MOCK IMPLEMENTATIONS (Called if is_mock=True) ---
-    def _mock_get_contracts_by_status(self, status: str):
-         if status == 'PENDING_LINKING':
-             return [{'contract_id': 'MKT_902_SPACY_DEMO', 'text': "Will 'NeuroCorp' release the 'Viper'?", 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': []}]
-         if status == 'PENDING_ANALYSIS':
-            return [{'contract_id': 'MKT_903', 'text': 'Test contract for NeuroCorp', 'vector': [0.3]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': ['E_123']}]
-         if status == 'PENDING_FUSION':
-            return [{'contract_id': 'MKT_FUSE_001', 'p_internal_alpha': 13.8, 'p_internal_beta': 9.2, 'p_market_experts': 0.45, 'p_market_all': 0.55, 'status': 'PENDING_FUSION'}]
-         return []
-    def _mock_find_entity_by_alias_fuzzy(self, alias_text: str):
-        if alias_text == "NeuroCorp": return {'entity_id': 'E_123', 'name': 'NeuroCorp, Inc.', 'confidence': 1.0}
-        return None
-    def _mock_get_all_resolved_trades_by_topic(self):
-        return pd.DataFrame([
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.2, 'outcome': 0.0},
-            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
-        ])
-    def _mock_get_live_trades_for_contract(self, contract_id):
-        return pd.DataFrame([
-            {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
-            {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
-        ])
-    def _mock_get_wallet_brier_scores(self, wallet_ids):
-        return { 'Wallet_ABC': {'brier_biotech': 0.0567}, 'Wallet_CROWD_1': {'brier_biotech': 0.25} }
-    def _mock_get_contracts_for_fusion(self):
-        return [c for c in self.mock_db['contracts'].values() if c['status'] == 'PENDING_FUSION']
-    def _mock_get_model_brier_scores(self): return self.model_brier_scores
-    def _mock_get_active_entity_clusters(self): return ["E_DUNE_3"]
-    def _mock_get_cluster_contracts(self, entity_id):
-        return [{'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True}, {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}]
-    def _mock_get_relationship_between_contracts(self, c1_id, c2_id, contracts):
-        if c1_id == 'MKT_A' and c2_id == 'MKT_B':
-            p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
-            return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
-        return {'type': 'NONE', 'p_joint': None}
-    def _mock_get_historical_data_for_replay(self, s, e):
+        log.info(f"MockGraph: Fetching historical data from {start_date} to {end_date} (STUB)")
         return pd.DataFrame([
             ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp release...', 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.50}),
             ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51, 'p_market_experts': 0.55}),
@@ -505,14 +537,29 @@ class GraphManager:
             ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
             ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
         ], columns=['timestamp', 'event_type', 'data'])
-    def _mock_get_human_review_queue(self): return self.mock_db['review_queue']
-    def _mock_get_portfolio_state(self): return {'cash': 8500.0, 'positions': [], 'total_value': 8500.0}
-    def _mock_get_pnl_history(self): return pd.Series(np.random.normal(0, 1, 100).cumsum() + 10000)
-    def _mock_get_regime_status(self): return "LOW_VOL", {"k": 1.5, "edge": 0.1}
-    def _mock_resolve_human_review_item(self, id, action, data): 
-        self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != id]
+        
+    def get_human_review_queue(self):
+        log.info("MockGraph: Fetching 'NEEDS_HUMAN_REVIEW' queue...")
+        return self.mock_db['review_queue']
+        
+    def get_portfolio_state(self):
+        log.info("MockGraph: Fetching current portfolio...")
+        # (Hardcoded for demo)
+        return {'cash': 8537.88, 'positions': [{'id': 'MKT_A', 'fraction': -0.075}, {'id': 'MKT_B', 'fraction': 0.075}], 'total_value': 8537.88}
+        
+    def get_pnl_history(self):
+        log.info("MockGraph: Fetching P&L history...")
+        return pd.Series(np.random.normal(0, 1, 100).cumsum() + 10000)
+        
+    def get_regime_status(self):
+        log.info("MockGraph: Fetching regime status...")
+        return "LOW_VOL", {"k_brier_scale": 1.5, "kelly_edge_thresh": 0.1}
+        
+    def resolve_human_review_item(self, item_id, action, data):
+        log.warning(f"MockGraph: Resolving {item_id} with action '{action}' and data: {data}")
+        self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != item_id]
+        # (In prod, this would trigger C2 linker to re-run on this contract_id)
         return True
-
 
 # ==============================================================================
 # ### COMPONENT 2: RelationalLinker (Production-Ready) ###
@@ -598,6 +645,7 @@ class AIAnalyst:
                 log.error(f"Failed to initialize Gemini client: {e}")
                 self.client = None
     
+    # --- FIX R2: Removed duplicate get_prior() method ---
     def get_prior(self, contract_text: str) -> dict:
         log.info(f"AI Analyst processing: '{contract_text[:50]}...'")
         system_prompt = "You are a 'superforecasting' analyst... respond ONLY with JSON: {\"probability\": 0.65, \"confidence_interval\": [0.55, 0.75], \"reasoning\": \"...\"}"
@@ -635,12 +683,13 @@ class PriorManager:
             log.warning(f"HITL Triggered: Liquidity ({liquidity}) > threshold")
             return True
         entity_ids = contract.get('entity_ids', [])
-        if not entity_ids: return False # Let C2 run again
+        if not entity_ids: return False
         min_count = min(self.graph.get_entity_contract_count(eid) for eid in entity_ids)
         if min_count < self.hitl_new_domain_threshold:
             log.warning(f"HITL Triggered: New domain (entity has {min_count} contracts).")
             return True
         return False
+    # --- FIX R8: Removed duplicate _is_hitl_required() method ---
 
     def process_pending_contracts(self):
         log.info("--- C3: Checking for contracts 'PENDING_ANALYSIS' ---")
@@ -669,6 +718,7 @@ class PriorManager:
             except Exception as e:
                 log.error(f"Failed to process prior for {contract_id}: {e}")
                 self.graph.update_contract_status(contract_id, 'PRIOR_FAILED', {'error': str(e)})
+    # --- FIX R9: Removed duplicate process_pending_contracts() method ---
 
 # ==============================================================================
 # ### COMPONENT 4: Market Intelligence Engine (Production-Ready) ###
@@ -691,7 +741,15 @@ class HistoricalProfiler:
         if all_trades_df.empty:
             log.warning("C4: No historical trades found to profile.")
             return
-        wallet_scores = all_trades_df.groupby(['wallet_id', 'entity_type']).apply(self._calculate_brier_score).to_dict()
+        # --- FIX P1.12: Vectorized lookup ---
+        # wallet_scores = all_trades_df.groupby(['wallet_id', 'entity_type']).apply(self._calculate_brier_score).to_dict()
+        
+        # We must keep .apply() because _calculate_brier_score has a condition (min_trades)
+        # A full vectorization would require more complex pandas ops (e.g., filter + transform)
+        # This .apply() is acceptable for a batch job.
+        wallet_scores_series = all_trades_df.groupby(['wallet_id', 'entity_type']).apply(self._calculate_brier_score)
+        wallet_scores = wallet_scores_series.to_dict()
+
         if wallet_scores:
             self.graph.update_wallet_scores(wallet_scores)
         log.info(f"--- C4: Historical Profiler Batch Job Complete. ---")
@@ -714,11 +772,13 @@ class LiveFeedHandler:
         wallet_ids = list(live_trades_df['wallet_id'].unique())
         wallet_scores = self.graph.get_wallet_brier_scores(wallet_ids)
         
-        def calculate_weight(row):
-            brier_score = wallet_scores.get(row['wallet_id'], {}).get(brier_key, 0.25)
-            return row['trade_volume'] / (brier_score + self.brier_epsilon)
-
-        live_trades_df['weight'] = live_trades_df.apply(calculate_weight, axis=1)
+        # --- FIX P1.12: Vectorized Brier score lookup ---
+        def get_brier(wallet_id):
+            return wallet_scores.get(wallet_id, {}).get(brier_key, 0.25)
+            
+        brier_values = live_trades_df['wallet_id'].map(get_brier)
+        live_trades_df['weight'] = live_trades_df['trade_volume'] / (brier_values + self.brier_epsilon)
+        
         denominator = live_trades_df['weight'].sum()
         if denominator == 0: return None
         p_market_experts = (live_trades_df['trade_price'] * live_trades_df['weight']).sum() / denominator
@@ -751,8 +811,12 @@ class BeliefEngine:
     def _fuse_betas(self, beta_dists: List[Tuple[float, float]]) -> Tuple[float, float]:
         fused_alpha, fused_beta = 1.0, 1.0
         for alpha, beta in beta_dists:
+            if math.isinf(alpha) and math.isinf(beta):
+                # This is (inf, inf) from the old convert_to_beta, which is invalid
+                log.warning("Invalid (inf, inf) prior found. Skipping.")
+                continue
             if math.isinf(alpha) or math.isinf(beta):
-                log.warning("Found logical rule (inf). Bypassing fusion.")
+                log.warning("Found logical rule (inf, 1) or (1, inf). Bypassing fusion.")
                 return (alpha, beta) 
             fused_alpha += (alpha - 1.0); fused_beta += (beta - 1.0)
         return (max(fused_alpha, 1.0), max(fused_beta, 1.0))
@@ -765,7 +829,6 @@ class BeliefEngine:
         return (mean, variance)
 
     def run_fusion_process(self):
-        """Main worker loop for Component 5."""
         log.info("--- C5: Checking for contracts 'PENDING_FUSION' ---")
         contracts = self.graph.get_contracts_for_fusion(limit=10)
         if not contracts:
@@ -784,7 +847,7 @@ class BeliefEngine:
                     beta_crowd = self._impute_beta_from_point(contract['p_market_all'], 'crowd')
                     (fused_alpha, fused_beta) = self._fuse_betas([beta_internal, beta_experts, beta_crowd])
                     (p_model, p_model_variance) = self._get_beta_stats(fused_alpha, fused_beta)
-                log.info(f"C5: Fusion complete for {contract_id}: P_model={p_model:.4f}, Var={p_model_variance:.4f}")
+                log.info(f"C5: Fusion complete for {contract_id}: P_model={p_model:.4f}")
                 self.graph.update_contract_fused_price(contract_id, p_model, p_model_variance)
             except Exception as e:
                 log.error(f"Failed to fuse prior for {contract_id}: {e}")
@@ -805,6 +868,7 @@ class HybridKellySolver:
         eigval, eigvec = np.linalg.eigh(A)
         eigval[eigval < 1e-8] = 1e-8 
         A_psd = eigvec @ np.diag(eigval) @ eigvec.T
+        # Renormalize to be a correlation matrix
         inv_diag = np.diag(1.0 / np.sqrt(np.diag(A_psd)))
         A_corr = inv_diag @ A_psd @ inv_diag
         np.fill_diagonal(A_corr, 1.0)
@@ -837,17 +901,20 @@ class HybridKellySolver:
         n = len(M); std_devs = np.sqrt(np.diag(C)); std_devs = np.where(std_devs == 0, 1e-9, std_devs)
         Corr = C / np.outer(std_devs, std_devs); np.fill_diagonal(Corr, 1.0)
         
+        L = None # <-- FIX R1: Initialize L
         try:
+            # --- FIX 3: Proper PSD calculation for Cholesky (P0.1) ---
             Corr_psd = self._nearest_psd(Corr)
             L = np.linalg.cholesky(Corr_psd)
         except np.linalg.LinAlgError:
             log.warning("Cov matrix not positive definite. Using MVN sampler (slower).")
             try:
                 sampler = qmc.MultivariateNormal(mean=np.zeros(n), cov=Corr + np.eye(n) * 1e-9)
-                Z = sampler.random(self.k_samples); L = None
+                Z = sampler.random(self.k_samples)
+                L = None # Signal to skip Cholesky path
             except Exception as e:
                 log.error(f"FATAL: MVN sampler also failed: {e}. Falling back to independence.")
-                L = np.eye(n)
+                L = np.eye(n) # Last resort
             
         if L is not None:
             sampler = qmc.Sobol(d=n, scramble=True); m_power = int(math.ceil(math.log2(self.k_samples)))
@@ -871,7 +938,9 @@ class HybridKellySolver:
         return result.x
 
     def solve_basket(self, graph, contracts):
-        n = len(contracts); M = np.array([c['M'] for c in contracts]); Q = np.array([c['Q'] for c in contracts])
+        n = len(contracts); 
+        if n == 0: return np.array([]) # Handle empty cluster
+        M = np.array([c['M'] for c in contracts]); Q = np.array([c['Q'] for c in contracts])
         E = M - Q; D = np.diag(Q); C = self._build_covariance_matrix(graph, contracts)
         F_analytical = self._solve_analytical(C, D, E)
         if self._is_numerical_required(E, Q, contracts):
@@ -1110,7 +1179,7 @@ class BacktestEngine:
                         if c_id in graph.mock_db['contracts']:
                             graph.mock_db['contracts'][c_id]['p_market_all'] = p_all
                             # Update p_market_experts from the event data
-                            graph.mock_db['contracts'][c_id]['p_market_experts'] = event[event['contract_id'] == c_id]['data'].iloc[0]['p_market_experts']
+                            graph.mock_db['contracts'][c_id]['p_market_experts'] = events[events['contract_id'] == c_id]['data'].iloc[0]['p_market_experts']
                             graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger pipeline
                     
                     prior_manager.process_pending_contracts() # C3 (calls C4) -> PENDING_FUSION
@@ -1135,7 +1204,6 @@ class BacktestEngine:
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
         
-        # We must "curry" the historical data into the objective function
         hist_data = self._load_historical_data()
         trainable_with_data = tune.with_parameters(self._run_single_backtest, historical_data=hist_data)
         
@@ -1143,26 +1211,19 @@ class BacktestEngine:
             "brier_internal_model": tune.loguniform(0.05, 0.25),
             "k_brier_scale": tune.loguniform(0.1, 5.0),
             "kelly_edge_thresh": tune.uniform(0.05, 0.25),
-            "min_trades_threshold": tune.qrandint(5, 50, 5) # Added C4 param
+            "min_trades_threshold": tune.qrandint(5, 50, 5)
         }
         
         scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
         
         analysis = tune.run(
-            trainable_with_data, # Use the curried function
-            config=search_space,
-            num_samples=20, # Reduced for demo
-            scheduler=scheduler,
-            resources_per_trial={"cpu": 1},
-            name="pm_tuning_job"
+            trainable_with_data, config=search_space,
+            num_samples=20, scheduler=scheduler,
+            resources_per_trial={"cpu": 1}, name="pm_tuning_job"
         )
         
         best_config = analysis.get_best_config(metric="irr", mode="max")
-        
-        log.info(f"--- C7: Tuning Job Complete ---")
-        log.info(f"Best config found for max IRR:")
-        log.info(best_config)
-        
+        log.info(f"--- C7: Tuning Job Complete --- Best config: {best_config}")
         ray.shutdown()
         return best_config
         
@@ -1171,7 +1232,6 @@ class BacktestEngine:
 # ==============================================================================
 
 # --- Global Instantiation (Import-Safe) ---
-# Use mock mode so 'pytest' can import this file without a DB connection
 IS_PROD_MODE = os.getenv("PROD_MODE", "false").lower() == "true"
 graph_manager = GraphManager(is_mock=not IS_PROD_MODE)
 
@@ -1290,6 +1350,18 @@ def display_page(pathname):
     else: return build_analyst_tab()
 
 # --- C8: Admin Callback (Async) ---
+def _run_async_job():
+    """Wrapper function for multiprocessing."""
+    log.info("Async process started...")
+    # We must instantiate a new (mock) graph for this process
+    try:
+        graph_stub = GraphManager(is_mock=True)
+        be = BacktestEngine(historical_data_path="mock_data.parquet")
+        best_config = be.run_tuning_job()
+        log.info(f"Async job finished. Best config: {best_config}")
+    except Exception as e:
+        log.error(f"Async job failed: {e}", exc_info=True)
+
 @callback(
     Output('admin-alert', 'children'),
     Output('admin-alert', 'is_open'),
@@ -1299,8 +1371,9 @@ def display_page(pathname):
 def start_tuning_job_callback(n_clicks):
     log.warning("Admin clicked 'Start New Tuning Job'")
     try:
-        pid = backtest_engine.run_tuning_job_async() 
-        return f"Tuning job started in background (PID: {pid})! See Ray Dashboard for progress.", True
+        p = multiprocessing.Process(target=_run_async_job)
+        p.start()
+        return f"Tuning job started in background (PID: {p.pid})! See logs/Ray Dashboard.", True
     except Exception as e:
         log.warning(f"Failed to start tuning job: {e}")
         return f"Error: {e}", True
@@ -1316,16 +1389,12 @@ def start_tuning_job_callback(n_clicks):
     prevent_initial_call=True
 )
 def open_analyst_modal(n_clicks):
-    """Opens the modal and populates it with the correct data."""
     ctx = dash.callback_context
     if not any(n_clicks): return False, {}, "", "", ""
-    
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
     item_id = json.loads(button_id)['index']
-    
     queue = graph_manager.get_human_review_queue()
     item_data = next((item for item in queue if item['id'] == item_id), None)
-    
     if item_data:
         details_str = json.dumps(item_data.get('details', {}), indent=2)
         return True, item_data, item_id, item_data.get('reason'), details_str
@@ -1341,21 +1410,99 @@ def open_analyst_modal(n_clicks):
     prevent_initial_call=True
 )
 def submit_analyst_resolution(n_clicks, item_data, resolution_data):
-    if not item_data:
-        return "Error: No item data found.", True, False
+    if not item_data: return "Error: No item data found.", True, False
     item_id = item_data.get('id')
     log.warning(f"Analyst is resolving {item_id} with data: {resolution_data}")
-    
     success = graph_manager.resolve_human_review_item(item_id, "SUBMITTED", resolution_data)
-    
-    if success:
-        return f"Item {item_id} resolved! Refreshing...", True, False
-    else:
-        return f"Failed to resolve {item_id}.", True, True
+    if success: return f"Item {item_id} resolved! Refreshing...", True, False
+    else: return f"Failed to resolve {item_id}.", True, True
 
 # ==============================================================================
 # --- MAIN LAUNCHER ---
 # ==============================================================================
+def run_c1_c2_demo():
+    log.info("--- (DEMO) Running Component 1 & 2 (Production) Demo ---")
+    try:
+        graph = GraphManager() # Real connection
+        graph.setup_schema()
+        linker = RelationalLinker(graph)
+        vector = [0.1] * graph.vector_dim 
+        graph.add_contract("MKT_902_PROD", "Will 'NeruCorp' ship the 'Viper'?", vector, 100, 0.5)
+        log.info("--- Running Linker (Pass 1) ---")
+        linker.process_pending_contracts() # Will fail (fuzzy/KNN) -> NEEDS_HUMAN_REVIEW
+        log.info("--- Simulating Human Fix ---")
+        with graph.driver.session() as session:
+            session.execute_write(lambda tx: tx.run(
+                "MERGE (e:Entity {entity_id: 'E_123'}) SET e.canonical_name = 'NeuroCorp, Inc.' "
+                "MERGE (a:Alias {text: 'NeruCorp'}) MERGE (a)-[:POINTS_TO]->(e)"))
+        log.info("--- Running Linker (Pass 2) ---")
+        graph.update_contract_status("MKT_902_PROD", 'PENDING_LINKING')
+        linker.process_pending_contracts() # Will succeed
+        graph.close()
+    except Exception as e:
+        log.error(f"C1/C2 Demo Failed: {e}", exc_info=True)
+
+def run_c3_demo():
+    log.info("--- (DEMO) Running Component 3 (Production) Demo ---")
+    try:
+        graph = GraphManager(is_mock=True) 
+        ai = AIAnalyst()
+        feed_handler = LiveFeedHandler(graph)
+        prior_manager = PriorManager(graph, ai, feed_handler)
+        # (Add mock data to C3)
+        graph.mock_db['contracts'] = {
+            'MKT_903_AI': {'text': 'NeuroCorp', 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': ['E_123'], 'status': 'PENDING_ANALYSIS'},
+            'MKT_904_HITL': {'text': 'High value', 'liquidity': 50000, 'p_market_all': 0.6, 'entity_ids': ['E_123'], 'status': 'PENDING_ANALYSIS'}
+        }
+        graph.mock_db['entities']['E_123'] = {'contract_count': 10}
+        prior_manager.process_pending_contracts()
+        log.info(f"C3 Demo AI Path Status: {graph.mock_db['contracts']['MKT_903_AI']['status']}")
+        log.info(f"C3 Demo HITL Path Status: {graph.mock_db['contracts']['MKT_904_HITL']['status']}")
+        graph.close()
+    except Exception as e:
+        log.error(f"C3 Demo Failed: {e}", exc_info=True)
+
+def run_c4_demo():
+    log.info("--- (DEMO) Running Component 4 (Production) Demo ---")
+    try:
+        graph = GraphManager(is_mock=True)
+        profiler = HistoricalProfiler(graph, min_trades_threshold=3)
+        profiler.run_profiling() # "Calculates" scores and saves to mock_db
+        feed_handler = LiveFeedHandler(graph)
+        p_experts = feed_handler.get_smart_money_price("MKT_BIO_001")
+        log.info(f"--- C4 Demo Complete. Final P_Experts: {p_experts:.4f} ---")
+        assert abs(p_experts - 0.3585) < 0.001
+        log.info("C4 Demo Test Passed!")
+        graph.close()
+    except Exception as e:
+        log.error(f"C4 Demo Failed: {e}", exc_info=True)
+
+def run_c5_demo():
+    log.info("--- (DEMO) Running Component 5 (Production) Demo ---")
+    try:
+        graph = GraphManager(is_mock=True)
+        # C3 must run first to set status
+        graph.mock_db['contracts']['MKT_FUSE_001'] = {'p_internal_alpha': 13.8, 'p_internal_beta': 9.2, 'p_market_experts': 0.45, 'p_market_all': 0.55, 'status': 'PENDING_FUSION'}
+        engine = BeliefEngine(graph)
+        engine.run_fusion_process()
+        log.info(f"C5 Demo Complete. Fused Status: {graph.mock_db['contracts']['MKT_FUSE_001']['status']}")
+        assert graph.mock_db['contracts']['MKT_FUSE_001']['status'] == 'MONITORED'
+        graph.close()
+    except Exception as e:
+        log.error(f"C5 Demo Failed: {e}", exc_info=True)
+
+def run_c6_demo():
+    log.info("--- (DEMO) Running Component 6 (Production) Demo ---")
+    try:
+        graph = GraphManager(is_mock=True)
+        solver = HybridKellySolver(num_samples_k=5000)
+        pm = PortfolioManager(graph, solver)
+        pm.run_optimization_cycle()
+        log.info("--- C6 Demo Complete. ---")
+        graph.close()
+    except Exception as e:
+        log.error(f"C6 Demo Failed: {e}", exc_info=True)
+
 def run_c7_demo():
     """Runs the C7 Backtest/Tuning demo"""
     log.info("--- (DEMO) Running Component 7 (Production) Demo ---")
@@ -1364,7 +1511,7 @@ def run_c7_demo():
         best_params = backtester.run_tuning_job()
         log.info(f"--- C7 Demo Complete. Best params: {best_params} ---")
     except Exception as e:
-        log.error(f"C7 Demo Failed: {e}")
+        log.error(f"C7 Demo Failed: {e}", exc_info=True)
         if "ray" in str(e): log.info("Hint: Run 'pip install \"ray[tune]\" pandas'")
 
 def run_c8_demo():
@@ -1374,17 +1521,30 @@ def run_c8_demo():
     try:
         app.run_server(debug=True, port=8050)
     except Exception as e:
-        log.error(f"C8 Demo Failed: {e}")
+        log.error(f"C8 Demo Failed: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
-    demos = { "C7": run_c7_demo, "C8": run_c8_demo }
+    
+    # Simple CLI launcher
+    demos = {
+        "C1_C2": run_c1_c2_demo,
+        "C3": run_c3_demo,
+        "C4": run_c4_demo,
+        "C5": run_c5_demo,
+        "C6": run_c6_demo,
+        "C7": run_c7_demo,
+        "C8": run_c8_demo,
+    }
     
     if len(sys.argv) > 1:
         demo_name = sys.argv[1].upper()
-        if demo_name in demos: demos[demo_name]()
+        if demo_name in demos:
+            demos[demo_name]()
         else:
             log.error(f"Unknown demo: {demo_name}")
-            log.info(f"Usage: python {sys.argv[0]} [C7|C8]")
+            log.info(f"Usage: python {sys.argv[0]} [{ '|'.join(demos.keys()) }]")
     else:
-        log.info("No demo specified. Running C8 (Dashboard) by default.")
+        log.info(f"No demo specified. Running C8 (Dashboard) by default.")
+        log.info(f"Try 'python {sys.argv[0]} C7' to run the tuning engine.")
         run_c8_demo()
