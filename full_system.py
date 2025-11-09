@@ -1259,13 +1259,31 @@ class BacktestEngine:
     def _run_dune_query(self, query_str: str, params: dict, name: str) -> pd.DataFrame:
         """Helper to run a parameterized Dune query and return a DataFrame."""
         log.info(f"Running Dune query: {name}...")
-        query_params = [QueryParameter.text_type(k, v) for k, v in params.items()]
-        query = QueryBase(name=name, query_sql=query_str, params=query_params)
         
+        # --- THIS IS THE CORRECT FIX ---
         try:
-            results = self.dune_client.run_query_dataframe(query)
-            log.info(f"Successfully fetched {len(results)} rows for {name}.")
-            return results
+            # 1. Convert params dict to list of QueryParameter objects
+            query_params = [QueryParameter.text_type(k, v) for k, v in params.items()]
+            
+            # 2. Create a new query object using the client.
+            #    This is the correct place to pass the raw SQL string.
+            created_query = self.dune_client.create_query(
+                name=name,
+                query_sql=query_str,  # <-- The correct argument
+                params=query_params
+            )
+            
+            log.info(f"Created temporary query '{name}' with ID: {created_query.base.query_id}")
+
+            # 3. Run the query using its 'base' attribute
+            results_df = self.dune_client.run_query_dataframe(
+                query=created_query.base,
+                ping_frequency=5 # Check status every 5 seconds
+            )
+            
+            log.info(f"Successfully fetched {len(results_df)} rows for {name}.")
+            return results_df
+
         except Exception as e:
             log.error(f"Dune query '{name}' failed: {e}", exc_info=True)
             return pd.DataFrame()
