@@ -23,7 +23,7 @@ import multiprocessing
 import requests # For downloading files
 import gzip     # For decompressing .gz files
 import io       # For reading in-memory bytes
-from datetime import datetime # For parsing timestamps
+from datetime import datetime, timedelta # For parsing timestamps
 from dune_client.client import DuneClient
 from dune_client.query import QueryBase
 from dune_client.types import QueryParameter
