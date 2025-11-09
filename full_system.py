@@ -24,9 +24,8 @@ import requests # For downloading files
 import gzip     # For decompressing .gz files
 import io       # For reading in-memory bytes
 from datetime import datetime # For parsing timestamps
-from dune_client.types import QueryParameter
 from dune_client.client import DuneClient
-from dune_client.query import Query
+from dune_client.models import Query, QueryParameter
 import time
 
 # ==============================================================================
