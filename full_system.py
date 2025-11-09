@@ -1260,7 +1260,7 @@ class BacktestEngine:
         """Helper to run a parameterized Dune query and return a DataFrame."""
         log.info(f"Running Dune query: {name}...")
         query_params = [QueryParameter.text_type(k, v) for k, v in params.items()]
-        query = QueryBase(name=name, query=query_str, params=query_params)
+        query = QueryBase(name=name, query_sql=query_str, params=query_params)
         
         try:
             results = self.dune_client.run_query_dataframe(query)
