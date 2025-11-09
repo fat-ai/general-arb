@@ -1645,12 +1645,9 @@ portfolio_manager = PortfolioManager(graph_manager, kelly_solver)
 
 # --- FIX: Provide all required arguments for the global instance ---
 # We provide mock URLs or read from env vars for the C8 dashboard demo
-POLY_MARKETS_URL = os.getenv("POLY_MARKETS_URL", "https://clob.polymarket.com/markets.csv.gz")
-POLY_TRADES_URL = os.getenv("POLY_TRADES_URL", "https://clob.polymarket.com/trades.csv.gz")
+
 backtest_engine = BacktestEngine(
     historical_data_path=".", # Save to current directory
-    markets_url=POLY_MARKETS_URL,
-    trades_url=POLY_TRADES_URL
 )
 
 # --- Dash App Definition ---
@@ -1764,7 +1761,7 @@ def _run_async_job():
     # We must instantiate a new (mock) graph for this process
     try:
         graph_stub = GraphManager(is_mock=True)
-        be = BacktestEngine(historical_data_path="mock_data.parquet")
+        be = BacktestEngine(historical_data_path=".")
         best_config = be.run_tuning_job()
         log.info(f"Async job finished. Best config: {best_config}")
     except Exception as e:
