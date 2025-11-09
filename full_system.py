@@ -25,7 +25,8 @@ import gzip     # For decompressing .gz files
 import io       # For reading in-memory bytes
 from datetime import datetime # For parsing timestamps
 from dune_client.client import DuneClient
-from dune_client.models import Query, QueryParameter
+from dune_client.types import QueryParameter
+from dune_client.query import QueryBase
 import time
 
 # ==============================================================================
@@ -1259,7 +1260,7 @@ class BacktestEngine:
         """Helper to run a parameterized Dune query and return a DataFrame."""
         log.info(f"Running Dune query: {name}...")
         query_params = [QueryParameter.text_type(k, v) for k, v in params.items()]
-        query = Query(name=name, query=query_str, params=query_params)
+        query = QueryBase(name=name, query=query_str, params=query_params)
         
         try:
             results = self.dune_client.run_query_dataframe(query)
