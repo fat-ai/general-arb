@@ -1269,6 +1269,7 @@ class BacktestEngine:
         1. Markets (with outcomes) from the Gamma REST API.
         2. Trades (full history) from the FPMM Subgraph.
         """
+
         # --- Query 1: Markets (from Gamma API) ---
         log.info("Fetching all market details from Polymarket Gamma API...")
         df_markets = self._fetch_all_markets_from_gamma()
@@ -1283,6 +1284,7 @@ class BacktestEngine:
         
         if df_trades.empty:
             log.warning("No trades found from Polymarket Subgraph.")
+            # Return an empty DataFrame with the expected *raw* columns from the Subgraph
             df_trades = pd.DataFrame(columns=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'market'])
         
         log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Polymarket APIs (using cache).")
@@ -1538,11 +1540,8 @@ class BacktestEngine:
                  df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date'], errors='coerce')
 
             # --- OUTCOME FIX ---
-            # Gamma API is tricky with outcomes. We will try to parse it.
             # If 'outcome' column doesn't exist (it's not in your log list), we default to None.
-            # This effectively disables the Profiler (C4) but allows the Backtest (C7) to run.
             if 'outcome' not in df_markets.columns:
-                 # Try to interpret 'umaResolutionStatus' or similar if available, otherwise NaN
                  df_markets['outcome'] = pd.NA 
 
             df_markets['start_price'] = 0.50
@@ -1595,7 +1594,6 @@ class BacktestEngine:
         df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
 
         market_id_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
-        # Outcome map might be empty if we couldn't find outcome column, that's okay for now
         outcome_map = df_markets.set_index('market_id')['outcome'].to_dict() if 'outcome' in df_markets.columns else {}
         
         df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_map)
@@ -1625,11 +1623,13 @@ class BacktestEngine:
             ))
             
         # Resolutions
-        for _, row in df_markets.dropna(subset=['resolution_timestamp', 'outcome']).iterrows():
-             events.append((
-                row['resolution_timestamp'], 'RESOLUTION',
-                {'id': row['market_id'], 'outcome': row['outcome']}
-            ))
+        for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
+            # Only add resolution event if we have an outcome
+             if pd.notna(row.get('outcome')):
+                 events.append((
+                    row['resolution_timestamp'], 'RESOLUTION',
+                    {'id': row['market_id'], 'outcome': row['outcome']}
+                ))
             
         # Prices
         for _, row in df_trades.iterrows():
