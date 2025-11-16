@@ -1501,6 +1501,9 @@ class BacktestEngine:
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
         This is the "Transform" phase.
+        It creates two crucial DataFrames from the TWO different data sources:
+        1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
+        2. event_log: The time-series log for the C7 replay harness.
         """
         log.info("Transforming raw Subgraph and Gamma API data into event log...")
 
@@ -1515,38 +1518,45 @@ class BacktestEngine:
             
             # Correct mapping based on YOUR log
             market_rename_map = {
-                'marketMakerAddress': 'fpmm_address', # This is the address trades link to
-                'conditionId': 'market_id',           # This is the condition ID
+                'marketMakerAddress': 'fpmm_address', 
+                'conditionId': 'market_id',           
                 'question': 'question',
                 'createdAt': 'created_at',
-                'closedTime': 'resolution_timestamp', # Use closedTime for resolution
+                'closedTime': 'resolution_timestamp', 
                 'endDateIso': 'end_date'
             }
             
-            # Only rename columns that exist
             existing_renames = {k: v for k, v in market_rename_map.items() if k in df_markets.columns}
             df_markets = df_markets.rename(columns=existing_renames)
 
-            # Ensure we have the join key
             if 'fpmm_address' not in df_markets.columns:
                 log.error("CRITICAL: 'marketMakerAddress' (fpmm_address) not found in Gamma data.")
                 return empty_log, empty_profiler
 
-            # Coercion
-            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce')
-            if 'resolution_timestamp' in df_markets.columns:
-                df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
+            # --- TIMEZONE FIX: Force everything to Naive UTC ---
+            # 1. Convert to UTC (handling ISO strings)
+            # 2. Strip timezone info (.dt.tz_localize(None))
+            
+            if 'created_at' in df_markets.columns:
+                df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
             else:
-                 df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date'], errors='coerce')
+                # Mock start time if missing (Naive UTC)
+                df_markets['created_at'] = pd.to_datetime(datetime.now() - timedelta(days=365)).tz_localize(None)
 
-            # --- OUTCOME FIX ---
-            # If 'outcome' column doesn't exist (it's not in your log list), we default to None.
-            if 'outcome' not in df_markets.columns:
+            if 'resolution_timestamp' in df_markets.columns:
+                df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
+            else:
+                # Fallback to end_date
+                 df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date'], errors='coerce', utc=True).dt.tz_localize(None)
+
+            # Outcome handling
+            if 'outcome' in df_markets.columns:
+                df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            else:
                  df_markets['outcome'] = pd.NA 
 
             df_markets['start_price'] = 0.50
             
-            # Drop invalid rows
             df_markets = df_markets.dropna(subset=['fpmm_address', 'market_id', 'question'])
             log.info(f"Valid markets processed: {len(df_markets)}")
 
@@ -1559,16 +1569,15 @@ class BacktestEngine:
             if df_trades.empty:
                 return empty_log, empty_profiler
             
-            # Subgraph columns from your log: ['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'wallet_id', 'market_id']
-            # 'market_id' in df_trades is actually the fpmm_address.
-            
             trade_rename_map = {
                 'tradeAmount': 'size',
                 'market_id': 'fpmm_address' 
             }
             df_trades = df_trades.rename(columns=trade_rename_map)
 
-            df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
+            # --- TIMEZONE FIX: Force to Naive UTC ---
+            df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce', utc=True).dt.tz_localize(None)
+            
             df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
             df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
 
@@ -1589,7 +1598,6 @@ class BacktestEngine:
             return empty_log, empty_profiler
 
         # --- 3. Join ---
-        # Key Fix: Ensure case-insensitive join
         df_markets['fpmm_address'] = df_markets['fpmm_address'].astype(str).str.lower()
         df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
 
@@ -1597,24 +1605,18 @@ class BacktestEngine:
         outcome_map = df_markets.set_index('market_id')['outcome'].to_dict() if 'outcome' in df_markets.columns else {}
         
         df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_map)
-        
-        # Drop trades that don't match a known market
         df_trades = df_trades.dropna(subset=['market_id'])
-        
-        # Map outcomes
         df_trades['outcome'] = df_trades['market_id'].map(outcome_map)
 
         # --- 4. Profiler Data ---
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic'
-        # This will likely drop everything if 'outcome' is missing, which is expected behavior given the data
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
         
         # --- 5. Event Log ---
         events = []
         
-        # New Contracts
-        market_vectors = {mid: [0.1]*768 for mid in market_id_map.values()} # Mock
+        market_vectors = {mid: [0.1]*768 for mid in market_id_map.values()} 
         
         for _, row in df_markets.iterrows():
             events.append((
@@ -1622,33 +1624,31 @@ class BacktestEngine:
                 {'id': row['market_id'], 'text': row['question'], 'vector': market_vectors.get(row['market_id']), 'liquidity': 0, 'p_market_all': 0.5}
             ))
             
-        # Resolutions
         for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
-            # Only add resolution event if we have an outcome
-             if pd.notna(row.get('outcome')):
+            # Only add resolution if outcome is present
+            if pd.notna(row.get('outcome')):
                  events.append((
                     row['resolution_timestamp'], 'RESOLUTION',
                     {'id': row['market_id'], 'outcome': row['outcome']}
                 ))
             
-        # Prices
         for _, row in df_trades.iterrows():
-             # --- FIX: Use correct keys for C4 LiveFeedHandler ---
             events.append((
                 row['timestamp'], 'PRICE_UPDATE',
                 {
                     'id': row['market_id'], 
                     'p_market_all': row['price'],
                     'wallet_id': row['wallet_id'],
-                    'trade_price': row['price'],    # Correct key
-                    'trade_volume': abs(row['size']) # Correct key
+                    'trade_price': row['price'],    
+                    'trade_volume': abs(row['size']) 
                 }
             ))
             
         event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
         if not event_log.empty:
             event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
-            event_log['timestamp'] = pd.to_datetime(event_log['timestamp'])
+            # Ensure final log is also Naive UTC
+            event_log['timestamp'] = pd.to_datetime(event_log['timestamp'], utc=True).dt.tz_localize(None)
             event_log = event_log.set_index('timestamp').sort_index()
 
         log.info(f"ETL Complete. Profiler: {len(profiler_data)}, Events: {len(event_log)}")
