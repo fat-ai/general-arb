@@ -1410,9 +1410,6 @@ class BacktestEngine:
              offset = 0
              headers = {"x-dune-api-key": self.dune_api_key}
              
-             # Make the direct API call
-             response = requests.get(url, headers=headers)
-             response.raise_for_status() # Raise an exception for bad status codes
              
              base_url = f"https://api.dune.com/api/v1/query/{query_id}/results"
 
