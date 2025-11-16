@@ -1250,12 +1250,12 @@ class BacktestEngine:
         self.cache_dir = Path(self.historical_data_path) / "dune_cache" # <-- ADD THIS
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        self.dune_api_key = os.getenv("DUNE_API_KEY")
-        if not self.dune_api_key:
-            log.error("DUNE_API_KEY environment variable not set. C7 will fail.")
-            self.dune_client = None
-        else:
-            self.dune_client = DuneClient(self.dune_api_key)
+ #       self.dune_api_key = os.getenv("DUNE_API_KEY")
+ #       if not self.dune_api_key:
+#            log.error("DUNE_API_KEY environment variable not set. C7 will fail.")
+#            self.dune_client = None
+#        else:
+#            self.dune_client = DuneClient(self.dune_api_key)
             
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
