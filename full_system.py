@@ -1484,16 +1484,15 @@ class BacktestEngine:
         # --- 1. Process and Rename Market Data ---
         try:
             log.info("Processing Market data...")
-            # 'market_id', 'question', 'outcome', etc. are now top-level
-            # from the un-nesting in _fetch_all_markets
+            # Note: Aliasing (e.g., 'outcome: winnerOutcome') was done in the GraphQL query
             market_rename_map = {
+                'id': 'market_id',
                 'creationTimestamp': 'created_at',
-                'resolutionTimestamp': 'resolution_timestamp'
             }
             df_markets = df_markets.rename(columns=market_rename_map)
 
             # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolveTimestamp'], unit='s', errors='coerce')
             df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
             
             # Subgraph outcome is a string "0" or "1". Convert it.
@@ -1514,28 +1513,44 @@ class BacktestEngine:
         try:
             log.info("Processing Trade data...")
             if not df_trades.empty:
+                log.info(f"Raw trades loaded: {len(df_trades)} rows")
                 # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
-                
-                # --- Type Coercion (Raw fields) ---
+                trade_rename_map = {
+                    'tradeAmount': 'size' # 'tradeAmount' is the trade size
+                }
+                df_trades = df_trades.rename(columns=trade_rename_map)
+
+                # --- Type Coercion (Trades) ---
                 df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
-                df_trades['tradeAmount'] = pd.to_numeric(df_trades['tradeAmount'], errors='coerce')
-                df_trades['outcomeTokensAmount'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
-                
-                # --- CALCULATE Price and Size ---
-                # `tradeAmount` is collateral (USDC), needs 1e6 scaling
-                # `outcomeTokensAmount` is token amount, needs 1e18 scaling
+                df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
+                df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
+
+                # --- NEW: Robust Price and Size Calculation ---
                 
                 # Size is the value of the collateral (USDC)
-                df_trades['size'] = df_trades['tradeAmount'] / 1e6
+                # Fill NaN with 0 before scaling
+                df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
                 
                 # Price = (collateral / 1e6) / (tokens / 1e18)
-                # Handle division by zero
-                df_trades['price'] = (df_trades['tradeAmount'] / 1e6) / ((df_trades['outcomeTokensAmount'] / 1e18) + 1e-9)
+                # Handle division by zero or NaN tokens
+                df_trades['tokens_scaled'] = (df_trades['tokens_raw'].fillna(0) / 1e18)
+                
+                # Set price to 0 where tokens are 0, else calculate
+                df_trades['price'] = 0.0
+                valid_mask = df_trades['tokens_scaled'] > 1e-9
+                df_trades.loc[valid_mask, 'price'] = df_trades['size'] / df_trades['tokens_scaled']
+                
                 # Cap price at 1.0 (it can fly to infinity on tiny amounts)
                 df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
                 
+                # --- NEW: Logging ---
+                log.info(f"Trades before dropna: {len(df_trades)} rows")
+                
+                # Drop rows where essential calculations failed
                 df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
-            
+                
+                log.info(f"Trades after dropna: {len(df_trades)} rows")
+
             else:
                 # Ensure empty df has the *calculated* columns
                 df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
