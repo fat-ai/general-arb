@@ -1405,22 +1405,48 @@ class BacktestEngine:
         
         try:
             # Construct the URL and headers as requested
-             url = f"https://api.dune.com/api/v1/query/{query_id}/results"
+             all_dfs = []
+             limit = 100000  # As requested
+             offset = 0
              headers = {"x-dune-api-key": self.dune_api_key}
              
              # Make the direct API call
              response = requests.get(url, headers=headers)
              response.raise_for_status() # Raise an exception for bad status codes
              
-             json_response = response.json()
+             base_url = f"https://api.dune.com/api/v1/query/{query_id}/results"
+
+             while True:
+                 paginated_url = f"{base_url}?limit={limit}&offset={offset}"
+                 log.info(f"Fetching chunk: offset={offset}, limit={limit}")
+                 
+                 # Make the direct API call
+                 response = requests.get(paginated_url, headers=headers)
+                 response.raise_for_status() # Raise an exception for bad status codes
+                 
+                 json_response = response.json()
  
-             # Extract the rows from the JSON response
-             # The structure is {"result": {"rows": [...]}}
-             if "result" not in json_response or "rows" not in json_response["result"]:
-                 log.warning(f"Dune query {query_id} returned unexpected JSON structure.")
-                 return pd.DataFrame()
-                       
-             df = pd.DataFrame(json_response["result"]["rows"])
+                 # Extract the rows from the JSON response
+                 if "result" not in json_response or "rows" not in json_response["result"]:
+                     log.warning(f"Dune query {query_id} (offset {offset}) returned unexpected JSON structure.")
+                     break # Stop if something is wrong
+                 
+                 rows = json_response["result"]["rows"]
+                 if not rows:
+                     log.info("No more rows returned. Pagination complete.")
+                     break # This is the exit condition
+                
+                 all_dfs.append(pd.DataFrame(rows))
+                
+                 # Increment offset for the next loop
+                 offset += limit
+ 
+             if not all_dfs:
+                 log.warning(f"No data fetched for query {query_id}.")
+                 df = pd.DataFrame()
+             else:
+                 df = pd.concat(all_dfs, ignore_index=True)
+                 log.info(f"Pagination complete. Fetched {len(df)} total rows.")
             
             # Save to cache
              with open(cache_file, 'wb') as f:
