@@ -1284,8 +1284,26 @@ class BacktestEngine:
         
         if df_trades.empty:
             log.warning("No trades found from Polymarket Subgraph.")
-            # Return an empty DataFrame with the expected *raw* columns from the Subgraph
-            df_trades = pd.DataFrame(columns=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'market'])
+            # We can continue, but the log will be empty
+        
+        # --- START DEBUGGING ---
+        # We will now inspect the raw data and then stop the script.
+        
+        log.info("--- DEBUG: RAW DATA INSPECTION ---")
+        
+        log.info(f"--- df_markets (from Gamma) ---")
+        log.info(f"Columns: {list(df_markets.columns)}")
+        log.info("Sample Data:")
+        log.info(df_markets.head())
+        
+        log.info(f"\n--- df_trades (from Subgraph) ---")
+        log.info(f"Columns: {list(df_trades.columns)}")
+        log.info("Sample Data:")
+        log.info(df_trades.head())
+
+        # Stop the script intentionally so we can analyze the schema
+        raise Exception("DEBUG: Stopping script to inspect raw data schema. Please paste this entire log.")
+        # --- END DEBUGGING ---
         
         log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Polymarket APIs (using cache).")
         return df_markets, df_trades
