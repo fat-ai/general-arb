@@ -1270,9 +1270,9 @@ class BacktestEngine:
         Dune queries, but are kept for consistency in the API. The pre-defined
         queries are assumed to fetch all necessary data.
         """
-        if not self.dune_client:
-            log.error("Dune client not initialized. Cannot load data.")
-            return pd.DataFrame(), pd.DataFrame()
+    #    if not self.dune_client:
+    #        log.error("Dune client not initialized. Cannot load data.")
+    #        return pd.DataFrame(), pd.DataFrame()
 
         # Define Query IDs from your spec
         MARKET_DETAILS_QUERY_ID = 6175624
