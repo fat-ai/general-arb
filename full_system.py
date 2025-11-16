@@ -1291,14 +1291,14 @@ class BacktestEngine:
 
     def _fetch_all_markets(self) -> pd.DataFrame:
         """
-        Fetches all 'fpmmMarket' entities from the Subgraph.
+        Fetches all 'market' entities from the Subgraph.
         """
         log.info("Fetching all markets from Polymarket Subgraph...")
         
-        # This GraphQL query gets all market data from the correct entity
+        # This GraphQL query gets all market data from the correct 'market' entity
         query_template = """
         {{
-          fpmmMarket(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+          markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             question: title
             creationTimestamp
@@ -1312,25 +1312,25 @@ class BacktestEngine:
             cache_key="polymarket_markets",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
-            entity_name="fpmmMarket"
+            entity_name="markets"
         )
-
+        
     def _fetch_all_trades(self) -> pd.DataFrame:
         """
-        Fetches all 'fills' (trades) entities from the Subgraph.
+        Fetches all 'orderFill' (trades) entities from the Subgraph.
         """
         log.info("Fetching all trades from Polymarket Subgraph...")
         
-        # This GraphQL query fetches trades (fills)
+        # This GraphQL query fetches trades (orderFills)
         query_template = """
         {{
-          fills(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+          orderFills(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             timestamp
             price
-            collateralAmount # This is the 'size'
-            creator {{ id }} # This is the wallet_id
-            market {{ id }} # This is the conditionId
+            size
+            creator: user {{ id }}
+            market {{ id }}
           }}
         }}
         """
@@ -1339,7 +1339,7 @@ class BacktestEngine:
             cache_key="polymarket_trades",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
-            entity_name="fills"
+            entity_name="orderFills"
         )
         
         if df.empty:
@@ -1456,19 +1456,19 @@ class BacktestEngine:
         # --- 1. Process and Rename Market Data ---
         try:
             log.info("Processing Market data...")
+            # Note: Aliasing (e.g., 'question: title') was done in the GraphQL query
+            # We just rename the 'id' and 'creationTimestamp'
             market_rename_map = {
-                'id': 'market_id', # 'id' from markets entity is the conditionId
-                'question': 'question',
-                'creationTimestamp': 'created_at', 
-                'resolveTimestamp': 'resolution_timestamp'
+                'id': 'market_id',
+                'creationTimestamp': 'created_at',
             }
             df_markets = df_markets.rename(columns=market_rename_map)
 
             # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolveTimestamp'], unit='s', errors='coerce')
             df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
             
-            # In Subgraph, outcome is a string "0" or "1". Convert it.
+            # Subgraph outcome is a string "0" or "1". Convert it.
             df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
             
             # Add missing 'start_price'
@@ -1486,18 +1486,15 @@ class BacktestEngine:
         try:
             log.info("Processing Trade data...")
             if not df_trades.empty:
-                # Note: 'wallet_id' and 'market_id' were already created in _fetch_all_trades
-                trade_rename_map = {
-                    'collateralAmount': 'size' # 'collateralAmount' is the trade size
-                }
-                df_trades = df_trades.rename(columns=trade_rename_map)
-
+                # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
+                # 'price' and 'size' columns are already named correctly from the query
+                
                 # --- Type Coercion (Trades) ---
                 df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
                 df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
                 df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
                 
-                # CRITICAL: Subgraph `collateralAmount` is a large integer (uint256).
+                # CRITICAL: Subgraph `size` is a large integer (uint256).
                 # We divide by 1e6 to convert it to USDC value.
                 df_trades['size'] = df_trades['size'] / 1e6
                 
@@ -1523,7 +1520,7 @@ class BacktestEngine:
         if not df_trades.empty:
             df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
         
-        # The Subgraph 'fills' entity provides one wallet ('wallet_id')
+        # The Subgraph 'orderFills' entity provides one wallet ('wallet_id')
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
