@@ -1257,31 +1257,29 @@ class BacktestEngine:
 
     def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
         """
-        Loads and transforms Polymarket data from the free public Subgraph
-        using daily caching and pagination.
+        Loads and transforms Polymarket data using a HYBRID approach:
+        1. Markets (with outcomes) from the Gamma REST API.
+        2. Trades (full history) from the FPMM Subgraph.
         """
 
-        # --- Query 1: Markets (Now a 2-step process) ---
-        log.info("Fetching all market details from Polymarket Subgraph...")
-        df_markets = self._fetch_all_markets()
+        # --- Query 1: Markets (from Gamma API) ---
+        log.info("Fetching all market details from Polymarket Gamma API...")
+        df_markets = self._fetch_all_markets_from_gamma()
 
         if df_markets.empty:
-            log.error("Failed to fetch markets. Aborting.")
+            log.error("Failed to fetch markets from Gamma API. Aborting.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # --- Query 2: Trades ---
-        log.info("Fetching all trades from Polymarket Subgraph...")
-        df_trades = self._fetch_all_trades()
+        # --- Query 2: Trades (from Subgraph) ---
+        log.info("Fetching all trades from Polymarket FPMM Subgraph...")
+        df_trades = self._fetch_all_trades_from_subgraph()
         
         if df_trades.empty:
             log.warning("No trades found from Polymarket Subgraph.")
             # Return an empty DataFrame with the expected *raw* columns from the Subgraph
             df_trades = pd.DataFrame(columns=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'market'])
-
-        # --- Data Type Coercion is now handled in _transform_data_to_event_log ---
-        # We return the raw dataframes here.
         
-        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Subgraph (using cache).")
+        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Polymarket APIs (using cache).")
         return df_markets, df_trades
     
         
@@ -1289,78 +1287,17 @@ class BacktestEngine:
         # The single source of truth, from the Polymarket docs (FPMM Subgraph)
         return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
 
-    def _fetch_all_markets(self) -> pd.DataFrame:
+    def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
         """
-        Fetches all markets by joining 'fixedProductMarketMakers' and 'conditions'
-        from the Subgraph.
+        Fetches all markets from the Gamma REST API with pagination.
         """
-        log.info("Fetching all markets (Step 1/2: fixedProductMarketMakers)...")
+        return self._fetch_paginated_rest(
+            cache_key="polymarket_markets_gamma",
+            base_url="https://gamma-api.polymarket.com/markets",
+            limit=500 # Smaller limit for markets
+        )
         
-        # 1. Fetch all 'fixedProductMarketMakers'
-        fpmm_query_template = """
-        {{
-          fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id
-            creationTimestamp
-            conditions
-          }}
-        }}
-        """
-        df_fpmm = self._fetch_paginated_subgraph(
-            cache_key="polymarket_fpmm_markets", # New cache key
-            subgraph_url=self._get_subgraph_url(),
-            query_template=fpmm_query_template,
-            entity_name="fixedProductMarketMakers"
-        )
-        if df_fpmm.empty:
-            log.error("Failed to fetch fpmmMarkets (Step 1).")
-            return pd.DataFrame()
-
-        # Un-nest the 'conditions' array (which is a list of string IDs)
-        df_fpmm['condition_id'] = df_fpmm['conditions'].apply(lambda x: x[0] if x and len(x) > 0 else None)
-        df_fpmm = df_fpmm.dropna(subset=['condition_id'])
-        df_fpmm = df_fpmm.rename(columns={'id': 'market_id'}) # 'id' is the fpmm address
-        df_fpmm = df_fpmm[['market_id', 'creationTimestamp', 'condition_id']] # Keep only what we need
-
-        log.info(f"Fetching all market details (Step 2/2: conditions)...")
-
-        # 2. Fetch all 'conditions'
-        condition_query_template = """
-        {{
-          conditions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id
-            question
-            resolutionTimestamp
-            outcome
-          }}
-        }}
-        """
-        df_conditions = self._fetch_paginated_subgraph(
-            cache_key="polymarket_conditions", # New cache key
-            subgraph_url=self._get_subgraph_url(),
-            query_template=condition_query_template,
-            entity_name="conditions"
-        )
-        if df_conditions.empty:
-            log.error("Failed to fetch conditions (Step 2).")
-            return pd.DataFrame()
-
-        # 'id' here is the 'condition_id'
-        df_conditions = df_conditions.rename(columns={'id': 'condition_id'})
-
-        # 3. Join the two DataFrames
-        log.info("Joining market and condition data...")
-        df_markets = pd.merge(
-            df_fpmm,
-            df_conditions,
-            on='condition_id',
-            how='inner'
-        )
-
-        log.info(f"Successfully joined {len(df_markets)} markets with details.")
-        return df_markets
-        
-    def _fetch_all_trades(self) -> pd.DataFrame:
+    def _fetch_all_trades_from_subgraph(self) -> pd.DataFrame:
         """
         Fetches all 'FpmmTransaction' (trades) entities from the Subgraph.
         """
@@ -1406,6 +1343,76 @@ class BacktestEngine:
         # Drop the original nested columns
         df = df.drop(columns=['user', 'market'])
         return df
+
+    def _fetch_paginated_rest(self, cache_key: str, base_url: str, limit: int) -> pd.DataFrame:
+        """
+        Generic helper to fetch paginated data from a REST URL with daily caching.
+        (Used for the Markets Gamma API)
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        cache_file = self.cache_dir / f"{cache_key}_{today}.pkl"
+        
+        # Clean up old cache files
+        for old_file in self.cache_dir.glob(f"{cache_key}_*.pkl"):
+            if old_file.name != cache_file.name:
+                log.info(f"Removing old cache file: {old_file}")
+                try:
+                    old_file.unlink()
+                except OSError as e:
+                    log.warning(f"Could not delete old cache file {old_file}: {e}")
+
+        if cache_file.exists():
+            log.info(f"Loading cached result for {cache_key} from {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    df = pickle.load(f)
+                    if not df.empty:
+                        log.info(f"Cached data for {cache_key} is valid and has {len(df)} rows.")
+                        return df
+                    else:
+                        log.warning(f"Cached file {cache_file} was empty. Refetching.")
+            except Exception as e:
+                log.warning(f"Failed to load cache file {cache_file}: {e}. Refetching.")
+
+        log.info(f"Fetching new paginated results for {cache_key} from {base_url}...")
+        try:
+            all_dfs = []
+            offset = 0
+
+            while True:
+                params = {"limit": limit, "offset": offset}
+                log.info(f"Fetching chunk: {base_url} (offset={offset}, limit={limit})")
+
+                response = requests.get(base_url, params=params)
+                response.raise_for_status()
+                
+                rows = response.json()
+                if not rows:
+                    log.info("No more rows returned. Pagination complete.")
+                    break # This is the exit condition
+                
+                all_dfs.append(pd.DataFrame(rows))
+                offset += limit
+            
+            if not all_dfs:
+                log.warning(f"No data fetched for {cache_key}.")
+                df = pd.DataFrame()
+            else:
+                df = pd.concat(all_dfs, ignore_index=True)
+                log.info(f"Pagination complete. Fetched {len(df)} total rows.")
+            
+            # Save to cache
+            with open(cache_file, 'wb') as f:
+                pickle.dump(df, f)
+            log.info(f"Saved new cache file: {cache_file}")
+            return df
+
+        except requests.exceptions.RequestException as e:
+            log.error(f"REST API request for {base_url} failed: {e}", exc_info=True)
+            return pd.DataFrame()
+        except Exception as e:
+            log.error(f"Failed to process REST response for {cache_key}: {e}", exc_info=True)
+            return pd.DataFrame()
             
     def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
         """
@@ -1493,50 +1500,53 @@ class BacktestEngine:
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
         This is the "Transform" phase.
-        It creates two crucial DataFrames from the RAW Subgraph data:
+        It creates two crucial DataFrames from the TWO different data sources:
         1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
         2. event_log: The time-series log for the C7 replay harness.
         """
-        log.info("Transforming raw Subgraph data into event log...")
+        log.info("Transforming raw Subgraph and Gamma API data into event log...")
 
-        # --- 1. Process and Rename Market Data ---
+        # --- 1. Process and Rename Market Data (from Gamma API) ---
         try:
-            log.info("Processing Market data...")
-            # Note: All columns (market_id, question, outcome) are now present
-            # from the join in _fetch_all_markets
+            log.info("Processing Market data (from Gamma API)...")
+            # This data has all the fields we need
             market_rename_map = {
-                'creationTimestamp': 'created_at',
-                'resolutionTimestamp': 'resolution_timestamp'
+                'id': 'fpmm_address', # This is the market_id (fpmm address)
+                'condition_id': 'market_id', # This is the true ID we need for trades
+                'question': 'question',
+                'start_time': 'created_at',
+                'resolved_on_timestamp': 'resolution_timestamp'
             }
             df_markets = df_markets.rename(columns=market_rename_map)
 
             # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
-            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
+            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce')
             
-            # Subgraph outcome is a string "0" or "1". Convert it.
+            # Gamma API outcome is a string "0" or "1". Convert it.
             df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
             
-            # Add missing 'start_price'
             if 'start_price' not in df_markets.columns:
                 df_markets['start_price'] = 0.50
             
-            df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
+            df_markets = df_markets.dropna(subset=['market_id', 'fpmm_address', 'question', 'created_at', 'outcome', 'start_price'])
             log.info(f"Markets after transform/dropna: {len(df_markets)} rows")
         
         except Exception as e:
-            log.error(f"Failed to parse Market data from Subgraph: {e}", exc_info=True)
+            log.error(f"Failed to parse Market data from Gamma API: {e}", exc_info=True)
             log.error(f"Market columns: {df_markets.columns}")
             return pd.DataFrame(), pd.DataFrame()
 
-        # --- 2. Process and Rename Trade Data ---
+        # --- 2. Process and Rename Trade Data (from Subgraph) ---
         try:
-            log.info("Processing Trade data...")
+            log.info("Processing Trade data (from Subgraph)...")
             if not df_trades.empty:
                 log.info(f"Raw trades loaded: {len(df_trades)} rows")
-                # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
+                # 'wallet_id' was created in _fetch_all_trades_from_subgraph
+                # 'market_id' from the Subgraph is the 'fpmm_address'
                 trade_rename_map = {
-                    'tradeAmount': 'size' # 'tradeAmount' is the trade size
+                    'tradeAmount': 'size',
+                    'market_id': 'fpmm_address' # Rename to join with markets
                 }
                 df_trades = df_trades.rename(columns=trade_rename_map)
 
@@ -1545,35 +1555,22 @@ class BacktestEngine:
                 df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
                 df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
 
-                # --- NEW: Robust Price and Size Calculation ---
-                
-                # Size is the value of the collateral (USDC)
-                # Fill NaN with 0 before scaling
+                # --- CALCULATE Price and Size ---
                 df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
-                
-                # Price = (collateral / 1e6) / (tokens / 1e18)
-                # Handle division by zero or NaN tokens
                 df_trades['tokens_scaled'] = (df_trades['tokens_raw'].fillna(0) / 1e18)
                 
-                # Set price to 0 where tokens are 0, else calculate
                 df_trades['price'] = 0.0
                 valid_mask = df_trades['tokens_scaled'] > 1e-9
                 df_trades.loc[valid_mask, 'price'] = df_trades['size'] / df_trades['tokens_scaled'][valid_mask]
-                
-                # Cap price at 1.0 (it can fly to infinity on tiny amounts)
                 df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
                 
-                # --- NEW: Logging ---
                 log.info(f"Trades before dropna: {len(df_trades)} rows")
-                
-                # Drop rows where essential calculations failed
-                df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
-                
+                df_trades = df_trades.dropna(subset=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
                 log.info(f"Trades after dropna: {len(df_trades)} rows")
 
             else:
                 # Ensure empty df has the *calculated* columns
-                df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
+                df_trades = pd.DataFrame(columns=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
 
         except Exception as e:
             log.error(f"Failed to parse Trade data from Subgraph: {e}", exc_info=True)
@@ -1581,21 +1578,33 @@ class BacktestEngine:
             return pd.DataFrame(), pd.DataFrame()
 
 
-        # --- 3. Prepare Market Data (for lookups) ---
+        # --- 3. Join Trades and Markets ---
+        # This is the critical step to link trades (fpmm_address)
+        # to the market details (market_id, outcome)
+        log.info("Joining trades and market data...")
+        # Create a lookup map from fpmm_address -> market_id (condition_id)
+        market_id_lookup = df_markets.set_index('fpmm_address')['market_id'].to_dict()
         market_outcomes = df_markets.set_index('market_id')['outcome'].to_dict()
         market_questions = df_markets.set_index('market_id')['question'].to_dict()
-        market_vectors = {mid: [0.1]*768 for mid in market_outcomes} # Mock embeddings
+        market_vectors = {mid: [0.1]*768 for mid in market_outcomes}
+        
+        # Map the true 'market_id' (condition_id) onto the trades DataFrame
+        df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_lookup)
+        
+        # Now that trades have the correct market_id, we can map the outcome
+        df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
+        
+        log.info(f"Trades after joining with market_id: {len(df_trades)}")
+        df_trades = df_trades.dropna(subset=['market_id', 'outcome'])
+        log.info(f"Trades after dropping those with no market_id/outcome: {len(df_trades)}")
 
         # --- 4. Create the Profiler DataFrame (for C4) ---
         log.info("Building profiler data...")
-        if not df_trades.empty:
-            df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
         
         # The Subgraph 'fpmmTransactions' entity provides one wallet ('wallet_id')
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
         
-        # --- NEW: Logging ---
         log.info(f"Profiler data before dropna (on outcome): {len(profiler_data)} rows")
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
         log.info(f"Profiler data after dropna (on outcome): {len(profiler_data)} rows")
