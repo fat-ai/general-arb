@@ -1770,11 +1770,25 @@ class BacktestEngine:
             name="pm_tuning_job"
         )
         
-        best_config = analysis.get_best_config(metric="irr", mode="max")
-        
-        log.info(f"--- C7: Tuning Job Complete ---")
-        log.info(f"Best config found for max IRR:")
-        log.info(best_config)
+        # --- START: NEW LOGGING CODE ---
+        best_trial = analysis.get_best_trial(metric="irr", mode="max")
+        if best_trial:
+            best_config = best_trial.config
+            best_metrics = best_trial.last_result
+            
+            log.info(f"--- C7: Tuning Job Complete ---")
+            log.info(f"Best config found for max IRR:")
+            log.info(json.dumps(best_config, indent=2))
+            log.info(f"--- Best Metrics ---")
+            log.info(f"IRR (Annualized): {best_metrics.get('irr', 0.0):.4f}")
+            log.info(f"Sharpe Ratio: {best_metrics.get('sharpe_ratio', 0.0):.4f}")
+            log.info(f"Max Drawdown: {best_metrics.get('max_drawdown', 0.0):.4f}")
+            log.info(f"Avg Brier Score: {best_metrics.get('brier_score', 0.0):.4f}")
+            
+        else:
+            log.error("--- C7: Tuning Job Failed. No successful trials completed. ---")
+            best_config = None
+        # --- END: NEW LOGGING CODE ---
         
         ray.shutdown()
         return best_config
