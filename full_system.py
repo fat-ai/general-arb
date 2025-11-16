@@ -1286,21 +1286,22 @@ class BacktestEngine:
     
         
     def _get_subgraph_url(self) -> str:
-        # The single source of truth, from the Polymarket docs.
-        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+        # The single source of truth, from the Polymarket docs (FPMM Subgraph)
+        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
 
     def _fetch_all_markets(self) -> pd.DataFrame:
         """
-        Fetches all 'market' entities from the Subgraph.
+        Fetches all 'FixedProductMarketMaker' entities from the Subgraph.
         """
         log.info("Fetching all markets from Polymarket Subgraph...")
         
-        # This GraphQL query gets all market data from the correct 'market' entity
+        # This GraphQL query gets all market data from the correct 'fixedProductMarketMakers' entity
+        # This entity is NOT in the orderbook subgraph, but IS in the fpmm-subgraph
         query_template = """
         {{
-          markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+          fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
-            question: title
+            question
             creationTimestamp
             resolveTimestamp: resolutionTimestamp
             outcome: winnerOutcome
@@ -1312,24 +1313,24 @@ class BacktestEngine:
             cache_key="polymarket_markets",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
-            entity_name="markets"
+            entity_name="fixedProductMarketMakers"
         )
         
     def _fetch_all_trades(self) -> pd.DataFrame:
         """
-        Fetches all 'orderFill' (trades) entities from the Subgraph.
+        Fetches all 'FpmmTransaction' (trades) entities from the Subgraph.
         """
         log.info("Fetching all trades from Polymarket Subgraph...")
         
-        # This GraphQL query fetches trades (orderFills)
+        # This GraphQL query fetches trades (fpmmTransactions)
         query_template = """
         {{
-          orderFills(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+          fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             timestamp
             price
-            size
-            creator: user {{ id }}
+            tradeAmount
+            user
             market {{ id }}
           }}
         }}
@@ -1339,16 +1340,16 @@ class BacktestEngine:
             cache_key="polymarket_trades",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
-            entity_name="orderFills"
+            entity_name="fpmmTransactions"
         )
         
         if df.empty:
             return df
 
         # --- Un-nest the nested data ---
-        # 'creator' column is a dict like {'id': '0x...'}. Get the 'id' value.
         try:
-            df['wallet_id'] = df['creator'].apply(lambda x: x['id'] if isinstance(x, dict) else None)
+            # 'user' column is just the wallet ID string
+            df['wallet_id'] = df['user']
             # 'market' column is a dict like {'id': '0x...'}. Get the 'id' value.
             df['market_id'] = df['market'].apply(lambda x: x['id'] if isinstance(x, dict) else None)
         except Exception as e:
@@ -1358,7 +1359,7 @@ class BacktestEngine:
             return pd.DataFrame()
         
         # Drop the original nested columns
-        df = df.drop(columns=['creator', 'market'])
+        df = df.drop(columns=['user', 'market'])
         return df
             
     def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
@@ -1456,8 +1457,7 @@ class BacktestEngine:
         # --- 1. Process and Rename Market Data ---
         try:
             log.info("Processing Market data...")
-            # Note: Aliasing (e.g., 'question: title') was done in the GraphQL query
-            # We just rename the 'id' and 'creationTimestamp'
+            # Note: Aliasing (e.g., 'outcome: winnerOutcome') was done in the GraphQL query
             market_rename_map = {
                 'id': 'market_id',
                 'creationTimestamp': 'created_at',
@@ -1487,14 +1487,17 @@ class BacktestEngine:
             log.info("Processing Trade data...")
             if not df_trades.empty:
                 # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
-                # 'price' and 'size' columns are already named correctly from the query
-                
+                trade_rename_map = {
+                    'tradeAmount': 'size' # 'tradeAmount' is the trade size
+                }
+                df_trades = df_trades.rename(columns=trade_rename_map)
+
                 # --- Type Coercion (Trades) ---
                 df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
                 df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
                 df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
                 
-                # CRITICAL: Subgraph `size` is a large integer (uint256).
+                # CRITICAL: Subgraph `tradeAmount` is a large integer (uint256).
                 # We divide by 1e6 to convert it to USDC value.
                 df_trades['size'] = df_trades['size'] / 1e6
                 
@@ -1520,7 +1523,7 @@ class BacktestEngine:
         if not df_trades.empty:
             df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
         
-        # The Subgraph 'orderFills' entity provides one wallet ('wallet_id')
+        # The Subgraph 'fpmmTransactions' entity provides one wallet ('wallet_id')
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
