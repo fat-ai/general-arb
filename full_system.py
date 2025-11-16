@@ -1501,189 +1501,176 @@ class BacktestEngine:
             return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
-        """
-        This is the "Transform" phase.
-        It creates two crucial DataFrames from the TWO different data sources:
-        1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
-        2. event_log: The time-series log for the C7 replay harness.
-        """
         log.info("Transforming raw Subgraph and Gamma API data into event log...")
 
-        # --- 1. Process and Rename Market Data (from Gamma API) ---
+        # Define empty returns for error cases
+        empty_log = pd.DataFrame(columns=['timestamp', 'event_type', 'data'])
+        empty_log.set_index('timestamp', inplace=True)
+        empty_profiler = pd.DataFrame(columns=['wallet_id', 'price', 'outcome', 'market_id', 'entity_type'])
+
+        # --- DEBUG: Print Schema ---
+        log.info(f"Markets Input Columns: {list(df_markets.columns)}")
+        if not df_trades.empty:
+            log.info(f"Trades Input Columns: {list(df_trades.columns)}")
+        # ---------------------------
+
+        # --- 1. Process Market Data (Gamma API) ---
         try:
-            log.info("Processing Market data (from Gamma API)...")
-            # This data has all the fields we need
-            market_rename_map = {
-                'id': 'fpmm_address', # This is the market_id (fpmm address)
-                'condition_id': 'market_id', # This is the true ID we need for trades
-                'question': 'question',
-                'start_time': 'created_at',
-                'resolved_on_timestamp': 'resolution_timestamp'
-            }
-            df_markets = df_markets.rename(columns=market_rename_map)
-
-            # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
-            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce')
+            # Map Gamma API columns to internal names
+            # Common Gamma columns: 'id' (market address), 'condition_id', 'question', 'outcomes' (list?), 'end_date_iso'
+            # We need to be flexible.
             
-            # Gamma API outcome is a string "0" or "1". Convert it.
-            df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            rename_map = {}
+            if 'id' in df_markets.columns: rename_map['id'] = 'fpmm_address'
+            if 'condition_id' in df_markets.columns: rename_map['condition_id'] = 'market_id'
+            if 'question' in df_markets.columns: rename_map['question'] = 'question'
+            # Gamma often uses 'end_date_iso' or 'resolution_time'
+            if 'end_date_iso' in df_markets.columns: rename_map['end_date_iso'] = 'resolution_timestamp'
+            if 'resolution_time' in df_markets.columns: rename_map['resolution_time'] = 'resolution_timestamp'
+            # Gamma might not have 'start_time', use 'created_at' or mock it
+            if 'created_at' in df_markets.columns: rename_map['created_at'] = 'created_at'
             
-            if 'start_price' not in df_markets.columns:
-                df_markets['start_price'] = 0.50
+            df_markets = df_markets.rename(columns=rename_map)
             
-            df_markets = df_markets.dropna(subset=['market_id', 'fpmm_address', 'question', 'created_at', 'outcome', 'start_price'])
-            log.info(f"Markets after transform/dropna: {len(df_markets)} rows")
-        
-        except Exception as e:
-            log.error(f"Failed to parse Market data from Gamma API: {e}", exc_info=True)
-            log.error(f"Market columns: {df_markets.columns}")
-            return pd.DataFrame(), pd.DataFrame()
+            # Ensure required columns exist
+            required_cols = ['fpmm_address', 'market_id', 'question']
+            for col in required_cols:
+                if col not in df_markets.columns:
+                    log.error(f"Missing required market column: {col}. Available: {df_markets.columns}")
+                    return empty_log, empty_profiler
 
-        # --- 2. Process and Rename Trade Data (from Subgraph) ---
-        try:
-            log.info("Processing Trade data (from Subgraph)...")
-            if not df_trades.empty:
-                log.info(f"Raw trades loaded: {len(df_trades)} rows")
-                # 'wallet_id' was created in _fetch_all_trades_from_subgraph
-                # 'market_id' from the Subgraph is the 'fpmm_address'
-                trade_rename_map = {
-                    'tradeAmount': 'size',
-                    'market_id': 'fpmm_address' # Rename to join with markets
-                }
-                df_trades = df_trades.rename(columns=trade_rename_map)
-
-                # --- Type Coercion (Trades) ---
-                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
-                df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
-                df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
-
-                # --- CALCULATE Price and Size ---
-                df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
-                df_trades['tokens_scaled'] = (df_trades['tokens_raw'].fillna(0) / 1e18)
-                
-                df_trades['price'] = 0.0
-                valid_mask = df_trades['tokens_scaled'] > 1e-9
-                df_trades.loc[valid_mask, 'price'] = df_trades['size'] / df_trades['tokens_scaled'][valid_mask]
-                df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
-                
-                log.info(f"Trades before dropna: {len(df_trades)} rows")
-                df_trades = df_trades.dropna(subset=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
-                log.info(f"Trades after dropna: {len(df_trades)} rows")
-
+            # Coercion
+            if 'resolution_timestamp' in df_markets.columns:
+                df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
             else:
-                # Ensure empty df has the *calculated* columns
-                df_trades = pd.DataFrame(columns=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
+                df_markets['resolution_timestamp'] = pd.NaT
+            
+            if 'created_at' not in df_markets.columns:
+                df_markets['created_at'] = datetime.now() - timedelta(days=365) # Mock start time if missing
+            else:
+                df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce')
+
+            # Outcome handling (Gamma often returns string '1' or '0', or just the outcome string)
+            # If outcome is missing, we can't use it for resolution, but we can use it for setup
+            if 'outcome' in df_markets.columns:
+                df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            else:
+                df_markets['outcome'] = pd.NA
+
+            df_markets['start_price'] = 0.50
+            
+            # Filter valid markets
+            df_markets = df_markets.dropna(subset=['market_id', 'fpmm_address', 'question'])
+            log.info(f"Valid markets processed: {len(df_markets)}")
 
         except Exception as e:
-            log.error(f"Failed to parse Trade data from Subgraph: {e}", exc_info=True)
-            log.error(f"Trade columns: {df_trades.columns}")
-            return pd.DataFrame(), pd.DataFrame()
+            log.error(f"Failed to parse Market data: {e}", exc_info=True)
+            return empty_log, empty_profiler
 
+        # --- 2. Process Trade Data (Subgraph) ---
+        try:
+            if df_trades.empty:
+                return empty_log, empty_profiler
+            
+            trade_rename_map = {
+                'tradeAmount': 'size',
+                'market_id': 'fpmm_address' 
+            }
+            df_trades = df_trades.rename(columns=trade_rename_map)
 
-        # --- 3. Join Trades and Markets ---
-        # This is the critical step to link trades (fpmm_address)
-        # to the market details (market_id, outcome)
-        log.info("Joining trades and market data...")
-        # Create a lookup map from fpmm_address -> market_id (condition_id)
-        market_id_lookup = df_markets.set_index('fpmm_address')['market_id'].to_dict()
-        market_outcomes = df_markets.set_index('market_id')['outcome'].to_dict()
-        market_questions = df_markets.set_index('market_id')['question'].to_dict()
-        market_vectors = {mid: [0.1]*768 for mid in market_outcomes}
-        
-        # Map the true 'market_id' (condition_id) onto the trades DataFrame
-        df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_lookup)
-        
-        # Now that trades have the correct market_id, we can map the outcome
-        df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
-        
-        log.info(f"Trades after joining with market_id: {len(df_trades)}")
-        df_trades = df_trades.dropna(subset=['market_id', 'outcome'])
-        log.info(f"Trades after dropping those with no market_id/outcome: {len(df_trades)}")
+            df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
+            df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
+            df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
 
-        # --- 4. Create the Profiler DataFrame (for C4) ---
-        log.info("Building profiler data...")
+            # Calcs
+            df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
+            df_trades['tokens_scaled'] = (df_trades['tokens_raw'].fillna(0) / 1e18)
+            
+            df_trades['price'] = 0.0
+            valid_mask = df_trades['tokens_scaled'] > 1e-9
+            df_trades.loc[valid_mask, 'price'] = df_trades['size'] / df_trades['tokens_scaled'][valid_mask]
+            df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
+            
+            df_trades = df_trades.dropna(subset=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
+            log.info(f"Valid trades processed: {len(df_trades)}")
+
+        except Exception as e:
+            log.error(f"Failed to parse Trade data: {e}", exc_info=True)
+            return empty_log, empty_profiler
+
+        # --- 3. Join ---
+        # Maps FPMM Address -> Market ID (Condition ID)
+        market_id_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
+        outcome_map = df_markets.set_index('market_id')['outcome'].to_dict()
         
-        # The Subgraph 'fpmmTransactions' entity provides one wallet ('wallet_id')
+        df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_map)
+        
+        # Drop trades for markets we don't have details for
+        df_trades = df_trades.dropna(subset=['market_id'])
+        
+        # Map outcomes (for profiler)
+        df_trades['outcome'] = df_trades['market_id'].map(outcome_map)
+
+        # --- 4. Profiler Data ---
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
-        profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
+        profiler_data['entity_type'] = 'default_topic'
+        profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']) # Only resolved trades
         
-        log.info(f"Profiler data before dropna (on outcome): {len(profiler_data)} rows")
-        profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
-        log.info(f"Profiler data after dropna (on outcome): {len(profiler_data)} rows")
-        
-        # --- 5. Create the Event Log (for C7) ---
-        log.info("Building event log...")
+        # --- 5. Event Log ---
         events = []
         
-        # a) Create NEW_CONTRACT events
+        # New Contracts
+        # We create vector mock here
         for _, row in df_markets.iterrows():
             events.append((
-                row['created_at'],
-                'NEW_CONTRACT',
-                {
-                    'id': row['market_id'],
-                    'text': row['question'],
-                    'vector': market_vectors.get(row['market_id'], [0.1]*768),
-                    'liquidity': 0, 
-                    'p_market_all': row['start_price']
-                }
+                row['created_at'], 'NEW_CONTRACT',
+                {'id': row['market_id'], 'text': row['question'], 'vector': [0.1]*768, 'liquidity': 0, 'p_market_all': 0.5}
             ))
             
-        # b) Create RESOLUTION events
-        for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
-            events.append((
-                row['resolution_timestamp'],
-                'RESOLUTION',
+        # Resolutions
+        for _, row in df_markets.dropna(subset=['resolution_timestamp', 'outcome']).iterrows():
+             events.append((
+                row['resolution_timestamp'], 'RESOLUTION',
                 {'id': row['market_id'], 'outcome': row['outcome']}
             ))
             
-        # c) Create PRICE_UPDATE events from trades
-        if not df_trades.empty:
-            for _, row in df_trades.iterrows():
-                
-                # --- THIS IS THE FIX ---
-                # We now create the event with the keys that C4 expects
-                event_data = {
-                    'id': row['market_id'],
+        # Prices
+        for _, row in df_trades.iterrows():
+            events.append((
+                row['timestamp'], 'PRICE_UPDATE',
+                {
+                    'id': row['market_id'], 
                     'p_market_all': row['price'],
                     'wallet_id': row['wallet_id'],
-                    'trade_price': row['price'], # C4 expects 'trade_price'
-                    'trade_volume': abs(row['size']) # C4 expects 'trade_volume'
+                    'trade_price': row['price'],
+                    'trade_volume': abs(row['size'])
                 }
-                
-                events.append((
-                    row['timestamp'],
-                    'PRICE_UPDATE',
-                    event_data
-                ))
-
-        # --- 6. Sort and return the final event log ---
-        event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
-        if event_log.empty:
-            log.warning("No events created. Returning empty event log.")
-            return pd.DataFrame(), profiler_data
+            ))
             
-        event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
-        event_log['timestamp'] = pd.to_datetime(event_log['timestamp'])
-        event_log = event_log.set_index('timestamp').sort_index()
-        
-        log.info(f"ETL complete. {len(profiler_data)} trades for profiler, {len(event_log)} total events.")
+        event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        if not event_log.empty:
+            event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
+            event_log['timestamp'] = pd.to_datetime(event_log['timestamp'])
+            event_log = event_log.set_index('timestamp').sort_index()
+
+        log.info(f"ETL Complete. Profiler: {len(profiler_data)}, Events: {len(event_log)}")
         return event_log, profiler_data
 
     @staticmethod
     def _run_single_backtest(config: Dict[str, Any], historical_data: pd.DataFrame, profiler_data: pd.DataFrame):
         """
         This is the "objective" function that Ray Tune will optimize.
-        It runs one *REAL* C1-C6 pipeline simulation.
-        (This function is unchanged from your original file)
         """
         log.debug(f"--- C7: Starting back-test run with config: {config} ---")
-        # --- START YOUR FIX 4: Quick Diagnostic ---
+        
+        # --- FIX: Defensive Logging to prevent KeyError ---
+        if historical_data.empty or 'event_type' not in historical_data.columns:
+            log.warning("[BACKTEST] Historical data is empty or malformed. Skipping run.")
+            # Return worst-case metrics so the tuner knows this run failed
+            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0, 'max_drawdown': 1.0})
+            return
+
         log.info(f"[BACKTEST] Starting with {len(historical_data)} events")
-        log.info(f"[BACKTEST] Event types: {historical_data['event_type'].value_counts().to_dict()}")
-        log.info(f"[BACKTEST] Profiler data: {len(profiler_data)} trades")
-        # --- END YOUR FIX 4 ---
         try:
             # 1. Initialize all components *with this run's config*
             graph = GraphManager(is_mock=True) # Mocks the DB
@@ -1697,13 +1684,9 @@ class BacktestEngine:
             linker = RelationalLinker(graph)
             ai_analyst = AIAnalyst()
             
-            # --- ** NEW: Pre-train the Profiler ** ---
-            # We must *first* train the profiler on all historical trades
-            # so the LiveFeedHandler has Brier scores to use.
             profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
-            # We pass the *real* profiler_data to the (mocked) GraphManager
             graph.mock_db['profiler_data'] = profiler_data 
-            profiler.run_profiling() # This will populate the mock_db['wallets']
+            profiler.run_profiling() 
             
             live_feed = LiveFeedHandler(graph)
             prior_manager = PriorManager(graph, ai_analyst, live_feed)
@@ -1721,73 +1704,47 @@ class BacktestEngine:
             portfolio.start_time = historical_data.index.min()
             portfolio.end_time = historical_data.index.max()
             
-            current_prices = {} # {contract_id: price}
+            current_prices = {} 
             
             # 3. --- The Replay Loop ---
             for timestamp, events in historical_data.groupby(historical_data.index):
                 
-                # --- A. Process all non-trade events first ---
                 for _, event in events.iterrows():
                     data = event['data']
                     event_type = event['event_type']
                     contract_id = event['contract_id']
                     
                     if event_type == 'NEW_CONTRACT':
-                        log.debug(f"Event: NEW_CONTRACT {contract_id}")
                         graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
                         prior_manager.process_pending_contracts()
-                        belief_engine.run_fusion_process() # <-- YOUR FIX 1
+                        belief_engine.run_fusion_process() 
                     
                     elif event_type == 'RESOLUTION':
-                        log.debug(f"Event: RESOLUTION {contract_id}")
                         p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
                         portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
                         current_prices.pop(contract_id, None)
                         graph.update_contract_status(contract_id, 'RESOLVED', {'outcome': data['outcome']})
 
-                # --- B. Process price updates & rebalance ---
+                # Process price updates & rebalance
                 price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
                 if price_updates:
-                    log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
-                    
                     for c_id, data in price_updates.items():
                         current_prices[c_id] = data['p_market_all']
                         if c_id in graph.mock_db['contracts']:
-                            # C1/C4: Add this trade to the graph mock_db
-                            # This simulates the ingestor updating the price and C4 seeing the trade
                             graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
-                            # Add the trade to the mock_db for C4 to find
-                            # (We create a list of all trades in this batch)
                             graph.mock_db['live_trades'] = [d['data'] for _, d in events.iterrows() if d['event_type'] == 'PRICE_UPDATE' and d['contract_id'] == c_id]
-                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger
+                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') 
                     
                     prior_manager.process_pending_contracts() 
-                    
                     belief_engine.run_fusion_process()
-                    # --- START YOUR FIX 4: Status Check ---
-                    monitored_count = sum(1 for c in graph.mock_db['contracts'].values() if c.get('status') == 'MONITORED')
-                    log.info(f"[BACKTEST] Contracts in MONITORED status: {monitored_count}")
-                    # --- END YOUR FIX 4 ---
                     
                     target_basket = pm.run_optimization_cycle()
-                    # --- START YOUR FIX 3: Log Basket ---
-                    log.info(f"[BACKTEST] Timestamp: {timestamp}, Target basket: {target_basket}, Current positions: {portfolio.positions}")
-                    # --- END YOUR FIX 3 ---
                     portfolio.rebalance(target_basket, current_prices)
             
-            # 4. Get final metrics
             metrics = portfolio.get_final_metrics()
-            
-            # 5. Report to Ray Tune
             tune.report(metrics)
-            
-            # --- START YOUR FIX 4: Final Log ---
-            log.info(f"[BACKTEST] Final portfolio: {portfolio.get_total_value(current_prices)}")
-            log.info(f"[BACKTEST] Total P&L history entries: {len(portfolio.pnl_history)}")
-            log.info(f"[BACKTEST] Total Brier scores recorded: {len(portfolio.brier_scores)}")
-            # --- END YOUR FIX 4 ---
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
