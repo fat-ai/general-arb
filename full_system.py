@@ -1433,13 +1433,13 @@ class BacktestEngine:
                  log.warning(f"Dune query {query_id} returned unexpected JSON structure.")
                  return pd.DataFrame()
                        
-            df = pd.DataFrame(json_response["result"]["rows"])
+             df = pd.DataFrame(json_response["result"]["rows"])
             
             # Save to cache
-            with open(cache_file, 'wb') as f:
-                pickle.dump(df, f)
-            log.info(f"Saved new cache file: {cache_file}")
-            return df
+             with open(cache_file, 'wb') as f:
+                 pickle.dump(df, f)
+             log.info(f"Saved new cache file: {cache_file}")
+             return df
             
         except Exception as e:
             log.error(f"Failed to process Dune response for {query_id}: {e}", exc_info=True)
