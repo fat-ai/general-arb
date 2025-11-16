@@ -24,9 +24,9 @@ import requests # For downloading files
 import gzip     # For decompressing .gz files
 import io       # For reading in-memory bytes
 from datetime import datetime, timedelta # For parsing timestamps# For parsing timestamps
-from dune_client.client import DuneClient
-from dune_client.query import QueryBase
-from dune_client.types import QueryParameter
+#from dune_client.client import DuneClient
+#from dune_client.query import QueryBase
+#from dune_client.types import QueryParameter
 import pickle
 from pathlib import Path
 import time
@@ -1405,22 +1405,35 @@ class BacktestEngine:
                 log.warning(f"Failed to load cache file {cache_file}: {e}. Refetching.")
         
         # If no cache, fetch from Dune
-        if not self.dune_client:
-            log.error("Dune client not initialized. Cannot fetch data.")
-            return pd.DataFrame()
+      #  if not self.dune_client:
+      #      log.error("Dune client not initialized. Cannot fetch data.")
+      #      return pd.DataFrame()
             
+      #  log.info(f"Fetching new result for query {query_id} from Dune...")
+        if not self.dune_api_key:
+             log.error("Dune API key not set. Cannot fetch data.")
+             return pd.DataFrame()
+
         log.info(f"Fetching new result for query {query_id} from Dune...")
+        
         try:
-            # Use get_latest_result as requested
-            query_result = self.dune_client.get_latest_result(query_id)
-            
-            # The result data is in query_result.result.rows
-            # This returns a list of dicts, perfect for pd.DataFrame
-            if not query_result.result:
-                log.warning(f"Dune query {query_id} returned no result object.")
-                return pd.DataFrame()
-                
-            df = pd.DataFrame(query_result.result.rows)
+            # Construct the URL and headers as requested
+             url = f"https://api.dune.com/api/v1/query/{query_id}/results"
+             headers = {"x-dune-api-key": self.dune_api_key}
+             
+             # Make the direct API call
+             response = requests.get(url, headers=headers)
+             response.raise_for_status() # Raise an exception for bad status codes
+             
+             json_response = response.json()
+ 
+             # Extract the rows from the JSON response
+             # The structure is {"result": {"rows": [...]}}
+             if "result" not in json_response or "rows" not in json_response["result"]:
+                 log.warning(f"Dune query {query_id} returned unexpected JSON structure.")
+                 return pd.DataFrame()
+                       
+            df = pd.DataFrame(json_response["result"]["rows"])
             
             # Save to cache
             with open(cache_file, 'wb') as f:
@@ -1429,7 +1442,7 @@ class BacktestEngine:
             return df
             
         except Exception as e:
-            log.error(f"Dune query {query_id} failed: {e}", exc_info=True)
+            log.error(f"Failed to process Dune response for {query_id}: {e}", exc_info=True)
             return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
