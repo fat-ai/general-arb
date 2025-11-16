@@ -1247,10 +1247,10 @@ class BacktestEngine:
     def __init__(self, historical_data_path: str):
         log.info("BacktestEngine (C7) Production initialized.")
         self.historical_data_path = historical_data_path # Useful for caching
-        self.cache_dir = Path(self.historical_data_path) / "dune_cache" 
+        self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.dune_api_key = os.getenv("DUNE_API_KEY")
         log.info("BacktestEngine initialized in Polymarket Subgraph API mode.")
+            
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
 
@@ -1377,11 +1377,17 @@ class BacktestEngine:
                 except OSError as e:
                     log.warning(f"Could not delete old cache file {old_file}: {e}")
 
+        # --- NEW: Improved Cache-Checking Logic ---
         if cache_file.exists():
             log.info(f"Loading cached result for {cache_key} from {cache_file}")
             try:
                 with open(cache_file, 'rb') as f:
-                    return pickle.load(f)
+                    df = pickle.load(f)
+                    if not df.empty:
+                        log.info(f"Cached data for {cache_key} is valid and has {len(df)} rows.")
+                        return df
+                    else:
+                        log.warning(f"Cached file {cache_file} was empty. Refetching.")
             except Exception as e:
                 log.warning(f"Failed to load cache file {cache_file}: {e}. Refetching.")
         
@@ -1401,8 +1407,14 @@ class BacktestEngine:
                 
                 data = response.json().get('data', {})
                 if not data:
-                    log.error(f"Invalid GraphQL response: {response.json()}")
-                    break
+                    # Check for GraphQL errors in the response
+                    errors = response.json().get('errors')
+                    if errors:
+                        log.error(f"Invalid GraphQL response: {errors}")
+                    else:
+                        log.error(f"Invalid GraphQL response: {response.json()}")
+                    break # Stop on error
+                
                 rows = data.get(entity_name, [])
                 
                 if not rows:
