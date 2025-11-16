@@ -1261,7 +1261,7 @@ class BacktestEngine:
         using daily caching and pagination.
         """
 
-        # --- Query 1: Markets ---
+        # --- Query 1: Markets (Now a 2-step process) ---
         log.info("Fetching all market details from Polymarket Subgraph...")
         df_markets = self._fetch_all_markets()
 
@@ -1276,7 +1276,7 @@ class BacktestEngine:
         if df_trades.empty:
             log.warning("No trades found from Polymarket Subgraph.")
             # Return an empty DataFrame with the expected *raw* columns from the Subgraph
-            df_trades = pd.DataFrame(columns=['id', 'timestamp', 'price', 'collateralAmount', 'creator', 'market'])
+            df_trades = pd.DataFrame(columns=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'market'])
 
         # --- Data Type Coercion is now handled in _transform_data_to_event_log ---
         # We return the raw dataframes here.
@@ -1291,57 +1291,74 @@ class BacktestEngine:
 
     def _fetch_all_markets(self) -> pd.DataFrame:
         """
-        Fetches all 'FixedProductMarketMaker' entities and their related 'Condition'
-        data from the Subgraph.
+        Fetches all markets by joining 'fixedProductMarketMakers' and 'conditions'
+        from the Subgraph.
         """
-        log.info("Fetching all markets from Polymarket Subgraph...")
+        log.info("Fetching all markets (Step 1/2: fixedProductMarketMakers)...")
         
-        # This GraphQL query now correctly fetches the nested Condition data
-        query_template = """
+        # 1. Fetch all 'fixedProductMarketMakers'
+        fpmm_query_template = """
         {{
           fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             creationTimestamp
-            conditions(first: 1) {{
-              id
-              question
-              resolutionTimestamp
-              outcome
-            }}
+            conditions
           }}
         }}
         """
-        
-        df = self._fetch_paginated_subgraph(
-            cache_key="polymarket_markets",
+        df_fpmm = self._fetch_paginated_subgraph(
+            cache_key="polymarket_fpmm_markets", # New cache key
             subgraph_url=self._get_subgraph_url(),
-            query_template=query_template,
+            query_template=fpmm_query_template,
             entity_name="fixedProductMarketMakers"
         )
-
-        if df.empty:
-            return df
-
-        # --- Un-nest the nested Condition data ---
-        # The 'conditions' column contains a list with one dictionary.
-        try:
-            df['condition_data'] = df['conditions'].apply(lambda x: x[0] if x and len(x) > 0 else None)
-            df_conditions = pd.json_normalize(df['condition_data'])
-            
-            # Concatenate the un-nested data back
-            df = pd.concat([df.drop(columns=['conditions', 'condition_data']), df_conditions], axis=1)
-            
-            # The 'id' from the condition entity is the 'condition_id'
-            # The 'id' from the parent is the 'market_id' (fpmm address)
-            df = df.rename(columns={'id': 'market_id', 'condition_id': 'condition_id_from_entity'})
-
-        except Exception as e:
-            log.error(f"Failed to un-nest Condition data: {e}")
-            log.error(f"Data columns: {df.columns}")
-            log.error(f"Sample data: {df.head()}")
+        if df_fpmm.empty:
+            log.error("Failed to fetch fpmmMarkets (Step 1).")
             return pd.DataFrame()
 
-        return df
+        # Un-nest the 'conditions' array (which is a list of string IDs)
+        df_fpmm['condition_id'] = df_fpmm['conditions'].apply(lambda x: x[0] if x and len(x) > 0 else None)
+        df_fpmm = df_fpmm.dropna(subset=['condition_id'])
+        df_fpmm = df_fpmm.rename(columns={'id': 'market_id'}) # 'id' is the fpmm address
+        df_fpmm = df_fpmm[['market_id', 'creationTimestamp', 'condition_id']] # Keep only what we need
+
+        log.info(f"Fetching all market details (Step 2/2: conditions)...")
+
+        # 2. Fetch all 'conditions'
+        condition_query_template = """
+        {{
+          conditions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+            id
+            question
+            resolutionTimestamp
+            outcome
+          }}
+        }}
+        """
+        df_conditions = self._fetch_paginated_subgraph(
+            cache_key="polymarket_conditions", # New cache key
+            subgraph_url=self._get_subgraph_url(),
+            query_template=condition_query_template,
+            entity_name="conditions"
+        )
+        if df_conditions.empty:
+            log.error("Failed to fetch conditions (Step 2).")
+            return pd.DataFrame()
+
+        # 'id' here is the 'condition_id'
+        df_conditions = df_conditions.rename(columns={'id': 'condition_id'})
+
+        # 3. Join the two DataFrames
+        log.info("Joining market and condition data...")
+        df_markets = pd.merge(
+            df_fpmm,
+            df_conditions,
+            on='condition_id',
+            how='inner'
+        )
+
+        log.info(f"Successfully joined {len(df_markets)} markets with details.")
+        return df_markets
         
     def _fetch_all_trades(self) -> pd.DataFrame:
         """
@@ -1485,15 +1502,16 @@ class BacktestEngine:
         # --- 1. Process and Rename Market Data ---
         try:
             log.info("Processing Market data...")
-            # Note: Aliasing (e.g., 'outcome: winnerOutcome') was done in the GraphQL query
+            # Note: All columns (market_id, question, outcome) are now present
+            # from the join in _fetch_all_markets
             market_rename_map = {
-                'id': 'market_id',
                 'creationTimestamp': 'created_at',
+                'resolutionTimestamp': 'resolution_timestamp'
             }
             df_markets = df_markets.rename(columns=market_rename_map)
 
             # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolveTimestamp'], unit='s', errors='coerce')
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
             df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
             
             # Subgraph outcome is a string "0" or "1". Convert it.
@@ -1504,29 +1522,34 @@ class BacktestEngine:
                 df_markets['start_price'] = 0.50
             
             df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
+            log.info(f"Markets after transform/dropna: {len(df_markets)} rows")
         
         except Exception as e:
             log.error(f"Failed to parse Market data from Subgraph: {e}", exc_info=True)
             log.error(f"Market columns: {df_markets.columns}")
             return pd.DataFrame(), pd.DataFrame()
 
-        # --- 2. Process and Rename Trade Data (THE FIX) ---
+        # --- 2. Process and Rename Trade Data ---
         try:
             log.info("Processing Trade data...")
             if not df_trades.empty:
                 log.info(f"Raw trades loaded: {len(df_trades)} rows")
                 # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
-                
-                # --- Type Coercion (Raw fields) ---
+                trade_rename_map = {
+                    'tradeAmount': 'size' # 'tradeAmount' is the trade size
+                }
+                df_trades = df_trades.rename(columns=trade_rename_map)
+
+                # --- Type Coercion (Trades) ---
                 df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
-                df_trades['tradeAmount_raw'] = pd.to_numeric(df_trades['tradeAmount'], errors='coerce')
+                df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
                 df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
 
-                # --- CALCULATE Price and Size ---
+                # --- NEW: Robust Price and Size Calculation ---
                 
                 # Size is the value of the collateral (USDC)
                 # Fill NaN with 0 before scaling
-                df_trades['size'] = (df_trades['tradeAmount_raw'].fillna(0) / 1e6)
+                df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
                 
                 # Price = (collateral / 1e6) / (tokens / 1e18)
                 # Handle division by zero or NaN tokens
@@ -1540,7 +1563,7 @@ class BacktestEngine:
                 # Cap price at 1.0 (it can fly to infinity on tiny amounts)
                 df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
                 
-                # --- Logging ---
+                # --- NEW: Logging ---
                 log.info(f"Trades before dropna: {len(df_trades)} rows")
                 
                 # Drop rows where essential calculations failed
@@ -1571,7 +1594,11 @@ class BacktestEngine:
         # The Subgraph 'fpmmTransactions' entity provides one wallet ('wallet_id')
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
+        
+        # --- NEW: Logging ---
+        log.info(f"Profiler data before dropna (on outcome): {len(profiler_data)} rows")
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+        log.info(f"Profiler data after dropna (on outcome): {len(profiler_data)} rows")
         
         # --- 5. Create the Event Log (for C7) ---
         log.info("Building event log...")
