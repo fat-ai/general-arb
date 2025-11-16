@@ -408,12 +408,15 @@ class GraphManager:
             return df if not df.empty else pd.DataFrame(columns=['wallet_id', 'trade_price', 'trade_volume'])
 
     def get_contract_topic(self, contract_id: str) -> str:
-        if self.is_mock: return "biotech"
+ 
+        if self.is_mock: 
+            return "default_topic"
+        
         with self.driver.session() as session:
             result = session.execute_read(
                 lambda tx: tx.run("MATCH (c:Contract {contract_id: $id})-[:IS_ABOUT]->(e:Entity) RETURN e.type AS topic LIMIT 1", id=contract_id).single()
             )
-        return result.data().get('topic') if result else "default"
+        return result.data().get('topic') if result else "default_topic"
 
     def update_wallet_scores(self, wallet_scores: Dict[tuple, float]):
         if self.is_mock: 
@@ -1676,6 +1679,11 @@ class BacktestEngine:
         (This function is unchanged from your original file)
         """
         log.debug(f"--- C7: Starting back-test run with config: {config} ---")
+        # --- START YOUR FIX 4: Quick Diagnostic ---
+        log.info(f"[BACKTEST] Starting with {len(historical_data)} events")
+        log.info(f"[BACKTEST] Event types: {historical_data['event_type'].value_counts().to_dict()}")
+        log.info(f"[BACKTEST] Profiler data: {len(profiler_data)} trades")
+        # --- END YOUR FIX 4 ---
         try:
             # 1. Initialize all components *with this run's config*
             graph = GraphManager(is_mock=True) # Mocks the DB
@@ -1730,6 +1738,7 @@ class BacktestEngine:
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
                         prior_manager.process_pending_contracts()
+                        belief_engine.run_fusion_process() # <-- YOUR FIX 1
                     
                     elif event_type == 'RESOLUTION':
                         log.debug(f"Event: RESOLUTION {contract_id}")
@@ -1755,8 +1764,17 @@ class BacktestEngine:
                             graph.update_contract_status(c_id, 'PENDING_ANALYSIS') # Re-trigger
                     
                     prior_manager.process_pending_contracts() 
+                    
                     belief_engine.run_fusion_process()
+                    # --- START YOUR FIX 4: Status Check ---
+                    monitored_count = sum(1 for c in graph.mock_db['contracts'].values() if c.get('status') == 'MONITORED')
+                    log.info(f"[BACKTEST] Contracts in MONITORED status: {monitored_count}")
+                    # --- END YOUR FIX 4 ---
+                    
                     target_basket = pm.run_optimization_cycle()
+                    # --- START YOUR FIX 3: Log Basket ---
+                    log.info(f"[BACKTEST] Timestamp: {timestamp}, Target basket: {target_basket}, Current positions: {portfolio.positions}")
+                    # --- END YOUR FIX 3 ---
                     portfolio.rebalance(target_basket, current_prices)
             
             # 4. Get final metrics
@@ -1764,6 +1782,12 @@ class BacktestEngine:
             
             # 5. Report to Ray Tune
             tune.report(metrics)
+            
+            # --- START YOUR FIX 4: Final Log ---
+            log.info(f"[BACKTEST] Final portfolio: {portfolio.get_total_value(current_prices)}")
+            log.info(f"[BACKTEST] Total P&L history entries: {len(portfolio.pnl_history)}")
+            log.info(f"[BACKTEST] Total Brier scores recorded: {len(portfolio.brier_scores)}")
+            # --- END YOUR FIX 4 ---
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
