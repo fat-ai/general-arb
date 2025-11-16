@@ -1277,10 +1277,7 @@ class BacktestEngine:
 
         # Define Query IDs from your spec
         MARKET_DETAILS_QUERY_ID = 6175624
-        TRADES_CURRENT_MONTH_ID = 6213459
-        TRADES_PRIOR_MONTH_ID = 6181947
-        TRADES_OLDER_ID = 6213588
-
+        TRADES_QUERY_ID = 6213459
         # --- Query 1: Markets ---
         log.info(f"Fetching market details (Query ID: {MARKET_DETAILS_QUERY_ID})...")
         df_markets = self._get_cached_dune_result(MARKET_DETAILS_QUERY_ID)
@@ -1290,23 +1287,12 @@ class BacktestEngine:
             return pd.DataFrame(), pd.DataFrame()
 
         # --- Query 2: Trades ---
-        log.info("Fetching market trades (all chunks)...")
-        df_trades_current = self._get_cached_dune_result(TRADES_CURRENT_MONTH_ID)
-        df_trades_prior = self._get_cached_dune_result(TRADES_PRIOR_MONTH_ID)
-        df_trades_older = self._get_cached_dune_result(TRADES_OLDER_ID)
+        log.info(f"Fetching all trades (Query ID: {TRADES_QUERY_ID})...")
+        df_trades = self._get_cached_dune_result(TRADES_QUERY_ID)
         
-        all_trade_dfs = []
-        if not df_trades_current.empty: all_trade_dfs.append(df_trades_current)
-        if not df_trades_prior.empty: all_trade_dfs.append(df_trades_prior)
-        if not df_trades_older.empty: all_trade_dfs.append(df_trades_older)
-
-        if not all_trade_dfs:
+        if df_trades.empty:
             log.warning("No trades found from any Dune query.")
-            df_trades = pd.DataFrame() # Empty frame with no columns
-        else:
-            df_trades = pd.concat(all_trade_dfs, ignore_index=True)
-            # De-duplicate trades, just in case of overlap
-            df_trades = df_trades.drop_duplicates()
+            df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address', 'outcome'])
 
         # --- Data Type Coercion (Same as original) ---
         try:
