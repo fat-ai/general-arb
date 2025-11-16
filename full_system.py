@@ -1291,19 +1291,19 @@ class BacktestEngine:
 
     def _fetch_all_markets(self) -> pd.DataFrame:
         """
-        Fetches all 'markets' entities from the Subgraph.
+        Fetches all 'fpmmMarket' entities from the Subgraph.
         """
         log.info("Fetching all markets from Polymarket Subgraph...")
         
-        # This GraphQL query gets all market data
+        # This GraphQL query gets all market data from the correct entity
         query_template = """
         {{
-          markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+          fpmmMarket(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
-            question
+            question: title
             creationTimestamp
-            resolveTimestamp
-            outcome
+            resolveTimestamp: resolutionTimestamp
+            outcome: winnerOutcome
           }}
         }}
         """
@@ -1312,7 +1312,7 @@ class BacktestEngine:
             cache_key="polymarket_markets",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
-            entity_name="markets"
+            entity_name="fpmmMarket"
         )
 
     def _fetch_all_trades(self) -> pd.DataFrame:
