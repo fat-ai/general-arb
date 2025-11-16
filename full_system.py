@@ -1247,6 +1247,8 @@ class BacktestEngine:
     def __init__(self, historical_data_path: str):
         log.info("BacktestEngine (C7) Production initialized.")
         self.historical_data_path = historical_data_path # Useful for caching
+        self.cache_dir = Path(self.historical_data_path) / "dune_cache" # <-- ADD THIS
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         
         self.dune_api_key = os.getenv("DUNE_API_KEY")
         if not self.dune_api_key:
