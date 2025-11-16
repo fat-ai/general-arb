@@ -1291,30 +1291,57 @@ class BacktestEngine:
 
     def _fetch_all_markets(self) -> pd.DataFrame:
         """
-        Fetches all 'FixedProductMarketMaker' entities from the Subgraph.
+        Fetches all 'FixedProductMarketMaker' entities and their related 'Condition'
+        data from the Subgraph.
         """
         log.info("Fetching all markets from Polymarket Subgraph...")
         
-        # This GraphQL query gets all market data from the correct 'fixedProductMarketMakers' entity
-        # This entity is NOT in the orderbook subgraph, but IS in the fpmm-subgraph
+        # This GraphQL query now correctly fetches the nested Condition data
         query_template = """
         {{
           fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
-            question
             creationTimestamp
-            resolveTimestamp: resolutionTimestamp
-            outcome: winnerOutcome
+            conditions(first: 1) {{
+              id
+              question
+              resolutionTimestamp
+              outcome
+            }}
           }}
         }}
         """
         
-        return self._fetch_paginated_subgraph(
+        df = self._fetch_paginated_subgraph(
             cache_key="polymarket_markets",
             subgraph_url=self._get_subgraph_url(),
             query_template=query_template,
             entity_name="fixedProductMarketMakers"
         )
+
+        if df.empty:
+            return df
+
+        # --- Un-nest the nested Condition data ---
+        # The 'conditions' column contains a list with one dictionary.
+        try:
+            df['condition_data'] = df['conditions'].apply(lambda x: x[0] if x and len(x) > 0 else None)
+            df_conditions = pd.json_normalize(df['condition_data'])
+            
+            # Concatenate the un-nested data back
+            df = pd.concat([df.drop(columns=['conditions', 'condition_data']), df_conditions], axis=1)
+            
+            # The 'id' from the condition entity is the 'condition_id'
+            # The 'id' from the parent is the 'market_id' (fpmm address)
+            df = df.rename(columns={'id': 'market_id', 'condition_id': 'condition_id_from_entity'})
+
+        except Exception as e:
+            log.error(f"Failed to un-nest Condition data: {e}")
+            log.error(f"Data columns: {df.columns}")
+            log.error(f"Sample data: {df.head()}")
+            return pd.DataFrame()
+
+        return df
         
     def _fetch_all_trades(self) -> pd.DataFrame:
         """
@@ -1322,14 +1349,14 @@ class BacktestEngine:
         """
         log.info("Fetching all trades from Polymarket Subgraph...")
         
-        # This GraphQL query fetches trades (fpmmTransactions)
+        # This GraphQL query fetches fields needed to *calculate* price
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             timestamp
-            price
             tradeAmount
+            outcomeTokensAmount
             user
             market {{ id }}
           }}
@@ -1457,15 +1484,16 @@ class BacktestEngine:
         # --- 1. Process and Rename Market Data ---
         try:
             log.info("Processing Market data...")
-            # Note: Aliasing (e.g., 'outcome: winnerOutcome') was done in the GraphQL query
+            # 'market_id', 'question', 'outcome', etc. are now top-level
+            # from the un-nesting in _fetch_all_markets
             market_rename_map = {
-                'id': 'market_id',
                 'creationTimestamp': 'created_at',
+                'resolutionTimestamp': 'resolution_timestamp'
             }
             df_markets = df_markets.rename(columns=market_rename_map)
 
             # --- Type Coercion (Markets) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolveTimestamp'], unit='s', errors='coerce')
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
             df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
             
             # Subgraph outcome is a string "0" or "1". Convert it.
@@ -1487,24 +1515,29 @@ class BacktestEngine:
             log.info("Processing Trade data...")
             if not df_trades.empty:
                 # 'wallet_id' and 'market_id' were already created in _fetch_all_trades
-                trade_rename_map = {
-                    'tradeAmount': 'size' # 'tradeAmount' is the trade size
-                }
-                df_trades = df_trades.rename(columns=trade_rename_map)
-
-                # --- Type Coercion (Trades) ---
-                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
-                df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
-                df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
                 
-                # CRITICAL: Subgraph `tradeAmount` is a large integer (uint256).
-                # We divide by 1e6 to convert it to USDC value.
-                df_trades['size'] = df_trades['size'] / 1e6
+                # --- Type Coercion (Raw fields) ---
+                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
+                df_trades['tradeAmount'] = pd.to_numeric(df_trades['tradeAmount'], errors='coerce')
+                df_trades['outcomeTokensAmount'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
+                
+                # --- CALCULATE Price and Size ---
+                # `tradeAmount` is collateral (USDC), needs 1e6 scaling
+                # `outcomeTokensAmount` is token amount, needs 1e18 scaling
+                
+                # Size is the value of the collateral (USDC)
+                df_trades['size'] = df_trades['tradeAmount'] / 1e6
+                
+                # Price = (collateral / 1e6) / (tokens / 1e18)
+                # Handle division by zero
+                df_trades['price'] = (df_trades['tradeAmount'] / 1e6) / ((df_trades['outcomeTokensAmount'] / 1e18) + 1e-9)
+                # Cap price at 1.0 (it can fly to infinity on tiny amounts)
+                df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
                 
                 df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
             
             else:
-                # Ensure empty df has the *renamed* columns
+                # Ensure empty df has the *calculated* columns
                 df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
 
         except Exception as e:
@@ -1567,7 +1600,7 @@ class BacktestEngine:
                         # We pass the trade data itself for C4 to use
                         'wallet_id': row['wallet_id'],
                         'price': row['price'],
-                        'volume': abs(row['size'] * row['price']) # (size * price)
+                        'volume': abs(row['size']) # Volume is just the size
                     }
                 ))
 
