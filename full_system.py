@@ -1247,32 +1247,24 @@ class BacktestEngine:
     def __init__(self, historical_data_path: str):
         log.info("BacktestEngine (C7) Production initialized.")
         self.historical_data_path = historical_data_path # Useful for caching
-        self.cache_dir = Path(self.historical_data_path) / "dune_cache" # <-- ADD THIS
+        self.cache_dir = Path(self.historical_data_path) / "dune_cache" 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.dune_api_key = os.getenv("DUNE_API_KEY")
-        
- #       self.dune_api_key = os.getenv("DUNE_API_KEY")
- #       if not self.dune_api_key:
-#            log.error("DUNE_API_KEY environment variable not set. C7 will fail.")
-#            self.dune_client = None
-#        else:
-#            self.dune_client = DuneClient(self.dune_api_key)
-            
+        log.info("BacktestEngine initialized in Polymarket Subgraph API mode.")
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
 
 
     def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
         """
-        Loads and transforms Polymarket data from the free public APIs
+        Loads and transforms Polymarket data from the free public Subgraph
         using daily caching and pagination.
-        (The start/end date params are ignored, as we fetch all history)
         """
 
         # --- Query 1: Markets ---
         log.info("Fetching all market details from Polymarket Subgraph...")
         df_markets = self._fetch_all_markets()
-        
+
         if df_markets.empty:
             log.error("Failed to fetch markets. Aborting.")
             return pd.DataFrame(), pd.DataFrame()
@@ -1283,117 +1275,101 @@ class BacktestEngine:
         
         if df_trades.empty:
             log.warning("No trades found from Polymarket Subgraph.")
+            # Return an empty DataFrame with the expected *raw* columns from the Subgraph
             df_trades = pd.DataFrame(columns=['id', 'timestamp', 'price', 'collateralAmount', 'creator', 'market'])
-        # --- Data Type Coercion (Same as original) ---
-        try:
-            # --- NEW: Rename columns to match script's expectations ---
-            log.info("Renaming columns from Dune to match internal schema...")
-            
-            # Market Details Mappings
-            market_rename_map = {
-                'condition_id': 'market_id',
-                # 'question' column already matches
-                'market_start_time': 'created_at',
-                'resolved_on_timestamp': 'resolution_timestamp'
-                # 'outcome' column already matches
-            }
-            df_markets = df_markets.rename(columns=market_rename_map)
 
-            # Check for 'start_price', which was in the old query.
-            if 'start_price' not in df_markets.columns:
-                log.warning("Market query missing 'start_price'. Defaulting to 0.50.")
-                # We can't know the true start price, so we'll use a neutral default.
-                # The transform logic expects this column.
-                df_markets['start_price'] = 0.50
-
-            if not df_trades.empty:
-                # Trades Mappings
-                trade_rename_map = {
-                    'condition_id': 'market_id',
-                    'block_time': 'timestamp',
-                    # 'price' column already matches
-                    'amount': 'size', # Map 'amount' to 'size'
-                    'maker': 'maker_address',
-                    'taker': 'taker_address'
-                }
-                df_trades = df_trades.rename(columns=trade_rename_map)
-
-            # --- Type Coercion (uses new names) ---
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
-            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce') # Coerce errors for market_start_time
-            df_markets['start_price'] = pd.to_numeric(df_markets['start_price'], errors='coerce')
-            df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
-            
-            if not df_trades.empty:
-                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
-                df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
-                df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
-                # The old query normalized size: "size" / 1e6 AS "size"
-                # Your new query returns 'amount' as 'double'.
-                # If this 'amount' column (now 'size') is *not* normalized,
-                # you MUST uncomment the line below:
-                # df_trades['size'] = df_trades['size'] / 1e6
-            
-            # Drop any rows where key data failed to parse (using renamed columns)
-            df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
-            if not df_trades.empty:
-                df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address'])
-            else:
-                # Create empty df with expected columns for _transform_data_to_event_log
-                df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address', 'outcome'])
-
-        except KeyError as e:
-            log.error(f"Column mismatch from Dune query: {e}. Check your query results.")
-            log.error("Market columns:" + str(df_markets.columns))
-            if not df_trades.empty: log.error("Trades columns:" + str(df_trades.columns))
-            return pd.DataFrame(), pd.DataFrame()
-        except Exception as e:
-            log.error(f"Failed to parse data types from Dune: {e}")
-            return pd.DataFrame(), pd.DataFrame()
-
+        # --- Data Type Coercion is now handled in _transform_data_to_event_log ---
+        # We return the raw dataframes here.
+        
         log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Subgraph (using cache).")
         return df_markets, df_trades
-
-    def _get_subgraph_url(self) -> str:
-        # The single source of truth, from the docs you provided.
-        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+    
         
+    def _get_subgraph_url(self) -> str:
+        # The single source of truth, from the Polymarket docs.
+        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+
     def _fetch_all_markets(self) -> pd.DataFrame:
-        # Use the simple REST API for markets, as it's easier and paginates well
-         return self._fetch_paginated_data(
-         log.info("Fetching all markets from Polymarket Subgraph...")
-         
-         # This GraphQL query gets all market data
-         query_template = """
-         {{
-           markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-             id
-             question
-             creationTimestamp
-             resolveTimestamp
-             outcome
-           }}
-         }}
-         """
-         
-         return self._fetch_paginated_subgraph(
-             cache_key="polymarket_markets",
-             subgraph_url=self._get_subgraph_url(),
-             query_template=query_template,
-             entity_name="markets"
-         )
-
-
-    def _get_cached_dune_result(self, query_id: int) -> pd.DataFrame:
         """
-        Fetches a Dune query result by ID, using a daily cache.
-        Cleans up old cache files for this query ID.
+        Fetches all 'markets' entities from the Subgraph.
+        """
+        log.info("Fetching all markets from Polymarket Subgraph...")
+        
+        # This GraphQL query gets all market data
+        query_template = """
+        {{
+          markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+            id
+            question
+            creationTimestamp
+            resolveTimestamp
+            outcome
+          }}
+        }}
+        """
+        
+        return self._fetch_paginated_subgraph(
+            cache_key="polymarket_markets",
+            subgraph_url=self._get_subgraph_url(),
+            query_template=query_template,
+            entity_name="markets"
+        )
+
+    def _fetch_all_trades(self) -> pd.DataFrame:
+        """
+        Fetches all 'fills' (trades) entities from the Subgraph.
+        """
+        log.info("Fetching all trades from Polymarket Subgraph...")
+        
+        # This GraphQL query fetches trades (fills)
+        query_template = """
+        {{
+          fills(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+            id
+            timestamp
+            price
+            collateralAmount # This is the 'size'
+            creator {{ id }} # This is the wallet_id
+            market {{ id }} # This is the conditionId
+          }}
+        }}
+        """
+        
+        df = self._fetch_paginated_subgraph(
+            cache_key="polymarket_trades",
+            subgraph_url=self._get_subgraph_url(),
+            query_template=query_template,
+            entity_name="fills"
+        )
+        
+        if df.empty:
+            return df
+
+        # --- Un-nest the nested data ---
+        # 'creator' column is a dict like {'id': '0x...'}. Get the 'id' value.
+        try:
+            df['wallet_id'] = df['creator'].apply(lambda x: x['id'] if isinstance(x, dict) else None)
+            # 'market' column is a dict like {'id': '0x...'}. Get the 'id' value.
+            df['market_id'] = df['market'].apply(lambda x: x['id'] if isinstance(x, dict) else None)
+        except Exception as e:
+            log.error(f"Failed to un-nest Subgraph data: {e}")
+            log.error(f"Data columns: {df.columns}")
+            log.error(f"Sample data: {df.head()}")
+            return pd.DataFrame()
+        
+        # Drop the original nested columns
+        df = df.drop(columns=['creator', 'market'])
+        return df
+            
+    def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
+        """
+        Generic helper to fetch ALL data from a TheGraph Subgraph with daily caching.
         """
         today = datetime.now().strftime('%Y-%m-%d')
-        cache_file = self.cache_dir / f"dune_query_{query_id}_{today}.pkl"
+        cache_file = self.cache_dir / f"{cache_key}_{today}.pkl"
         
-        # Clean up old cache files for this query_id
-        for old_file in self.cache_dir.glob(f"dune_query_{query_id}_*.pkl"):
+        # Clean up old cache files
+        for old_file in self.cache_dir.glob(f"{cache_key}_*.pkl"):
             if old_file.name != cache_file.name:
                 log.info(f"Removing old cache file: {old_file}")
                 try:
@@ -1401,107 +1377,146 @@ class BacktestEngine:
                 except OSError as e:
                     log.warning(f"Could not delete old cache file {old_file}: {e}")
 
-        # Check for today's cache file
         if cache_file.exists():
-            log.info(f"Loading cached result for query {query_id} from {cache_file}")
+            log.info(f"Loading cached result for {cache_key} from {cache_file}")
             try:
                 with open(cache_file, 'rb') as f:
                     return pickle.load(f)
             except Exception as e:
                 log.warning(f"Failed to load cache file {cache_file}: {e}. Refetching.")
         
-        # If no cache, fetch from Dune
-      #  if not self.dune_client:
-      #      log.error("Dune client not initialized. Cannot fetch data.")
-      #      return pd.DataFrame()
-            
-      #  log.info(f"Fetching new result for query {query_id} from Dune...")
-        if not self.dune_api_key:
-             log.error("Dune API key not set. Cannot fetch data.")
-             return pd.DataFrame()
-
-        log.info(f"Fetching new result for query {query_id} from Dune...")
-        
+        # --- Subgraph GraphQL Fetching & Pagination Logic ---
+        log.info(f"Fetching new paginated results for {cache_key} from Subgraph...")
         try:
-            # Construct the URL and headers as requested
-             all_dfs = []
-             limit = 100000  # As requested
-             offset = 0
-             headers = {"x-dune-api-key": self.dune_api_key}
-            
-             base_url = f"https://api.dune.com/api/v1/query/{query_id}/results"
+            all_dfs = []
+            last_id = "" # Start with an empty last_id
 
-             while True:
-                 paginated_url = f"{base_url}?limit={limit}&offset={offset}"
-                 log.info(f"Fetching chunk: offset={offset}, limit={limit}")
-                 
-                 # Make the direct API call
-                 response = requests.get(paginated_url, headers=headers)
-                 response.raise_for_status() # Raise an exception for bad status codes
-                 
-                 json_response = response.json()
- 
-                 # Extract the rows from the JSON response
-                 if "result" not in json_response or "rows" not in json_response["result"]:
-                     log.warning(f"Dune query {query_id} (offset {offset}) returned unexpected JSON structure.")
-                     break # Stop if something is wrong
-                 
-                 rows = json_response["result"]["rows"]
-                 if not rows:
-                     log.info("No more rows returned. Pagination complete.")
-                     break # This is the exit condition
+            while True:
+                # Format the query with the last ID for pagination
+                query_body = query_template.format(last_id=last_id)
                 
-                 all_dfs.append(pd.DataFrame(rows))
+                log.info(f"Fetching chunk for {entity_name} after id {last_id}")
+                response = requests.post(subgraph_url, json={'query': query_body})
+                response.raise_for_status()
                 
-                 # Increment offset for the next loop
-                 offset += limit
- 
-             if not all_dfs:
-                 log.warning(f"No data fetched for query {query_id}.")
-                 df = pd.DataFrame()
-             else:
-                 df = pd.concat(all_dfs, ignore_index=True)
-                 log.info(f"Pagination complete. Fetched {len(df)} total rows.")
+                data = response.json().get('data', {})
+                if not data:
+                    log.error(f"Invalid GraphQL response: {response.json()}")
+                    break
+                rows = data.get(entity_name, [])
+                
+                if not rows:
+                    log.info("No more rows returned. Pagination complete.")
+                    break # This is the exit condition
+                
+                all_dfs.append(pd.DataFrame(rows))
+                last_id = rows[-1]['id'] # Get the last ID for the next page
+
+            if not all_dfs:
+                log.warning(f"No data fetched for {cache_key}.")
+                df = pd.DataFrame() # Return empty frame
+            else:
+                df = pd.concat(all_dfs, ignore_index=True)
+                log.info(f"Subgraph pagination complete. Fetched {len(df)} total rows.")
             
             # Save to cache
-             with open(cache_file, 'wb') as f:
-                 pickle.dump(df, f)
-             log.info(f"Saved new cache file: {cache_file}")
-             return df
-            
+            with open(cache_file, 'wb') as f:
+                pickle.dump(df, f)
+            log.info(f"Saved new cache file: {cache_file}")
+            return df
+
+        except requests.exceptions.RequestException as e:
+            log.error(f"Subgraph request for {subgraph_url} failed: {e}", exc_info=True)
+            return pd.DataFrame()
         except Exception as e:
-            log.error(f"Failed to process Dune response for {query_id}: {e}", exc_info=True)
+            log.error(f"Failed to process Subgraph response for {cache_key}: {e}", exc_info=True)
             return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
         This is the "Transform" phase.
-        It creates two crucial DataFrames:
+        It creates two crucial DataFrames from the RAW Subgraph data:
         1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
         2. event_log: The time-series log for the C7 replay harness.
         """
-        log.info("Transforming raw data into event log...")
+        log.info("Transforming raw Subgraph data into event log...")
+
+        # --- 1. Process and Rename Market Data ---
+        try:
+            log.info("Processing Market data...")
+            market_rename_map = {
+                'id': 'market_id', # 'id' from markets entity is the conditionId
+                'question': 'question',
+                'creationTimestamp': 'created_at', 
+                'resolveTimestamp': 'resolution_timestamp'
+            }
+            df_markets = df_markets.rename(columns=market_rename_map)
+
+            # --- Type Coercion (Markets) ---
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], unit='s', errors='coerce')
+            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], unit='s', errors='coerce')
+            
+            # In Subgraph, outcome is a string "0" or "1". Convert it.
+            df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            
+            # Add missing 'start_price'
+            if 'start_price' not in df_markets.columns:
+                df_markets['start_price'] = 0.50
+            
+            df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
         
-        # --- 1. Prepare Market Data (for lookups) ---
-        df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
-        df_markets['created_at'] = pd.to_datetime(df_markets['created_at'])
-        # Create a simple lookup for outcome
+        except Exception as e:
+            log.error(f"Failed to parse Market data from Subgraph: {e}", exc_info=True)
+            log.error(f"Market columns: {df_markets.columns}")
+            return pd.DataFrame(), pd.DataFrame()
+
+        # --- 2. Process and Rename Trade Data ---
+        try:
+            log.info("Processing Trade data...")
+            if not df_trades.empty:
+                # Note: 'wallet_id' and 'market_id' were already created in _fetch_all_trades
+                trade_rename_map = {
+                    'collateralAmount': 'size' # 'collateralAmount' is the trade size
+                }
+                df_trades = df_trades.rename(columns=trade_rename_map)
+
+                # --- Type Coercion (Trades) ---
+                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce')
+                df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
+                df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
+                
+                # CRITICAL: Subgraph `collateralAmount` is a large integer (uint256).
+                # We divide by 1e6 to convert it to USDC value.
+                df_trades['size'] = df_trades['size'] / 1e6
+                
+                df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
+            
+            else:
+                # Ensure empty df has the *renamed* columns
+                df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'wallet_id'])
+
+        except Exception as e:
+            log.error(f"Failed to parse Trade data from Subgraph: {e}", exc_info=True)
+            log.error(f"Trade columns: {df_trades.columns}")
+            return pd.DataFrame(), pd.DataFrame()
+
+
+        # --- 3. Prepare Market Data (for lookups) ---
         market_outcomes = df_markets.set_index('market_id')['outcome'].to_dict()
         market_questions = df_markets.set_index('market_id')['question'].to_dict()
         market_vectors = {mid: [0.1]*768 for mid in market_outcomes} # Mock embeddings
 
-        # --- 2. Create the Profiler DataFrame (for C4) ---
-        # We need all *resolved* trades to build Brier scores.
+        # --- 4. Create the Profiler DataFrame (for C4) ---
         log.info("Building profiler data...")
-        df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
-        # We must use *both* maker and taker wallets
-        trades_maker = df_trades[['maker_address', 'price', 'outcome', 'market_id']].rename(columns={'maker_address': 'wallet_id', 'price': 'bet_price'})
-        trades_taker = df_trades[['taker_address', 'price', 'outcome', 'market_id']].rename(columns={'taker_address': 'wallet_id', 'price': 'bet_price'})
-        # We'll just assign a 'default' topic for now
-        profiler_data = pd.concat([trades_maker, trades_taker]).dropna(subset=['outcome', 'bet_price'])
-        profiler_data['entity_type'] = 'default_topic'
+        if not df_trades.empty:
+            df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
         
-        # --- 3. Create the Event Log (for C7) ---
+        # The Subgraph 'fills' entity provides one wallet ('wallet_id')
+        profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
+        profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
+        profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+        
+        # --- 5. Create the Event Log (for C7) ---
         log.info("Building event log...")
         events = []
         
@@ -1513,7 +1528,7 @@ class BacktestEngine:
                 {
                     'id': row['market_id'],
                     'text': row['question'],
-                    'vector': market_vectors[row['market_id']],
+                    'vector': market_vectors.get(row['market_id'], [0.1]*768),
                     'liquidity': 0, # We don't have this, so we'll mock it
                     'p_market_all': row['start_price']
                 }
@@ -1528,37 +1543,28 @@ class BacktestEngine:
             ))
             
         # c) Create PRICE_UPDATE events from trades
-        df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
-        for _, row in df_trades.iterrows():
-            # Add Taker
-            events.append((
-                row['timestamp'],
-                'PRICE_UPDATE',
-                {
-                    'id': row['market_id'],
-                    'p_market_all': row['price'],
-                    # We pass the trade data itself for C4 to use
-                    'wallet_id': row['taker_address'],
-                    'price': row['price'],
-                    'volume': row['size'] * row['price'] # (size * price)
-                }
-            ))
-            # Add Maker
-            events.append((
-                row['timestamp'],
-                'PRICE_UPDATE',
-                {
-                    'id': row['market_id'],
-                    'p_market_all': row['price'],
-                    'wallet_id': row['maker_address'],
-                    'price': row['price'],
-                    'volume': row['size'] * row['price']
-                }
-            ))
+        # This new logic uses the single-wallet model
+        if not df_trades.empty:
+            for _, row in df_trades.iterrows():
+                events.append((
+                    row['timestamp'],
+                    'PRICE_UPDATE',
+                    {
+                        'id': row['market_id'],
+                        'p_market_all': row['price'],
+                        # We pass the trade data itself for C4 to use
+                        'wallet_id': row['wallet_id'],
+                        'price': row['price'],
+                        'volume': abs(row['size'] * row['price']) # (size * price)
+                    }
+                ))
 
-        # --- 4. Sort and return the final event log ---
-        # --- THIS LINE IS THE CRITICAL FIX FROM YOUR ORIGINAL FILE ---
+        # --- 6. Sort and return the final event log ---
         event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        if event_log.empty:
+            log.warning("No events created. Returning empty event log.")
+            return pd.DataFrame(), profiler_data
+            
         event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
         event_log['timestamp'] = pd.to_datetime(event_log['timestamp'])
         event_log = event_log.set_index('timestamp').sort_index()
@@ -1674,28 +1680,24 @@ class BacktestEngine:
             ray.init(logging_level=logging.ERROR)
         
         # --- THIS IS THE NEW ETL STEP ---
-        # We load data from Dune *once* before starting the tuning job.
+        # We load data from the Subgraph *once* before starting the tuning job.
         try:
-            # --- Define your backtest window ---
-            end_date_dt = datetime.now()
-            start_date_dt = end_date_dt - timedelta(days=90) # e.g., 90-day backtest
-            
-            end_date_str = end_date_dt.strftime('%Y-%m-%d %H:%M:%S')
-            start_date_str = start_date_dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            log.info(f"C7: Loading data from Dune for window: {start_date_str} to {end_date_str}")
+            log.info(f"C7: Loading all historical data from Polymarket Subgraph...")
             
             # --- Call the NEW function ---
-            df_markets, df_trades = self._load_data_from_polymarket(start_date_str, end_date_str)
+            df_markets, df_trades = self._load_data_from_polymarket()
             
-            if df_markets.empty or df_trades.empty:
-                log.error("No data loaded from Dune. Aborting tuning job.")
+            if df_markets.empty:
+                log.error("No market data loaded from Subgraph. Aborting tuning job.")
                 return None
+            if df_trades.empty:
+                log.warning("No trade data loaded from Subgraph. Proceeding with empty trades.")
+                # We can continue, but profiler will be empty
                 
             event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
         
         except Exception as e:
-            log.error(f"FATAL: Failed to load or transform Dune data: {e}", exc_info=True)
+            log.error(f"FATAL: Failed to load or transform Subgraph data: {e}", exc_info=True)
             return None
         
         # "Curry" the real data into the objective function
