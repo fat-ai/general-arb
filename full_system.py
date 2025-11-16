@@ -1500,11 +1500,11 @@ class BacktestEngine:
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
         This is the "Transform" phase.
-        It creates two crucial DataFrames from the TWO different data sources:
+        It creates two crucial DataFrames from the RAW Subgraph data:
         1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
         2. event_log: The time-series log for the C7 replay harness.
         """
-        log.info("Transforming raw Subgraph and Gamma API data into event log...")
+        log.info("Transforming raw Subgraph data into event log...")
 
         # --- 1. Process and Rename Market Data (from Gamma API) ---
         try:
@@ -1579,19 +1579,13 @@ class BacktestEngine:
 
 
         # --- 3. Join Trades and Markets ---
-        # This is the critical step to link trades (fpmm_address)
-        # to the market details (market_id, outcome)
         log.info("Joining trades and market data...")
-        # Create a lookup map from fpmm_address -> market_id (condition_id)
         market_id_lookup = df_markets.set_index('fpmm_address')['market_id'].to_dict()
         market_outcomes = df_markets.set_index('market_id')['outcome'].to_dict()
         market_questions = df_markets.set_index('market_id')['question'].to_dict()
         market_vectors = {mid: [0.1]*768 for mid in market_outcomes}
         
-        # Map the true 'market_id' (condition_id) onto the trades DataFrame
         df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_lookup)
-        
-        # Now that trades have the correct market_id, we can map the outcome
         df_trades['outcome'] = df_trades['market_id'].map(market_outcomes)
         
         log.info(f"Trades after joining with market_id: {len(df_trades)}")
@@ -1601,9 +1595,8 @@ class BacktestEngine:
         # --- 4. Create the Profiler DataFrame (for C4) ---
         log.info("Building profiler data...")
         
-        # The Subgraph 'fpmmTransactions' entity provides one wallet ('wallet_id')
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
-        profiler_data['entity_type'] = 'default_topic' # Assign 'default_topic'
+        profiler_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler data before dropna (on outcome): {len(profiler_data)} rows")
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
@@ -1622,7 +1615,7 @@ class BacktestEngine:
                     'id': row['market_id'],
                     'text': row['question'],
                     'vector': market_vectors.get(row['market_id'], [0.1]*768),
-                    'liquidity': 0, # We don't have this, so we'll mock it
+                    'liquidity': 0, 
                     'p_market_all': row['start_price']
                 }
             ))
@@ -1636,20 +1629,23 @@ class BacktestEngine:
             ))
             
         # c) Create PRICE_UPDATE events from trades
-        # This new logic uses the single-wallet model
         if not df_trades.empty:
             for _, row in df_trades.iterrows():
+                
+                # --- THIS IS THE FIX ---
+                # We now create the event with the keys that C4 expects
+                event_data = {
+                    'id': row['market_id'],
+                    'p_market_all': row['price'],
+                    'wallet_id': row['wallet_id'],
+                    'trade_price': row['price'], # C4 expects 'trade_price'
+                    'trade_volume': abs(row['size']) # C4 expects 'trade_volume'
+                }
+                
                 events.append((
                     row['timestamp'],
                     'PRICE_UPDATE',
-                    {
-                        'id': row['market_id'],
-                        'p_market_all': row['price'],
-                        # We pass the trade data itself for C4 to use
-                        'wallet_id': row['wallet_id'],
-                        'price': row['price'],
-                        'volume': abs(row['size']) # Volume is just the size
-                    }
+                    event_data
                 ))
 
         # --- 6. Sort and return the final event log ---
