@@ -1290,79 +1290,174 @@ class BacktestEngine:
 
     def _load_data_from_dune(self, start_date: str, end_date: str) -> (pd.DataFrame, pd.DataFrame):
         """
-        Loads and transforms Polymarket data from Dune Analytics.
-        This is the new "Extract" phase.
+        Loads and transforms Polymarket data from Dune Analytics
+        using pre-defined query IDs and daily caching.
+        
+        Note: The start_date and end_date params are no longer used to *filter*
+        Dune queries, but are kept for consistency in the API. The pre-defined
+        queries are assumed to fetch all necessary data.
         """
         if not self.dune_client:
             log.error("Dune client not initialized. Cannot load data.")
             return pd.DataFrame(), pd.DataFrame()
 
+        # Define Query IDs from your spec
+        MARKET_DETAILS_QUERY_ID = 6175624
+        TRADES_CURRENT_MONTH_ID = 6213459
+        TRADES_PRIOR_MONTH_ID = 6181947
+        TRADES_OLDER_ID = 6213588
+
         # --- Query 1: Markets ---
-        # Get all resolved markets created within the backtest window
-        markets_query_sql = """
-        SELECT
-            "market_id", "question", "created_at", "resolution_timestamp",
-            "start_price", "outcome"
-        FROM polymarket_v2.markets
-        WHERE "created_at" >= CAST('{{start_date}}' AS TIMESTAMP)
-          AND "created_at" <= CAST('{{end_date}}' AS TIMESTAMP)
-          AND "outcome" IS NOT NULL AND "question" IS NOT NULL AND "question" != ''
-        LIMIT 2000 -- Safety limit, adjust as needed
-        """
+        log.info(f"Fetching market details (Query ID: {MARKET_DETAILS_QUERY_ID})...")
+        df_markets = self._get_cached_dune_result(MARKET_DETAILS_QUERY_ID)
         
-        df_markets = self._run_dune_query(
-            markets_query_sql,
-            {"start_date": start_date, "end_date": end_date},
-            "Polymarket Markets"
-        )
         if df_markets.empty:
             log.error("Failed to fetch markets from Dune. Aborting.")
             return pd.DataFrame(), pd.DataFrame()
 
         # --- Query 2: Trades ---
-        # Get all trades for the markets we just retrieved
-        market_ids_str = ",".join([f"'{mid}'" for mid in df_markets['market_id'].unique()])
+        log.info("Fetching market trades (all chunks)...")
+        df_trades_current = self._get_cached_dune_result(TRADES_CURRENT_MONTH_ID)
+        df_trades_prior = self._get_cached_dune_result(TRADES_PRIOR_MONTH_ID)
+        df_trades_older = self._get_cached_dune_result(TRADES_OLDER_ID)
         
-        trades_query_sql = f"""
-        SELECT
-            "market_id", "timestamp", "price", 
-            "size" / 1e6 AS "size", -- Normalize size (assuming 6 decimals)
-            "maker_address", "taker_address"
-        FROM polymarket_v2.trades
-        WHERE "market_id" IN ({market_ids_str})
-          AND "timestamp" <= CAST('{{end_date}}' AS TIMESTAMP)
-        """
+        all_trade_dfs = []
+        if not df_trades_current.empty: all_trade_dfs.append(df_trades_current)
+        if not df_trades_prior.empty: all_trade_dfs.append(df_trades_prior)
+        if not df_trades_older.empty: all_trade_dfs.append(df_trades_older)
 
-        df_trades = self._run_dune_query(
-            trades_query_sql,
-            {"end_date": end_date}, # `start_date` is implicitly handled by market_id filter
-            "Polymarket Trades"
-        )
-        if df_trades.empty:
-            log.warning("No trades found for the fetched markets.")
-        
-        # --- Data Type Coercion ---
-        # Ensure data types match what _transform_data_to_event_log expects
+        if not all_trade_dfs:
+            log.warning("No trades found from any Dune query.")
+            df_trades = pd.DataFrame() # Empty frame with no columns
+        else:
+            df_trades = pd.concat(all_trade_dfs, ignore_index=True)
+            # De-duplicate trades, just in case of overlap
+            df_trades = df_trades.drop_duplicates()
+
+        # --- Data Type Coercion (Same as original) ---
         try:
-            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
-            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'])
-            df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
+            # --- NEW: Rename columns to match script's expectations ---
+            log.info("Renaming columns from Dune to match internal schema...")
             
-            df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
-            df_markets['start_price'] = pd.to_numeric(df_markets['start_price'], errors='coerce')
-            df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
-            df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
-            
-            # Drop any rows where key data failed to parse
-            df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
-            df_trades = df_trades.dropna()
+            # Market Details Mappings
+            market_rename_map = {
+                'condition_id': 'market_id',
+                # 'question' column already matches
+                'market_start_time': 'created_at',
+                'resolved_on_timestamp': 'resolution_timestamp'
+                # 'outcome' column already matches
+            }
+            df_markets = df_markets.rename(columns=market_rename_map)
 
+            # Check for 'start_price', which was in the old query.
+            if 'start_price' not in df_markets.columns:
+                log.warning("Market query missing 'start_price'. Defaulting to 0.50.")
+                # We can't know the true start price, so we'll use a neutral default.
+                # The transform logic expects this column.
+                df_markets['start_price'] = 0.50
+
+            if not df_trades.empty:
+                # Trades Mappings
+                trade_rename_map = {
+                    'condition_id': 'market_id',
+                    'block_time': 'timestamp',
+                    # 'price' column already matches
+                    'amount': 'size', # Map 'amount' to 'size'
+                    'maker': 'maker_address',
+                    'taker': 'taker_address'
+                }
+                df_trades = df_trades.rename(columns=trade_rename_map)
+
+            # --- Type Coercion (uses new names) ---
+            df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce')
+            df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce') # Coerce errors for market_start_time
+            df_markets['start_price'] = pd.to_numeric(df_markets['start_price'], errors='coerce')
+            df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            
+            if not df_trades.empty:
+                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'])
+                df_trades['price'] = pd.to_numeric(df_trades['price'], errors='coerce')
+                df_trades['size'] = pd.to_numeric(df_trades['size'], errors='coerce')
+                # The old query normalized size: "size" / 1e6 AS "size"
+                # Your new query returns 'amount' as 'double'.
+                # If this 'amount' column (now 'size') is *not* normalized,
+                # you MUST uncomment the line below:
+                # df_trades['size'] = df_trades['size'] / 1e6
+            
+            # Drop any rows where key data failed to parse (using renamed columns)
+            df_markets = df_markets.dropna(subset=['market_id', 'question', 'created_at', 'outcome', 'start_price'])
+            if not df_trades.empty:
+                df_trades = df_trades.dropna(subset=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address'])
+            else:
+                # Create empty df with expected columns for _transform_data_to_event_log
+                df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address', 'outcome'])
+
+
+        except KeyError as e:
+            log.error(f"Column mismatch from Dune query: {e}. Check your query results.")
+            log.error("Market columns:" + str(df_markets.columns))
+            if not df_trades.empty: log.error("Trades columns:" + str(df_trades.columns))
+            return pd.DataFrame(), pd.DataFrame()
         except Exception as e:
             log.error(f"Failed to parse data types from Dune: {e}")
             return pd.DataFrame(), pd.DataFrame()
 
-        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Dune.")
+        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Dune (using cache).")
         return df_markets, df_trades
+
+    def _get_cached_dune_result(self, query_id: int) -> pd.DataFrame:
+        """
+        Fetches a Dune query result by ID, using a daily cache.
+        Cleans up old cache files for this query ID.
+        """
+        today = datetime.now().strftime('%Y-%m-%d')
+        cache_file = self.cache_dir / f"dune_query_{query_id}_{today}.pkl"
+        
+        # Clean up old cache files for this query_id
+        for old_file in self.cache_dir.glob(f"dune_query_{query_id}_*.pkl"):
+            if old_file.name != cache_file.name:
+                log.info(f"Removing old cache file: {old_file}")
+                try:
+                    old_file.unlink()
+                except OSError as e:
+                    log.warning(f"Could not delete old cache file {old_file}: {e}")
+
+        # Check for today's cache file
+        if cache_file.exists():
+            log.info(f"Loading cached result for query {query_id} from {cache_file}")
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                log.warning(f"Failed to load cache file {cache_file}: {e}. Refetching.")
+        
+        # If no cache, fetch from Dune
+        if not self.dune_client:
+            log.error("Dune client not initialized. Cannot fetch data.")
+            return pd.DataFrame()
+            
+        log.info(f"Fetching new result for query {query_id} from Dune...")
+        try:
+            # Use get_latest_result as requested
+            query_result = self.dune_client.get_latest_result(query_id)
+            
+            # The result data is in query_result.result.rows
+            # This returns a list of dicts, perfect for pd.DataFrame
+            if not query_result.result:
+                log.warning(f"Dune query {query_id} returned no result object.")
+                return pd.DataFrame()
+                
+            df = pd.DataFrame(query_result.result.rows)
+            
+            # Save to cache
+            with open(cache_file, 'wb') as f:
+                pickle.dump(df, f)
+            log.info(f"Saved new cache file: {cache_file}")
+            return df
+            
+        except Exception as e:
+            log.error(f"Dune query {query_id} failed: {e}", exc_info=True)
+            return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
