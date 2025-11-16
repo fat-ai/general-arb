@@ -1262,38 +1262,28 @@ class BacktestEngine:
             ray.init(logging_level=logging.ERROR)
 
 
-    def _load_data_from_dune(self, start_date: str, end_date: str) -> (pd.DataFrame, pd.DataFrame):
+    def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
         """
-        Loads and transforms Polymarket data from Dune Analytics
-        using pre-defined query IDs and daily caching.
-        
-        Note: The start_date and end_date params are no longer used to *filter*
-        Dune queries, but are kept for consistency in the API. The pre-defined
-        queries are assumed to fetch all necessary data.
+        Loads and transforms Polymarket data from the free public APIs
+        using daily caching and pagination.
+        (The start/end date params are ignored, as we fetch all history)
         """
-    #    if not self.dune_client:
-    #        log.error("Dune client not initialized. Cannot load data.")
-    #        return pd.DataFrame(), pd.DataFrame()
 
-        # Define Query IDs from your spec
-        MARKET_DETAILS_QUERY_ID = 6175624
-        TRADES_QUERY_ID = 6213459
         # --- Query 1: Markets ---
-        log.info(f"Fetching market details (Query ID: {MARKET_DETAILS_QUERY_ID})...")
-        df_markets = self._get_cached_dune_result(MARKET_DETAILS_QUERY_ID)
+        log.info("Fetching all market details from Polymarket Subgraph...")
+        df_markets = self._fetch_all_markets()
         
         if df_markets.empty:
-            log.error("Failed to fetch markets from Dune. Aborting.")
+            log.error("Failed to fetch markets. Aborting.")
             return pd.DataFrame(), pd.DataFrame()
 
         # --- Query 2: Trades ---
-        log.info(f"Fetching all trades (Query ID: {TRADES_QUERY_ID})...")
-        df_trades = self._get_cached_dune_result(TRADES_QUERY_ID)
+        log.info("Fetching all trades from Polymarket Subgraph...")
+        df_trades = self._fetch_all_trades()
         
         if df_trades.empty:
-            log.warning("No trades found from any Dune query.")
-            df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address', 'outcome'])
-
+            log.warning("No trades found from Polymarket Subgraph.")
+            df_trades = pd.DataFrame(columns=['id', 'timestamp', 'price', 'collateralAmount', 'creator', 'market'])
         # --- Data Type Coercion (Same as original) ---
         try:
             # --- NEW: Rename columns to match script's expectations ---
@@ -1352,7 +1342,6 @@ class BacktestEngine:
                 # Create empty df with expected columns for _transform_data_to_event_log
                 df_trades = pd.DataFrame(columns=['market_id', 'timestamp', 'price', 'size', 'maker_address', 'taker_address', 'outcome'])
 
-
         except KeyError as e:
             log.error(f"Column mismatch from Dune query: {e}. Check your query results.")
             log.error("Market columns:" + str(df_markets.columns))
@@ -1362,8 +1351,38 @@ class BacktestEngine:
             log.error(f"Failed to parse data types from Dune: {e}")
             return pd.DataFrame(), pd.DataFrame()
 
-        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Dune (using cache).")
+        log.info(f"Loaded {len(df_markets)} markets and {len(df_trades)} trades from Subgraph (using cache).")
         return df_markets, df_trades
+
+    def _get_subgraph_url(self) -> str:
+        # The single source of truth, from the docs you provided.
+        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+        
+    def _fetch_all_markets(self) -> pd.DataFrame:
+        # Use the simple REST API for markets, as it's easier and paginates well
+         return self._fetch_paginated_data(
+         log.info("Fetching all markets from Polymarket Subgraph...")
+         
+         # This GraphQL query gets all market data
+         query_template = """
+         {{
+           markets(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
+             id
+             question
+             creationTimestamp
+             resolveTimestamp
+             outcome
+           }}
+         }}
+         """
+         
+         return self._fetch_paginated_subgraph(
+             cache_key="polymarket_markets",
+             subgraph_url=self._get_subgraph_url(),
+             query_template=query_template,
+             entity_name="markets"
+         )
+
 
     def _get_cached_dune_result(self, query_id: int) -> pd.DataFrame:
         """
@@ -1409,8 +1428,7 @@ class BacktestEngine:
              limit = 100000  # As requested
              offset = 0
              headers = {"x-dune-api-key": self.dune_api_key}
-             
-             
+            
              base_url = f"https://api.dune.com/api/v1/query/{query_id}/results"
 
              while True:
@@ -1668,7 +1686,7 @@ class BacktestEngine:
             log.info(f"C7: Loading data from Dune for window: {start_date_str} to {end_date_str}")
             
             # --- Call the NEW function ---
-            df_markets, df_trades = self._load_data_from_dune(start_date_str, end_date_str)
+            df_markets, df_trades = self._load_data_from_polymarket(start_date_str, end_date_str)
             
             if df_markets.empty or df_trades.empty:
                 log.error("No data loaded from Dune. Aborting tuning job.")
