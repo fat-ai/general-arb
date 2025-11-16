@@ -1249,6 +1249,7 @@ class BacktestEngine:
         self.historical_data_path = historical_data_path # Useful for caching
         self.cache_dir = Path(self.historical_data_path) / "dune_cache" # <-- ADD THIS
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.dune_api_key = os.getenv("DUNE_API_KEY")
         
  #       self.dune_api_key = os.getenv("DUNE_API_KEY")
  #       if not self.dune_api_key:
