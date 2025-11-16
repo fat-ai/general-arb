@@ -1349,7 +1349,8 @@ class BacktestEngine:
         """
         log.info("Fetching all trades from Polymarket Subgraph...")
         
-        # This GraphQL query fetches fields needed to *calculate* price
+        # This GraphQL query fetches trades (fpmmTransactions)
+        # It now correctly requests the 'user' field as a string
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
@@ -1373,9 +1374,9 @@ class BacktestEngine:
         if df.empty:
             return df
 
-        # --- Un-nest the nested data ---
+        # --- Un-nest the nested data (Corrected) ---
         try:
-            # 'user' column is just the wallet ID string
+            # 'user' column is just the wallet ID string. No .apply needed.
             df['wallet_id'] = df['user']
             # 'market' column is a dict like {'id': '0x...'}. Get the 'id' value.
             df['market_id'] = df['market'].apply(lambda x: x['id'] if isinstance(x, dict) else None)
