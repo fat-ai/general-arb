@@ -85,7 +85,7 @@ def cosine_similarity(v1, v2):
 # ==============================================================================
 
 class GraphManager:
-    """Component 1: Production-ready GraphManager."""
+    """Component 1: Production-ready GraphManager (Fixed for Backtesting)."""
     def __init__(self, is_mock=False):
         self.is_mock = is_mock
         if self.is_mock:
@@ -93,7 +93,7 @@ class GraphManager:
             self.vector_dim = 768
             self.model_brier_scores = {'brier_internal_model': 0.08, 'brier_expert_model': 0.05, 'brier_crowd_model': 0.15}
             
-            # --- FIX R1: Initialize mock_db in constructor ---
+            # Initialize empty mock DB
             self.mock_db = {
                 'contracts': {}, # {contract_id: {data}}
                 'entities': {
@@ -102,15 +102,8 @@ class GraphManager:
                 'aliases': {
                     'NeuroCorp': 'E_123'
                 },
-                'wallets': {
-                    'Wallet_ABC': {'brier_biotech': 0.0567, 'brier_geopolitics': 0.81},
-                    'Wallet_XYZ': {'brier_biotech': 0.49, 'brier_geopolitics': 0.01},
-                    'Wallet_CROWD_1': {'brier_biotech': 0.25},
-                },
-                'review_queue': [
-                    {'id': 'MKT_902', 'reason': 'No alias match found', 'details': json.dumps({'entities': ['NeruCorp']})},
-                    {'id': 'MKT_905', 'reason': 'NEEDS_MERGE_CONFIRMATION', 'details': json.dumps({'similar_contracts': ['MKT_888']})}
-                ]
+                'wallets': {}, # Will be populated by Profiler
+                'review_queue': []
             }
             return
 
@@ -144,11 +137,9 @@ class GraphManager:
             session.execute_write(lambda tx: tx.run("CREATE INDEX entity_type_index IF NOT EXISTS FOR (e:Entity) ON (e.type)"))
             try:
                 session.execute_write(lambda tx: tx.run("CALL apoc.index.add('aliases', ['Alias(text)'])"))
-                log.info("APOC text index 'aliases' ensured.")
             except ClientError:
-                log.warning("APOC index failed (is APOC plugin installed?).")
+                log.warning("APOC index failed.")
             
-            # --- FIX R3: Add Vector Index Creation ---
             try:
                 session.execute_write(
                     lambda tx: tx.run(
@@ -162,9 +153,8 @@ class GraphManager:
                         """
                     )
                 )
-                log.info("Contract vector index applied.")
             except Exception:
-                log.warning(f"Could not create vector index (requires Neo4j Enterprise/Aura).")
+                log.warning(f"Could not create vector index.")
         log.info("Schema setup complete.")
         
     def add_contract(self, contract_id: str, text: str, vector: list[float], liquidity: float = 0.0, p_market_all: float = None):
@@ -180,7 +170,6 @@ class GraphManager:
             raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {len(vector)}")
         with self.driver.session() as session:
             session.execute_write(self._tx_merge_contract, contract_id, text, vector, liquidity, p_market_all)
-        log.info(f"Merged Contract: {contract_id}")
 
     @staticmethod
     def _tx_merge_contract(tx, contract_id, text, vector, liquidity, p_market_all):
@@ -201,14 +190,15 @@ class GraphManager:
     # --- C2: Read/Write Methods ---
     def link_contract_to_entity(self, contract_id, entity_id, confidence):
         if self.is_mock: 
-            self.mock_db['contracts'][contract_id]['entity_ids'].append(entity_id)
-            self.mock_db['contracts'][contract_id]['status'] = 'PENDING_ANALYSIS'
-            # (Fix R5) Increment contract count for this entity
+            if contract_id in self.mock_db['contracts']:
+                self.mock_db['contracts'][contract_id]['entity_ids'].append(entity_id)
+                self.mock_db['contracts'][contract_id]['status'] = 'PENDING_ANALYSIS'
             if entity_id in self.mock_db['entities']:
                 self.mock_db['entities'][entity_id]['contract_count'] += 1
             return
         with self.driver.session() as session:
             session.execute_write(self._tx_link_contract, contract_id, entity_id, confidence)
+
     @staticmethod
     def _tx_link_contract(tx, contract_id, entity_id, confidence):
         tx.run(
@@ -223,15 +213,10 @@ class GraphManager:
     
     def get_contracts_by_status(self, status, limit=10) -> list[dict]:
         if self.is_mock: 
-             # --- FIX R5: Use mock_db ---
-             res = []
-             for cid, data in self.mock_db['contracts'].items():
-                 if data['status'] == status:
-                     res.append({'contract_id': cid, **data})
-                     if len(res) >= limit: break
-             return res
+             return self._mock_get_contracts_by_status(status, limit)
         with self.driver.session() as session:
             return session.execute_read(self._tx_get_contracts_by_status, status, limit)
+
     @staticmethod
     def _tx_get_contracts_by_status(tx, status, limit):
         result = tx.run(
@@ -245,13 +230,8 @@ class GraphManager:
         
     def find_entity_by_alias_fuzzy(self, alias_text: str, threshold: float = 0.9) -> dict:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
-            entity_id = self.mock_db['aliases'].get(alias_text)
-            if entity_id:
-                return {'entity_id': entity_id, 'name': self.mock_db['entities'][entity_id]['canonical_name'], 'confidence': 1.0}
-            return None
+            return self._mock_find_entity_by_alias_fuzzy(alias_text)
         
-        # --- PRODUCTION-READY C2 LOGIC ---
         query = """
             CALL apoc.index.search('aliases', $text) YIELD node AS a, properties
             WITH a, properties.text AS matched_text
@@ -279,8 +259,7 @@ class GraphManager:
                 if result: return result.data()
                 result = session.run(fallback_query, text=alias_text, threshold=threshold).single()
                 return result.data() if result else None
-            except ClientError as e:
-                log.warning(f"APOC fuzzy query failed: {e}. Falling back to exact match.")
+            except ClientError:
                 result = session.execute_read(self._tx_find_entity_exact, alias_text).single()
                 return result.data() if result else None
 
@@ -294,8 +273,6 @@ class GraphManager:
         
     def find_similar_contracts_by_vector(self, contract_id: str, vector: List[float], k: int = 5) -> List[Dict]:
         if self.is_mock: return []
-        
-        # --- PRODUCTION-READY C2 LOGIC ---
         query = """
             CALL db.index.vector.queryNodes('contract_vector_index', $k, $vector) YIELD node, similarity
             WHERE node.contract_id <> $contract_id
@@ -305,8 +282,7 @@ class GraphManager:
             try:
                 results = session.run(query, k=k, vector=vector, contract_id=contract_id)
                 return [r.data() for r in results]
-            except ClientError as e:
-                log.warning(f"Vector KNN query failed (is index 'contract_vector_index' built?): {e}")
+            except ClientError:
                 return []
                 
     def update_contract_status(self, contract_id, status, metadata=None):
@@ -323,14 +299,12 @@ class GraphManager:
         params = {'contract_id': contract_id, 'status': status}
         if metadata:
             query += " SET c.review_metadata = $metadata"
-            # --- FIX 2: Use json.dumps for safe serialization (P0.4) ---
             params['metadata'] = json.dumps(metadata)
         tx.run(query, **params)
     
     # --- C3: Read/Write Methods ---
     def get_entity_contract_count(self, entity_id: str) -> int:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
             return self.mock_db['entities'].get(entity_id, {}).get('contract_count', 0)
         
         query = "MATCH (e:Entity {entity_id: $entity_id})<-[:IS_ABOUT]-(c:Contract) RETURN count(c) AS count"
@@ -340,7 +314,6 @@ class GraphManager:
             
     def update_contract_prior(self, contract_id: str, p_internal: float, alpha: float, beta: float, source: str, p_experts: float, p_all: float):
         if self.is_mock:
-            # --- FIX R5: Use mock_db ---
             if contract_id in self.mock_db['contracts']:
                 self.mock_db['contracts'][contract_id].update({
                     'p_internal_prior': p_internal, 'p_internal_alpha': alpha,
@@ -366,24 +339,18 @@ class GraphManager:
             contract_id=contract_id, p_internal=p_internal, alpha=alpha, beta=beta, 
             source=source, p_experts=p_experts, p_all=p_all
         )
-    # --- FIX R7: Removed duplicate update_contract_prior method ---
 
     # --- C4: Read/Write Methods ---
     def get_all_resolved_trades_by_topic(self) -> pd.DataFrame:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db (albeit still hardcoded for this demo) ---
-            return pd.DataFrame([
-                {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
-                {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
-                {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
-            ])
+            return pd.DataFrame()
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract)-[:IS_ABOUT]->(e:Entity)
         WHERE c.status = 'RESOLVED' AND c.outcome IS NOT NULL AND t.price IS NOT NULL
         RETURN w.wallet_id AS wallet_id, e.type AS entity_type, 
                t.price AS bet_price, c.outcome AS outcome
         SKIP 0 LIMIT 10000 
-        """ # <-- P1: Added LIMIT
+        """ 
         with self.driver.session() as session:
             results = session.run(query)
             df = pd.DataFrame([r.data() for r in results])
@@ -391,36 +358,31 @@ class GraphManager:
 
     def get_live_trades_for_contract(self, contract_id: str) -> pd.DataFrame:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db (hardcoded) ---
-            return pd.DataFrame([
-                {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
-                {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
-            ])
+            return self._mock_get_live_trades_for_contract(contract_id)
+
         query = """
         MATCH (w:Wallet)-[t:TRADED_ON]->(c:Contract {contract_id: $contract_id})
         WHERE t.price IS NOT NULL AND t.volume IS NOT NULL
         RETURN w.wallet_id AS wallet_id, t.price AS trade_price, t.volume AS trade_volume
         LIMIT 1000
-        """ # <-- P1: Added LIMIT
+        """
         with self.driver.session() as session:
             results = session.run(query, contract_id=contract_id)
             df = pd.DataFrame([r.data() for r in results])
             return df if not df.empty else pd.DataFrame(columns=['wallet_id', 'trade_price', 'trade_volume'])
 
     def get_contract_topic(self, contract_id: str) -> str:
- 
         if self.is_mock: 
+             # For backtest consistency, always use 'default_topic' as generated by transform
             return "default_topic"
-        
         with self.driver.session() as session:
             result = session.execute_read(
                 lambda tx: tx.run("MATCH (c:Contract {contract_id: $id})-[:IS_ABOUT]->(e:Entity) RETURN e.type AS topic LIMIT 1", id=contract_id).single()
             )
-        return result.data().get('topic') if result else "default_topic"
+        return result.data().get('topic') if result else "default"
 
     def update_wallet_scores(self, wallet_scores: Dict[tuple, float]):
         if self.is_mock: 
-            log.info(f"MockGraph: Updating {len(wallet_scores)} wallet scores (STUB)")
             for (wallet_id, topic), score in wallet_scores.items():
                 if wallet_id not in self.mock_db['wallets']: self.mock_db['wallets'][wallet_id] = {}
                 self.mock_db['wallets'][wallet_id][f"brier_{topic}"] = score
@@ -431,11 +393,9 @@ class GraphManager:
         query = "UNWIND $scores_list AS score MERGE (w:Wallet {wallet_id: score.wallet_id}) SET w[score.topic_key] = score.brier_score"
         with self.driver.session() as session:
             session.execute_write(lambda tx: tx.run(query, scores_list=scores_list))
-        log.info(f"Updated {len(scores_list)} wallet scores in graph.")
         
     def get_wallet_brier_scores(self, wallet_ids: List[str]) -> Dict[str, Dict[str, float]]:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
             return {wid: scores for wid, scores in self.mock_db['wallets'].items() if wid in wallet_ids}
         
         query = "MATCH (w:Wallet) WHERE w.wallet_id IN $wallet_ids RETURN w.wallet_id AS wallet_id, properties(w) AS scores"
@@ -445,8 +405,7 @@ class GraphManager:
 
     # --- C5: Read/Write Methods ---
     def get_contracts_for_fusion(self, limit: int = 10) -> List[Dict]:
-        """Gets all raw data needed for C5 fusion."""
-        if self.is_mock: return self._mock_get_contracts_for_fusion() # <-- FIX: Call the correct mock
+        if self.is_mock: return self._mock_get_contracts_for_fusion()
         
         query = """
         MATCH (c:Contract {status: 'PENDING_FUSION'})
@@ -470,7 +429,6 @@ class GraphManager:
 
     def update_contract_fused_price(self, contract_id: str, p_model: float, p_model_variance: float):
         if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
             if contract_id in self.mock_db['contracts']:
                 self.mock_db['contracts'][contract_id]['p_model'] = p_model
                 self.mock_db['contracts'][contract_id]['p_model_variance'] = p_model_variance
@@ -487,12 +445,7 @@ class GraphManager:
     # --- C6: Read Methods ---
     def get_active_entity_clusters(self) -> List[str]:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db ---
-            clusters = set()
-            for c in self.mock_db['contracts'].values():
-                if c['status'] == 'MONITORED':
-                    for eid in c['entity_ids']: clusters.add(eid)
-            return list(clusters) if clusters else ["E_DUNE_3"] # Default for demo
+            return self._mock_get_active_entity_clusters()
             
         query = "MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity) RETURN DISTINCT e.entity_id AS entity_id"
         with self.driver.session() as session:
@@ -501,11 +454,8 @@ class GraphManager:
             
     def get_cluster_contracts(self, entity_id: str) -> List[Dict]:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db (default to arb demo) ---
-            return [
-                {'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True},
-                {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}
-            ]
+            return self._mock_get_cluster_contracts(entity_id)
+
         query = """
         MATCH (c:Contract {status:'MONITORED'})-[:IS_ABOUT]->(e:Entity {entity_id: $entity_id})
         WHERE c.p_model IS NOT NULL AND c.p_market_all IS NOT NULL
@@ -519,10 +469,6 @@ class GraphManager:
             
     def get_relationship_between_contracts(self, c1_id: str, c2_id: str, contracts: List[Dict]) -> Dict:
         if self.is_mock: 
-            # --- FIX R5: Use mock_db (default to arb demo) ---
-            if c1_id == 'MKT_A' and c2_id == 'MKT_B':
-                p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
-                return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
             return {'type': 'NONE', 'p_joint': None}
             
         query = """
@@ -537,95 +483,77 @@ class GraphManager:
             p_model_c1 = next(c['M'] for c in contracts if c['id'] == c1_id)
             result = session.run(query, c1_id=c1_id, c2_id=c2_id).single()
             if result and result.data().get('type') == 'IMPLIES':
-                log.debug(f"Found LOGICAL_IMPLIES between {c1_id} and {c2_id}")
                 return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_model_c1}
         return {'type': 'NONE', 'p_joint': None}
 
     # --- C7/C8: Mock-driving Methods ---
-    def get_historical_data_for_replay(self, start_date, end_date):
-        log.info(f"MockGraph: Fetching historical data from {start_date} to {end_date} (STUB)")
-        return pd.DataFrame([
-            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp release...', 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.50}),
-            ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51, 'p_market_experts': 0.55}),
-            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [0.2]*768, 'liquidity': 50000, 'p_market_all': 0.70}),
-            ('2023-01-02T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.55, 'p_market_experts': 0.60}),
-            ('2023-01-02T10:06:00Z', 'PRICE_UPDATE', {'id': 'MKT_2', 'p_market_all': 0.70, 'p_market_experts': 0.75}),
-            ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
-            ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
-        ], columns=['timestamp', 'event_type', 'data'])
-        
     def get_human_review_queue(self):
-        log.info("MockGraph: Fetching 'NEEDS_HUMAN_REVIEW' queue...")
         return self.mock_db['review_queue']
         
     def get_portfolio_state(self):
-        log.info("MockGraph: Fetching current portfolio...")
-        # (Hardcoded for demo)
         return {'cash': 8537.88, 'positions': [{'id': 'MKT_A', 'fraction': -0.075}, {'id': 'MKT_B', 'fraction': 0.075}], 'total_value': 8537.88}
         
     def get_pnl_history(self):
-        log.info("MockGraph: Fetching P&L history...")
         return pd.Series(np.random.normal(0, 1, 100).cumsum() + 10000)
         
     def get_regime_status(self):
-        log.info("MockGraph: Fetching regime status...")
         return "LOW_VOL", {"k_brier_scale": 1.5, "kelly_edge_thresh": 0.1}
         
     def resolve_human_review_item(self, item_id, action, data):
-        log.warning(f"MockGraph: Resolving {item_id} with action '{action}' and data: {data}")
         self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != item_id]
-        # (In prod, this would trigger C2 linker to re-run on this contract_id)
         return True
 
-    # --- MOCK IMPLEMENTATIONS (Called if is_mock=True) ---
+    # --- MOCK IMPLEMENTATIONS (CORRECTED) ---
     
     def _mock_get_contracts_by_status(self, status: str, limit: int = 10):
-         if status == 'PENDING_LINKING':
-             return [{'contract_id': 'MKT_902_SPACY_DEMO', 'text': "Will 'NeuroCorp' release the 'Viper'?", 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': []}]
-         if status == 'PENDING_ANALYSIS':
-            return [{'contract_id': 'MKT_903', 'text': 'Test contract for NeuroCorp', 'vector': [0.3]*768, 'liquidity': 100, 'p_market_all': 0.5, 'entity_ids': ['E_123']}]
-         if status == 'PENDING_FUSION':
-            return [{'contract_id': 'MKT_FUSE_001', 'p_internal_alpha': 13.8, 'p_internal_beta': 9.2, 'p_market_experts': 0.45, 'p_market_all': 0.55, 'status': 'PENDING_FUSION'}]
-         return []
-         
+         # FIX: Actually query the mock DB instead of returning hardcoded demo data
+         res = []
+         for cid, data in self.mock_db['contracts'].items():
+             if data['status'] == status:
+                 item = data.copy()
+                 item['contract_id'] = cid
+                 res.append(item)
+                 if len(res) >= limit: break
+         return res
+
     def _mock_find_entity_by_alias_fuzzy(self, alias_text: str):
-        if alias_text == "NeuroCorp": return {'entity_id': 'E_123', 'name': 'NeuroCorp, Inc.', 'confidence': 1.0}
-        return None
-        
-    def _mock_get_all_resolved_trades_by_topic(self):
-        return pd.DataFrame([
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.8, 'outcome': 1.0},
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.7, 'outcome': 1.0},
-            {'wallet_id': 'Wallet_ABC', 'entity_type': 'biotech', 'bet_price': 0.2, 'outcome': 0.0},
-            {'wallet_id': 'Wallet_XYZ', 'entity_type': 'geopolitics', 'bet_price': 0.4, 'outcome': 0.0},
-        ])
+        # Simple exact match for backtest speed
+        entity_id = self.mock_db['aliases'].get(alias_text)
+        if entity_id:
+            return {'entity_id': entity_id, 'name': self.mock_db['entities'][entity_id]['canonical_name'], 'confidence': 1.0}
+        # Fallback: Create a dynamic entity for any new alias found in backtest
+        # This prevents "No entities found" errors for valid markets
+        fake_id = f"E_{hash(alias_text)}"
+        self.mock_db['entities'][fake_id] = {'canonical_name': alias_text, 'type': 'default_topic', 'contract_count': 0}
+        self.mock_db['aliases'][alias_text] = fake_id
+        return {'entity_id': fake_id, 'name': alias_text, 'confidence': 1.0}
         
     def _mock_get_live_trades_for_contract(self, contract_id):
-        return pd.DataFrame([
-            {'wallet_id': 'Wallet_ABC', 'trade_price': 0.35, 'trade_volume': 5000},
-            {'wallet_id': 'Wallet_CROWD_1', 'trade_price': 0.60, 'trade_volume': 100},
-        ])
-        
-    def _mock_get_wallet_brier_scores(self, wallet_ids):
-        return { 'Wallet_ABC': {'brier_biotech': 0.0567}, 'Wallet_CROWD_1': {'brier_biotech': 0.25} }
+        if 'live_trades' in self.mock_db:
+            # If backtest injected live trades, use them
+            all_trades = pd.DataFrame(self.mock_db['live_trades'])
+            if not all_trades.empty and 'id' in all_trades.columns:
+                 return all_trades[all_trades['id'] == contract_id]
+        return pd.DataFrame(columns=['wallet_id', 'trade_price', 'trade_volume'])
         
     def _mock_get_contracts_for_fusion(self):
-        return [c for c in self.mock_db['contracts'].values() if c['status'] == 'PENDING_FUSION']
-        
-    def _mock_get_model_brier_scores(self): 
-        return self.model_brier_scores
-        
+        # FIX: Inject contract_id into the returned dicts
+        res = []
+        for cid, data in self.mock_db['contracts'].items():
+            if data.get('status') == 'PENDING_FUSION':
+                item = data.copy()
+                item['contract_id'] = cid
+                res.append(item)
+        return res
+            
     def _mock_get_active_entity_clusters(self): 
         clusters = set()
         for c in self.mock_db['contracts'].values():
             if c.get('status') == 'MONITORED':
                 for eid in c.get('entity_ids', []): clusters.add(eid)
-        return list(clusters) if clusters else ["E_DUNE_3_MOCK"] # Default for demo
+        return list(clusters)
             
     def _mock_get_cluster_contracts(self, entity_id):
-        if entity_id == "E_DUNE_3_MOCK":
-            return [{'id': 'MKT_A', 'M': 0.60, 'Q': 0.60, 'is_logical_rule': True}, {'id': 'MKT_B', 'M': 0.60, 'Q': 0.50, 'is_logical_rule': True}]
-        
         res = []
         for cid, data in self.mock_db['contracts'].items():
             if data.get('status') == 'MONITORED' and entity_id in data.get('entity_ids', []):
@@ -633,46 +561,9 @@ class GraphManager:
                     'id': cid,
                     'M': data.get('p_model'),
                     'Q': data.get('p_market_all'),
-                    'is_logical_rule': data.get('is_logical_rule', False)
+                    'is_logical_rule': False
                 })
         return res
-            
-    def _mock_get_relationship_between_contracts(self, c1_id, c2_id, contracts):
-        if c1_id == 'MKT_A' and c2_id == 'MKT_B':
-            p_A = next(c['M'] for c in contracts if c['id'] == 'MKT_A')
-            return {'type': 'LOGICAL_IMPLIES', 'p_joint': p_A}
-        return {'type': 'NONE', 'p_joint': None}
-        
-    def _mock_get_historical_data_for_replay(self, s, e):
-        df = pd.DataFrame([
-            ('2023-01-01T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_1', 'text': 'NeuroCorp release...', 'vector': [0.1]*768, 'liquidity': 100, 'p_market_all': 0.50}),
-            ('2023-01-01T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.51, 'p_market_experts': 0.55}),
-            ('2023-01-02T10:00:00Z', 'NEW_CONTRACT', {'id': 'MKT_2', 'text': 'Dune 3...', 'vector': [0.2]*768, 'liquidity': 50000, 'p_market_all': 0.70}),
-            ('2023-01-02T10:05:00Z', 'PRICE_UPDATE', {'id': 'MKT_1', 'p_market_all': 0.55, 'p_market_experts': 0.60}),
-            ('2023-01-02T10:06:00Z', 'PRICE_UPDATE', {'id': 'MKT_2', 'p_market_all': 0.70, 'p_market_experts': 0.75}),
-            ('2023-01-03T12:00:00Z', 'RESOLUTION', {'id': 'MKT_1', 'outcome': 1.0}),
-            ('2023-01-04T12:00:00Z', 'RESOLUTION', {'id': 'MKT_2', 'outcome': 0.0}),
-        ], columns=['timestamp', 'event_type', 'data'])
-        df['contract_id'] = df['data'].apply(lambda x: x.get('id'))
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.set_index('timestamp').sort_index()
-        return df
-        
-    def _mock_get_human_review_queue(self): 
-        return self.mock_db['review_queue']
-        
-    def _mock_get_portfolio_state(self): 
-        return {'cash': 8500.0, 'positions': [], 'total_value': 8500.0}
-        
-    def _mock_get_pnl_history(self): 
-        return pd.Series(np.random.normal(0, 1, 100).cumsum() + 10000)
-        
-    def _mock_get_regime_status(self): 
-        return "LOW_VOL", {"k": 1.5, "edge": 0.1}
-        
-    def _mock_resolve_human_review_item(self, id, action, data): 
-        self.mock_db['review_queue'] = [item for item in self.mock_db['review_queue'] if item['id'] != id]
-        return True
 
 # ==============================================================================
 # ### COMPONENT 2: RelationalLinker (Production-Ready) ###
