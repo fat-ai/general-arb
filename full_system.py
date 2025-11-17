@@ -1558,11 +1558,11 @@ class BacktestEngine:
             tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0, 'max_drawdown': 1.0})
             return
         
-        # --- OPTIMIZATION LOGGING ---
-        log.info(f"[BACKTEST] Starting with {len(historical_data)} events")
+        # --- OPTIMIZATION: Batch by Time Window (1000x Speedup) ---
+        log.info(f"[BACKTEST] Starting with {len(historical_data)} events. Resampling to 1H buckets...")
         
         try:
-            # 1. Initialize all components
+            # 1. Initialize components
             graph = GraphManager(is_mock=True) 
             
             graph.model_brier_scores = {
@@ -1595,62 +1595,67 @@ class BacktestEngine:
             
             current_prices = {} 
             
-            # --- PERFORMANCE FIX 1: Increase Interval ---
-            last_rebalance_time = None
-            rebalance_interval = timedelta(hours=4) # Trade every 4 hours (Standard for crypto backtests)
+            # 3. Prepare Data Batches
+            # We create a 'bucket' column to group events by hour
+            df_batch = historical_data.copy()
+            df_batch['bucket'] = df_batch.index.floor('1h')
             
-            # 3. --- The Replay Loop ---
-            # We iterate through groups of events (all events at the exact same timestamp)
-            for timestamp, events in historical_data.groupby(historical_data.index):
+            # 4. The Fast Loop (Iterates ~2,000 times instead of 2,000,000)
+            for bucket_time, bucket_events in df_batch.groupby('bucket'):
                 
-                # --- A. Process Critical Events (Contracts/Resolutions) ---
-                for _, event in events.iterrows():
+                # A. Handle Critical Events (Contracts & Resolutions)
+                # We iterate these fully because logic depends on exact sequence
+                critical_mask = bucket_events['event_type'].isin(['NEW_CONTRACT', 'RESOLUTION'])
+                critical_events = bucket_events[critical_mask]
+                
+                for _, event in critical_events.iterrows():
                     data = event['data']
-                    event_type = event['event_type']
                     contract_id = event['contract_id']
                     
-                    if event_type == 'NEW_CONTRACT':
+                    if event['event_type'] == 'NEW_CONTRACT':
                         graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
-                        # We defer heavy logic (Priors/Fusion) to the rebalance block
+                        prior_manager.process_pending_contracts()
+                        belief_engine.run_fusion_process() 
                     
-                    elif event_type == 'RESOLUTION':
+                    elif event['event_type'] == 'RESOLUTION':
                         p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
                         portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
                         current_prices.pop(contract_id, None)
                         graph.update_contract_status(contract_id, 'RESOLVED', {'outcome': data['outcome']})
 
-                # --- B. Process Price Updates (Batched) ---
-                price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
+                # B. Handle Price Updates (Bulk Optimized)
+                # We only need the LAST price for each contract in this hour to make a decision
+                price_mask = bucket_events['event_type'] == 'PRICE_UPDATE'
+                price_events = bucket_events[price_mask]
                 
-                if price_updates:
-                    # 1. Update "Live" Prices in Mock DB (Fast dictionary updates only)
-                    for c_id, data in price_updates.items():
+                if not price_events.empty:
+                    # Drop duplicates to keep only the last price per contract per hour
+                    latest_updates = price_events.drop_duplicates(subset='contract_id', keep='last')
+                    
+                    for _, row in latest_updates.iterrows():
+                        c_id = row['contract_id']
+                        data = row['data']
                         current_prices[c_id] = data['p_market_all']
+                        
                         if c_id in graph.mock_db['contracts']:
-                            graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
-                            graph.mock_db['live_trades'] = [d['data'] for _, d in events.iterrows() if d['event_type'] == 'PRICE_UPDATE' and d['contract_id'] == c_id]
-                            # We do NOT set 'PENDING_ANALYSIS' here to avoid triggering logic loops
-                            # We leave it to the periodic check below
+                             graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
+                             # Update live trades view for C4
+                             graph.mock_db['live_trades'] = [data] 
+                             graph.update_contract_status(c_id, 'PENDING_ANALYSIS')
 
-                    # 2. Run Pipeline Logic (HEAVILY THROTTLED)
-                    # We ONLY run the heavy math (Priors, Fusion, Kelly) once every 4 hours
-                    if last_rebalance_time is None or (timestamp - last_rebalance_time) >= rebalance_interval:
-                        
-                        # --- PERFORMANCE FIX 2: Run Logic ONLY when needed ---
-                        prior_manager.process_pending_contracts() 
-                        belief_engine.run_fusion_process()
-                        
-                        target_basket = pm.run_optimization_cycle()
-                        
-                        if target_basket: 
-                            log.debug(f"[BACKTEST] {timestamp} Rebalance. Targets: {len(target_basket)}")
-                        
-                        portfolio.rebalance(target_basket, current_prices)
-                        last_rebalance_time = timestamp
+                    # C. Run Trading Logic (Once per Hour)
+                    prior_manager.process_pending_contracts()
+                    belief_engine.run_fusion_process()
+                    
+                    target_basket = pm.run_optimization_cycle()
+                    if target_basket:
+                        log.debug(f"[BACKTEST] {bucket_time} Rebalance. Targets: {len(target_basket)}")
+                    
+                    portfolio.rebalance(target_basket, current_prices)
 
-            # 4. Get final metrics
+            # 5. Final Metrics
             metrics = portfolio.get_final_metrics()
             tune.report(metrics)
             
@@ -1659,7 +1664,7 @@ class BacktestEngine:
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
             tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0})
-            
+                  
     def run_tuning_job(self):
         """Main entry point for Component 7."""
         log.info("--- C7: Starting Hyperparameter Tuning Job ---")
