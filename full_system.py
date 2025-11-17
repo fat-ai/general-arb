@@ -1553,34 +1553,32 @@ class BacktestEngine:
         """
         log.debug(f"--- C7: Starting back-test run with config: {config} ---")
         
-        # --- FIX: Defensive Logging to prevent KeyError ---
         if historical_data.empty or 'event_type' not in historical_data.columns:
             log.warning("[BACKTEST] Historical data is empty or malformed. Skipping run.")
-            # Return worst-case metrics so the tuner knows this run failed
             tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0, 'max_drawdown': 1.0})
             return
         
-        log.info(f"[BACKTEST] Starting with {len(historical_data)} events")
-        log.info(f"[BACKTEST] Event types: {historical_data['event_type'].value_counts().to_dict()}")
-        log.info(f"[BACKTEST] Profiler data: {len(profiler_data)} trades")
-        # --- END FIX ---
+        # --- OPTIMIZATION: Downsample for speed during tuning ---
+        # If we have too many events, we can't simulate every tick for a tuning job.
+        # We keep all 'NEW_CONTRACT' and 'RESOLUTION' events, but downsample 'PRICE_UPDATE'
+        # This is optional, but recommended if you have >1M rows.
+        # For now, we rely on the 'rebalance_interval' check below.
         
         try:
-            # 1. Initialize all components *with this run's config*
-            graph = GraphManager(is_mock=True) # Mocks the DB
+            # 1. Initialize all components
+            graph = GraphManager(is_mock=True) 
             
             graph.model_brier_scores = {
                 'brier_internal_model': config['brier_internal_model'],
                 'brier_expert_model': 0.05, 'brier_crowd_model': 0.15,
             }
             
-            # --- Instantiate REAL Pipeline ---
             linker = RelationalLinker(graph)
             ai_analyst = AIAnalyst()
             
             profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
             graph.mock_db['profiler_data'] = profiler_data 
-            profiler.run_profiling() # This will populate the mock_db['wallets']
+            profiler.run_profiling() 
             
             live_feed = LiveFeedHandler(graph)
             prior_manager = PriorManager(graph, ai_analyst, live_feed)
@@ -1593,68 +1591,72 @@ class BacktestEngine:
             )
             pm = PortfolioManager(graph, kelly_solver)
             
-            # 2. Initialize the simulation portfolio
+            # 2. Initialize Portfolio
             portfolio = BacktestPortfolio()
             portfolio.start_time = historical_data.index.min()
             portfolio.end_time = historical_data.index.max()
             
-            current_prices = {} # {contract_id: price}
+            current_prices = {} 
+            
+            # --- PERFORMANCE FIX: Throttle Rebalancing ---
+            last_rebalance_time = None
+            rebalance_interval = timedelta(hours=1) # Only trade once per hour
             
             # 3. --- The Replay Loop ---
+            # We iterate through groups of events (all events at the exact same timestamp)
             for timestamp, events in historical_data.groupby(historical_data.index):
                 
-                # --- A. Process all non-trade events first ---
+                # --- A. Process Critical Events (Contracts/Resolutions) ---
                 for _, event in events.iterrows():
                     data = event['data']
                     event_type = event['event_type']
                     contract_id = event['contract_id']
                     
                     if event_type == 'NEW_CONTRACT':
-                        log.debug(f"Event: NEW_CONTRACT {contract_id}")
                         graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
                         prior_manager.process_pending_contracts()
-                        belief_engine.run_fusion_process() # <-- YOUR FIX 1
+                        belief_engine.run_fusion_process() 
                     
                     elif event_type == 'RESOLUTION':
-                        log.debug(f"Event: RESOLUTION {contract_id}")
                         p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
                         portfolio.handle_resolution(contract_id, data['outcome'], p_model, current_prices)
                         current_prices.pop(contract_id, None)
                         graph.update_contract_status(contract_id, 'RESOLVED', {'outcome': data['outcome']})
 
-                # --- B. Process price updates & rebalance ---
+                # --- B. Process Price Updates (Batched) ---
                 price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
+                
                 if price_updates:
-                    log.debug(f"Event: PRICE_UPDATE {list(price_updates.keys())}")
-                    
+                    # 1. Update "Live" Prices in Mock DB
                     for c_id, data in price_updates.items():
                         current_prices[c_id] = data['p_market_all']
+                        # Only update graph if we are tracking this contract
                         if c_id in graph.mock_db['contracts']:
                             graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
+                            # For C4 (LiveFeed), we ideally pass the specific trade, but for speed we just pass the batch
+                            # NOTE: In a full prod system, we'd append to a deque. 
+                            # Here we overwrite to simulate "latest trade"
                             graph.mock_db['live_trades'] = [d['data'] for _, d in events.iterrows() if d['event_type'] == 'PRICE_UPDATE' and d['contract_id'] == c_id]
                             graph.update_contract_status(c_id, 'PENDING_ANALYSIS') 
-                    
+
+                    # 2. Run Pipeline Logic (Throttled)
+                    # We ALWAYS update priors/belief (cheap)
                     prior_manager.process_pending_contracts() 
-                    
                     belief_engine.run_fusion_process()
-                    monitored_count = sum(1 for c in graph.mock_db['contracts'].values() if c.get('status') == 'MONITORED')
-                    log.info(f"[BACKTEST] Contracts in MONITORED status: {monitored_count}")
                     
-                    target_basket = pm.run_optimization_cycle()
-                    log.info(f"[BACKTEST] Timestamp: {timestamp}, Target basket: {target_basket}, Current positions: {portfolio.positions}")
-                    portfolio.rebalance(target_basket, current_prices)
-            
+                    # We ONLY run Portfolio Optimization (Expensive) periodically
+                    if last_rebalance_time is None or (timestamp - last_rebalance_time) >= rebalance_interval:
+                        target_basket = pm.run_optimization_cycle()
+                        if target_basket: # Only log if we actually want to trade
+                            log.debug(f"[BACKTEST] {timestamp} Rebalance. Targets: {len(target_basket)}")
+                        portfolio.rebalance(target_basket, current_prices)
+                        last_rebalance_time = timestamp
+
             # 4. Get final metrics
             metrics = portfolio.get_final_metrics()
-            
-            # 5. Report to Ray Tune
             tune.report(metrics)
-            
-            log.info(f"[BACKTEST] Final portfolio: {portfolio.get_total_value(current_prices)}")
-            log.info(f"[BACKTEST] Total P&L history entries: {len(portfolio.pnl_history)}")
-            log.info(f"[BACKTEST] Total Brier scores recorded: {len(portfolio.brier_scores)}")
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
