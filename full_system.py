@@ -1558,11 +1558,8 @@ class BacktestEngine:
             tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0, 'max_drawdown': 1.0})
             return
         
-        # --- OPTIMIZATION: Downsample for speed during tuning ---
-        # If we have too many events, we can't simulate every tick for a tuning job.
-        # We keep all 'NEW_CONTRACT' and 'RESOLUTION' events, but downsample 'PRICE_UPDATE'
-        # This is optional, but recommended if you have >1M rows.
-        # For now, we rely on the 'rebalance_interval' check below.
+        # --- OPTIMIZATION LOGGING ---
+        log.info(f"[BACKTEST] Starting with {len(historical_data)} events")
         
         try:
             # 1. Initialize all components
@@ -1598,9 +1595,9 @@ class BacktestEngine:
             
             current_prices = {} 
             
-            # --- PERFORMANCE FIX: Throttle Rebalancing ---
+            # --- PERFORMANCE FIX 1: Increase Interval ---
             last_rebalance_time = None
-            rebalance_interval = timedelta(hours=1) # Only trade once per hour
+            rebalance_interval = timedelta(hours=4) # Trade every 4 hours (Standard for crypto backtests)
             
             # 3. --- The Replay Loop ---
             # We iterate through groups of events (all events at the exact same timestamp)
@@ -1616,8 +1613,7 @@ class BacktestEngine:
                         graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
-                        prior_manager.process_pending_contracts()
-                        belief_engine.run_fusion_process() 
+                        # We defer heavy logic (Priors/Fusion) to the rebalance block
                     
                     elif event_type == 'RESOLUTION':
                         p_model = graph.mock_db['contracts'].get(contract_id, {}).get('p_model', 0.5)
@@ -1629,34 +1625,36 @@ class BacktestEngine:
                 price_updates = {e['contract_id']: e['data'] for _, e in events.iterrows() if e['event_type'] == 'PRICE_UPDATE'}
                 
                 if price_updates:
-                    # 1. Update "Live" Prices in Mock DB
+                    # 1. Update "Live" Prices in Mock DB (Fast dictionary updates only)
                     for c_id, data in price_updates.items():
                         current_prices[c_id] = data['p_market_all']
-                        # Only update graph if we are tracking this contract
                         if c_id in graph.mock_db['contracts']:
                             graph.mock_db['contracts'][c_id]['p_market_all'] = data['p_market_all']
-                            # For C4 (LiveFeed), we ideally pass the specific trade, but for speed we just pass the batch
-                            # NOTE: In a full prod system, we'd append to a deque. 
-                            # Here we overwrite to simulate "latest trade"
                             graph.mock_db['live_trades'] = [d['data'] for _, d in events.iterrows() if d['event_type'] == 'PRICE_UPDATE' and d['contract_id'] == c_id]
-                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS') 
+                            # We do NOT set 'PENDING_ANALYSIS' here to avoid triggering logic loops
+                            # We leave it to the periodic check below
 
-                    # 2. Run Pipeline Logic (Throttled)
-                    # We ALWAYS update priors/belief (cheap)
-                    prior_manager.process_pending_contracts() 
-                    belief_engine.run_fusion_process()
-                    
-                    # We ONLY run Portfolio Optimization (Expensive) periodically
+                    # 2. Run Pipeline Logic (HEAVILY THROTTLED)
+                    # We ONLY run the heavy math (Priors, Fusion, Kelly) once every 4 hours
                     if last_rebalance_time is None or (timestamp - last_rebalance_time) >= rebalance_interval:
+                        
+                        # --- PERFORMANCE FIX 2: Run Logic ONLY when needed ---
+                        prior_manager.process_pending_contracts() 
+                        belief_engine.run_fusion_process()
+                        
                         target_basket = pm.run_optimization_cycle()
-                        if target_basket: # Only log if we actually want to trade
+                        
+                        if target_basket: 
                             log.debug(f"[BACKTEST] {timestamp} Rebalance. Targets: {len(target_basket)}")
+                        
                         portfolio.rebalance(target_basket, current_prices)
                         last_rebalance_time = timestamp
 
             # 4. Get final metrics
             metrics = portfolio.get_final_metrics()
             tune.report(metrics)
+            
+            log.info(f"[BACKTEST] Final portfolio: {portfolio.get_total_value(current_prices)}")
             
         except Exception as e:
             log.error(f"Back-test run failed: {e}", exc_info=True)
