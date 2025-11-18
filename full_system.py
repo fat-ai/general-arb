@@ -1404,16 +1404,19 @@ class BacktestEngine:
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
-        (Optimized) Transforms raw data and PRE-CALCULATES NLP entities.
+        (Optimized v2.1) Transforms raw data and PRE-CALCULATES NLP entities with Batching + Progress Logs.
         """
         log.info("Transforming raw Subgraph and Gamma API data into event log...")
 
-        # --- FIX 2: Load NLP once, globally, before the loop ---
         try:
             nlp = spacy.load("en_core_web_sm")
+            # Disable unnecessary pipeline components for speed
+            # We only need NER (Named Entity Recognition), so we disable tagger, parser, etc.
+            nlp.select_pipes(enable=['ner']) 
             relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
-        except Exception:
-            log.warning("spaCy model not found. NLP pre-processing will be skipped.")
+            log.info("spaCy model loaded. Using optimized nlp.pipe for batch processing.")
+        except Exception as e:
+            log.warning(f"spaCy setup failed ({e}). NLP pre-processing will be skipped.")
             nlp = None
 
         empty_log = pd.DataFrame(columns=['timestamp', 'event_type', 'data'])
@@ -1471,6 +1474,7 @@ class BacktestEngine:
             return empty_log, empty_profiler
 
         # --- 3. Join ---
+        log.info("Joining Market and Trade data...")
         df_markets['fpmm_address'] = df_markets['fpmm_address'].astype(str).str.lower()
         df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
         market_id_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
@@ -1483,20 +1487,31 @@ class BacktestEngine:
         profiler_data['entity_type'] = 'default_topic'
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
         
-        # --- 4. Event Log with NLP Pre-calc ---
+        # --- 4. Event Log with Batch NLP ---
+        log.info(f"Generating event log for {len(df_markets)} markets (this includes NLP parsing)...")
         events = []
         market_vectors = {mid: [0.1]*768 for mid in market_id_map.values()} 
         
-        for _, row in df_markets.iterrows():
-            # --- FIX 2 (Continued): Extract entities here ---
+        # Convert DataFrame to list of dicts for iteration
+        market_records = df_markets.to_dict('records')
+        
+        # Prepare texts for batch processing
+        if nlp:
+            questions = [r['question'] for r in market_records]
+            # nlp.pipe is much faster than calling nlp() in a loop
+            # batch_size=50 is a safe default
+            doc_stream = nlp.pipe(questions, batch_size=50)
+        else:
+            doc_stream = [None] * len(market_records)
+
+        count = 0
+        for row, doc in zip(market_records, doc_stream):
             extracted_entities = []
-            if nlp:
-                doc = nlp(row['question'])
+            if doc:
                 extracted_entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
-                # If no entities found, fallback to the first noun chunk or the whole string
                 if not extracted_entities:
                      extracted_entities = [row['question'][:20]]
-
+            
             events.append((
                 row['created_at'], 'NEW_CONTRACT',
                 {
@@ -1505,14 +1520,21 @@ class BacktestEngine:
                     'vector': market_vectors.get(row['market_id']), 
                     'liquidity': 0, 
                     'p_market_all': 0.5,
-                    'precalc_entities': extracted_entities # <--- Storing them here
+                    'precalc_entities': extracted_entities
                 }
             ))
             
+            # Progress Logger
+            count += 1
+            if count % 500 == 0:
+                log.info(f"Processed NLP for {count}/{len(market_records)} markets...")
+
+        # Add resolutions
         for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
             if pd.notna(row.get('outcome')):
                  events.append((row['resolution_timestamp'], 'RESOLUTION', {'id': row['market_id'], 'outcome': row['outcome']}))
             
+        # Add trades
         for _, row in df_trades.iterrows():
             events.append((row['timestamp'], 'PRICE_UPDATE',
                 {'id': row['market_id'], 'p_market_all': row['price'], 'wallet_id': row['wallet_id'], 'trade_price': row['price'], 'trade_volume': abs(row['size'])}
@@ -1526,7 +1548,6 @@ class BacktestEngine:
 
         log.info(f"ETL Complete. Profiler: {len(profiler_data)}, Events: {len(event_log)}")
         return event_log, profiler_data
-
     @staticmethod
     def _run_single_backtest(config: Dict[str, Any], historical_data: pd.DataFrame, profiler_data: pd.DataFrame):
         """
