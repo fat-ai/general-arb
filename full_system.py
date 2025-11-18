@@ -157,18 +157,22 @@ class GraphManager:
                 log.warning(f"Could not create vector index.")
         log.info("Schema setup complete.")
         
-    def add_contract(self, contract_id: str, text: str, vector: list[float], liquidity: float = 0.0, p_market_all: float = None):
+    # Update the signature to accept **kwargs
+    def add_contract(self, contract_id: str, text: str, vector: list[float], liquidity: float = 0.0, p_market_all: float = None, **kwargs):
         if self.is_mock:
             self.mock_db['contracts'][contract_id] = {
                 'text': text, 'vector': vector, 'liquidity': liquidity,
                 'p_market_all': p_market_all, 'status': 'PENDING_LINKING',
-                'entity_ids': []
+                'entity_ids': [],
+                # Store any extra data (like pre-calculated entities) for the backtest
+                **kwargs 
             }
             return
             
         if len(vector) != self.vector_dim:
             raise ValueError(f"Vector dimension mismatch. Expected {self.vector_dim}, got {len(vector)}")
         with self.driver.session() as session:
+            # Production path remains unchanged, ignores kwargs
             session.execute_write(self._tx_merge_contract, contract_id, text, vector, liquidity, p_market_all)
 
     @staticmethod
@@ -568,17 +572,23 @@ class GraphManager:
 # ==============================================================================
 # ### COMPONENT 2: RelationalLinker (Production-Ready) ###
 # ==============================================================================
+_GLOBAL_SPACY_MODEL = None
+
 class RelationalLinker:
     """(Production-Ready C2)"""
     def __init__(self, graph_manager: GraphManager):
         self.graph = graph_manager
-        model_name = "en_core_web_sm"
-        try:
-            self.nlp = spacy.load(model_name)
-            log.info("spaCy NER model loaded.")
-        except IOError:
-            log.error(f"Failed to load spaCy model '{model_name}'. Run: python -m spacy download en_core_web_sm")
-            raise
+        global _GLOBAL_SPACY_MODEL
+        
+        # Optimization: Only load spaCy once per process, not per trial
+        if _GLOBAL_SPACY_MODEL is None:
+            try:
+                log.info("Loading spaCy model (Global)...")
+                _GLOBAL_SPACY_MODEL = spacy.load("en_core_web_sm")
+            except IOError:
+                log.error("Failed to load spaCy model.")
+                raise
+        self.nlp = _GLOBAL_SPACY_MODEL
     
     def _extract_entities(self, text: str) -> set[str]:
         doc = self.nlp(text)
@@ -602,16 +612,21 @@ class RelationalLinker:
         return "NEEDS_MERGE_CONFIRMATION", {'similar_contracts': [c['id'] for c in similar_contracts]}
 
     def process_pending_contracts(self):
-        log.info("--- C2: Checking for 'PENDING_LINKING' contracts ---")
+        # log.info("--- C2: Checking for 'PENDING_LINKING' contracts ---") 
+        # (Logging commented out for speed in backtest loops)
+        
         contracts = self.graph.get_contracts_by_status('PENDING_LINKING', limit=10)
-        if not contracts:
-            log.info("C2: No contracts to link.")
-            return
+        if not contracts: return
 
         for contract in contracts:
-            contract_id, contract_text, contract_vector = contract['contract_id'], contract['text'], contract['vector']
-            log.info(f"--- C2: Processing Contract: {contract_id} ---")
-            extracted_entities = self._extract_entities(contract_text)
+            contract_id = contract['contract_id']
+            contract_text = contract['text']
+            contract_vector = contract['vector']
+            
+            if 'precalc_entities' in contract and contract['precalc_entities']:
+                extracted_entities = set(contract['precalc_entities'])
+            else:
+                extracted_entities = self._extract_entities(contract_text)
             
             if not extracted_entities:
                 self.graph.update_contract_status(contract_id, 'NEEDS_HUMAN_REVIEW', {'reason': 'No entities found'})
@@ -620,15 +635,13 @@ class RelationalLinker:
             fast_path_matches = self._run_fast_path(extracted_entities)
 
             if len(fast_path_matches) >= 1:
-                log.info(f"C2: Fast Path success. Linking {len(fast_path_matches)} entities.")
                 for entity_id, (confidence, name) in fast_path_matches.items():
                     self.graph.link_contract_to_entity(contract_id, entity_id, confidence)
             else:
-                log.info("C2: No Fast Path matches. Escalating to Fuzzy Path (KNN).")
+                # Logic Preserved: Still attempts Vector Search if text match fails
                 reason, details = self._run_fuzzy_path_knn(contract_id, contract_vector)
                 details['extracted_entities'] = list(extracted_entities)
                 self.graph.update_contract_status(contract_id, 'NEEDS_HUMAN_REVIEW', {'reason': reason, **details})
-            log.info(f"--- C2: Finished Processing: {contract_id} ---")
 
 # ==============================================================================
 # ### COMPONENT 3: Prior Engines (Production-Ready) ###
@@ -1391,99 +1404,68 @@ class BacktestEngine:
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
         """
-        This is the "Transform" phase.
-        It creates two crucial DataFrames from the TWO different data sources:
-        1. profiler_data: Used to *pre-train* the C4 HistoricalProfiler.
-        2. event_log: The time-series log for the C7 replay harness.
+        (Optimized) Transforms raw data and PRE-CALCULATES NLP entities.
         """
         log.info("Transforming raw Subgraph and Gamma API data into event log...")
 
-        # Define empty returns for error cases
+        # --- FIX 2: Load NLP once, globally, before the loop ---
+        try:
+            nlp = spacy.load("en_core_web_sm")
+            relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
+        except Exception:
+            log.warning("spaCy model not found. NLP pre-processing will be skipped.")
+            nlp = None
+
         empty_log = pd.DataFrame(columns=['timestamp', 'event_type', 'data'])
         empty_log.set_index('timestamp', inplace=True)
         empty_profiler = pd.DataFrame(columns=['wallet_id', 'price', 'outcome', 'market_id', 'entity_type'])
 
-        # --- 1. Process Market Data (Gamma API) ---
+        # --- 1. Process Market Data ---
         try:
             log.info("Processing Market data (from Gamma API)...")
-            
-            # Correct mapping based on YOUR log
             market_rename_map = {
-                'marketMakerAddress': 'fpmm_address', 
-                'conditionId': 'market_id',           
-                'question': 'question',
-                'createdAt': 'created_at',
-                'closedTime': 'resolution_timestamp', 
-                'endDateIso': 'end_date'
+                'marketMakerAddress': 'fpmm_address', 'conditionId': 'market_id',           
+                'question': 'question', 'createdAt': 'created_at',
+                'closedTime': 'resolution_timestamp', 'endDateIso': 'end_date'
             }
-            
             existing_renames = {k: v for k, v in market_rename_map.items() if k in df_markets.columns}
             df_markets = df_markets.rename(columns=existing_renames)
 
-            if 'fpmm_address' not in df_markets.columns:
-                log.error("CRITICAL: 'marketMakerAddress' (fpmm_address) not found in Gamma data.")
-                return empty_log, empty_profiler
-
-            # --- TIMEZONE FIX: Force everything to Naive UTC ---
-            # 1. Convert to UTC (handling ISO strings)
-            # 2. Strip timezone info (.dt.tz_localize(None))
-            
             if 'created_at' in df_markets.columns:
                 df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
             else:
-                # Mock start time if missing (Naive UTC)
                 df_markets['created_at'] = pd.to_datetime(datetime.now() - timedelta(days=365)).tz_localize(None)
 
             if 'resolution_timestamp' in df_markets.columns:
                 df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
             else:
-                # Fallback to end_date
                  df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date'], errors='coerce', utc=True).dt.tz_localize(None)
 
-            # Outcome handling
             if 'outcome' in df_markets.columns:
                 df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
             else:
                  df_markets['outcome'] = pd.NA 
 
             df_markets['start_price'] = 0.50
-            
             df_markets = df_markets.dropna(subset=['fpmm_address', 'market_id', 'question'])
-            log.info(f"Valid markets processed: {len(df_markets)}")
-
+            
         except Exception as e:
             log.error(f"Failed to parse Market data: {e}", exc_info=True)
             return empty_log, empty_profiler
 
-        # --- 2. Process Trade Data (Subgraph) ---
+        # --- 2. Process Trade Data ---
         try:
-            if df_trades.empty:
-                return empty_log, empty_profiler
-            
-            trade_rename_map = {
-                'tradeAmount': 'size',
-                'market_id': 'fpmm_address' 
-            }
+            if df_trades.empty: return empty_log, empty_profiler
+            trade_rename_map = {'tradeAmount': 'size', 'market_id': 'fpmm_address'}
             df_trades = df_trades.rename(columns=trade_rename_map)
-
-            # --- TIMEZONE FIX: Force to Naive UTC ---
             df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce', utc=True).dt.tz_localize(None)
-            
-            df_trades['size_raw'] = pd.to_numeric(df_trades['size'], errors='coerce')
-            df_trades['tokens_raw'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce')
-
-            # Calcs
-            df_trades['size'] = (df_trades['size_raw'].fillna(0) / 1e6)
-            df_trades['tokens_scaled'] = (df_trades['tokens_raw'].fillna(0) / 1e18)
-            
+            df_trades['size'] = (pd.to_numeric(df_trades['size'], errors='coerce').fillna(0) / 1e6)
+            tokens = (pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce').fillna(0) / 1e18)
             df_trades['price'] = 0.0
-            valid_mask = df_trades['tokens_scaled'] > 1e-9
-            df_trades.loc[valid_mask, 'price'] = df_trades['size'] / df_trades['tokens_scaled'][valid_mask]
+            valid_mask = tokens > 1e-9
+            df_trades.loc[valid_mask, 'price'] = df_trades['size'] / tokens[valid_mask]
             df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
-            
             df_trades = df_trades.dropna(subset=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
-            log.info(f"Valid trades processed: {len(df_trades)}")
-
         except Exception as e:
             log.error(f"Failed to parse Trade data: {e}", exc_info=True)
             return empty_log, empty_profiler
@@ -1491,54 +1473,54 @@ class BacktestEngine:
         # --- 3. Join ---
         df_markets['fpmm_address'] = df_markets['fpmm_address'].astype(str).str.lower()
         df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
-
         market_id_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
         outcome_map = df_markets.set_index('market_id')['outcome'].to_dict() if 'outcome' in df_markets.columns else {}
-        
         df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_map)
         df_trades = df_trades.dropna(subset=['market_id'])
         df_trades['outcome'] = df_trades['market_id'].map(outcome_map)
 
-        # --- 4. Profiler Data ---
         profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
         profiler_data['entity_type'] = 'default_topic'
         profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
         
-        # --- 5. Event Log ---
+        # --- 4. Event Log with NLP Pre-calc ---
         events = []
-        
         market_vectors = {mid: [0.1]*768 for mid in market_id_map.values()} 
         
         for _, row in df_markets.iterrows():
+            # --- FIX 2 (Continued): Extract entities here ---
+            extracted_entities = []
+            if nlp:
+                doc = nlp(row['question'])
+                extracted_entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
+                # If no entities found, fallback to the first noun chunk or the whole string
+                if not extracted_entities:
+                     extracted_entities = [row['question'][:20]]
+
             events.append((
                 row['created_at'], 'NEW_CONTRACT',
-                {'id': row['market_id'], 'text': row['question'], 'vector': market_vectors.get(row['market_id']), 'liquidity': 0, 'p_market_all': 0.5}
+                {
+                    'id': row['market_id'], 
+                    'text': row['question'], 
+                    'vector': market_vectors.get(row['market_id']), 
+                    'liquidity': 0, 
+                    'p_market_all': 0.5,
+                    'precalc_entities': extracted_entities # <--- Storing them here
+                }
             ))
             
         for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
-            # Only add resolution if outcome is present
             if pd.notna(row.get('outcome')):
-                 events.append((
-                    row['resolution_timestamp'], 'RESOLUTION',
-                    {'id': row['market_id'], 'outcome': row['outcome']}
-                ))
+                 events.append((row['resolution_timestamp'], 'RESOLUTION', {'id': row['market_id'], 'outcome': row['outcome']}))
             
         for _, row in df_trades.iterrows():
-            events.append((
-                row['timestamp'], 'PRICE_UPDATE',
-                {
-                    'id': row['market_id'], 
-                    'p_market_all': row['price'],
-                    'wallet_id': row['wallet_id'],
-                    'trade_price': row['price'],    
-                    'trade_volume': abs(row['size']) 
-                }
+            events.append((row['timestamp'], 'PRICE_UPDATE',
+                {'id': row['market_id'], 'p_market_all': row['price'], 'wallet_id': row['wallet_id'], 'trade_price': row['price'], 'trade_volume': abs(row['size'])}
             ))
             
         event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
         if not event_log.empty:
             event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
-            # Ensure final log is also Naive UTC
             event_log['timestamp'] = pd.to_datetime(event_log['timestamp'], utc=True).dt.tz_localize(None)
             event_log = event_log.set_index('timestamp').sort_index()
 
@@ -1598,7 +1580,7 @@ class BacktestEngine:
             # 3. Prepare Data Batches
             # We create a 'bucket' column to group events by hour
             df_batch = historical_data.copy()
-            df_batch['bucket'] = df_batch.index.floor('1h')
+            df_batch['bucket'] = df_batch.index.floor('1d')
             
             # 4. The Fast Loop (Iterates ~2,000 times instead of 2,000,000)
             for bucket_time, bucket_events in df_batch.groupby('bucket'):
