@@ -1595,7 +1595,11 @@ class BacktestEngine:
                     contract_id = event['contract_id']
                     
                     if event['event_type'] == 'NEW_CONTRACT':
-                        graph.add_contract(data['id'], data['text'], data['vector'], data['liquidity'], data['p_market_all'])
+                        graph.add_contract(
+                            data['id'], data['text'], data['vector'], 
+                            data['liquidity'], data['p_market_all'],
+                            precalc_entities=data.get('precalc_entities') # <--- Passed here
+                        )
                         current_prices[contract_id] = data['p_market_all']
                         linker.process_pending_contracts()
                         prior_manager.process_pending_contracts()
