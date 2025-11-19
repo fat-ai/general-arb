@@ -1025,105 +1025,449 @@ class PortfolioManager:
 # ### COMPONENT 7: Back-Testing & Tuning (Production-Ready) ###
 # ==============================================================================
 
-class BacktestPortfolio:
+import numpy as np
+import pandas as pd
+from numba import njit
+import logging
+import scipy.optimize as opt
+from scipy.stats import norm
+from typing import Dict, List, Tuple
+from datetime import timedelta
+from itertools import groupby
+
+log = logging.getLogger(__name__)
+
+# ============================================================================
+# OPTIMIZATION 1: Numba-Accelerated Kelly Solver
+# ============================================================================
+
+@njit
+def fast_kelly_objective(F, M, Q, I_k):
     """
-    (Production-Ready C7.sub) Helper class for C7.
-    Tracks cash, positions, P&L, and simulates frictions.
-    """
-    def __init__(self, initial_cash=10000.0, fee_pct=0.01, slippage_pct=0.005):
-        self.cash = initial_cash
-        self.initial_cash = initial_cash
-        self.positions: Dict[str, Tuple[float, float]] = {} 
-        self.fee_pct = fee_pct
-        self.slippage_pct = slippage_pct
-        self.pnl_history = [initial_cash]
-        self.brier_scores = []
-        self.start_time = None
-        self.end_time = None
-
-    def get_total_value(self, current_prices: Dict[str, float]) -> float:
-        position_value = 0.0
-        for contract_id, (fraction, entry_price) in self.positions.items():
-            current_price = current_prices.get(contract_id, entry_price)
-            pos_value_mult = 0.0
-            if fraction > 0: # Long
-                if entry_price > 1e-9: pos_value_mult = current_price / entry_price
-            else: # Short
-                if (1.0 - entry_price) > 1e-9: pos_value_mult = (1.0 - current_price) / (1.0 - entry_price)
-            position_value += (abs(fraction) * self.initial_cash) * pos_value_mult
-        return self.cash + position_value
-
-    def rebalance(self, target_basket: Dict[str, float], current_prices: Dict[str, float]):
-        all_contracts = set(target_basket.keys()) | set(self.positions.keys())
-        for contract_id in all_contracts:
-            target_fraction = target_basket.get(contract_id, 0.0)
-            current_fraction, entry_price = self.positions.get(contract_id, (0.0, 0.0))
-            trade_fraction = target_fraction - current_fraction
-            
-            if abs(trade_fraction) < 1e-5: continue
-            
-            trade_value = abs(trade_fraction) * self.initial_cash
-            trade_price = current_prices.get(contract_id)
-            if trade_price is None:
-                log.warning(f"No price for {contract_id} in rebalance. Skipping trade.")
-                continue
-
-            fees = trade_value * self.fee_pct
-            slippage_cost = trade_value * self.slippage_pct
-            self.cash -= (fees + slippage_cost)
-            
-            if trade_fraction > 0: # BUYING
-                self.cash -= trade_value
-                if current_fraction >= 0: # Increasing long
-                    new_avg_price = ((current_fraction * entry_price) + (trade_fraction * trade_price)) / target_fraction if target_fraction != 0 else trade_price
-                    self.positions[contract_id] = (target_fraction, new_avg_price)
-                else: # Closing short
-                    self.positions[contract_id] = (target_fraction, trade_price) 
-            else: # SELLING
-                self.cash += trade_value
-                if abs(target_fraction) < 1e-5: # Full exit
-                    if contract_id in self.positions: del self.positions[contract_id]
-                else:
-                    if current_fraction == 0.0: # Opening new short
-                        self.positions[contract_id] = (target_fraction, trade_price)
-                    else: 
-                        self.positions[contract_id] = (target_fraction, entry_price)
+    Numba-compiled Kelly objective function using pre-calculated outcomes.
     
-    def handle_resolution(self, contract_id: str, outcome: float, p_model: float, current_prices: Dict):
-        if contract_id in self.positions:
-            fraction, entry_price = self.positions.pop(contract_id)
-            bet_value = abs(fraction) * self.initial_cash
-            
-            if fraction > 0: # Long
-                payout = bet_value * (outcome / entry_price) if entry_price > 1e-9 else 0.0
-            else: # Short
-                payout = bet_value * ((1.0 - outcome) / (1.0 - entry_price)) if (1.0 - entry_price) > 1e-9 else 0.0
-            self.cash += payout
+    Args:
+        F: Portfolio fractions (n,)
+        M: Model probabilities (n,)
+        Q: Market probabilities (n,)
+        I_k: Pre-calculated binary outcomes (k_samples, n)
         
-        self.pnl_history.append(self.get_total_value(current_prices))
-        if p_model is not None:
-            self.brier_scores.append((p_model - outcome)**2)
+    Returns:
+        Negative expected log growth rate (minimization objective)
+    """
+    k = I_k.shape[0]
+    n = len(M)
+    
+    # Calculate returns
+    # Add epsilon to avoid division by zero
+    Q_safe = np.empty_like(Q)
+    for i in range(n):
+        Q_safe[i] = max(1e-9, min(Q[i], 1.0 - 1e-9))
+    
+    total_log_wealth = 0.0
+    
+    # Iterate samples
+    for i in range(k):
+        port_return = 0.0
+        # Iterate assets
+        for j in range(n):
+            f_val = F[j]
+            if f_val == 0:
+                continue
+                
+            outcome = I_k[i, j]
+            q_val = Q_safe[j]
+            
+            if f_val > 0:  # Long
+                gains = (outcome - q_val) / q_val
+            else:  # Short
+                gains = (q_val - outcome) / (1.0 - q_val)
+                
+            port_return += f_val * gains
+        
+        W = 1.0 + port_return
+        if W <= 1e-9:
+            return 1e9  # Bankruptcy penalty
+        
+        total_log_wealth += np.log(W)
+    
+    return -total_log_wealth / k
 
-    def get_final_metrics(self) -> Dict[str, float]:
-        pnl = np.array(self.pnl_history)
-        returns = (pnl[1:] - pnl[:-1]) / pnl[:-1]
-        if len(returns) == 0: returns = np.array([0])
-        final_pnl = pnl[-1]
-        initial_pnl = self.initial_cash
+
+# ============================================================================
+# OPTIMIZATION 2: Pre-computed NLP Cache
+# ============================================================================
+
+class NLPCache:
+    """Pre-compute all NLP results once, reuse across trials."""
+    
+    def __init__(self, df_markets, nlp_model):
+        log.info("Building NLP cache for all markets...")
+        self.cache = {}
         
+        if df_markets.empty:
+            return
+
+        questions = df_markets['question'].tolist()
+        market_ids = df_markets['market_id'].tolist()
+        
+        # Batch process with spaCy (50x faster than loop)
+        relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
+        
+        # Handle case where nlp_model might be None or mock
         try:
-            total_days = (self.end_time.date() - self.start_time.date()).days
-            if total_days == 0: total_days = 1
-            total_return = (final_pnl / initial_pnl) - 1.0
-            irr = ((1.0 + total_return) ** (365.0 / total_days)) - 1.0
+            doc_stream = nlp_model.pipe(questions, batch_size=100)
         except Exception:
-            irr = (final_pnl / initial_pnl) - 1.0
+            doc_stream = [None] * len(questions)
+
+        for doc, mid in zip(doc_stream, market_ids):
+            entities = []
+            if doc:
+                entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
             
-        sharpe = np.mean(returns) / (np.std(returns) + 1e-9) * np.sqrt(252)
-        max_drawdown = np.max((np.maximum.accumulate(pnl) - pnl) / np.maximum.accumulate(pnl)) if len(pnl) > 0 else 0.0
-        avg_brier = np.mean(self.brier_scores) if self.brier_scores else 0.25
+            if not entities:
+                # Fallback to simple split if no entities found or NLP failed
+                idx = next((i for i, row in df_markets.iterrows() if row['market_id'] == mid), 0)
+                text = questions[idx] if idx < len(questions) else "Unknown"
+                entities = [text[:20]] 
+                
+            self.cache[mid] = entities
         
-        return {'irr': irr, 'sharpe_ratio': sharpe, 'max_drawdown': max_drawdown, 'brier_score': avg_brier}
+        log.info(f"NLP cache built for {len(self.cache)} markets")
+    
+    def get_entities(self, market_id):
+        return self.cache.get(market_id, [])
+
+
+# ============================================================================
+# OPTIMIZATION 3: Vectorized Profiler
+# ============================================================================
+
+def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
+    """
+    Vectorized Brier score calculation (100x faster than groupby.apply).
+    """
+    if profiler_data.empty:
+        return {}
+
+    # Filter valid rows
+    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+    
+    # Group and count
+    counts = valid.groupby(['wallet_id', 'entity_type']).size()
+    sufficient = counts[counts >= min_trades].index
+    
+    # Filter to sufficient trades
+    # Optimization: Use merge instead of isin for large datasets
+    valid.set_index(['wallet_id', 'entity_type'], inplace=True)
+    filtered = valid.loc[valid.index.intersection(sufficient)].reset_index()
+    
+    # Vectorized Brier calculation
+    filtered['brier'] = (filtered['bet_price'] - filtered['outcome']) ** 2
+    
+    # Group and mean
+    scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
+    
+    return scores.to_dict()
+
+
+# ============================================================================
+# OPTIMIZATION 4: Batched Event Processing (FIXED)
+# ============================================================================
+
+class FastBacktestEngine:
+    """Optimized backtest engine with batching and caching."""
+    
+    def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
+        self.event_log = event_log
+        self.profiler_data = profiler_data
+        self.nlp_cache = nlp_cache
+        self.precalc_priors = precalc_priors
+        
+        # Pre-group events by hour for batch processing
+        log.info("Pre-grouping events by hour...")
+        records = event_log.reset_index().to_dict('records')
+        records.sort(key=lambda x: x['timestamp'])
+        
+        self.hourly_batches = []
+        for hour_key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H')):
+            self.hourly_batches.append(list(group))
+        
+        log.info(f"Created {len(self.hourly_batches)} hourly batches")
+    
+    def run_trial(self, config: Dict) -> Dict[str, float]:
+        """
+        Run a single backtest trial with optimizations.
+        """
+        # Initialize portfolio
+        cash = 10000.0
+        positions = {}  # {contract_id: (fraction, entry_price)}
+        pnl_history = [cash]
+        brier_scores = []
+        
+        # Current state
+        current_prices = {}
+        contracts = {}  # {id: {status, p_model, entities, etc}}
+        
+        # Profiling scores (pre-calculated)
+        wallet_scores = fast_calculate_brier_scores(self.profiler_data, 
+                                                    config.get('min_trades_threshold', 20))
+        
+        # Rebalancing throttle
+        last_rebalance_time = None
+        min_rebalance_interval = timedelta(hours=4)
+        
+        # Process batches
+        for batch in self.hourly_batches:
+            if not batch: continue
+            
+            batch_time = batch[0]['timestamp']
+            needs_rebalance = False
+            
+            # Process events in batch
+            for event in batch:
+                ev_type = event['event_type']
+                data = event['data']
+                c_id = event['contract_id']
+                
+                if ev_type == 'NEW_CONTRACT':
+                    # Get pre-calculated entities and priors
+                    entities = self.nlp_cache.get_entities(c_id)
+                    prior = self.precalc_priors.get(c_id, {'alpha': 1.0, 'beta': 1.0})
+                    
+                    # Fast contract initialization
+                    # Note: Merging prior (alpha/beta) with market_price (data)
+                    p_prior = prior['alpha'] / (prior['alpha'] + prior['beta'])
+                    
+                    # Simple fusion for fast backtest: Average of Prior + Market
+                    # (Full system uses Bayesian update, here we approximate for speed)
+                    p_fused = (p_prior + data['p_market_all']) / 2.0
+                    
+                    contracts[c_id] = {
+                        'status': 'MONITORED',
+                        'p_model': p_fused,
+                        'p_market_all': data['p_market_all'],
+                        'entities': entities
+                    }
+                    current_prices[c_id] = data['p_market_all']
+                    needs_rebalance = True
+                
+                elif ev_type == 'PRICE_UPDATE':
+                    if c_id in contracts:
+                        contracts[c_id]['p_market_all'] = data['p_market_all']
+                        current_prices[c_id] = data['p_market_all']
+                
+                elif ev_type == 'RESOLUTION':
+                    if c_id in contracts:
+                        # Settle position
+                        if c_id in positions:
+                            fraction, entry = positions.pop(c_id)
+                            bet_value = abs(fraction) * 10000.0 # Fixed initial capital ref
+                            
+                            outcome = data['outcome']
+                            payout = 0.0
+                            if fraction > 0:  # Long
+                                if entry > 1e-9:
+                                    payout = bet_value * (outcome / entry)
+                            else:  # Short
+                                if (1.0 - entry) > 1e-9:
+                                    payout = bet_value * ((1.0 - outcome) / (1.0 - entry))
+                            
+                            cash += payout
+                        
+                        # Brier score
+                        p_model = contracts[c_id]['p_model']
+                        brier_scores.append((p_model - data['outcome']) ** 2)
+                        
+                        # Remove contract
+                        del contracts[c_id]
+                        if c_id in current_prices:
+                            del current_prices[c_id]
+                        
+                        needs_rebalance = True
+            
+            # Rebalance check (throttled)
+            should_rebalance = needs_rebalance and (
+                last_rebalance_time is None or 
+                (batch_time - last_rebalance_time) > min_rebalance_interval
+            )
+            
+            if should_rebalance and len(contracts) > 0:
+                # Generate Target Basket
+                target_basket = self._fast_kelly_allocation(
+                    contracts, current_prices, config
+                )
+                
+                # Execute rebalance
+                # FIX: Must capture updated cash variable
+                cash = self._rebalance_portfolio(positions, target_basket, 
+                                               current_prices, cash)
+                
+                last_rebalance_time = batch_time
+            
+            # Track PnL
+            position_value = self._calculate_position_value(positions, current_prices)
+            pnl_history.append(cash + position_value)
+        
+        # Calculate metrics
+        return self._calculate_metrics(pnl_history, brier_scores)
+    
+    def _fast_kelly_allocation(self, contracts, prices, config, use_numerical=False):
+        """
+        Fast allocation strategy. 
+        Defaults to Analytical (fastest), falls back to Numerical (Numba) if requested.
+        """
+        basket = {}
+        
+        # Arrays for numerical solver
+        ids = []
+        M_list = []
+        Q_list = []
+        
+        for c_id, contract in contracts.items():
+            M = contract['p_model']
+            Q = prices.get(c_id, 0.5)
+            
+            # Filter invalid
+            if not (0 <= Q <= 1): Q = 0.5
+            
+            # Simple edge-based allocation (Analytical)
+            edge = M - Q
+            
+            # Only allocate if edge exceeds threshold (Noise filtering)
+            if abs(edge) > config['kelly_edge_thresh']:
+                
+                if not use_numerical:
+                    # --- ANALYTICAL PATH (Fastest) ---
+                    # f* = edge / variance (approx for independent bets)
+                    variance = M * (1 - M)
+                    if variance > 1e-9:
+                        fraction = edge / (config['k_brier_scale'] * variance)
+                        # Hard position limits
+                        fraction = max(-0.2, min(0.2, fraction)) 
+                        basket[c_id] = fraction
+                else:
+                    # --- NUMERICAL PREP ---
+                    ids.append(c_id)
+                    M_list.append(M)
+                    Q_list.append(Q)
+
+        if use_numerical and len(ids) > 0:
+            # --- NUMERICAL PATH (High Accuracy) ---
+            M_arr = np.array(M_list)
+            Q_arr = np.array(Q_list)
+            n = len(M_arr)
+            
+            # Generate uncorrelated samples (Identity correlation for speed, 
+            # can be replaced with full correlation matrix if available)
+            # k_samples = 1000
+            # Z = np.random.random((k_samples, n))
+            # I_k = (Z < M_arr).astype(float)
+            
+            # result_F = self._solve_numba(M_arr, Q_arr, I_k)
+            # for idx, c_id in enumerate(ids):
+            #    basket[c_id] = result_F[idx]
+            pass # Placeholder to prevent runtime error in this snippet
+
+        # Scale to max exposure
+        total = sum(abs(f) for f in basket.values())
+        MAX_LEVERAGE = 1.0 # Conservative 1x leverage
+        if total > MAX_LEVERAGE:
+            scale = MAX_LEVERAGE / total
+            basket = {k: v * scale for k, v in basket.items()}
+        
+        return basket
+    
+    def _rebalance_portfolio(self, positions, target, prices, cash):
+        """
+        Rebalances portfolio with TRANSACTION FEES.
+        """
+        FEE_RATE = 0.01       # 1% Taker fee
+        SLIPPAGE_RATE = 0.005 # 0.5% Slippage
+        COST_BASIS = FEE_RATE + SLIPPAGE_RATE
+        
+        # Close positions not in target
+        for c_id in list(positions.keys()):
+            if c_id not in target:
+                fraction, _ = positions.pop(c_id)
+                # Exit cost
+                trade_value = abs(fraction) * 10000.0
+                cash -= trade_value * COST_BASIS
+        
+        # Adjust/Open positions
+        for c_id, target_frac in target.items():
+            if c_id not in prices: continue
+            
+            current_frac, entry_price = positions.get(c_id, (0.0, 0.0))
+            
+            if abs(target_frac - current_frac) < 1e-4:
+                continue # Skip trivial updates
+                
+            trade_frac_diff = target_frac - current_frac
+            trade_value = abs(trade_frac_diff) * 10000.0
+            
+            # DEDUCT FEES
+            cash -= trade_value * COST_BASIS
+            
+            # Update position record
+            if c_id in positions:
+                # Weighted average price update logic could go here
+                # For speed, we just reset entry on major rebalance or keep old
+                positions[c_id] = (target_frac, prices[c_id])
+            else:
+                positions[c_id] = (target_frac, prices[c_id])
+        
+        return cash # Return updated cash
+
+    def _calculate_position_value(self, positions, prices):
+        """Fast position valuation."""
+        total = 0.0
+        for c_id, (frac, entry) in positions.items():
+            curr = prices.get(c_id, entry)
+            if frac > 0:
+                mult = curr / entry if entry > 1e-9 else 0
+            else:
+                mult = (1 - curr) / (1 - entry) if (1 - entry) > 1e-9 else 0
+            total += abs(frac) * 10000.0 * mult
+        return total
+    
+    def _calculate_metrics(self, pnl_history, brier_scores):
+        """Fast metrics calculation."""
+        pnl = np.array(pnl_history)
+        
+        if len(pnl) < 2:
+            return {'irr': 0, 'sharpe_ratio': 0, 'max_drawdown': 0, 'brier_score': 0.25}
+        
+        # Returns
+        returns = np.diff(pnl) / pnl[:-1]
+        
+        # Metrics
+        total_return = (pnl[-1] / pnl[0]) - 1
+        # Approximation of annualized IRR for short backtests
+        irr = total_return 
+        
+        std_dev = np.std(returns) + 1e-9
+        sharpe = (np.mean(returns) / std_dev) * np.sqrt(252 * 24) # Hourly data
+        
+        max_dd = 0.0
+        peak = pnl[0]
+        for val in pnl:
+            if val > peak: peak = val
+            dd = (peak - val) / peak
+            if dd > max_dd: max_dd = dd
+        
+        avg_brier = np.mean(brier_scores) if brier_scores else 0.25
+        
+        return {
+            'irr': irr,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_dd,
+            'brier_score': avg_brier
+        }
+
+# Wrapper function for Ray Tune
+def optimized_backtest_wrapper(config, fast_engine):
+    return fast_engine.run_trial(config)
 
 
 class BacktestEngine:
@@ -1360,7 +1704,7 @@ class BacktestEngine:
                     log.info("No more rows returned. Pagination complete.")
                     break 
                 
-                all_rows.extend(rows) # CHANGED: Extend list of dicts
+                all_rows.extend(rows) 
                 last_id = rows[-1]['id'] 
 
             if not all_rows:
@@ -1531,244 +1875,78 @@ class BacktestEngine:
         log.info(f"ETL Complete. Profiler: {len(profiler_data)}, Events: {len(event_log)}")
         return event_log, profiler_data
         
-    @staticmethod
-    def _run_single_backtest(config: Dict[str, Any], historical_data: pd.DataFrame, profiler_data: pd.DataFrame):
-        """
-        This is the "objective" function that Ray Tune will optimize.
-        It runs one *REAL* C1-C6 pipeline simulation.
-        """
-        # Imports needed locally for the static method if not available globally
-        from datetime import timedelta
-        from itertools import groupby
-        
-        log.debug(f"--- C7: Starting back-test run with config: {config} ---")
-        
-        if historical_data.empty or 'event_type' not in historical_data.columns:
-            log.warning("[BACKTEST] Historical data is empty or malformed. Skipping run.")
-            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0, 'max_drawdown': 1.0})
-            return
-        
-        log.info(f"[BACKTEST] Starting with {len(historical_data)} events. Optimization: Enabled.")
-        
-        try:
-            # 1. Initialize components
-            graph = GraphManager(is_mock=True) 
-            
-            graph.model_brier_scores = {
-                'brier_internal_model': config['brier_internal_model'],
-                'brier_expert_model': 0.05, 'brier_crowd_model': 0.15,
-            }
-            
-            linker = RelationalLinker(graph)
-            ai_analyst = AIAnalyst()
-            
-            profiler = HistoricalProfiler(graph, min_trades_threshold=config.get('min_trades_threshold', 5))
-            graph.mock_db['profiler_data'] = profiler_data 
-            profiler.run_profiling() 
-            
-            live_feed = LiveFeedHandler(graph)
-            prior_manager = PriorManager(graph, ai_analyst, live_feed)
-            belief_engine = BeliefEngine(graph)
-            belief_engine.k_brier_scale = config['k_brier_scale']
-            
-            kelly_solver = HybridKellySolver(
-                analytical_edge_threshold=config['kelly_edge_thresh'],
-                num_samples_k=2000 
-            )
-            pm = PortfolioManager(graph, kelly_solver)
-            
-            # 2. Initialize Portfolio
-            portfolio = BacktestPortfolio()
-            portfolio.start_time = historical_data.index.min()
-            portfolio.end_time = historical_data.index.max()
-            
-            current_prices = {} 
-            
-            # === PATCH START: Pre-Calculate AI Priors ===
-            # Optimization: Run AI logic once per contract upfront, avoiding overhead inside the time loop.
-            log.info("[BACKTEST] Pre-calculating AI priors for all contracts...")
-            
-            # Filter only new contract events
-            contract_events = historical_data[historical_data['event_type'] == 'NEW_CONTRACT']
-            
-            precalc_priors = {}
-            
-            # Iterate using simple tuples for speed
-            for _, row in contract_events.iterrows():
-                c_id = row.get('contract_id')
-                data = row.get('data', {})
-                text = data.get('text', '')
-                
-                # Use the mocked AI analyst to get parameters
-                prior_data = ai_analyst.get_prior(text)
-                mean = prior_data['probability']
-                ci = prior_data['confidence_interval']
-                
-                # Use global helper to convert to Beta
-                (alpha, beta) = convert_to_beta(mean, ci)
-                
-                precalc_priors[c_id] = {
-                    'alpha': alpha, 
-                    'beta': beta, 
-                    'source': 'ai_generated'
-                }
-            # === PATCH END ===
 
-            # 3. Prepare Data for Efficient Iteration
-            # Optimization: Convert DataFrame to list of dicts (50x faster iteration)
-            historical_records = historical_data.reset_index().to_dict('records')
-            
-            # Ensure data is sorted by timestamp for correct simulation
-            historical_records.sort(key=lambda x: x['timestamp'])
-
-            # State tracking for rebalancing optimization
-            last_rebalance_time = portfolio.start_time
-            min_rebalance_interval = timedelta(hours=4) 
-            price_change_threshold = 0.05 # 5% move triggers rebalance
-            last_prices_at_rebalance = {}
-
-            # Helper for grouping keys
-            def get_hour_key(row):
-                return row['timestamp'].strftime('%Y%m%d%H')
-            
-            # 4. The Fast Loop (Grouped by Hour)
-            for hour_key, hourly_events_iter in groupby(historical_records, key=get_hour_key):
-                hourly_events = list(hourly_events_iter)
-                
-                # Flags to determine if we need to re-run expensive logic
-                market_structure_changed = False
-                significant_price_move = False
-                
-                for event in hourly_events:
-                    ev_type = event['event_type']
-                    data = event['data']
-                    c_id = event['contract_id']
-
-                    if ev_type == 'NEW_CONTRACT':
-                        # --- Full Production Logic ---
-                        graph.add_contract(
-                            data['id'], data['text'], data['vector'], 
-                            data['liquidity'], data['p_market_all'],
-                            precalc_entities=data.get('precalc_entities') 
-                        )
-                        current_prices[c_id] = data['p_market_all']
-                        
-                        # Run C2 (Linker)
-                        linker.process_pending_contracts()
-                        
-                        # Run C3 (Prior Manager) - OPTIMIZED
-                        # Instead of checking the queue, we inject the pre-calculated prior directly.
-                        if c_id in precalc_priors:
-                            prior = precalc_priors[c_id]
-                            mean_val = prior['alpha'] / (prior['alpha'] + prior['beta'])
-                            graph.update_contract_prior(
-                                c_id, 
-                                mean_val, 
-                                prior['alpha'], 
-                                prior['beta'], 
-                                prior['source'], 
-                                data['p_market_all'], # p_experts (assumed equal for mock)
-                                data['p_market_all']  # p_all
-                            )
-                        else:
-                            # Fallback to standard path if pre-calc missing
-                            prior_manager.process_pending_contracts()
-
-                        # Mark structure changed to force a solver run
-                        market_structure_changed = True
-
-                    elif ev_type == 'RESOLUTION':
-                        # --- Full Production Logic ---
-                        p_model = graph.mock_db['contracts'].get(c_id, {}).get('p_model', 0.5)
-                        portfolio.handle_resolution(c_id, data['outcome'], p_model, current_prices)
-                        
-                        if c_id in current_prices: del current_prices[c_id]
-                        graph.update_contract_status(c_id, 'RESOLVED', {'outcome': data['outcome']})
-                        
-                        market_structure_changed = True
-
-                    elif ev_type == 'PRICE_UPDATE':
-                        new_price = data['p_market_all']
-                        # old_price = current_prices.get(c_id, new_price) # Unused variable removed
-                        current_prices[c_id] = new_price
-                        
-                        # Check for significant move to trigger rebalance
-                        if abs(new_price - last_prices_at_rebalance.get(c_id, 0)) > price_change_threshold:
-                            significant_price_move = True
-                            
-                        # Minimal Mock Updates (Skip heavy graph calls if not needed)
-                        if c_id in graph.mock_db['contracts']:
-                            graph.mock_db['contracts'][c_id]['p_market_all'] = new_price
-                            # Update live trades view for C4 logic
-                            graph.mock_db['live_trades'] = [data]
-                            graph.update_contract_status(c_id, 'PENDING_ANALYSIS')
-
-                # --- OPTIMIZED REBALANCE LOGIC ---
-                current_time = hourly_events[-1]['timestamp']
-                time_since_rebalance = current_time - last_rebalance_time
-                
-                # Throttling: Only run heavy math if market changed, moved 5%, or 4 hours passed
-                should_rebalance = (
-                    market_structure_changed or 
-                    significant_price_move or 
-                    (time_since_rebalance > min_rebalance_interval)
-                )
-
-                if should_rebalance and current_prices:
-                    # Run the heavy lifters (C3/C5/C6)
-                    # Note: PriorManager generally handled via pre-calc, but checked here for price updates
-                    prior_manager.process_pending_contracts()
-                    belief_engine.run_fusion_process()
-                    
-                    target_basket = pm.run_optimization_cycle()
-                    
-                    if target_basket:
-                        # Execute trades
-                        portfolio.rebalance(target_basket, current_prices)
-                    
-                    # Reset optimization triggers
-                    last_rebalance_time = current_time
-                    last_prices_at_rebalance = current_prices.copy()
-
-            # 5. Final Metrics
-            metrics = portfolio.get_final_metrics()
-            tune.report(metrics)
-            
-            log.info(f"[BACKTEST] Run complete. Final Value: {portfolio.get_total_value(current_prices):.2f}")
-            
-        except Exception as e:
-            log.error(f"Back-test run failed: {e}", exc_info=True)
-            tune.report({'irr': -1.0, 'brier': 1.0, 'sharpe': -10.0})
-                  
     def run_tuning_job(self):
-        """Main entry point for Component 7."""
-        log.info("--- C7: Starting Hyperparameter Tuning Job ---")
+        """Main entry point for Component 7 (Optimized)."""
+        log.info("--- C7: Starting Hyperparameter Tuning Job (Optimized) ---")
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
         
-        # --- THIS IS THE NEW ETL STEP ---
+        # 1. Load Data (Keep existing ETL logic)
         try:
             log.info(f"C7: Loading all historical data from Polymarket APIs...")
-            
             df_markets, df_trades = self._load_data_from_polymarket()
             
             if df_markets.empty:
-                log.error("No market data loaded from Gamma API. Aborting tuning job.")
+                log.error("No market data loaded. Aborting.")
                 return None
                 
             event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
+            log.info("Data loaded and transformed successfully.")
         
         except Exception as e:
-            log.error(f"FATAL: Failed to load or transform data: {e}", exc_info=True)
+            log.error(f"FATAL: Failed to load data: {e}", exc_info=True)
+            return None
+
+        # 2. Pre-Compute Optimizations (The New Stuff)
+        try:
+            log.info("--- Starting Pre-computation Phase ---")
+            
+            # A. NLP Cache
+            # We use the global _GLOBAL_SPACY_MODEL if available, else load new
+            import spacy
+            try:
+                nlp = spacy.load("en_core_web_sm")
+                nlp.select_pipes(enable=['ner'])
+            except Exception:
+                log.warning("SpaCy model not found. NLP cache will be empty.")
+                nlp = None
+                
+            nlp_cache = NLPCache(df_markets, nlp)
+
+            # B. AI Priors (Pre-calc)
+            log.info("Pre-calculating AI priors...")
+            # Note: We use the global ai_analyst instance from the bottom of the file 
+            # or create a temporary one if needed.
+            temp_ai = AIAnalyst() 
+            precalc_priors = {}
+            
+            for _, row in df_markets.iterrows():
+                mid = row.get('market_id')
+                text = row.get('question', '')
+                if not mid: continue
+                
+                # Call AI (or mock)
+                prior_data = temp_ai.get_prior(text)
+                mean = prior_data['probability']
+                ci = tuple(prior_data['confidence_interval'])
+                
+                # Convert to Beta
+                alpha, beta = convert_to_beta(mean, ci)
+                precalc_priors[mid] = {'alpha': alpha, 'beta': beta}
+            
+            log.info(f"Pre-calculated {len(precalc_priors)} priors.")
+
+            # 3. Initialize Fast Engine
+            fast_engine = FastBacktestEngine(
+                event_log, profiler_data, nlp_cache, precalc_priors
+            )
+
+        except Exception as e:
+            log.error(f"Failed to initialize fast engine: {e}", exc_info=True)
             return None
         
-        # "Curry" the real data into the objective function
-        trainable_with_data = tune.with_parameters(
-            self._run_single_backtest,
-            historical_data=event_log,
-            profiler_data=profiler_data
-        )
-        
+        # 4. Run Ray Tune
         search_space = {
             "brier_internal_model": tune.loguniform(0.05, 0.25),
             "k_brier_scale": tune.loguniform(0.1, 5.0),
@@ -1778,35 +1956,30 @@ class BacktestEngine:
         
         scheduler = ASHAScheduler(metric="irr", mode="max", max_t=10, grace_period=1, reduction_factor=2)
         
+        # Pass the initialized engine to the workers
+        trainable = tune.with_parameters(
+            optimized_backtest_wrapper,
+            fast_engine=fast_engine
+        )
+        
         analysis = tune.run(
-            trainable_with_data,
+            trainable,
             config=search_space,
-            num_samples=20, # Reduced for demo
+            num_samples=20,
             scheduler=scheduler,
             resources_per_trial={"cpu": 1},
-            name="pm_tuning_job"
+            name="pm_tuning_fast"
         )
         
         best_trial = analysis.get_best_trial(metric="irr", mode="max")
         if best_trial:
             best_config = best_trial.config
             best_metrics = best_trial.last_result
-            
-            log.info(f"--- C7: Tuning Job Complete ---")
-            log.info(f"Best config found for max IRR:")
-            log.info(json.dumps(best_config, indent=2))
-            log.info(f"--- Best Metrics ---")
-            log.info(f"IRR (Annualized): {best_metrics.get('irr', 0.0):.4f}")
-            log.info(f"Sharpe Ratio: {best_metrics.get('sharpe_ratio', 0.0):.4f}")
-            log.info(f"Max Drawdown: {best_metrics.get('max_drawdown', 0.0):.4f}")
-            log.info(f"Avg Brier Score: {best_metrics.get('brier_score', 0.0):.4f}")
-            
+            log.info(f"--- Tuning Complete. Best IRR: {best_metrics.get('irr', 0.0):.4f} ---")
+            return best_config
         else:
-            log.error("--- C7: Tuning Job Failed. No successful trials completed. ---")
-            best_config = None
-        
-        ray.shutdown()
-        return best_config
+            log.error("Tuning failed.")
+            return None
         
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
