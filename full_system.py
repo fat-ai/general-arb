@@ -1551,11 +1551,159 @@ class BacktestEngine:
             return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
-        # Placeholder: Use the robust transform logic defined in Component 7 of previous steps
-        # Note: This function body was provided in full in the previous correct response.
-        # Ensure you copy the full _transform_data_to_event_log logic here.
-        # For brevity in this optimization patch, I am skipping the body repetition.
-        pass 
+        """
+        Transforms raw data and PRE-CALCULATES NLP entities with Batching + Progress Logs.
+        """
+        log.info("Transforming raw Subgraph and Gamma API data into event log...")
+
+        # Initialize empty frames for fallback
+        empty_log = pd.DataFrame(columns=['timestamp', 'event_type', 'data'])
+        empty_log.set_index('timestamp', inplace=True)
+        empty_profiler = pd.DataFrame(columns=['wallet_id', 'price', 'outcome', 'market_id', 'entity_type'])
+
+        try:
+            # Setup NLP
+            try:
+                import spacy
+                nlp = spacy.load("en_core_web_sm")
+                # Disable unnecessary pipeline components for speed
+                nlp.select_pipes(enable=['ner']) 
+                relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
+                log.info("spaCy model loaded. Using optimized nlp.pipe for batch processing.")
+            except Exception as e:
+                log.warning(f"spaCy setup failed ({e}). NLP pre-processing will be skipped.")
+                nlp = None
+
+            # --- 1. Process Market Data ---
+            log.info("Processing Market data (from Gamma API)...")
+            
+            # Validate input
+            if df_markets is None or df_markets.empty:
+                log.warning("df_markets is empty/None. Returning empty logs.")
+                return empty_log, empty_profiler
+
+            market_rename_map = {
+                'marketMakerAddress': 'fpmm_address', 'conditionId': 'market_id',           
+                'question': 'question', 'createdAt': 'created_at',
+                'closedTime': 'resolution_timestamp', 'endDateIso': 'end_date'
+            }
+            existing_renames = {k: v for k, v in market_rename_map.items() if k in df_markets.columns}
+            df_markets = df_markets.rename(columns=existing_renames)
+
+            # Fix timestamps
+            if 'created_at' in df_markets.columns:
+                df_markets['created_at'] = pd.to_datetime(df_markets['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
+            else:
+                df_markets['created_at'] = pd.to_datetime(datetime.now() - timedelta(days=365)).tz_localize(None)
+
+            if 'resolution_timestamp' in df_markets.columns:
+                df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
+            else:
+                 df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['end_date'], errors='coerce', utc=True).dt.tz_localize(None)
+
+            if 'outcome' in df_markets.columns:
+                df_markets['outcome'] = pd.to_numeric(df_markets['outcome'], errors='coerce')
+            else:
+                 df_markets['outcome'] = pd.NA 
+
+            df_markets = df_markets.dropna(subset=['fpmm_address', 'market_id', 'question'])
+            
+            # --- 2. Process Trade Data ---
+            # If trades are empty, we still continue to process markets
+            if df_trades is None or df_trades.empty:
+                log.warning("df_trades is empty. Proceeding with markets only.")
+                df_trades = pd.DataFrame(columns=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
+            else:
+                trade_rename_map = {'tradeAmount': 'size', 'market_id': 'fpmm_address'}
+                df_trades = df_trades.rename(columns=trade_rename_map)
+                df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s', errors='coerce', utc=True).dt.tz_localize(None)
+                df_trades['size'] = (pd.to_numeric(df_trades['size'], errors='coerce').fillna(0) / 1e6)
+                tokens = (pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce').fillna(0) / 1e18)
+                df_trades['price'] = 0.0
+                valid_mask = tokens > 1e-9
+                df_trades.loc[valid_mask, 'price'] = df_trades['size'] / tokens[valid_mask]
+                df_trades['price'] = df_trades['price'].clip(0.0, 1.0)
+                df_trades = df_trades.dropna(subset=['fpmm_address', 'timestamp', 'price', 'size', 'wallet_id'])
+
+            # --- 3. Join ---
+            log.info("Joining Market and Trade data...")
+            df_markets['fpmm_address'] = df_markets['fpmm_address'].astype(str).str.lower()
+            df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
+            
+            market_id_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
+            outcome_map = df_markets.set_index('market_id')['outcome'].to_dict() if 'outcome' in df_markets.columns else {}
+            
+            df_trades['market_id'] = df_trades['fpmm_address'].map(market_id_map)
+            df_trades = df_trades.dropna(subset=['market_id'])
+            df_trades['outcome'] = df_trades['market_id'].map(outcome_map)
+
+            profiler_data = df_trades[['wallet_id', 'price', 'outcome', 'market_id']].rename(columns={'price': 'bet_price'})
+            profiler_data['entity_type'] = 'default_topic'
+            profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+            
+            # --- 4. Event Log with Batch NLP ---
+            log.info(f"Generating event log for {len(df_markets)} markets...")
+            events = []
+            market_vectors = {mid: [0.1]*768 for mid in market_id_map.values()} 
+            
+            market_records = df_markets.to_dict('records')
+            
+            # Batch NLP
+            if nlp:
+                questions = [r.get('question', '') for r in market_records]
+                doc_stream = nlp.pipe(questions, batch_size=50)
+            else:
+                doc_stream = [None] * len(market_records)
+
+            count = 0
+            for row, doc in zip(market_records, doc_stream):
+                extracted_entities = []
+                if doc:
+                    extracted_entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
+                
+                # Fallback if NLP failed or found nothing
+                if not extracted_entities:
+                     extracted_entities = [row.get('question', '')[:20]]
+                
+                events.append((
+                    row['created_at'], 'NEW_CONTRACT',
+                    {
+                        'id': row['market_id'], 
+                        'text': row['question'], 
+                        'vector': market_vectors.get(row['market_id']), 
+                        'liquidity': 0, 
+                        'p_market_all': 0.5,
+                        'precalc_entities': extracted_entities
+                    }
+                ))
+                count += 1
+
+            # Add resolutions
+            for _, row in df_markets.dropna(subset=['resolution_timestamp']).iterrows():
+                if pd.notna(row.get('outcome')):
+                     events.append((row['resolution_timestamp'], 'RESOLUTION', {'id': row['market_id'], 'outcome': row['outcome']}))
+                
+            # Add trades
+            for _, row in df_trades.iterrows():
+                events.append((row['timestamp'], 'PRICE_UPDATE',
+                    {'id': row['market_id'], 'p_market_all': row['price'], 'wallet_id': row['wallet_id'], 'trade_price': row['price'], 'trade_volume': abs(row['size'])}
+                ))
+                
+            event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+            if not event_log.empty:
+                event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id'))
+                event_log['timestamp'] = pd.to_datetime(event_log['timestamp'], utc=True).dt.tz_localize(None)
+                event_log = event_log.set_index('timestamp').sort_index()
+
+            log.info(f"ETL Complete. Profiler: {len(profiler_data)}, Events: {len(event_log)}")
+            
+            # --- CRITICAL FIX: ALWAYS RETURN TWO DATAFRAMES ---
+            return event_log, profiler_data
+
+        except Exception as e:
+            log.error(f"Failed to parse data in _transform_data_to_event_log: {e}", exc_info=True)
+            # --- CRITICAL FIX: Return empty frames on error, NOT None ---
+            return empty_log, empty_profiler
 
     def run_tuning_job(self):
         """Main entry point for Component 7 (Optimized)."""
