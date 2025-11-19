@@ -1076,6 +1076,10 @@ class NLPCache:
         if df_markets.empty:
             return
 
+        # SAFETY CHECK: Print data size
+        total_markets = len(df_markets)
+        log.info(f"Total markets to process: {total_markets}")
+        
         questions = df_markets['question'].tolist()
         market_ids = df_markets['market_id'].tolist()
         relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
@@ -1083,25 +1087,38 @@ class NLPCache:
         # Handle case where nlp_model might be None
         try:
             if nlp_model:
-                doc_stream = nlp_model.pipe(questions, batch_size=100)
+                # OPTIMIZATION: Use n_process to use all CPU cores (Linux/Mac only)
+                # If on Windows, remove n_process argument or set to 1
+                import os
+                n_cores = os.cpu_count() or 1
+                # Using -1 or a fixed number. n_process=1 is safer for Windows stability.
+                doc_stream = nlp_model.pipe(questions, batch_size=200, n_process=1)
             else:
                 doc_stream = [None] * len(questions)
-        except Exception:
+        except Exception as e:
+            log.warning(f"NLP Pipe failed: {e}. Falling back to simple list.")
             doc_stream = [None] * len(questions)
 
+        # Iteration with Progress Log
+        count = 0
+        log_interval = max(100, total_markets // 10) # Log every 10%
+        
         for doc, mid in zip(doc_stream, market_ids):
             entities = []
             if doc:
                 entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
             
             if not entities:
-                # IMPROVED FALLBACK: Use first 3 words instead of slicing characters
-                # This prevents partial words like "Bitco"
+                # Fallback: First 3 words
                 idx = next((i for i, row in df_markets.iterrows() if row['market_id'] == mid), 0)
                 text = questions[idx] if idx < len(questions) else "Unknown"
                 entities = text.split()[:3]
                 
             self.cache[mid] = entities
+            
+            count += 1
+            if count % log_interval == 0:
+                log.info(f"NLP Cache Progress: {count}/{total_markets} ({count/total_markets:.0%})")
         
         log.info(f"NLP cache built for {len(self.cache)} markets")
     
