@@ -1714,6 +1714,14 @@ class BacktestEngine:
             log.info(f"C7: Loading all historical data...")
             df_markets, df_trades = self._load_data_from_polymarket()
             if df_markets.empty: return None
+
+            if 'conditionId' in df_markets.columns:
+                df_markets = df_markets.rename(columns={'conditionId': 'market_id'})
+            
+            # Renaming other common inconsistencies for safety
+            if 'question' in df_markets.columns:
+                 # Ensure question exists and isn't null for NLP
+                 df_markets['question'] = df_markets['question'].fillna("")
             
             # Assuming _transform_data_to_event_log is populated with the full logic
             event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
