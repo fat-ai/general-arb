@@ -5,11 +5,17 @@ scipy         # For optimization (C6) and QMC/stats (C6)
 pandas        # For data handling (C4) and P&L (C7)
 
 # --- NLP (C2) ---
-spacy         # For entity extraction. (Requires model download, see below)
+spacy>=3.7.3,<3.8.0
+spacy-transformers
+torch
+torchvision
+torchaudio
+https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.3/en_core_web_trf-3.7.3-py3-none-any.whl
 
 # --- AI Analyst (C3) ---
 google-generativeai
 dune-client
+
 # --- Back-testing & Tuning (C7) ---
 ray[tune]     # For distributed back-testing and hyperparameter tuning
 
