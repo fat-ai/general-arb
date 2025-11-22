@@ -31,7 +31,7 @@ from numba import njit
 import pickle
 from pathlib import Path
 import time
-
+import traceback
 # ==============================================================================
 # --- Global Setup & Helpers ---
 # ==============================================================================
@@ -1438,21 +1438,32 @@ class FastBacktestEngine:
             'brier_score': avg_brier
         }
 
-
 # --- RAY TUNE WRAPPER (OPTIMIZED WITH OBJECT STORE) ---
 def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
     """
-    Fetches large data from shared memory (Object Store) then runs the trial.
+    Fetches large data from shared memory then runs the trial.
+    Includes Error Trapping to debug 'Trials did not complete'.
     """
-    # Retrieve large objects from Ray's shared memory
-    # This happens locally on the worker node, zero-copy if possible
-    event_log = ray.get(event_log_ref)
-    profiler = ray.get(profiler_ref)
-    nlp_cache = ray.get(nlp_cache_ref)
-    priors = ray.get(priors_ref)
-    
-    engine = FastBacktestEngine(event_log, profiler, nlp_cache, priors)
-    return engine.run_trial(config)
+    try:
+        # 1. Retrieve large objects from Ray's shared memory
+        event_log = ray.get(event_log_ref)
+        profiler = ray.get(profiler_ref)
+        nlp_cache = ray.get(nlp_cache_ref)
+        priors = ray.get(priors_ref)
+        
+        # 2. Initialize Engine
+        engine = FastBacktestEngine(event_log, profiler, nlp_cache, priors)
+        
+        # 3. Run Trial
+        return engine.run_trial(config)
+
+    except Exception as e:
+        # --- CRITICAL: Print the error so we see it in the console ---
+        print(f"!!!!! WORKER CRASH !!!!!")
+        print(f"Error: {e}")
+        traceback.print_exc()
+        # Return a dummy result to stop the whole Tune job from exploding
+        return {'irr': -1.0, 'sharpe_ratio': 0.0, 'brier_score': 1.0}
 
 
 class BacktestEngine:
@@ -1613,6 +1624,8 @@ class BacktestEngine:
             else:
                 df_markets['created_at'] = pd.to_datetime(datetime.now() - timedelta(days=365)).tz_localize(None)
 
+            df_markets = df_markets.dropna(subset=['created_at', 'market_id', 'question'])
+            
             if 'resolution_timestamp' in df_markets.columns:
                 df_markets['resolution_timestamp'] = pd.to_datetime(df_markets['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
             else:
