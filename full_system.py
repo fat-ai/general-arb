@@ -1,6 +1,5 @@
 import os
 import logging
-import spacy
 import numpy as np
 import pandas as pd
 import scipy.optimize as opt
@@ -32,6 +31,19 @@ import pickle
 from pathlib import Path
 import time
 import traceback
+import spacy
+import torch
+
+# 1. Force PyTorch to use the Apple 'MPS' (Metal Performance Shaders) device
+if torch.backends.mps.is_available():
+    spacy.require_gpu()
+    print("🚀 Using M3 GPU (MPS acceleration)!")
+else:
+    print("⚠️ MPS not available. Using CPU.")
+
+# 2. Load the transformer model (CNN models like 'sm' won't benefit much from this)
+nlp = spacy.load("en_core_web_trf")
+
 # ==============================================================================
 # --- Global Setup & Helpers ---
 # ==============================================================================
