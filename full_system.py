@@ -1078,64 +1078,72 @@ def fast_kelly_objective(F, M, Q, I_k):
 
 
 # --- OPTIMIZATION HELPER: NLP Cache ---
+
+
 class NLPCache:
-    """Pre-compute all NLP results once, reuse across trials."""
-    
-    def __init__(self, df_markets, nlp_model):
-        log.info("Building NLP cache for all markets...")
+    """
+    Persistent NLP Cache.
+    Loads previous results from disk so we don't re-run spaCy on old markets.
+    """
+    def __init__(self, df_markets, nlp_model, cache_path="nlp_cache.json"):
+        self.cache_path = Path(cache_path)
         self.cache = {}
+        self.new_entries = False
         
-        if df_markets.empty:
+        # 1. Load existing cache from disk
+        if self.cache_path.exists():
+            try:
+                with open(self.cache_path, 'r') as f:
+                    self.cache = json.load(f)
+                log.info(f"Loaded {len(self.cache)} NLP entities from disk.")
+            except Exception as e:
+                log.warning(f"Failed to load NLP cache: {e}")
+
+        # 2. Identify which markets are missing from the cache
+        # We only run NLP on the *delta* (missing keys)
+        missing_ids = [
+            mid for mid in df_markets['market_id'].astype(str) 
+            if mid not in self.cache
+        ]
+        
+        if not missing_ids:
+            log.info("All markets already cached! Skipping NLP.")
             return
 
-        # SAFETY CHECK: Print data size
-        total_markets = len(df_markets)
-        log.info(f"Total markets to process: {total_markets}")
+        log.info(f"Running NLP on {len(missing_ids)} new markets...")
         
-        questions = df_markets['question'].tolist()
-        market_ids = df_markets['market_id'].tolist()
+        # Filter df to only new markets
+        df_new = df_markets[df_markets['market_id'].astype(str).isin(missing_ids)]
+        questions = df_new['question'].tolist()
+        ids = df_new['market_id'].astype(str).tolist()
+        
         relevant_labels = {'ORG', 'PERSON', 'GPE', 'PRODUCT', 'EVENT', 'WORK_OF_ART'}
         
-        # Handle case where nlp_model might be None
-        try:
-            if nlp_model:
-                # OPTIMIZATION: Use n_process to use all CPU cores (Linux/Mac only)
-                # If on Windows, remove n_process argument or set to 1
-                import os
-                n_cores = os.cpu_count() or 1
-                # Using -1 or a fixed number. n_process=1 is safer for Windows stability.
-                doc_stream = nlp_model.pipe(questions, batch_size=200, n_process=1)
-            else:
-                doc_stream = [None] * len(questions)
-        except Exception as e:
-            log.warning(f"NLP Pipe failed: {e}. Falling back to simple list.")
-            doc_stream = [None] * len(questions)
+        # 3. Batch Process only the new questions
+        if nlp_model:
+            doc_stream = nlp_model.pipe(questions, batch_size=200)
+            for doc, mid in zip(doc_stream, ids):
+                ents = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
+                self.cache[mid] = ents
+                self.new_entries = True
+        else:
+            # Fallback if no NLP model provided
+            for q, mid in zip(questions, ids):
+                self.cache[mid] = q.split()[:3]
+                self.new_entries = True
 
-        # Iteration with Progress Log
-        count = 0
-        log_interval = max(100, total_markets // 10) # Log every 10%
-        
-        for doc, mid in zip(doc_stream, market_ids):
-            entities = []
-            if doc:
-                entities = [ent.text for ent in doc.ents if ent.label_ in relevant_labels]
-            
-            if not entities:
-                # Fallback: First 3 words
-                idx = next((i for i, row in df_markets.iterrows() if row['market_id'] == mid), 0)
-                text = questions[idx] if idx < len(questions) else "Unknown"
-                entities = text.split()[:3]
-                
-            self.cache[mid] = entities
-            
-            count += 1
-            if count % log_interval == 0:
-                log.info(f"NLP Cache Progress: {count}/{total_markets} ({count/total_markets:.0%})")
-        
-        log.info(f"NLP cache built for {len(self.cache)} markets")
-    
+        # 4. Save back to disk immediately
+        if self.new_entries:
+            self.save()
+
+    def save(self):
+        """Saves the cache to disk."""
+        log.info(f"Saving NLP cache ({len(self.cache)} entries) to disk...")
+        with open(self.cache_path, 'w') as f:
+            json.dump(self.cache, f)
+
     def get_entities(self, market_id):
-        return self.cache.get(market_id, [])
+        return self.cache.get(str(market_id), [])
 
 
 # --- OPTIMIZATION HELPER: Vectorized Profiler ---
@@ -1542,28 +1550,78 @@ class BacktestEngine:
         return df.drop(columns=['user', 'market'])
 
     def _fetch_paginated_rest(self, cache_key: str, base_url: str, limit: int) -> pd.DataFrame:
-        today = datetime.now().strftime('%Y-%m-%d')
-        cache_file = self.cache_dir / f"{cache_key}_{today}.pkl"
-        if cache_file.exists():
-            with open(cache_file, 'rb') as f: return pickle.load(f)
-
+    cache_file = self.cache_dir / f"{cache_key}_master.parquet" # Switch to Parquet for speed
+    
+    # 1. Load existing cache if it exists
+    existing_df = pd.DataFrame()
+    start_offset = 0
+    
+    if cache_file.exists():
         try:
-            all_dfs = []
-            offset = 0
-            while True:
-                params = {"limit": limit, "offset": offset}
-                response = requests.get(base_url, params=params)
-                rows = response.json()
-                if not rows: break
-                all_dfs.append(pd.DataFrame(rows))
-                offset += limit
-            
-            if not all_dfs: return pd.DataFrame()
-            df = pd.concat(all_dfs, ignore_index=True)
-            with open(cache_file, 'wb') as f: pickle.dump(df, f)
-            return df
+            existing_df = pd.read_parquet(cache_file)
+            # If we have data, we don't necessarily rely on offset for the API, 
+            # but we can check for the latest data. 
+            # NOTE: For Gamma API specifically, it uses 'offset'. 
+            # A true 'top-up' requires an API that supports 'created_after'.
+            # If the API only supports offset, we might still have to re-fetch, 
+            # BUT we can stop early if we hit a known ID.
+            log.info(f"Loaded {len(existing_df)} rows from cache.")
         except Exception:
-            return pd.DataFrame()
+            log.warning("Cache corrupted, starting fresh.")
+
+    # 2. Fetch new data (Simplest 'Top-Up' logic for this specific API)
+    # Gamma doesn't easily support "give me data since X" without filtering.
+    # So we fetch, but we STOP fetching once we see IDs we already have.
+    
+    existing_ids = set(existing_df['market_id']) if not existing_df.empty else set()
+    new_rows = []
+    offset = 0
+    
+    while True:
+        params = {"limit": limit, "offset": offset}
+        # Add specific sort if API supports it to ensure we get newest first
+        # params['order'] = 'newest' 
+        
+        try:
+            response = requests.get(base_url, params=params, timeout=10)
+            rows = response.json()
+        except Exception as e:
+            log.error(f"API Request failed: {e}")
+            break
+            
+        if not rows: 
+            break
+            
+        # Check if we have reached data we already know
+        # (This assumes the API returns newest first. If it returns oldest first, 
+        # you generally have to fetch everything anyway unless you track 'offset')
+        batch_new = [r for r in rows if r.get('conditionId') not in existing_ids]
+        
+        if not batch_new and len(existing_ids) > 0:
+            log.info("Hit existing data boundary. Stopping fetch.")
+            break
+            
+        new_rows.extend(batch_new)
+        offset += limit
+        
+        if len(batch_new) < len(rows): 
+             # Partial match means we merged into old history
+             break
+
+    if not new_rows:
+        return existing_df
+
+    # 3. Merge and Save
+    new_df = pd.DataFrame(new_rows)
+    combined_df = pd.concat([new_df, existing_df], ignore_index=True)
+    
+    # Deduplicate just in case
+    if 'conditionId' in combined_df.columns:
+         combined_df = combined_df.drop_duplicates(subset=['conditionId'])
+         
+    # Save as Master Cache
+    combined_df.to_parquet(cache_file)
+    return combined_df
 
     def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
         today = datetime.now().strftime('%Y-%m-%d')
