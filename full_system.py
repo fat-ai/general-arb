@@ -1557,78 +1557,78 @@ class BacktestEngine:
         return df.drop(columns=['user', 'market'])
 
     def _fetch_paginated_rest(self, cache_key: str, base_url: str, limit: int) -> pd.DataFrame:
-    cache_file = self.cache_dir / f"{cache_key}_master.parquet" # Switch to Parquet for speed
-    
-    # 1. Load existing cache if it exists
-    existing_df = pd.DataFrame()
-    start_offset = 0
-    
-    if cache_file.exists():
-        try:
-            existing_df = pd.read_parquet(cache_file)
-            # If we have data, we don't necessarily rely on offset for the API, 
-            # but we can check for the latest data. 
-            # NOTE: For Gamma API specifically, it uses 'offset'. 
-            # A true 'top-up' requires an API that supports 'created_after'.
-            # If the API only supports offset, we might still have to re-fetch, 
-            # BUT we can stop early if we hit a known ID.
-            log.info(f"Loaded {len(existing_df)} rows from cache.")
-        except Exception:
-            log.warning("Cache corrupted, starting fresh.")
-
-    # 2. Fetch new data (Simplest 'Top-Up' logic for this specific API)
-    # Gamma doesn't easily support "give me data since X" without filtering.
-    # So we fetch, but we STOP fetching once we see IDs we already have.
-    
-    existing_ids = set(existing_df['market_id']) if not existing_df.empty else set()
-    new_rows = []
-    offset = 0
-    
-    while True:
-        params = {"limit": limit, "offset": offset}
-        # Add specific sort if API supports it to ensure we get newest first
-        # params['order'] = 'newest' 
+        cache_file = self.cache_dir / f"{cache_key}_master.parquet" # Switch to Parquet for speed
         
-        try:
-            response = requests.get(base_url, params=params, timeout=10)
-            rows = response.json()
-        except Exception as e:
-            log.error(f"API Request failed: {e}")
-            break
-            
-        if not rows: 
-            break
-            
-        # Check if we have reached data we already know
-        # (This assumes the API returns newest first. If it returns oldest first, 
-        # you generally have to fetch everything anyway unless you track 'offset')
-        batch_new = [r for r in rows if r.get('conditionId') not in existing_ids]
+        # 1. Load existing cache if it exists
+        existing_df = pd.DataFrame()
+        start_offset = 0
         
-        if not batch_new and len(existing_ids) > 0:
-            log.info("Hit existing data boundary. Stopping fetch.")
-            break
-            
-        new_rows.extend(batch_new)
-        offset += limit
-        
-        if len(batch_new) < len(rows): 
-             # Partial match means we merged into old history
-             break
-
-    if not new_rows:
-        return existing_df
-
-    # 3. Merge and Save
-    new_df = pd.DataFrame(new_rows)
-    combined_df = pd.concat([new_df, existing_df], ignore_index=True)
+        if cache_file.exists():
+            try:
+                existing_df = pd.read_parquet(cache_file)
+                # If we have data, we don't necessarily rely on offset for the API, 
+                # but we can check for the latest data. 
+                # NOTE: For Gamma API specifically, it uses 'offset'. 
+                # A true 'top-up' requires an API that supports 'created_after'.
+                # If the API only supports offset, we might still have to re-fetch, 
+                # BUT we can stop early if we hit a known ID.
+                log.info(f"Loaded {len(existing_df)} rows from cache.")
+            except Exception:
+                log.warning("Cache corrupted, starting fresh.")
     
-    # Deduplicate just in case
-    if 'conditionId' in combined_df.columns:
-         combined_df = combined_df.drop_duplicates(subset=['conditionId'])
-         
-    # Save as Master Cache
-    combined_df.to_parquet(cache_file)
-    return combined_df
+        # 2. Fetch new data (Simplest 'Top-Up' logic for this specific API)
+        # Gamma doesn't easily support "give me data since X" without filtering.
+        # So we fetch, but we STOP fetching once we see IDs we already have.
+        
+        existing_ids = set(existing_df['market_id']) if not existing_df.empty else set()
+        new_rows = []
+        offset = 0
+        
+        while True:
+            params = {"limit": limit, "offset": offset}
+            # Add specific sort if API supports it to ensure we get newest first
+            # params['order'] = 'newest' 
+            
+            try:
+                response = requests.get(base_url, params=params, timeout=10)
+                rows = response.json()
+            except Exception as e:
+                log.error(f"API Request failed: {e}")
+                break
+                
+            if not rows: 
+                break
+                
+            # Check if we have reached data we already know
+            # (This assumes the API returns newest first. If it returns oldest first, 
+            # you generally have to fetch everything anyway unless you track 'offset')
+            batch_new = [r for r in rows if r.get('conditionId') not in existing_ids]
+            
+            if not batch_new and len(existing_ids) > 0:
+                log.info("Hit existing data boundary. Stopping fetch.")
+                break
+                
+            new_rows.extend(batch_new)
+            offset += limit
+            
+            if len(batch_new) < len(rows): 
+                 # Partial match means we merged into old history
+                 break
+    
+        if not new_rows:
+            return existing_df
+    
+        # 3. Merge and Save
+        new_df = pd.DataFrame(new_rows)
+        combined_df = pd.concat([new_df, existing_df], ignore_index=True)
+        
+        # Deduplicate just in case
+        if 'conditionId' in combined_df.columns:
+             combined_df = combined_df.drop_duplicates(subset=['conditionId'])
+             
+        # Save as Master Cache
+        combined_df.to_parquet(cache_file)
+        return combined_df
 
     def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
         today = datetime.now().strftime('%Y-%m-%d')
