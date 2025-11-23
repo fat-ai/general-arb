@@ -1458,18 +1458,26 @@ class FastBacktestEngine:
             'brier_score': avg_brier
         }
 
-# --- RAY TUNE WRAPPER (OPTIMIZED WITH OBJECT STORE) ---
+# --- RAY TUNE WRAPPER (FIXED FOR OBJECT REF TYPES) ---
+import traceback
+
 def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
     """
     Fetches large data from shared memory then runs the trial.
-    Includes Error Trapping to debug 'Trials did not complete'.
+    Includes robust checking to see if data is an ObjectRef or already a DataFrame.
     """
     try:
-        # 1. Retrieve large objects from Ray's shared memory
-        event_log = ray.get(event_log_ref)
-        profiler = ray.get(profiler_ref)
-        nlp_cache = ray.get(nlp_cache_ref)
-        priors = ray.get(priors_ref)
+        # Helper function to safely get data
+        def safe_get(obj):
+            if isinstance(obj, ray.ObjectRef):
+                return ray.get(obj)
+            return obj
+
+        # 1. Retrieve large objects (Handle both Ref and Raw Data cases)
+        event_log = safe_get(event_log_ref)
+        profiler = safe_get(profiler_ref)
+        nlp_cache = safe_get(nlp_cache_ref)
+        priors = safe_get(priors_ref)
         
         # 2. Initialize Engine
         engine = FastBacktestEngine(event_log, profiler, nlp_cache, priors)
@@ -1478,11 +1486,10 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         return engine.run_trial(config)
 
     except Exception as e:
-        # --- CRITICAL: Print the error so we see it in the console ---
         print(f"!!!!! WORKER CRASH !!!!!")
         print(f"Error: {e}")
         traceback.print_exc()
-        # Return a dummy result to stop the whole Tune job from exploding
+        # Return dummy result to prevent total job failure
         return {'irr': -1.0, 'sharpe_ratio': 0.0, 'brier_score': 1.0}
 
 
