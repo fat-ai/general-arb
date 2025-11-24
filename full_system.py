@@ -1245,17 +1245,39 @@ class FastBacktestEngine:
                     
                     contracts[c_id] = {
                         'status': 'MONITORED',
-                        'p_model': p_fused,
+                        'p_model': data['p_market_all'], # Default to market initially
                         'p_market_all': data['p_market_all'],
-                        'entities': entities
                     }
+                    smart_money_tracker[c_id] = {'weighted_sum': 0.0, 'weight_sum': 0.0}
                     current_prices[c_id] = data['p_market_all']
                     needs_rebalance = True
                 
                 elif ev_type == 'PRICE_UPDATE':
                     if c_id in contracts:
+                        # Update Market Price
                         contracts[c_id]['p_market_all'] = data['p_market_all']
                         current_prices[c_id] = data['p_market_all']
+
+                        # CHANGE B: Calculate Smart Money Price on the fly
+                        # 1. Get Trader's Reputation (Lower Brier = Higher Score)
+                        w_id = data.get('wallet_id')
+                        brier = wallet_scores.get((w_id, 'default_topic'), 0.25)
+                        
+                        # 2. Calculate Weight (Inverse Variance weighting)
+                        # epsilon prevents division by zero for perfect traders
+                        trade_weight = data['trade_volume'] / (brier + 0.001)
+                        
+                        # 3. Update Running Average
+                        tracker = smart_money_tracker[c_id]
+                        tracker['weighted_sum'] += data['trade_price'] * trade_weight
+                        tracker['weight_sum'] += trade_weight
+                        
+                        # 4. Compute Smart Price
+                        if tracker['weight_sum'] > 0:
+                            p_smart = tracker['weighted_sum'] / tracker['weight_sum']
+                            
+                            # CHANGE C: The "Belief" is NOW purely the Smart Money Price
+                            contracts[c_id]['p_model'] = p_smart
                 
                 elif ev_type == 'RESOLUTION':
                     if c_id in contracts:
