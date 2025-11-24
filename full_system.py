@@ -1209,7 +1209,11 @@ class FastBacktestEngine:
         current_prices = {}
         contracts = {}  # {id: {status, p_model, entities, etc}}
         
-        # Profiling scores (pre-calculated)
+        # 1. NEW: Track running weighted sums for Smart Money calculation
+        # Structure: { contract_id: {'weighted_sum': 0.0, 'weight_sum': 0.0} }
+        smart_money_tracker = {}
+
+        # Load wallet scores (The "Reputation" database)
         wallet_scores = fast_calculate_brier_scores(self.profiler_data, 
                                                     config.get('min_trades_threshold', 20))
         
