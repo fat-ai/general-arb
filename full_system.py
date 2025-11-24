@@ -1606,7 +1606,12 @@ class BacktestEngine:
         # Gamma doesn't easily support "give me data since X" without filtering.
         # So we fetch, but we STOP fetching once we see IDs we already have.
         
-        existing_ids = set(existing_df['market_id']) if not existing_df.empty else set()
+        id_col = 'conditionId'
+        if 'conditionId' not in existing_df.columns and 'market_id' in existing_df.columns:
+            id_col = 'market_id'
+            
+        existing_ids = set(existing_df[id_col]) if not existing_df.empty and id_col in existing_df.columns else set()
+        
         new_rows = []
         offset = 0
         
