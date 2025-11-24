@@ -1219,7 +1219,7 @@ class FastBacktestEngine:
         
         # Rebalancing throttle
         last_rebalance_time = None
-        min_rebalance_interval = timedelta(hours=4)
+        min_rebalance_interval = timedelta(hours=48)
         
         # Process batches
         for batch in self.hourly_batches:
