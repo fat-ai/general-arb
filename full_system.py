@@ -1431,8 +1431,9 @@ class FastBacktestEngine:
             
             current_frac, entry_price = positions.get(c_id, (0.0, 0.0))
             
-            if abs(target_frac - current_frac) < 1e-4:
-                continue 
+            buffer = 0.05 # 5% buffer
+            if abs(target_frac - current_frac) < buffer:
+                 continue
                 
             trade_frac_diff = target_frac - current_frac
             trade_value = abs(trade_frac_diff) * 10000.0
