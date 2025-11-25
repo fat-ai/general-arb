@@ -1304,8 +1304,7 @@ class FastBacktestEngine:
         pnl_history = [cash]
         contracts = {} 
         current_prices = {}
-        # Tracks Log-Odds sums now, not linear sums
-        smart_money_tracker = {} 
+        smart_money_tracker = {} # Tracks Log-Odds sums
         
         trade_count = 0
         rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0, "insufficient_funds": 0}
@@ -1319,7 +1318,9 @@ class FastBacktestEngine:
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
-                c_id = event['contract_id']
+                
+                # --- FIX: Read 'contract_id' from the data dictionary ---
+                c_id = data['contract_id'] 
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[c_id] = {
@@ -1815,21 +1816,22 @@ class BacktestEngine:
         # Create Events
         events = []
         for r in markets.to_dict('records'):
+            # WAS: 'id': r['fpmm_address'] -> CHANGE TO: 'contract_id'
             events.append((r['created_at'], 'NEW_CONTRACT', {
-                'id': r['fpmm_address'], 
+                'contract_id': r['fpmm_address'], 
                 'p_market_all': 0.5,
                 'liquidity': r.get('liquidity', 10000.0) 
             }))
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
-                 events.append((r['resolution_timestamp'], 'RESOLUTION', {'id': r['fpmm_address'], 'outcome': r['outcome']}))
+                 # WAS: 'id': r['fpmm_address'] -> CHANGE TO: 'contract_id'
+                 events.append((r['resolution_timestamp'], 'RESOLUTION', {'contract_id': r['fpmm_address'], 'outcome': r['outcome']}))
                  
         for r in trades.to_dict('records'):
             price = r['bet_price'] if 'bet_price' in r else 0.5
-            
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
                 'p_market_all': min(max(price, 0.01), 0.99),
-                'wallet_id': r['user'], # FIX: Use normalized string directly
+                'wallet_id': r['user'],
                 'trade_price': price,
                 'trade_volume': float(r['tradeAmount'])/1e6
             }))
