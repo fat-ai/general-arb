@@ -1532,6 +1532,9 @@ class BacktestEngine:
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
+        if ray.is_initialized():
+            ray.shutdown()
+        
         if not ray.is_initialized():
             ray.init(logging_level=logging.ERROR)
 
