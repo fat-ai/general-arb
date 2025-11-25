@@ -1708,7 +1708,7 @@ class BacktestEngine:
         df = pd.DataFrame(all_rows)
         if not df.empty:
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
-        return df
+                return df
 
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
