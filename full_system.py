@@ -1190,7 +1190,11 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 
         engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
         
-        # FIX: Enforce Walk-Forward to prevent overfitting
+        # PATCH 4: Fixed Seed for reproducibility inside the worker
+        import numpy as np
+        np.random.seed(config.get('seed', 42))
+
+        # Run Walk-Forward Validation
         return engine.run_walk_forward(config)
 
     except Exception as e:
@@ -1199,16 +1203,16 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         return {'total_return': -1.0, 'sharpe_ratio': -99.0, 'max_drawdown': 1.0}
 
 # ==============================================================================
-# --- REPLACEMENT CLASS 1: FastBacktestEngine (Hardened Logic) ---
+# --- REPLACEMENT CLASS 1: FastBacktestEngine (Patched & Vectorized) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Hardened Backtester.
-    FIXES:
-    1. Performance: Minute-level batching.
-    2. Kelly: Fractional sizing + Covariance penalty.
-    3. Costs: Dynamic slippage based on liquidity.
-    4. Validation: Adaptive Walk-Forward windows.
+    Production Backtester.
+    INCLUDES PATCHES:
+    1. Data-Driven Correlation (Price-based).
+    2. Dynamic Slippage (Liquidity-based).
+    3. Vectorized Mark-to-Market (Performance).
+    4. Aggregated Logging.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1220,35 +1224,39 @@ class FastBacktestEngine:
         # Ensure Profiler Data has timestamps
         if 'timestamp' not in self.profiler_data.columns:
             self.profiler_data['timestamp'] = pd.Timestamp.min
+            
+        # PATCH 1 PREP: Pre-calculate Price Correlations
+        # We use historical price movements to estimate correlation between assets
+        if not self.profiler_data.empty:
+            # Resample to hourly to align timelines
+            pivot = self.profiler_data.set_index('timestamp').groupby('market_id')['bet_price'].resample('1h').last().unstack()
+            # Forward fill missing hours, then compute corr
+            self.price_corr = pivot.ffill().corr().fillna(0.0)
+        else:
+            self.price_corr = pd.DataFrame()
         
+        # Sort & Batch Events
         if not event_log.empty:
             if not isinstance(event_log.index, pd.DatetimeIndex):
                 event_log.index = pd.to_datetime(event_log.index)
             event_log = event_log.sort_index()
             
-            # FIX: Minutely batching for higher granularity
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
             from itertools import groupby
-            # Group by YYYYMMDDHHMM
             for key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H%M')):
                 self.minute_batches.append(list(group))
         else:
             self.minute_batches = []
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        """
-        Adaptive Walk-Forward Validation.
-        Adjusts window sizes based on data density.
-        """
         if not self.minute_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
         
         timestamps = [b[0]['timestamp'] for b in self.minute_batches]
         min_date, max_date = min(timestamps), max(timestamps)
         
-        # FIX: Adaptive Windows
+        # Adaptive Windows
         data_density = len(timestamps) / max(1, (max_date - min_date).days)
-        # If data is sparse, use wider windows. If dense, use narrower.
         train_days = config.get('train_days', max(30, int(1000 / (data_density + 1e-9))))
         test_days = config.get('test_days', max(15, train_days // 2))
         
@@ -1267,18 +1275,17 @@ class FastBacktestEngine:
             
             if not test_batch: break
 
-            # Train: Calc Scores
+            # Train Phase
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
             
-            # Test: Run Sim
+            # Test Phase
             fold_res = self._run_single_period(test_batch, fold_wallet_scores, config)
             results.append(fold_res)
             
-            # Roll Forward
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
@@ -1287,13 +1294,12 @@ class FastBacktestEngine:
         # Params
         kelly_thresh = config.get('kelly_edge_thresh', 0.02)
         k_scale = config.get('k_brier_scale', 1.0)
-        risk_aversion = config.get('risk_aversion', 0.5) # Fractional Kelly
+        risk_aversion = config.get('risk_aversion', 0.5)
         smart_weight_thresh = config.get('min_smart_weight', 20.0)
         
         # Costs
         FEE_RATE = config.get('fee_rate', 0.001)
         BASE_SLIPPAGE = config.get('slippage', 0.001)
-        AVG_LIQUIDITY = config.get('avg_liquidity', 10000.0) # Proxy for market depth
         
         cash = 10000.0
         positions = {} 
@@ -1313,7 +1319,11 @@ class FastBacktestEngine:
                 c_id = event['contract_id']
                 
                 if ev_type == 'NEW_CONTRACT':
-                    contracts[c_id] = {'p_model': data['p_market_all']}
+                    contracts[c_id] = {
+                        'p_model': data['p_market_all'],
+                        # PATCH 2: Store liquidity for dynamic slippage
+                        'liquidity': data.get('liquidity', 10000.0) 
+                    }
                     smart_money_tracker[c_id] = {'w_sum': 0.0, 'wt_sum': 0.0}
                     current_prices[c_id] = data['p_market_all']
                     needs_rebalance = True
@@ -1332,7 +1342,8 @@ class FastBacktestEngine:
                         
                         if tracker['wt_sum'] > smart_weight_thresh:
                             raw_p = tracker['w_sum'] / tracker['wt_sum']
-                            # FIX: Add noise to model prob for realism
+                            # PATCH 4: Fixed Seed Noise
+                            np.random.seed(42 + int(tracker['wt_sum'])) 
                             noise = np.random.normal(0, 0.01) if tracker['wt_sum'] < 100 else 0
                             contracts[c_id]['p_model'] = min(max(raw_p + noise, 0.01), 0.99)
                         else:
@@ -1356,25 +1367,33 @@ class FastBacktestEngine:
             
             if needs_rebalance:
                 basket = self._calculate_kelly_basket(contracts, current_prices, kelly_thresh, k_scale, risk_aversion, rejection_log)
-                
-                # Execute with Dynamic Slippage
-                cash, trades_made = self._execute_trades(positions, basket, current_prices, cash, FEE_RATE, BASE_SLIPPAGE, AVG_LIQUIDITY, rejection_log)
+                cash, trades_made = self._execute_trades(positions, basket, current_prices, contracts, cash, FEE_RATE, BASE_SLIPPAGE, rejection_log)
                 trade_count += trades_made
             
-            # Mark to Market
+            # PATCH 9: Vectorized Mark-to-Market
             nav = cash
-            for c_id, (frac, entry) in positions.items():
-                curr = current_prices.get(c_id, entry)
-                bet_amt = abs(frac) * 10000.0
-                if frac > 0: nav += bet_amt * (curr / entry)
-                else: nav += bet_amt * ((1-curr) / (1-entry))
+            if positions:
+                c_ids = list(positions.keys())
+                fracs = np.array([f[0] for f in positions.values()])
+                entries = np.array([f[1] for f in positions.values()])
+                currs = np.array([current_prices.get(cid, ent) for cid, ent in zip(c_ids, entries)])
+                bet_amts = np.abs(fracs) * 10000.0
+                
+                # Long Value: Amt * (Curr/Entry)
+                # Short Value: Amt * ((1-Curr)/(1-Entry))
+                longs = fracs > 0
+                shorts = ~longs
+                
+                val_long = np.where(longs, bet_amts * (currs / (entries + 1e-9)), 0)
+                val_short = np.where(shorts, bet_amts * ((1 - currs) / (1 - entries + 1e-9)), 0)
+                nav += np.sum(val_long + val_short)
+
             pnl_history.append(nav)
             
         return self._calculate_metrics(pnl_history, trade_count, rejection_log)
 
     def _calculate_kelly_basket(self, contracts, prices, threshold, k_scale, risk_aversion, logs):
         basket = {}
-        # Collect vectors for covariance calculation
         candidates = []
         
         for c_id, data in contracts.items():
@@ -1385,7 +1404,6 @@ class FastBacktestEngine:
                 logs['no_price'] += 1
                 continue
             
-            # Binary Kelly
             f = 0.0
             if M > Q + threshold: # Long
                 b = (1.0 - Q) / Q
@@ -1395,30 +1413,37 @@ class FastBacktestEngine:
                 f = -((1.0 - M) * b - M) / b
             
             if abs(f) > 1e-4:
-                # FIX: Fractional Kelly scaling
                 f = f * risk_aversion 
-                # Hard Cap for safety
                 f = max(-0.15, min(0.15, f)) 
                 candidates.append((c_id, f, Q))
 
         if not candidates: return {}
 
-        # FIX: Covariance Penalty
+        # PATCH 1: Covariance Scaling
         if len(candidates) > 1:
             ids = [x[0] for x in candidates]
             fs = np.array([x[1] for x in candidates])
             qs = np.array([x[2] for x in candidates])
             
-            # Heuristic Covariance: Assume 0.2 correlation between all assets
-            # Diag = Q*(1-Q). Off-diag = 0.2 * sqrt(var_i * var_j)
-            std = np.sqrt(qs * (1 - qs))
-            cov = np.outer(std, std) * 0.2
-            np.fill_diagonal(cov, qs * (1 - qs))
+            # Construct Correlation Matrix from History
+            n = len(ids)
+            corr = np.eye(n)
             
-            # Portfolio Variance = F.T @ Cov @ F
+            # Fill off-diagonals if we have history
+            if not self.price_corr.empty:
+                # This is an O(N^2) loop but N (basket size) is usually small (<20)
+                for i in range(n):
+                    for j in range(i+1, n):
+                        # Get pre-calculated correlation
+                        c = self.price_corr.get(ids[i], {}).get(ids[j], 0.1) # Default 0.1
+                        corr[i, j] = c
+                        corr[j, i] = c
+            
+            std = np.sqrt(qs * (1 - qs))
+            cov = np.outer(std, std) * corr
+            
             port_var = np.dot(np.abs(fs), np.dot(cov, np.abs(fs)))
             
-            # If variance too high, scale down entire basket
             if port_var > 0.05:
                 scaling = 0.05 / port_var
                 fs *= scaling
@@ -1430,25 +1455,26 @@ class FastBacktestEngine:
 
         return basket
 
-    def _execute_trades(self, positions, basket, current_prices, cash, fee_rate, base_slippage, avg_liquidity, logs):
+    def _execute_trades(self, positions, basket, current_prices, contracts, cash, fee_rate, base_slippage, logs):
         trades = 0
         
-        # Close positions
+        # Close
         for c_id in list(positions.keys()):
             if c_id not in basket:
                 frac, entry = positions.pop(c_id)
                 curr = current_prices.get(c_id, entry)
                 trade_val = abs(frac) * 10000.0
                 
-                # Dynamic Slippage on Exit
-                slip = base_slippage + (trade_val / avg_liquidity) * 0.01
+                # PATCH 2: Dynamic Slippage
+                liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+                slip = base_slippage + (trade_val / liq) * 0.01
                 tx_cost = fee_rate + slip
                 
                 exit_val = trade_val * (curr/entry) if frac > 0 else trade_val * ((1-curr)/(1-entry))
                 cash += exit_val * (1.0 - tx_cost)
                 trades += 1
 
-        # Adjust/Open
+        # Open/Adjust
         for c_id, target_frac in basket.items():
             current_frac, entry = positions.get(c_id, (0.0, 0.0))
             delta = target_frac - current_frac
@@ -1456,19 +1482,17 @@ class FastBacktestEngine:
             
             trade_val = abs(delta) * 10000.0
             
-            # Dynamic Slippage on Entry
-            slip = base_slippage + (trade_val / avg_liquidity) * 0.01
+            liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+            slip = base_slippage + (trade_val / liq) * 0.01
             tx_cost = fee_rate + slip
             
             if abs(target_frac) > abs(current_frac): # Buying
                 cost = trade_val * (1.0 + tx_cost)
-                # FIX: Graceful insufficient funds
                 if cash < cost:
                     scale = cash / cost
                     target_frac = current_frac + (delta * scale)
-                    cost = cash # take all remaining
+                    cost = cash 
                     logs['insufficient_funds'] += 1
-                
                 cash -= cost
             else: # Selling
                 proceeds = trade_val * (1.0 - tx_cost)
@@ -1485,28 +1509,38 @@ class FastBacktestEngine:
         sharpes = []
         drawdowns = []
         trades = 0
+        
+        # PATCH 10: Aggregated Logs
+        agg_logs = {}
+        
         for r in results:
             total_ret *= (1.0 + r['total_return'])
             sharpes.append(r['sharpe_ratio'])
             drawdowns.append(r['max_drawdown'])
             trades += r['trades']
+            
+            # Merge logs
+            for k, v in r.get('rejection_logs', {}).items():
+                agg_logs[k] = agg_logs.get(k, 0) + v
+            
         return {
             'total_return': total_ret - 1.0,
             'sharpe_ratio': np.mean(sharpes),
             'max_drawdown': max(drawdowns),
-            'trades': trades
+            'trades': trades,
+            'rejection_logs': agg_logs
         }
 
     def _calculate_metrics(self, pnl_history, trades, logs):
         arr = np.array(pnl_history)
         if len(arr) < 2: 
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0, 'rejection_logs': logs}
         
         total_ret = (arr[-1] / arr[0]) - 1.0
         pct_changes = np.diff(arr) / arr[:-1]
         mean_ret = np.mean(pct_changes)
         std_ret = np.std(pct_changes) + 1e-9
-        sharpe = (mean_ret / std_ret) * np.sqrt(8760) # 24/7 hours
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760)
         
         peak = arr[0]
         max_dd = 0.0
@@ -1515,48 +1549,45 @@ class FastBacktestEngine:
             dd = (peak - x) / peak
             if dd > max_dd: max_dd = dd
             
-        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades}
+        return {
+            'total_return': total_ret, 
+            'sharpe_ratio': sharpe, 
+            'max_drawdown': max_dd, 
+            'trades': trades,
+            'rejection_logs': logs
+        }
 
 # ==============================================================================
-# --- REPLACEMENT CLASS 2: BacktestEngine (Data Integrity & Orchestration) ---
+# --- REPLACEMENT CLASS 2: BacktestEngine (Orchestrator) ---
 # ==============================================================================
 class BacktestEngine:
     """
-    Orchestrator for Component 7.
-    FIXES:
-    1. Integrity: Wash Trading Filter.
-    2. Tuning: Bayesian Optimization (HyperOpt).
-    3. Caching: Hash validation.
-    4. Data Fetching: Full implementation (Strict Gamma + Subgraph).
+    Orchestrator.
+    INCLUDES PATCHES:
+    1. Liquidity Fetching.
+    2. Bayesian Optimization.
+    3. Results Persistence.
+    4. Suspicious Resolution Filter.
     """
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Robust Session
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
-        
         if ray.is_initialized(): ray.shutdown()
         try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
         except: pass
 
     def run_tuning_job(self):
         log.info("--- Starting Production Tuning (Bayesian) ---")
-        
         df_markets, df_trades = self._load_data()
-        if df_markets.empty: 
-            log.warning("Data load returned empty. Checking connection/cache...")
-            return None
+        if df_markets.empty: return None
         
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
-        if event_log.empty:
-            log.warning("Event log empty after transformation.")
-            return None
         
-        # FIX: Bayesian Search Space
+        # PATCH 4: Bayesian Search Space (HyperOpt)
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
@@ -1567,10 +1598,11 @@ class BacktestEngine:
             "fee_rate": 0.001,
             "train_days": tune.randint(30, 90),
             "test_days": tune.randint(15, 45),
-            "walk_forward": True
+            "seed": 42
         }
         
-        searcher = HyperOptSearch(metric="sharpe_ratio", mode="max")
+        # Seed for reproducibility
+        searcher = HyperOptSearch(metric="sharpe_ratio", mode="max", random_state_seed=42)
         
         ev_ref = ray.put(event_log)
         prof_ref = ray.put(profiler_data)
@@ -1581,140 +1613,85 @@ class BacktestEngine:
             lambda cfg: ray_backtest_wrapper(cfg, ev_ref, prof_ref, nlp_ref, priors_ref),
             config=search_space,
             search_alg=searcher,
-            num_samples=20, # Higher sample count for Bayesian
+            num_samples=50,
             resources_per_trial={"cpu": 1},
         )
         
-        # FIX: Persist Logs
+        # PATCH 7: Results Persistence
         try:
             with open('tuning_results.json', 'w') as f:
-                # Simple serialization of results
-                json.dump([t.last_result for t in analysis.trials], f, default=str)
+                 # Serialize relevant parts of trials
+                 results = [{
+                     'config': t.config, 
+                     'metrics': t.last_result
+                 } for t in analysis.trials if t.last_result]
+                 json.dump(results, f, indent=2, default=str)
         except Exception as e:
-            log.warning(f"Could not save tuning logs: {e}")
-            
-        best_config = analysis.get_best_config(metric="sharpe_ratio", mode="max")
-        log.info(f"Tuning Complete. Best Config: {best_config}")
-        return best_config
+            log.warning(f"Failed to save results: {e}")
+
+        return analysis.get_best_config(metric="sharpe_ratio", mode="max")
 
     def _load_data(self):
-        # 1. Fetch Trades
         trades = self._fetch_subgraph_trades()
-        if trades.empty: 
-            log.error("Trades fetch failed.")
-            return pd.DataFrame(), pd.DataFrame()
-            
+        if trades.empty: return pd.DataFrame(), pd.DataFrame()
         trades['fpmm_address'] = trades['market_id'].str.lower()
         trades = trades.dropna(subset=['fpmm_address'])
         
-        # 2. Fetch Markets
         markets = self._fetch_gamma_markets()
-        if markets.empty: 
-            log.error("Markets fetch failed.")
-            return pd.DataFrame(), trades
-            
+        if markets.empty: return pd.DataFrame(), trades
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
-        # 3. Intersect
         valid_ids = set(trades['fpmm_address'])
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
-        # FIX: Hash Check for Integrity
-        try:
-            import hashlib
-            data_hash = hashlib.md5(pd.util.hash_pandas_object(markets).values.tobytes()).hexdigest()
-            log.info(f"Loaded Data Hash: {data_hash}")
-        except: pass
-        
-        log.info(f"Data Loaded: {len(markets)} Markets, {len(trades)} Trades.")
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        # Strict Mode Fetcher (No optional params)
-        today = datetime.now().strftime('%Y-%m-%d')
         cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
+        if cache_file.exists(): return pd.read_parquet(cache_file)
         
-        if cache_file.exists(): 
-            try:
-                return pd.read_parquet(cache_file)
-            except: pass
-
         all_rows = []
-        limit = 100
-        offset = 0
-        base_url = "https://gamma-api.polymarket.com/markets"
-        
-        print("Fetching Markets (Strict Mode)", end="")
+        limit, offset = 100, 0
+        print("Fetching Markets", end="")
         while True:
             try:
-                # STRICT: Only pass limit and offset.
-                params = {"limit": limit, "offset": offset}
-                resp = self.session.get(base_url, params=params, timeout=10)
-                
-                if resp.status_code != 200: 
-                    log.warning(f"Gamma Error {resp.status_code}")
-                    break
-                    
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
+                                      params={"limit": limit, "offset": offset}, timeout=10)
+                if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
-                
                 all_rows.extend(rows)
                 offset += limit
-                
-                # Fetch deeper to ensure we overlap with history
-                if offset > 100000: break 
-                if offset % 2000 == 0: print(".", end="", flush=True)
-                    
-            except Exception as e:
-                log.error(f"Fetch failed: {e}")
-                break
-        
+                if offset % 1000 == 0: print(".", end="", flush=True)
+                if offset > 50000: break
+            except: break
         print(" Done.")
-        if not all_rows: return pd.DataFrame()
         
         df = pd.DataFrame(all_rows)
-        
-        # Map Gamma -> Pipeline
         rename_map = {
-            'marketMakerAddress': 'fpmm_address',
-            'question': 'question',
-            'endDate': 'resolution_timestamp',
-            'outcome': 'outcome',
-            'createdAt': 'created_at'
+            'marketMakerAddress': 'fpmm_address', 
+            'question': 'question', 
+            'endDate': 'resolution_timestamp', 
+            'outcome': 'outcome', 
+            'createdAt': 'created_at',
+            # PATCH 2: Fetch Liquidity
+            'liquidity': 'liquidity' 
         }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        if 'resolution_timestamp' in df.columns:
-            df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-        if 'created_at' in df.columns:
-            df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
+        # Default liquidity if missing
+        if 'liquidity' not in df.columns: df['liquidity'] = 10000.0 
         
-        # Normalize Outcome
-        def clean_outcome(val):
-            try:
-                f = float(val)
-                # Keep float outcomes (0, 0.5, 1)
-                return f
-            except: return pd.NA
-        
-        if 'outcome' in df.columns:
-            df['outcome'] = df['outcome'].apply(clean_outcome)
-            
-        # Cache
-        try:
-            df.to_parquet(cache_file)
-        except Exception as e:
-            log.warning(f"Failed to cache markets: {e}")
-            
+        df.to_parquet(cache_file)
         return df
 
     def _fetch_subgraph_trades(self):
-        # Standard Subgraph Query
         cache_file = self.cache_dir / f"subgraph_trades.pkl"
         if cache_file.exists(): 
-            try:
-                with open(cache_file, 'rb') as f: return pickle.load(f)
-            except: pass
+            with open(cache_file, 'rb') as f: return pickle.load(f)
             
         url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
         query_template = """
@@ -1729,48 +1706,33 @@ class BacktestEngine:
           }}
         }}
         """
-        
         all_rows = []
         last_id = ""
-        
         while True:
             try:
                 resp = self.session.post(url, json={'query': query_template.format(last_id=last_id)}, timeout=30)
                 if resp.status_code != 200: break
-                
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
-                
                 all_rows.extend(data)
                 last_id = data[-1]['id']
                 if len(all_rows) % 5000 == 0: log.info(f"Trades: {len(all_rows)}...")
             except: break
-
+            
         df = pd.DataFrame(all_rows)
         if not df.empty:
-            try:
-                with open(cache_file, 'wb') as f: pickle.dump(df, f)
-            except Exception: pass
-            
+            with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
 
     def _transform_to_events(self, markets, trades):
-        log.info("Transforming Data...")
-        # FIX: Wash Trading Filter
+        log.info("Filtering Wash Trades...")
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
         trades.sort_values(['fpmm_address', 'user', 'timestamp'], inplace=True)
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
-        
-        # Logic: Same user trading same contract within 60s
         trades['is_wash'] = (trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60)
-        
-        # Filter
-        before_len = len(trades)
         trades = trades[~trades['is_wash']].drop(columns=['prev_user', 'time_delta', 'is_wash'])
-        log.info(f"Wash Trading Filter: Removed {before_len - len(trades)} trades.")
         
-        # Standard Transform
         common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
         markets = markets[markets['fpmm_address'].isin(common_ids)]
         trades = trades[trades['fpmm_address'].isin(common_ids)]
@@ -1781,23 +1743,31 @@ class BacktestEngine:
         prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
         
-        # FIX: Validate Outcomes
         outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
-        # Keep outcomes that are numeric (0, 0.5, 1)
-        prof_data = prof_data[pd.to_numeric(prof_data['outcome'], errors='coerce').notna()]
+        # PATCH 6: Suspicious Resolutions
+        trade_counts = trades.groupby('fpmm_address').size()
+        prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
+        # Drop strict 0/1 outcomes with <10 trades
+        suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 10)
+        prof_data = prof_data[~suspicious]
+        
+        prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
         prof_data['entity_type'] = 'default_topic'
         
         events = []
         for r in markets.to_dict('records'):
-            events.append((r['created_at'], 'NEW_CONTRACT', {'id': r['fpmm_address'], 'p_market_all': 0.5}))
+            events.append((r['created_at'], 'NEW_CONTRACT', {
+                'id': r['fpmm_address'], 
+                'p_market_all': 0.5,
+                'liquidity': r.get('liquidity', 10000.0) # Pass Liquidity
+            }))
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
                  events.append((r['resolution_timestamp'], 'RESOLUTION', {'id': r['fpmm_address'], 'outcome': r['outcome']}))
                  
         for r in trades.to_dict('records'):
             price = r['bet_price'] if 'bet_price' in r else 0.5
-            
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
                 'p_market_all': min(max(price, 0.01), 0.99),
