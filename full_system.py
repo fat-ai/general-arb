@@ -1245,8 +1245,8 @@ class FastBacktestEngine:
     """
     Production Backtester.
     FIXES:
-    1. Signal Amplification: Tunable 'conviction_scalar'.
-    2. Debugging: Prints sample rejections to see WHY trades fail.
+    1. Simultaneity Bias: Updates Market Price AFTER calculating Smart Money edge.
+    2. Directional Logic: Ensures signals persist into the rebalance phase.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1320,8 +1320,7 @@ class FastBacktestEngine:
         k_scale = config.get('k_brier_scale', 1.0)
         risk_aversion = config.get('risk_aversion', 0.5)
         smart_weight_thresh = config.get('min_smart_weight', 20.0)
-        # NEW: Amplification Scalar
-        conviction_scalar = config.get('conviction_scalar', 1.0) 
+        conviction_scalar = config.get('conviction_scalar', 1.0)
         
         FEE_RATE = config.get('fee_rate', 0.001)
         BASE_SLIPPAGE = config.get('slippage', 0.001)
@@ -1362,9 +1361,12 @@ class FastBacktestEngine:
                 
                 elif ev_type == 'PRICE_UPDATE':
                     if c_id in contracts:
-                        current_prices[c_id] = data['p_market_all']
-                        w_id = data.get('wallet_id')
+                        # --- CRITICAL FIX START ---
+                        # 1. Get the PREVIOUS Market Price (The price we are betting against)
+                        prev_market_p = current_prices.get(c_id, 0.5)
                         
+                        # 2. Calculate Smart Money Signal
+                        w_id = data.get('wallet_id')
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
                             trade_val = data['trade_price'] * data['trade_volume']
@@ -1380,21 +1382,23 @@ class FastBacktestEngine:
                         tracker['w_sum'] += weight
                         
                         if tracker['w_sum'] > smart_weight_thresh:
-                            # 1. Smart Money View
                             smart_logit = tracker['w_logit_sum'] / tracker['w_sum']
                             
-                            # 2. Market View
-                            market_p = min(max(current_prices[c_id], 0.001), 0.999)
-                            market_logit = logit(market_p)
+                            # Use PREVIOUS Market Price for comparison to generate edge
+                            market_logit = logit(min(max(prev_market_p, 0.001), 0.999))
                             
-                            # 3. SCIENTIFIC AMPLIFICATION
-                            # Scale the disagreement by conviction_scalar
+                            # Amplification
                             diff = smart_logit - market_logit
                             final_logit = market_logit + (diff * conviction_scalar)
                             
                             contracts[c_id]['p_model'] = sigmoid(final_logit)
                         else:
                             rejection_log['low_confidence'] += 1
+                            
+                        # 3. Update Market Price AFTER Signal Generation
+                        # This creates the lag needed for the Rebalancer to see the discrepancy
+                        current_prices[c_id] = data['p_market_all']
+                        # --- CRITICAL FIX END ---
 
                 elif ev_type == 'RESOLUTION':
                     if c_id in contracts:
@@ -1449,10 +1453,6 @@ class FastBacktestEngine:
             
             if abs(M - Q) < threshold: 
                 logs['low_edge'] += 1
-                
-                # DEBUG: If random check hits, print WHY we rejected it
-                if np.random.random() < 0.00001: # Rare print
-                    print(f"DEBUG REJECT: Edge={abs(M-Q):.4f} < Thresh={threshold:.4f} (M={M:.2f}, Q={Q:.2f})")
                 continue
             
             f = 0.0
@@ -1501,10 +1501,6 @@ class FastBacktestEngine:
 
         return basket
 
-    # ... (Keep _execute_trades, _aggregate_fold_results, _calculate_metrics exactly as they were in previous robust version) ...
-    # I am omitting them to save space, but you MUST include them in the file.
-    # If you need them reposted, just ask.
-    
     def _execute_trades(self, positions, basket, current_prices, contracts, cash, fee_rate, base_slippage, logs):
         trades = 0
         for c_id in list(positions.keys()):
