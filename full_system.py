@@ -1173,47 +1173,45 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     
     return scores.to_dict()
 
+# ==============================================================================
+# --- HELPER: Ray Wrapper (Global) ---
+# ==============================================================================
 def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
-    """
-    Worker function for Ray Tune. 
-    Retrieves data from shared memory (Object store) to save RAM/Time.
-    """
     import traceback
     try:
-        # Helper to unwrap Ray Objects if needed
         def get_ref(obj):
-            if isinstance(obj, ray.ObjectRef):
-                return ray.get(obj)
+            if isinstance(obj, ray.ObjectRef): return ray.get(obj)
             return obj
 
-        # 1. Fetch Data
         event_log = get_ref(event_log_ref)
         profiler_data = get_ref(profiler_ref)
         nlp_cache = get_ref(nlp_cache_ref)
         priors = get_ref(priors_ref)
 
-        # 2. Initialize Engine
         engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
         
-        # 3. Run Trial
-        return engine.run_trial(config)
+        # EXPERT FIX: Use Walk-Forward if enabled, otherwise Standard
+        if config.get('walk_forward', False):
+            return engine.run_walk_forward(config)
+        else:
+            return engine.run_trial(config)
 
     except Exception as e:
-        print(f"!!!!! WORKER CRASH !!!!!")
+        print(f"!!!!! WORKER CRASH !!!!! Config: {config}")
         traceback.print_exc()
-        return {'irr': -1.0, 'sharpe_ratio': 0.0, 'brier_score': 1.0}
-        
-# ==============================================================================
-# --- REPLACEMENT CLASS 1: FastBacktestEngine (Logic Fixed) ---
-# ==============================================================================
+        return {'total_return': -1.0, 'sharpe_ratio': -99.0, 'max_drawdown': 1.0}
 
+# ==============================================================================
+# --- REPLACEMENT CLASS 1: FastBacktestEngine (Financial Logic Fixed) ---
+# ==============================================================================
 class FastBacktestEngine:
     """
-    Optimized backtest engine.
+    Production Backtester.
     FIXES:
-    1. Signal Amplification: Forces trades by amplifying Smart Money divergence.
-    2. Zero Fees: Removes friction to prove signal validity.
-    3. Logging: Prints trade counts to console so you know it's working.
+    1. Cash Accounting: Separates fees (loss) from capital deployment (asset).
+    2. Binary Kelly: Uses correct formula for binary options.
+    3. Walk-Forward: Implements rolling window validation.
+    4. Partial Resolutions: Handles non-binary outcomes (0.5, etc).
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1222,501 +1220,503 @@ class FastBacktestEngine:
         self.nlp_cache = nlp_cache
         self.precalc_priors = precalc_priors
         
-        # Sort and Group by hour for speed
+        # Ensure Profiler Data has timestamps for Walk-Forward slicing
+        if 'timestamp' not in self.profiler_data.columns:
+            # Fallback if missing (should be fixed in transform)
+            self.profiler_data['timestamp'] = pd.Timestamp.min
+        
+        # Pre-process Event Log
         if not event_log.empty:
-            records = event_log.reset_index().to_dict('records')
-            records.sort(key=lambda x: x['timestamp'])
+            if not isinstance(event_log.index, pd.DatetimeIndex):
+                event_log.index = pd.to_datetime(event_log.index)
+            event_log = event_log.sort_index()
             
+            # Group by Hour
+            records = event_log.reset_index().to_dict('records')
             self.hourly_batches = []
             from itertools import groupby
             for hour_key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H')):
                 self.hourly_batches.append(list(group))
         else:
             self.hourly_batches = []
+
+    def run_walk_forward(self, config: Dict) -> Dict[str, float]:
+        """
+        EXPERT FIX: Real Walk-Forward Validation.
+        Rolling Window: Train 60 days -> Test 30 days -> Roll 30 days.
+        """
+        train_days = 60
+        test_days = 30
+        
+        # Get Time Boundaries
+        if not self.hourly_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
+        
+        timestamps = [b[0]['timestamp'] for b in self.hourly_batches]
+        min_date, max_date = min(timestamps), max(timestamps)
+        
+        results = []
+        current_date = min_date
+        
+        log.info(f"Starting Walk-Forward: {min_date.date()} to {max_date.date()}")
+        
+        fold = 0
+        while current_date + timedelta(days=train_days + test_days) <= max_date:
+            train_end = current_date + timedelta(days=train_days)
+            test_end = train_end + timedelta(days=test_days)
             
+            # 1. SLICE DATA (Strictly Time-Based)
+            train_batch = [b for b in self.hourly_batches if current_date <= b[0]['timestamp'] < train_end]
+            test_batch = [b for b in self.hourly_batches if train_end <= b[0]['timestamp'] < test_end]
+            
+            if not test_batch: break
+
+            # 2. TRAIN PHASE: Calculate Wallet Scores on TRAIN data only
+            # Filter profiler data to only include trades visible in training window
+            train_profiler = self.profiler_data[
+                (self.profiler_data['timestamp'] >= current_date) & 
+                (self.profiler_data['timestamp'] < train_end)
+            ]
+            
+            # Calculate scores (Brier or similar)
+            fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
+            
+            # 3. TEST PHASE: Run Simulation on TEST data using FROZEN scores
+            # We initialize a fresh portfolio for each fold to measure period performance independently
+            fold_res = self._run_single_period(test_batch, fold_wallet_scores, config)
+            results.append(fold_res)
+            
+            # Roll Forward
+            current_date += timedelta(days=test_days)
+            fold += 1
+            
+        return self._aggregate_fold_results(results)
+
     def run_trial(self, config: Dict) -> Dict[str, float]:
-        # --- HARDCODED TEST PARAMETERS ---
-        # We override config to ensure the engine tries to trade
-        config['kelly_edge_thresh'] = 0.005 # Trade on 0.5% edge
-        config['k_brier_scale'] = 1.0
+        """Runs a standard in-sample trial (for debugging or simple backtests)."""
+        wallet_scores = fast_calculate_brier_scores(self.profiler_data, min_trades=5)
+        return self._run_single_period(self.hourly_batches, wallet_scores, config)
+
+    def _run_single_period(self, batches, wallet_scores, config):
+        # Config
+        kelly_thresh = config.get('kelly_edge_thresh', 0.02)
+        k_scale = config.get('k_brier_scale', 1.0)
+        smart_weight_thresh = config.get('min_smart_weight', 20.0) # Tunable now
+        
+        # Fees
+        FEE_RATE = config.get('fee_rate', 0.001)
+        SLIPPAGE = config.get('slippage', 0.001)
+        TX_COST = FEE_RATE + SLIPPAGE
         
         cash = 10000.0
         positions = {} 
         pnl_history = [cash]
-        brier_scores = []
         
-        current_prices = {}
         contracts = {} 
+        current_prices = {}
         smart_money_tracker = {}
         
-        # Load wallet scores (Reputation DB)
-        wallet_scores = fast_calculate_brier_scores(self.profiler_data, 20)
-        
         trade_count = 0
+        rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0, "insufficient_funds": 0}
         
-        for batch in self.hourly_batches:
-            if not batch: continue
+        for batch in batches:
             needs_rebalance = False
             
+            # --- PROCESS EVENTS ---
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
                 c_id = event['contract_id']
                 
                 if ev_type == 'NEW_CONTRACT':
-                    contracts[c_id] = {
-                        'status': 'MONITORED',
-                        'p_model': data['p_market_all'], 
-                    }
-                    smart_money_tracker[c_id] = {'weighted_sum': 0.0, 'weight_sum': 0.0}
+                    contracts[c_id] = {'p_model': data['p_market_all']}
+                    smart_money_tracker[c_id] = {'w_sum': 0.0, 'wt_sum': 0.0}
                     current_prices[c_id] = data['p_market_all']
                     needs_rebalance = True
                 
                 elif ev_type == 'PRICE_UPDATE':
                     if c_id in contracts:
-                        contracts[c_id]['p_market_all'] = data['p_market_all']
                         current_prices[c_id] = data['p_market_all']
-
-                        # --- SMART MONEY LOGIC ---
+                        
+                        # Smart Money Calc
                         w_id = data.get('wallet_id')
                         brier = wallet_scores.get((w_id, 'default_topic'), 0.25)
-                        
-                        # Weighting: Lower Brier (better) = Higher Weight
-                        trade_weight = data['trade_volume'] / (brier + 0.001)
+                        weight = data['trade_volume'] / (brier + 0.0001)
                         
                         tracker = smart_money_tracker[c_id]
-                        tracker['weighted_sum'] += data['trade_price'] * trade_weight
-                        tracker['weight_sum'] += trade_weight
+                        tracker['w_sum'] += data['trade_price'] * weight
+                        tracker['wt_sum'] += weight
                         
-                        if tracker['weight_sum'] > 0:
-                            p_smart_avg = tracker['weighted_sum'] / tracker['weight_sum']
-                            
-                            # --- SIGNAL AMPLIFICATION (The Fix) ---
-                            # If Smart Money > Market, we assume price is going UP.
-                            # We amplify this small difference to create a tradeable target.
-                            market_p = data['p_market_all']
-                            diff = p_smart_avg - market_p
-                            
-                            # 5.0x Multiplier: If expert is 1% higher, we target 5% higher.
-                            p_target = market_p + (diff * 5.0) 
-                            p_target = max(0.01, min(0.99, p_target))
-                            
-                            contracts[c_id]['p_model'] = p_target
+                        # EXPERT FIX: Configurable Threshold
+                        if tracker['wt_sum'] > smart_weight_thresh:
+                            contracts[c_id]['p_model'] = tracker['w_sum'] / tracker['wt_sum']
+                        else:
+                            rejection_log['low_confidence'] += 1
 
                 elif ev_type == 'RESOLUTION':
                     if c_id in contracts:
-                        # Settle
+                        # SETTLEMENT
                         if c_id in positions:
-                            fraction, entry = positions.pop(c_id)
-                            bet_value = abs(fraction) * 10000.0 
-                            outcome = data['outcome']
-                            payout = 0.0
+                            frac, entry = positions.pop(c_id)
+                            # EXPERT FIX: Handle Partial Resolutions (0.0 to 1.0)
+                            outcome = float(data['outcome']) # Can be 0.5!
+                            bet_amt = abs(frac) * 10000.0
                             
-                            if fraction > 0: # Long
-                                if entry > 1e-9: payout = bet_value * (outcome / entry)
+                            payout = 0.0
+                            if frac > 0: # Long
+                                payout = (bet_amt / entry) * outcome
                             else: # Short
-                                if (1.0-entry) > 1e-9: payout = bet_value * ((1.0-outcome) / (1.0-entry))
+                                # Short pays out if outcome is 0. If outcome is 0.5, pays 0.5.
+                                payout = (bet_amt / (1.0 - entry)) * (1.0 - outcome)
                             
                             cash += payout
                         
-                        p_model = contracts[c_id]['p_model']
-                        brier_scores.append((p_model - data['outcome']) ** 2)
-                        
                         del contracts[c_id]
-                        del smart_money_tracker[c_id]
+                        if c_id in smart_money_tracker: del smart_money_tracker[c_id]
                         if c_id in current_prices: del current_prices[c_id]
                         needs_rebalance = True
             
+            # --- PORTFOLIO REBALANCING ---
             if needs_rebalance:
-                basket = self._fast_kelly_allocation(contracts, current_prices, config)
-                # Pass logging=True to see trades in console? (Keeping it silent for speed, metrics will show)
-                cash, trades_made = self._rebalance_portfolio(positions, basket, current_prices, cash)
-                trade_count += trades_made
+                basket = self._calculate_kelly_basket(contracts, current_prices, kelly_thresh, k_scale, rejection_log)
                 
+                # EXPERT FIX: Correct Cash Accounting
+                cash, trades_made = self._execute_trades(positions, basket, current_prices, cash, TX_COST, rejection_log)
+                trade_count += trades_made
+            
             # Mark to Market
-            pnl_history.append(cash + self._calculate_position_value(positions, current_prices))
-        
-        # Calculate Final Metrics
-        metrics = self._calculate_metrics(pnl_history, brier_scores)
-        
-        # PRINT DEBUG STATS TO CONSOLE
-        if trade_count > 0:
-            print(f"  [Trial Finished] Trades: {trade_count} | IRR: {metrics['irr']:.2%} | Sharpe: {metrics['sharpe_ratio']:.2f}")
-        else:
-            print(f"  [Trial Finished] NO TRADES. (Check Data Overlap)")
+            nav = cash
+            for c_id, (frac, entry) in positions.items():
+                curr = current_prices.get(c_id, entry)
+                bet_amt = abs(frac) * 10000.0
+                if frac > 0: 
+                    nav += bet_amt * (curr / entry)
+                else:
+                    nav += bet_amt * ((1-curr) / (1-entry))
+            pnl_history.append(nav)
             
-        return metrics
-    
-    def _fast_kelly_allocation(self, contracts, prices, config, use_numerical=False):
+        return self._calculate_metrics(pnl_history, trade_count, rejection_log)
+
+    def _calculate_kelly_basket(self, contracts, prices, threshold, k_scale, logs):
         basket = {}
-        for c_id, contract in contracts.items():
-            M = contract['p_model']
+        for c_id, data in contracts.items():
+            M = data['p_model']
             Q = prices.get(c_id, 0.5)
-            if not (0.01 <= Q <= 0.99): continue
             
-            edge = M - Q
-            if abs(edge) > config['kelly_edge_thresh']:
-                variance = M * (1 - M)
-                if variance > 1e-9:
-                    fraction = edge / (config['k_brier_scale'] * variance)
-                    fraction = max(-0.2, min(0.2, fraction)) # Cap leverage
-                    basket[c_id] = fraction
-        
-        # Max portfolio leverage 1.0
-        total = sum(abs(f) for f in basket.values())
-        if total > 1.0:
-            scale = 1.0 / total
-            basket = {k: v * scale for k, v in basket.items()}
+            if not (0.01 < Q < 0.99): 
+                logs['no_price'] += 1
+                continue
+            
+            # EXPERT FIX: Binary Kelly Formula
+            # f = (p * b - q) / b
+            f = 0.0
+            if M > Q + threshold: # Long
+                b = (1.0 - Q) / Q # Odds
+                f = (M * b - (1.0 - M)) / b
+            elif M < Q - threshold: # Short
+                b = Q / (1.0 - Q) # Odds
+                f = -((1.0 - M) * b - M) / b # Negative indicates short
+            else:
+                logs['low_edge'] += 1
+                continue
+                
+            if abs(f) < 1e-4: continue
+            
+            # Apply Risk Scaling & Caps
+            f = f / k_scale
+            f = max(-0.20, min(0.20, f)) # Hard cap 20%
+            basket[c_id] = f
             
         return basket
-    
-    def _rebalance_portfolio(self, positions, target, prices, cash):
+
+    def _execute_trades(self, positions, basket, current_prices, cash, tx_cost, logs):
         trades = 0
-        FEE_RATE = 0.0 # Zero fees for validation
-        SLIPPAGE_RATE = 0.0 
-        COST_BASIS = FEE_RATE + SLIPPAGE_RATE
         
-        # Close
+        # Close positions absent from basket
         for c_id in list(positions.keys()):
-            if c_id not in target:
-                fraction, _ = positions.pop(c_id)
-                cash -= abs(fraction) * 10000.0 * COST_BASIS
-                trades += 1
-        
-        # Open/Adjust
-        for c_id, target_frac in target.items():
-            if c_id not in prices: continue
-            current_frac, _ = positions.get(c_id, (0.0, 0.0))
-            
-            if abs(target_frac - current_frac) < 0.01: continue # 1% Buffer
+            if c_id not in basket:
+                frac, entry = positions.pop(c_id)
+                # Sell asset -> Cash increases by (Value * (1-fee))
+                # Value approx = Notional? No, we just dump at current price?
+                # Simplified: We mark to market at current price and realize PnL
+                curr = current_prices.get(c_id, entry)
+                bet_amt = abs(frac) * 10000.0
                 
-            cash -= abs(target_frac - current_frac) * 10000.0 * COST_BASIS
-            positions[c_id] = (target_frac, prices[c_id])
+                # Approx exit value
+                exit_val = 0
+                if frac > 0: exit_val = bet_amt * (curr/entry)
+                else: exit_val = bet_amt * ((1-curr)/(1-entry))
+                
+                proceeds = exit_val * (1.0 - tx_cost)
+                cash += proceeds
+                trades += 1
+
+        # Adjust/Open positions
+        for c_id, target_frac in basket.items():
+            current_frac, entry = positions.get(c_id, (0.0, 0.0))
+            delta = target_frac - current_frac
+            
+            if abs(delta) < 0.01: continue # Buffer
+            
+            trade_val = abs(delta) * 10000.0
+            
+            # EXPERT FIX: Proper Accounting
+            if abs(target_frac) > abs(current_frac): # Increasing exposure (Buying)
+                cost = trade_val * (1.0 + tx_cost)
+                if cash < cost: 
+                    logs['insufficient_funds'] += 1
+                    continue
+                cash -= cost
+                # We now own the asset, it enters 'positions'
+            else: # Decreasing exposure (Selling)
+                # We sell portion of asset, get cash back
+                # Estimate value of the delta portion
+                curr = current_prices.get(c_id, 0.5)
+                # simplified: assuming value ~= cost for the delta slice (rebalancing freq is high)
+                proceeds = trade_val * (1.0 - tx_cost)
+                cash += proceeds
+                
+            positions[c_id] = (target_frac, current_prices.get(c_id, 0.5))
             trades += 1
             
         return cash, trades
 
-    def _calculate_position_value(self, positions, prices):
-        total = 0.0
-        for c_id, (frac, entry) in positions.items():
-            curr = prices.get(c_id, entry)
-            if frac > 0:
-                if entry < 1e-9: val = 0
-                else: val = abs(frac)*10000.0 * (curr/entry)
-            else:
-                if (1-entry) < 1e-9: val = 0
-                else: val = abs(frac)*10000.0 * ((1-curr)/(1-entry))
-            total += val
-        return total
+    def _aggregate_fold_results(self, results):
+        if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
+        
+        # Simple average of Sharpe, Total Return compounded
+        total_ret = 1.0
+        sharpes = []
+        drawdowns = []
+        trades = 0
+        
+        for r in results:
+            total_ret *= (1.0 + r['total_return'])
+            sharpes.append(r['sharpe_ratio'])
+            drawdowns.append(r['max_drawdown'])
+            trades += r['trades']
+            
+        return {
+            'total_return': total_ret - 1.0,
+            'sharpe_ratio': np.mean(sharpes),
+            'max_drawdown': max(drawdowns),
+            'trades': trades
+        }
 
-    def _calculate_metrics(self, pnl_history, brier_scores):
-        pnl = np.array(pnl_history)
-        if len(pnl) < 2: return {'irr': 0, 'sharpe_ratio': 0, 'max_drawdown': 0, 'brier_score': 0.25}
+    def _calculate_metrics(self, pnl_history, trades, logs):
+        arr = np.array(pnl_history)
+        if len(arr) < 2: 
+            # EXPERT FIX: Return logs even on failure
+            print(f"  ⚠️ NO TRADES. Rejections: {logs}")
+            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         
-        returns = np.diff(pnl) / pnl[:-1]
-        irr = (pnl[-1] / pnl[0]) - 1
-        std = np.std(returns) + 1e-9
-        sharpe = (np.mean(returns) / std) * np.sqrt(252 * 6)
+        total_ret = (arr[-1] / arr[0]) - 1.0
         
-        peak = pnl[0]
+        pct_changes = np.diff(arr) / arr[:-1]
+        mean_ret = np.mean(pct_changes)
+        std_ret = np.std(pct_changes) + 1e-9
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760)
+        
+        peak = arr[0]
         max_dd = 0.0
-        for x in pnl:
+        for x in arr:
             if x > peak: peak = x
             dd = (peak - x) / peak
             if dd > max_dd: max_dd = dd
             
-        avg_brier = np.mean(brier_scores) if brier_scores else 0.25
-        return {'irr': irr, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'brier_score': avg_brier}
-
+        if trades == 0:
+            print(f"  ⚠️ NO TRADES. Rejections: {logs}")
+            
+        return {
+            'total_return': total_ret,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_dd,
+            'trades': trades
+        }
 
 # ==============================================================================
-# --- REPLACEMENT CLASS 2: BacktestEngine (Data Fetching Fixed) ---
+# --- REPLACEMENT CLASS 2: BacktestEngine (Orchestrator & Data) ---
 # ==============================================================================
-
 class BacktestEngine:
     """
-    Production-Ready C7 Engine.
-    FIXES:
-    1. Gamma Fetching: Uses strict pagination (no 'order' param) to avoid 422s.
-    2. Data Joining: Normalizes addresses to lowercase to ensure Trades match Markets.
-    3. Resolution Logic: Sets resolution to NOW for filtered markets to force backtest completion.
+    Orchestrator for Component 7.
+    Handles Data Fetching, Transformation, and Ray Tuning.
     """
     def __init__(self, historical_data_path: str):
-        log.info("BacktestEngine (C7) Production initialized.")
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Cleanup ports
+        # Robust Session
+        self.session = requests.Session()
+        retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
+        
         if ray.is_initialized(): ray.shutdown()
-        try:
-            ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
-        except:
-            pass
+        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
+        except: pass
 
-    def _get_subgraph_url(self) -> str:
-        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
+    def run_tuning_job(self):
+        log.info("--- Starting Production Tuning Job (Walk-Forward Enabled) ---")
+        
+        df_markets, df_trades = self._load_data()
+        if df_markets.empty: return None
+        
+        event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        
+        # EXPERT FIX: Wide Search Space & ASHA Scheduler
+        search_space = {
+            "kelly_edge_thresh": tune.grid_search([0.01, 0.02, 0.04, 0.06]),
+            "k_brier_scale": tune.choice([0.5, 1.0, 2.0, 4.0]),
+            "min_smart_weight": tune.choice([10.0, 50.0, 100.0]),
+            "fee_rate": 0.001,
+            "walk_forward": True # ENABLED
+        }
+        
+        scheduler = ASHAScheduler(metric="sharpe_ratio", mode="max")
+        
+        ev_ref = ray.put(event_log)
+        prof_ref = ray.put(profiler_data)
+        nlp_ref = ray.put(None)
+        priors_ref = ray.put({})
+        
+        analysis = tune.run(
+            lambda cfg: ray_backtest_wrapper(cfg, ev_ref, prof_ref, nlp_ref, priors_ref),
+            config=search_space,
+            scheduler=scheduler,
+            num_samples=20, # Run enough samples to cover the space
+            resources_per_trial={"cpu": 1},
+        )
+        
+        best = analysis.get_best_config(metric="sharpe_ratio", mode="max")
+        print("\n🏆 BEST CONFIG FOUND:", best)
+        return best
 
-    def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
-        # 1. Load Trades (Source of Truth)
-        log.info("Step 1: Loading historical TRADES from Subgraph...")
-        df_trades = self._fetch_all_trades_from_subgraph()
+    def _load_data(self):
+        # Fetch Trades
+        trades = self._fetch_subgraph_trades()
+        if trades.empty: return pd.DataFrame(), pd.DataFrame()
+        trades['fpmm_address'] = trades['market_id'].str.lower()
+        trades = trades.dropna(subset=['fpmm_address'])
         
-        if df_trades.empty:
-            log.warning("No trades found.")
-            return pd.DataFrame(), pd.DataFrame()
+        # Fetch Markets
+        markets = self._fetch_gamma_markets()
+        if markets.empty: return pd.DataFrame(), trades
+        markets['fpmm_address'] = markets['fpmm_address'].str.lower()
+        
+        # Intersect
+        valid_ids = set(trades['fpmm_address'])
+        markets = markets[markets['fpmm_address'].isin(valid_ids)]
+        
+        log.info(f"Pipeline: {len(markets)} Markets, {len(trades)} Trades.")
+        return markets, trades
 
-        # Clean/Normalize Trade Keys
-        if 'fpmm_address' not in df_trades.columns:
-            if 'market_id' in df_trades.columns:
-                df_trades['fpmm_address'] = df_trades['market_id']
-            elif 'market' in df_trades.columns:
-                df_trades['fpmm_address'] = df_trades['market'].apply(lambda x: x.get('id') if isinstance(x, dict) else None)
+    def _fetch_gamma_markets(self):
+        cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
+        if cache_file.exists(): return pd.read_parquet(cache_file)
         
-        df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
-        df_trades = df_trades.dropna(subset=['fpmm_address'])
-        
-        # 2. Fetch All Markets (Gamma Strict Mode)
-        log.info(f"Step 2: Fetching ALL Market Metadata from Gamma...")
-        df_markets = self._fetch_all_markets_from_gamma()
-        
-        if df_markets.empty:
-            return pd.DataFrame(), df_trades
-
-        # 3. Join
-        # Filter markets to only those we have trades for
-        trade_market_ids = set(df_trades['fpmm_address'])
-        df_markets = df_markets[df_markets['fpmm_address'].isin(trade_market_ids)]
-        
-        log.info(f"Matched metadata for {len(df_markets)} markets.")
-        return df_markets, df_trades
-
-    def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
-        # Strict Mode Fetcher (No optional params)
-        today = datetime.now().strftime('%Y-%m-%d')
-        cache_file = self.cache_dir / f"polymarket_markets_gamma_strict_{today}.parquet"
-        
-        if cache_file.exists():
-            try:
-                log.info("Loading Gamma Markets from local cache...")
-                return pd.read_parquet(cache_file)
-            except Exception: pass
-
         all_rows = []
-        limit = 100
-        offset = 0
-        base_url = "https://gamma-api.polymarket.com/markets"
-        
-        log.info("Downloading Market Catalog (Strict Mode)...")
+        limit, offset = 100, 0
+        print("Fetching Markets", end="")
         while True:
             try:
-                params = {"limit": limit, "offset": offset} # STRICT
-                resp = requests.get(base_url, params=params, timeout=10)
-                
-                if resp.status_code != 200:
-                    log.error(f"Gamma Error {resp.status_code}")
-                    break
-                    
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
+                                      params={"limit": limit, "offset": offset}, timeout=10)
+                if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
-                
                 all_rows.extend(rows)
                 offset += limit
-                
-                # Fetch deeper to ensure we overlap with 3-month old trades
-                if offset > 100000: break 
-                if offset % 2000 == 0: print(".", end="", flush=True)
-                    
-            except Exception as e:
-                log.error(f"Fetch failed: {e}")
-                break
-        
+                if offset % 1000 == 0: print(".", end="", flush=True)
+                if offset > 50000: break
+            except: break
         print(" Done.")
-        if not all_rows: return pd.DataFrame()
         
         df = pd.DataFrame(all_rows)
+        rename_map = {'marketMakerAddress': 'fpmm_address', 'question': 'question', 'endDate': 'resolution_timestamp', 'outcome': 'outcome', 'createdAt': 'created_at'}
+        df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        # Map Gamma -> Pipeline
-        rename_map = {
-            'conditionId': 'market_id',
-            'marketMakerAddress': 'fpmm_address',
-            'question': 'question',
-            'createdAt': 'created_at',
-            'endDate': 'resolution_timestamp',
-            'outcome': 'outcome',
-            'resolved': 'is_resolved'
-        }
-        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
         
-        if 'fpmm_address' in df.columns:
-            df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
-            
-        if 'resolution_timestamp' in df.columns:
-            df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-
-        # Normalize Outcome
-        def clean_outcome(val):
-            try:
-                f = float(val)
-                if f == 0.0: return 0
-                if f == 1.0: return 1
-                return pd.NA
-            except: return pd.NA
-        
-        if 'outcome' in df.columns:
-            df['outcome'] = df['outcome'].apply(clean_outcome)
-            
         df.to_parquet(cache_file)
         return df
 
-    def _fetch_all_trades_from_subgraph(self) -> pd.DataFrame:
-        # Standard Subgraph Query
-        query_template = """
-        {{
-          fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id
-            timestamp
-            tradeAmount
-            outcomeTokensAmount
-            user {{ id }}
-            market {{ id }}
-          }}
-        }}
-        """
-        return self._fetch_paginated_subgraph(
-            "polymarket_trades", 
-            self._get_subgraph_url(), 
-            query_template, 
-            "fpmmTransactions"
-        )
-
-    def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
-        today = datetime.now().strftime('%Y-%m-%d')
-        cache_file = self.cache_dir / f"{cache_key}_{today}.pkl"
-        if cache_file.exists():
-            try:
-                with open(cache_file, 'rb') as f: return pickle.load(f)
-            except: pass
-
+    def _fetch_subgraph_trades(self):
+        cache_file = self.cache_dir / f"subgraph_trades.pkl"
+        if cache_file.exists(): 
+            with open(cache_file, 'rb') as f: return pickle.load(f)
+            
+        url = self._get_subgraph_url()
+        query = """{{ fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{ id timestamp tradeAmount outcomeTokensAmount user {{ id }} market {{ id }} }} }}"""
+        
         all_rows = []
         last_id = ""
-        
         while True:
             try:
-                resp = requests.post(subgraph_url, json={'query': query_template.format(last_id=last_id)}, timeout=30)
+                resp = self.session.post(url, json={'query': query.format(last_id=last_id)}, timeout=30)
                 if resp.status_code != 200: break
-                
-                data = resp.json().get('data', {}).get(entity_name, [])
+                data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
-                
                 all_rows.extend(data)
                 last_id = data[-1]['id']
                 if len(all_rows) % 5000 == 0: log.info(f"Trades: {len(all_rows)}...")
             except: break
-
+            
         df = pd.DataFrame(all_rows)
         if not df.empty:
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
+        
+    def _get_subgraph_url(self):
+        return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
 
-    def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
-        log.info("Transforming raw data...")
-        if df_markets.empty or df_trades.empty: return pd.DataFrame(), pd.DataFrame()
+    def _transform_to_events(self, markets, trades):
+        # 1. Intersection
+        common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
+        markets = markets[markets['fpmm_address'].isin(common_ids)]
+        trades = trades[trades['fpmm_address'].isin(common_ids)]
         
-        # 1. Filter resolved markets for Backtest correctness
-        df_markets = df_markets.dropna(subset=['resolution_timestamp', 'outcome'])
-        log.info(f"Using {len(df_markets)} RESOLVED markets for backtest.")
+        # 2. Profiler Data (MUST KEEP TIMESTAMP FOR WALK-FORWARD)
+        trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s') # Convert once here
         
-        # 2. Join Trades
-        market_map = df_markets.set_index('fpmm_address')['market_id'].to_dict()
-        outcome_map = df_markets.set_index('fpmm_address')['outcome'].to_dict()
+        prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
+        prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp'] # Added timestamp
+        prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
+        prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
+        prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
         
-        df_trades['market_id'] = df_trades['fpmm_address'].map(market_map)
-        df_trades = df_trades.dropna(subset=['market_id'])
+        outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        prof_data['entity_type'] = 'default_topic'
         
-        # 3. Create Profiler Data
-        profiler_data = df_trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'market_id']].copy()
-        profiler_data.columns = ['wallet_id', 'size', 'tokens', 'market_id']
-        profiler_data['size'] = pd.to_numeric(profiler_data['size'], errors='coerce') / 1e6
-        profiler_data['tokens'] = pd.to_numeric(profiler_data['tokens'], errors='coerce') / 1e18
-        
-        # Calculate Price
-        profiler_data['price'] = 0.0
-        mask = profiler_data['tokens'] > 1e-9
-        profiler_data.loc[mask, 'price'] = profiler_data.loc[mask, 'size'] / profiler_data.loc[mask, 'tokens']
-        profiler_data['price'] = profiler_data['price'].clip(0, 1)
-        
-        # Map Outcomes
-        profiler_data['outcome'] = profiler_data['market_id'].map(lambda x: outcome_map.get(x)) # Note: using ID not addr might be tricky if they differ
-        # Use Address map directly if IDs are weird
-        
-        profiler_data = profiler_data.rename(columns={'price': 'bet_price'})
-        profiler_data['entity_type'] = 'default_topic'
-        profiler_data = profiler_data.dropna(subset=['outcome', 'bet_price'])
-
-        # 4. Create Event Log
+        # 3. Events
         events = []
-        # New Contracts
-        for r in df_markets.to_dict('records'):
-            events.append((r['created_at'], 'NEW_CONTRACT', {
-                'id': r['fpmm_address'], # Use address as ID for consistency
-                'p_market_all': 0.5
-            }))
-            events.append((r['resolution_timestamp'], 'RESOLUTION', {
-                'id': r['fpmm_address'],
-                'outcome': r['outcome']
-            }))
+        for r in markets.to_dict('records'):
+            events.append((r['created_at'], 'NEW_CONTRACT', {'id': r['fpmm_address'], 'p_market_all': 0.5}))
+            if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
+                 events.append((r['resolution_timestamp'], 'RESOLUTION', {'id': r['fpmm_address'], 'outcome': r['outcome']}))
+                 
+        for r in trades.to_dict('records'):
+            price = r['bet_price'] if 'bet_price' in r else 0.5 # fallback
+            # Re-calculate from raw just in case
+            if 'tradeAmount' in r:
+                 val_sz = float(r['tradeAmount'])/1e6
+                 val_tk = float(r['outcomeTokensAmount'])/1e18
+                 if val_tk > 0: price = val_sz / val_tk
             
-        # Prices
-        df_trades['timestamp'] = pd.to_datetime(df_trades['timestamp'], unit='s')
-        # Calc price again for log
-        df_trades['size'] = pd.to_numeric(df_trades['tradeAmount'], errors='coerce') / 1e6
-        df_trades['tokens'] = pd.to_numeric(df_trades['outcomeTokensAmount'], errors='coerce') / 1e18
-        df_trades['price'] = 0.0
-        mask = df_trades['tokens'] > 1e-9
-        df_trades.loc[mask, 'price'] = df_trades.loc[mask, 'size'] / df_trades.loc[mask, 'tokens']
-        
-        for r in df_trades.to_dict('records'):
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
-                'p_market_all': r['price'],
+                'p_market_all': min(max(price, 0.01), 0.99),
                 'wallet_id': r['user']['id'],
-                'trade_price': r['price'],
-                'trade_volume': r['size']
+                'trade_price': price,
+                'trade_volume': float(r['tradeAmount'])/1e6
             }))
-
-        event_log = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
-        event_log['contract_id'] = event_log['data'].apply(lambda x: x.get('id') or x.get('contract_id'))
-        event_log = event_log.set_index('timestamp').sort_index()
+            
+        df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data']).dropna(subset=['timestamp'])
+        df_ev = df_ev.set_index('timestamp').sort_index()
         
-        return event_log, profiler_data
-
-    def run_tuning_job(self):
-        log.info("--- C7: Starting Hyperparameter Tuning Job ---")
-        try:
-            df_markets, df_trades = self._load_data_from_polymarket()
-            if df_markets.empty: return None
-            
-            event_log, profiler_data = self._transform_data_to_event_log(df_markets, df_trades)
-            if event_log.empty: return None
-            
-            # Put in Ray
-            event_log_ref = ray.put(event_log)
-            profiler_ref = ray.put(profiler_data)
-            nlp_cache_ref = ray.put(None) # Not used in simple test
-            priors_ref = ray.put({})
-            
-            # Run Single Trial for Verification
-            from ray import tune
-            def wrapper(config):
-                return ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref)
-                
-            analysis = tune.run(wrapper, config={}, num_samples=1)
-            return analysis.get_best_config(metric="irr", mode="max")
-            
-        except Exception as e:
-            log.error(f"Job Failed: {e}", exc_info=True)
-            return None
+        return df_ev, prof_data
         
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
