@@ -1292,16 +1292,15 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Multi-Strategy Backtester (Directional).
-    FIXES:
-    1. Directional Splash: Only buys if price is moving UP with volume.
-    2. Fee Awareness: Only trades if trend is strong enough to cover fees.
+    Production Backtester (Logic Corrected).
+    FIX: Aligns Walk-Forward loop to TRADES, not Market Creation events.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
         self.profiler_data = profiler_data
         
+        # Pre-process batches
         if not event_log.empty:
             if not isinstance(event_log.index, pd.DatetimeIndex):
                 event_log.index = pd.to_datetime(event_log.index)
@@ -1315,39 +1314,59 @@ class FastBacktestEngine:
             self.minute_batches = []
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        if not self.minute_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
+        if self.profiler_data.empty or not self.minute_batches: 
+            return {'total_return': 0.0, 'sharpe_ratio': 0.0}
         
-        timestamps = [b[0]['timestamp'] for b in self.minute_batches]
-        min_date, max_date = min(timestamps), max(timestamps)
+        # --- FIX: Start Clock based on TRADES, not Markets ---
+        # Market creation (NEW_CONTRACT) can happen months before trades.
+        # If we start there, our first training window will be empty of trades.
+        trade_timestamps = pd.to_datetime(self.profiler_data['timestamp'])
+        if trade_timestamps.empty:
+             return {'total_return': 0.0}
+             
+        min_trade_date = trade_timestamps.min()
+        max_date = trade_timestamps.max()
         
-        # Fixed windows for simplicity in this mode
         train_days = config.get('train_days', 30)
         test_days = config.get('test_days', 15)
         
+        # Start exactly at the first trade
+        current_date = min_trade_date
         results = []
-        current_date = min_date
         
-        profiler = HistoricalProfiler(None) 
+        profiler = HistoricalProfiler(None)
+        
+        log.info(f"Walk-Forward Aligned: {current_date} -> {max_date}")
         
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            train_batch = [b for b in self.minute_batches if current_date <= b[0]['timestamp'] < train_end]
-            test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
-            
-            if not test_batch: break
-
-            # Train
+            # 1. Slice Profiler Data (TRAIN)
+            # We use strictly < train_end to avoid leakage
             train_data = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
+            
+            # If training window has no trades, skip forward
+            if train_data.empty:
+                current_date += timedelta(days=test_days)
+                continue
+
             smart_wallets, market_baselines = profiler.run_profiling(train_data)
             
-            # Test
-            fold_res = self._run_single_period(test_batch, smart_wallets, market_baselines, config)
-            results.append(fold_res)
+            # 2. Slice Event Batches (TEST)
+            # Identify the subset of batches that fall in the test window
+            test_batch = []
+            for b in self.minute_batches:
+                ts = b[0]['timestamp']
+                if train_end <= ts < test_end:
+                    test_batch.append(b)
+            
+            if test_batch:
+                fold_res = self._run_single_period(test_batch, smart_wallets, market_baselines, config)
+                results.append(fold_res)
             
             current_date += timedelta(days=test_days)
             
@@ -1361,10 +1380,12 @@ class FastBacktestEngine:
         positions = {} 
         pnl_history = [cash]
         contracts = {} 
-        current_prices = {} # Track current prices
         
         trade_count = 0
         logs = {'sidecar_triggers': 0, 'splash_triggers': 0}
+        
+        # We need to track which markets we've seen 'NEW_CONTRACT' for, 
+        # or infer liquidity if we missed the start event.
         
         for batch in batches:
             for event in batch:
@@ -1374,60 +1395,33 @@ class FastBacktestEngine:
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[c_id] = {'liquidity': data.get('liquidity', 10000.0)}
-                    current_prices[c_id] = data['p_market_all']
                 
                 elif ev_type == 'PRICE_UPDATE':
-                    # 1. Get Price Delta (Direction)
-                    prev_price = current_prices.get(c_id, data['trade_price'])
-                    current_prices[c_id] = data['trade_price']
+                    # Default to 10k liquidity if we missed the NEW_CONTRACT event (common in mid-stream starts)
+                    if c_id not in contracts: contracts[c_id] = {'liquidity': 10000.0}
                     
-                    price_delta = data['trade_price'] - prev_price
-                    
-                    # 2. Signals
+                    # --- SIGNALS ---
                     is_smart = data['wallet_id'] in smart_wallets
                     
-                    avg_vol = market_baselines.get(c_id, 100.0)
-                    if avg_vol < 10: avg_vol = 10
+                    # Splash Logic
+                    avg_vol = market_baselines.get(c_id, 10.0) # Low default
+                    if avg_vol < 1.0: avg_vol = 1.0
                     is_splash = (data['trade_volume'] / avg_vol) > splash_threshold
                     
-                    # 3. EXECUTION (Directional)
                     if is_smart or is_splash:
-                        
-                        # Determine side based on Price Movement
-                        # If Price UP -> Buy YES (Long)
-                        # If Price DOWN -> Sell YES (Short)
-                        
-                        # Filter: Only trade if price is actually moving
-                        if abs(price_delta) < 0.001: continue
-                        
-                        fee = follow_size * 0.002 # 0.2% fee
+                        # Execution
+                        fee = follow_size * 0.002
                         cash -= fee
                         
-                        curr_pos = positions.get(c_id, [0.0, 0.0]) # [Size, Entry]
+                        # Add Position
+                        curr_pos = positions.get(c_id, [0.0, 0.0]) # Size, Entry
+                        new_size = curr_pos[0] + follow_size
+                        # Weighted Entry
+                        total_val = (curr_pos[0]*curr_pos[1]) + (follow_size*data['trade_price'])
+                        new_entry = total_val / new_size
+                        positions[c_id] = [new_size, new_entry]
+                        trade_count += 1
                         
-                        if price_delta > 0: 
-                            # MOMENTUM BUY
-                            new_size = curr_pos[0] + follow_size
-                            # Weighted Entry
-                            total_val = (curr_pos[0] * curr_pos[1]) + (follow_size * data['trade_price'])
-                            new_entry = total_val / new_size
-                            positions[c_id] = [new_size, new_entry]
-                            trade_count += 1
-                            
-                        elif price_delta < 0:
-                            # MOMENTUM SELL (Reduce Position)
-                            # If we don't have position, we can short (negative size)
-                            # Simplified: Just subtract size
-                            new_size = curr_pos[0] - follow_size
-                            
-                            # PnL Realization if closing
-                            # (Entry - Exit) * Size? 
-                            # Keeping simple "Avg Entry" logic for shorting is tricky.
-                            # Let's assume we open a Short Position at current price.
-                            
-                            positions[c_id] = [new_size, data['trade_price']]
-                            trade_count += 1
-
                         if is_smart: logs['sidecar_triggers'] += 1
                         if is_splash: logs['splash_triggers'] += 1
 
@@ -1436,16 +1430,10 @@ class FastBacktestEngine:
                         size, entry = positions.pop(c_id)
                         outcome = float(data['outcome'])
                         
-                        # Payout Logic
-                        # Long (Size > 0): Pays if Outcome 1
-                        # Short (Size < 0): Pays if Outcome 0
-                        
-                        payout = 0.0
-                        if size > 0:
-                            payout = (abs(size) / entry) * outcome
-                        elif size < 0:
-                            payout = (abs(size) / (1.0 - entry)) * (1.0 - outcome)
-                            
+                        # Payout
+                        # Size is Notional USD. Shares = Size / Entry.
+                        # Payout = Shares * Outcome
+                        payout = (size / max(entry, 0.001)) * outcome
                         cash += payout
             
             pnl_history.append(cash)
@@ -1465,24 +1453,28 @@ class FastBacktestEngine:
             drawdowns.append(r['max_drawdown'])
             trades += r['trades']
             for k, v in r.get('rejection_logs', {}).items(): agg_logs[k] = agg_logs.get(k, 0) + v
+        
         return {'total_return': total_ret - 1.0, 'sharpe_ratio': np.mean(sharpes), 'max_drawdown': max(drawdowns), 'trades': trades, 'rejection_logs': agg_logs}
 
     def _calculate_metrics(self, pnl_history, trades, logs):
         arr = np.array(pnl_history)
         if len(arr) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0, 'rejection_logs': logs}
+        
         total_ret = (arr[-1] / arr[0]) - 1.0
+        
         with np.errstate(divide='ignore', invalid='ignore'):
             pct_changes = np.diff(arr) / arr[:-1]
-            pct_changes = np.nan_to_num(pct_changes, nan=0.0)
-        mean_ret = np.mean(pct_changes)
-        std_ret = np.std(pct_changes) + 1e-9
-        sharpe = (mean_ret / std_ret) * np.sqrt(8760)
+            mean_ret = np.mean(pct_changes)
+            std_ret = np.std(pct_changes) + 1e-9
+            sharpe = (mean_ret / std_ret) * np.sqrt(8760)
+            
         peak = arr[0]
         max_dd = 0.0
         for x in arr:
             if x > peak: peak = x
             dd = (peak - x) / peak
             if dd > max_dd: max_dd = dd
+            
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades, 'rejection_logs': logs}
         
 # ==============================================================================
