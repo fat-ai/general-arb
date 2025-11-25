@@ -1658,87 +1658,104 @@ class BacktestEngine:
         
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
         """
-        REPLACEMENT: Robust Subgraph Fetcher (Gnosis V2 Schema).
-        Fixed to match the specific fields available on the Goldsky Endpoint.
+        Fetches ALL markets from Gamma API via pagination.
+        This bypasses the 'Batch ID' 422 error and the Subgraph Schema errors.
         """
-        # --- 1. The Correct Query for Gnosis/Polymarket FPMM ---
-        # We fetch 'title' (question) and 'condition' (outcome data).
-        query_template = """
-        {{
-          fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id
-            title
-            creationTimestamp
-            condition {{
-              id
-              payoutNumerators
-            }}
-          }}
-        }}
-        """
+        # Cache check (Parquet for speed)
+        today = datetime.now().strftime('%Y-%m-%d')
+        cache_file = self.cache_dir / f"polymarket_markets_gamma_full_{today}.parquet"
         
-        df = self._fetch_paginated_subgraph(
-            cache_key="polymarket_markets_subgraph_v2",
-            subgraph_url=self._get_subgraph_url(),
-            query_template=query_template,
-            entity_name="fixedProductMarketMakers"
-        )
-        
-        if df.empty: return pd.DataFrame()
-
-        # --- 2. Rename Columns to match Pipeline ---
-        df = df.rename(columns={
-            'id': 'fpmm_address',
-            'creationTimestamp': 'created_at',
-            'title': 'question'
-        })
-        
-        # Ensure ID alignment (Subgraph uses address as ID)
-        df['market_id'] = df['fpmm_address']
-        
-        # --- 3. Extract Outcomes from 'Condition' (The Truth Source) ---
-        # The subgraph stores outcome in 'payoutNumerators'.
-        # Format: ["10000...", "0"] means Outcome 0 won.
-        # Format: ["0", "10000..."] means Outcome 1 won.
-        
-        def parse_outcome(row):
-            cond = row.get('condition')
-            if not isinstance(cond, dict): return pd.NA
-            
-            payouts = cond.get('payoutNumerators', [])
-            if not payouts or len(payouts) < 2: return pd.NA
-            
-            # Check for non-zero payouts to determine winner
+        if cache_file.exists():
             try:
-                p0 = float(payouts[0])
-                p1 = float(payouts[1])
+                log.info("Loading Gamma Markets from local cache...")
+                return pd.read_parquet(cache_file)
+            except Exception:
+                pass
+
+        all_rows = []
+        limit = 100
+        offset = 0
+        base_url = "https://gamma-api.polymarket.com/markets"
+        
+        log.info("Downloading Market Catalog from Gamma...")
+        
+        while True:
+            try:
+                # We order by 'newest' to get active ones, but we fetch deep to get history
+                params = {"limit": limit, "offset": offset, "order": "newest"}
+                resp = requests.get(base_url, params=params, timeout=10)
                 
-                # If both are 0, it's unresolved.
-                if p0 == 0 and p1 == 0: return pd.NA
+                if resp.status_code != 200:
+                    log.warning(f"Gamma API Error: {resp.status_code}")
+                    break
+                    
+                rows = resp.json()
+                if not rows:
+                    break
                 
-                # If one is greater, that side won.
-                if p0 > p1: return 0  # No / Long Short
-                if p1 > p0: return 1  # Yes / Long Long
+                all_rows.extend(rows)
+                offset += limit
                 
-                return pd.NA # Tie or weird state
+                # Safety break to prevent infinite loops (Gamma has ~10k-20k relevant markets)
+                if offset > 20000: 
+                    log.info("Hit safety limit of 20k markets.")
+                    break
+                    
+                if offset % 1000 == 0:
+                    print(f".", end="", flush=True) # Progress indicator
+                    
+            except Exception as e:
+                log.error(f"Fetch failed at offset {offset}: {e}")
+                break
+
+        if not all_rows:
+            return pd.DataFrame()
+            
+        print(" Done.")
+        df = pd.DataFrame(all_rows)
+
+        # --- RENAME & CLEANUP ---
+        # Map Gamma fields to Pipeline fields
+        rename_map = {
+            'conditionId': 'market_id',       # Gamma's internal ID (keep for reference)
+            'marketMakerAddress': 'fpmm_address', # CRITICAL: This is what we join on
+            'question': 'question',
+            'createdAt': 'created_at',
+            'endDate': 'resolution_timestamp',
+            'outcome': 'outcome',
+            'resolved': 'is_resolved'
+        }
+        
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Normalize Join Key
+        if 'fpmm_address' in df.columns:
+            df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
+        else:
+            log.warning("Gamma data missing 'marketMakerAddress'. Join will fail.")
+            
+        # Normalize Timestamp
+        if 'resolution_timestamp' in df.columns:
+            df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+
+        # Normalize Outcome (Gamma returns strings like "0.5", "1", "0")
+        def clean_outcome(val):
+            try:
+                f = float(val)
+                # If 0 or 1, keep. If 0.5 or other, treat as unresolved/tie for now
+                if f == 0.0: return 0
+                if f == 1.0: return 1
+                return pd.NA
             except:
                 return pd.NA
-
-        df['outcome'] = df.apply(parse_outcome, axis=1)
         
-        # --- 4. Fix "Right Censoring" (Crucial) ---
-        # The subgraph is missing 'resolutionTimestamp'. 
-        # If we leave it null, the backtest drops the market.
-        # If we set it to 'created_at', the backtest closes the market before trades happen.
-        # FIX: For all resolved markets, set resolution to NOW. 
-        # This forces the backtest to replay ALL historical trades before resolving.
-        
-        df['resolution_timestamp'] = pd.NA
-        resolved_mask = df['outcome'].notna()
-        df.loc[resolved_mask, 'resolution_timestamp'] = datetime.now()
+        if 'outcome' in df.columns:
+            df['outcome'] = df['outcome'].apply(clean_outcome)
 
+        # Save to cache
+        df.to_parquet(cache_file)
         return df
-
+        
     def _fetch_all_trades_from_subgraph(self) -> pd.DataFrame:
         # This query is known to work on the Goldsky endpoint
         query_template = """
