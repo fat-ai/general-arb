@@ -18,7 +18,7 @@ dune-client
 
 # --- Back-testing & Tuning (C7) ---
 ray[tune]     # For distributed back-testing and hyperparameter tuning
-
+hyperopt
 # --- Dashboard (C8) ---
 dash                      # The core web framework
 dash-bootstrap-components # For UI layout and components
