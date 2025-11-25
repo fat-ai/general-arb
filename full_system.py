@@ -1758,20 +1758,44 @@ class BacktestEngine:
         return df
 
     def _transform_to_events(self, markets, trades):
-        log.info("Filtering Wash Trades...")
+        log.info("Transforming Data...")
+        
+        # --- FIX 1: Silence Timestamp Warning ---
+        # Explicitly convert to numeric first
+        trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+
+        # --- FIX 2: Normalize User IDs (The Crash Fix) ---
+        # Ensure 'user' is always a string ID, extracting from dict if necessary
+        def extract_wallet(val):
+            if isinstance(val, dict):
+                return val.get('id')
+            return str(val)
+        
+        if 'user' in trades.columns:
+            trades['user'] = trades['user'].apply(extract_wallet)
+        
+        # --------------------------------------------------
+
+        # Filter Wash Trades
+        log.info("Filtering Wash Trades...")
         trades.sort_values(['fpmm_address', 'user', 'timestamp'], inplace=True)
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
+        
         trades['is_wash'] = (trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60)
         trades = trades[~trades['is_wash']].drop(columns=['prev_user', 'time_delta', 'is_wash'])
         
+        # Intersection
         common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
         markets = markets[markets['fpmm_address'].isin(common_ids)]
         trades = trades[trades['fpmm_address'].isin(common_ids)]
         
+        # Create Profiler Data
+        # User column is now safe to copy as 'wallet_id'
         prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
         prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
+        
         prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
         prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
@@ -1779,32 +1803,33 @@ class BacktestEngine:
         outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
-        # PATCH 6: Suspicious Resolutions
+        # Suspicious Resolutions Filter
         trade_counts = trades.groupby('fpmm_address').size()
         prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
-        # Drop strict 0/1 outcomes with <10 trades
         suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 10)
         prof_data = prof_data[~suspicious]
         
         prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
         prof_data['entity_type'] = 'default_topic'
         
+        # Create Events
         events = []
         for r in markets.to_dict('records'):
             events.append((r['created_at'], 'NEW_CONTRACT', {
                 'id': r['fpmm_address'], 
                 'p_market_all': 0.5,
-                'liquidity': r.get('liquidity', 10000.0) # Pass Liquidity
+                'liquidity': r.get('liquidity', 10000.0) 
             }))
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
                  events.append((r['resolution_timestamp'], 'RESOLUTION', {'id': r['fpmm_address'], 'outcome': r['outcome']}))
                  
         for r in trades.to_dict('records'):
             price = r['bet_price'] if 'bet_price' in r else 0.5
+            
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
                 'p_market_all': min(max(price, 0.01), 0.99),
-                'wallet_id': r['user']['id'],
+                'wallet_id': r['user'], # FIX: Use normalized string directly
                 'trade_price': price,
                 'trade_volume': float(r['tradeAmount'])/1e6
             }))
