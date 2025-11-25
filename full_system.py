@@ -1298,192 +1298,286 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 # --- REPLACEMENT CLASS 1: FastBacktestEngine (Dual Strategy) ---
 # ==============================================================================
-class FastBacktestEngine:
+class BacktestEngine:
     """
-    Production Backtester (Logic Corrected).
-    FIX: Aligns Walk-Forward loop to TRADES, not Market Creation events.
+    Orchestrator.
+    FIXED:
+    1. Synchronized Data Fetching (Newest Markets + Newest Trades).
+    2. Robust Column Handling.
+    3. Debug Logging for Intersection.
     """
-    
-    def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
-        self.event_log = event_log
-        self.profiler_data = profiler_data
-        
-        # Pre-process batches
-        if not event_log.empty:
-            if not isinstance(event_log.index, pd.DatetimeIndex):
-                event_log.index = pd.to_datetime(event_log.index)
-            event_log = event_log.sort_index()
-            records = event_log.reset_index().to_dict('records')
-            self.minute_batches = []
-            from itertools import groupby
-            for key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H%M')):
-                self.minute_batches.append(list(group))
-        else:
-            self.minute_batches = []
+    def __init__(self, historical_data_path: str):
+        self.historical_data_path = historical_data_path
+        self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.session = requests.Session()
+        retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
+        if ray.is_initialized(): ray.shutdown()
+        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
+        except: pass
 
-    def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        if self.profiler_data.empty or not self.minute_batches: 
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0}
+    def run_tuning_job(self):
+        log.info("--- Starting Production Tuning (Bayesian) ---")
         
-        # --- FIX: Start Clock based on TRADES, not Markets ---
-        # Market creation (NEW_CONTRACT) can happen months before trades.
-        # If we start there, our first training window will be empty of trades.
-        trade_timestamps = pd.to_datetime(self.profiler_data['timestamp'])
-        if trade_timestamps.empty:
-             return {'total_return': 0.0}
-             
-        min_trade_date = trade_timestamps.min()
-        max_date = trade_timestamps.max()
+        # Load Data
+        df_markets, df_trades = self._load_data()
         
-        train_days = config.get('train_days', 30)
-        test_days = config.get('test_days', 15)
-        
-        # Start exactly at the first trade
-        current_date = min_trade_date
-        results = []
-        
-        profiler = HistoricalProfiler(None)
-        
-        log.info(f"Walk-Forward Aligned: {current_date} -> {max_date}")
-        
-        while current_date + timedelta(days=train_days + test_days) <= max_date:
-            train_end = current_date + timedelta(days=train_days)
-            test_end = train_end + timedelta(days=test_days)
+        if df_markets.empty:
+            log.error("❌ CRITICAL: No overlapping markets found. Cannot run tuning.")
+            return None
             
-            # 1. Slice Profiler Data (TRAIN)
-            # We use strictly < train_end to avoid leakage
-            train_data = self.profiler_data[
-                (self.profiler_data['timestamp'] >= current_date) & 
-                (self.profiler_data['timestamp'] < train_end)
-            ]
-            
-            # If training window has no trades, skip forward
-            if train_data.empty:
-                current_date += timedelta(days=test_days)
-                continue
+        log.info(f"✅ Data Loaded. Overlapping Markets: {len(df_markets)}")
+        
+        event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        
+        # Bayesian Search Space
+        from ray.tune.search.hyperopt import HyperOptSearch
+        
+        search_space = {
+            "splash_threshold": tune.choice([2.0, 5.0, 10.0]),
+            "follow_size": tune.choice([50.0, 100.0, 200.0]),
+            "train_days": tune.randint(30, 90),
+            "test_days": tune.randint(15, 45),
+            "seed": 42
+        }
+        
+        searcher = HyperOptSearch(metric="sharpe_ratio", mode="max", random_state_seed=42)
+        
+        ev_ref = ray.put(event_log)
+        prof_ref = ray.put(profiler_data)
+        nlp_ref = ray.put(None)
+        priors_ref = ray.put({})
+        
+        analysis = tune.run(
+            lambda cfg: ray_backtest_wrapper(cfg, ev_ref, prof_ref, nlp_ref, priors_ref),
+            config=search_space,
+            search_alg=searcher,
+            num_samples=20, # Reduced samples for speed
+            resources_per_trial={"cpu": 1},
+        )
 
-            smart_wallets, market_baselines = profiler.run_profiling(train_data)
+        best_config = analysis.get_best_config(metric="sharpe_ratio", mode="max")
+        
+        if best_config:
+            best_trial = [t for t in analysis.trials if t.config == best_config][0]
+            metrics = best_trial.last_result
+            print("\n" + "="*60)
+            print("🏆  WINNING STRATEGY METRICS  🏆")
+            print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
+            print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
+            print(f"   Total Trades:   {metrics.get('trades', 0)}")
+            print("="*60 + "\n")
             
-            # 2. Slice Event Batches (TEST)
-            # Identify the subset of batches that fall in the test window
-            test_batch = []
-            for b in self.minute_batches:
-                ts = b[0]['timestamp']
-                if train_end <= ts < test_end:
-                    test_batch.append(b)
-            
-            if test_batch:
-                fold_res = self._run_single_period(test_batch, smart_wallets, market_baselines, config)
-                results.append(fold_res)
-            
-            current_date += timedelta(days=test_days)
-            
-        return self._aggregate_fold_results(results)
+        return best_config
 
-    def _run_single_period(self, batches, smart_wallets, market_baselines, config):
-        follow_size = config.get('follow_size', 50.0)
-        splash_threshold = config.get('splash_threshold', 5.0)
+    def _load_data(self):
+        trades = self._fetch_subgraph_trades()
+        if trades.empty: 
+            log.error("Trades data is empty.")
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Extract market_id from Goldsky 'market' dict
+        if 'market' in trades.columns:
+            trades['market_id'] = trades['market'].apply(lambda x: x.get('id') if isinstance(x, dict) else None)
         
-        cash = 10000.0
-        positions = {} 
-        pnl_history = [cash]
-        contracts = {} 
-        
-        trade_count = 0
-        logs = {'sidecar_triggers': 0, 'splash_triggers': 0}
-        
-        # We need to track which markets we've seen 'NEW_CONTRACT' for, 
-        # or infer liquidity if we missed the start event.
-        
-        for batch in batches:
-            for event in batch:
-                ev_type = event['event_type']
-                data = event['data']
-                c_id = data.get('contract_id')
+        if 'market_id' not in trades.columns:
+            log.error("Trades data missing 'market_id'.")
+            return pd.DataFrame(), pd.DataFrame()
                 
-                if ev_type == 'NEW_CONTRACT':
-                    contracts[c_id] = {'liquidity': data.get('liquidity', 10000.0)}
+        trades['fpmm_address'] = trades['market_id'].str.lower()
+        trades = trades.dropna(subset=['fpmm_address'])
+        
+        # Valid IDs from trades (Newest 50k trades)
+        valid_ids = set(trades['fpmm_address'])
+        print(f"DEBUG: Found {len(valid_ids)} unique markets in trades.")
+        
+        markets = self._fetch_gamma_markets()
+        if markets.empty: 
+            log.error("Markets data is empty.")
+            return pd.DataFrame(), trades
+            
+        markets['fpmm_address'] = markets['fpmm_address'].str.lower()
+        
+        # Intersection Logic
+        markets = markets[markets['fpmm_address'].isin(valid_ids)]
+        
+        print(f"DEBUG: Intersection complete. {len(markets)} markets remain after matching with trades.")
+        
+        return markets, trades
+
+    def _fetch_gamma_markets(self):
+        cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
+        # Force fresh fetch if previous run failed/was empty
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty: return df
+            except: pass
+
+        all_rows = []
+        limit, offset = 1000, 0
+        print("Fetching Markets (Closed, Newest First)", end="")
+        while True:
+            try:
+                # FIX: Added 'order' and 'ascending' to align with recent trades
+                params = {
+                    "limit": limit, 
+                    "offset": offset, 
+                    "closed": "true",
+                    "order": "endDate",     # Sort by resolution date
+                    "ascending": "false"    # Newest first
+                }
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
+                                      params=params, timeout=10)
+                if resp.status_code != 200: break
+                rows = resp.json()
+                if not rows: break
+                all_rows.extend(rows)
+                offset += limit
+                if offset % 1000 == 0: print(".", end="", flush=True)
+                # Fetch more markets to increase intersection chance
+                if offset > 10000: break
+            except: break
+        print(" Done.")
+        
+        if not all_rows: return pd.DataFrame()
+        
+        df = pd.DataFrame(all_rows)
+        
+        rename_map = {
+            'marketMakerAddress': 'fpmm_address', 
+            'question': 'question', 
+            'endDate': 'resolution_timestamp', 
+            'outcome': 'outcome', 
+            'createdAt': 'created_at',
+            'liquidity': 'liquidity' 
+        }
+        df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+        
+        # Safe Column Creation
+        for col in ['outcome', 'resolution_timestamp', 'created_at', 'fpmm_address']:
+            if col not in df.columns: df[col] = pd.NA
+            
+        df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
+        if 'liquidity' in df.columns:
+            df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(0.0)
+            
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        
+        df = df.dropna(subset=['fpmm_address', 'outcome'])
+        df.to_parquet(cache_file)
+        return df
+
+    def _fetch_subgraph_trades(self):
+        cache_file = self.cache_dir / f"subgraph_trades.pkl"
+        # Force fresh fetch if previous run was empty
+        if cache_file.exists(): 
+            try:
+                df = pickle.load(open(cache_file, "rb"))
+                if not df.empty: return df
+            except: pass
+            
+        url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
+        
+        # FIX: Descending Sort + Timestamp paging
+        query_template = """
+        {{
+          fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
+            id
+            timestamp
+            tradeAmount
+            outcomeTokensAmount
+            user {{ id }}
+            market {{ id }}
+          }}
+        }}
+        """
+        all_rows = []
+        import time
+        time_cursor = int(time.time())
+        print("Fetching Trades (Newest First)", end="")
+        
+        while True:
+            try:
+                resp = self.session.post(url, json={'query': query_template.format(time_cursor=time_cursor)}, timeout=30)
+                if resp.status_code != 200: break
+                data = resp.json().get('data', {}).get('fpmmTransactions', [])
+                if not data: break
+                all_rows.extend(data)
+                time_cursor = data[-1]['timestamp']
                 
-                elif ev_type == 'PRICE_UPDATE':
-                    # Default to 10k liquidity if we missed the NEW_CONTRACT event (common in mid-stream starts)
-                    if c_id not in contracts: contracts[c_id] = {'liquidity': 10000.0}
-                    
-                    # --- SIGNALS ---
-                    is_smart = data['wallet_id'] in smart_wallets
-                    
-                    # Splash Logic
-                    avg_vol = market_baselines.get(c_id, 10.0) # Low default
-                    if avg_vol < 1.0: avg_vol = 1.0
-                    is_splash = (data['trade_volume'] / avg_vol) > splash_threshold
-                    
-                    if is_smart or is_splash:
-                        # Execution
-                        fee = follow_size * 0.002
-                        cash -= fee
-                        
-                        # Add Position
-                        curr_pos = positions.get(c_id, [0.0, 0.0]) # Size, Entry
-                        new_size = curr_pos[0] + follow_size
-                        # Weighted Entry
-                        total_val = (curr_pos[0]*curr_pos[1]) + (follow_size*data['trade_price'])
-                        new_entry = total_val / new_size
-                        positions[c_id] = [new_size, new_entry]
-                        trade_count += 1
-                        
-                        if is_smart: logs['sidecar_triggers'] += 1
-                        if is_splash: logs['splash_triggers'] += 1
+                if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
+                if len(all_rows) >= 50000: break
+            except: break
+        print(" Done.")
+            
+        df = pd.DataFrame(all_rows)
+        if not df.empty:
+            with open(cache_file, 'wb') as f: pickle.dump(df, f)
+        return df
 
-                elif ev_type == 'RESOLUTION':
-                    if c_id in positions:
-                        size, entry = positions.pop(c_id)
-                        outcome = float(data['outcome'])
-                        
-                        # Payout
-                        # Size is Notional USD. Shares = Size / Entry.
-                        # Payout = Shares * Outcome
-                        payout = (size / max(entry, 0.001)) * outcome
-                        cash += payout
-            
-            pnl_history.append(cash)
-            
-        return self._calculate_metrics(pnl_history, trade_count, logs)
+    def _transform_to_events(self, markets, trades):
+        log.info("Transforming Data...")
+        
+        # Ensure timestamp is datetime
+        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
+             trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
+             trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+        
+        # Extract Wallet ID
+        if 'user' in trades.columns:
+            trades['user'] = trades['user'].apply(lambda x: x.get('id') if isinstance(x, dict) else str(x))
 
-    def _aggregate_fold_results(self, results):
-        if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
-        total_ret = 1.0
-        sharpes = []
-        drawdowns = []
-        trades = 0
-        agg_logs = {}
-        for r in results:
-            total_ret *= (1.0 + r['total_return'])
-            sharpes.append(r['sharpe_ratio'])
-            drawdowns.append(r['max_drawdown'])
-            trades += r['trades']
-            for k, v in r.get('rejection_logs', {}).items(): agg_logs[k] = agg_logs.get(k, 0) + v
+        # Filter Wash Trades
+        trades = trades.sort_values(['fpmm_address', 'user', 'timestamp'])
+        trades['prev_user'] = trades['user'].shift(1)
+        trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
+        trades = trades[~((trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60))].copy()
         
-        return {'total_return': total_ret - 1.0, 'sharpe_ratio': np.mean(sharpes), 'max_drawdown': max(drawdowns), 'trades': trades, 'rejection_logs': agg_logs}
-
-    def _calculate_metrics(self, pnl_history, trades, logs):
-        arr = np.array(pnl_history)
-        if len(arr) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0, 'rejection_logs': logs}
+        # Intersection Check
+        common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
+        markets = markets[markets['fpmm_address'].isin(common_ids)]
+        trades = trades[trades['fpmm_address'].isin(common_ids)]
         
-        total_ret = (arr[-1] / arr[0]) - 1.0
+        # Create Profiler Data
+        prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
+        prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
+        prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
+        prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
+        prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
         
-        with np.errstate(divide='ignore', invalid='ignore'):
-            pct_changes = np.diff(arr) / arr[:-1]
-            mean_ret = np.mean(pct_changes)
-            std_ret = np.std(pct_changes) + 1e-9
-            sharpe = (mean_ret / std_ret) * np.sqrt(8760)
+        outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        prof_data = prof_data[prof_data['outcome'].isin([0, 1])]
+        prof_data['entity_type'] = 'default_topic'
+        
+        # Create Events
+        events = []
+        for r in markets.to_dict('records'):
+            events.append((r['created_at'], 'NEW_CONTRACT', {
+                'contract_id': r['fpmm_address'], 
+                'liquidity': float(r.get('liquidity', 10000.0))
+            }))
+            if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
+                 events.append((r['resolution_timestamp'], 'RESOLUTION', {
+                     'contract_id': r['fpmm_address'], 
+                     'outcome': r['outcome']
+                 }))
+                 
+        for r in trades.to_dict('records'):
+            events.append((r['timestamp'], 'PRICE_UPDATE', {
+                'contract_id': r['fpmm_address'],
+                'wallet_id': r['user'],
+                'trade_price': r['bet_price'],
+                'trade_volume': float(r['tradeAmount'])/1e6
+            }))
             
-        peak = arr[0]
-        max_dd = 0.0
-        for x in arr:
-            if x > peak: peak = x
-            dd = (peak - x) / peak
-            if dd > max_dd: max_dd = dd
-            
-        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades, 'rejection_logs': logs}
+        df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data']).dropna(subset=['timestamp'])
+        df_ev = df_ev.set_index('timestamp').sort_index()
+        
+        return df_ev, prof_data
         
 # ==============================================================================
 # --- REPLACEMENT CLASS 2: BacktestEngine (Orchestrator) ---
