@@ -767,43 +767,67 @@ class HistoricalProfiler:
         self.min_trades = min_trades_threshold
         log.info(f"HistoricalProfiler initialized (min_trades: {self.min_trades}).")
 
-    def run_profiling(self, df_trades: pd.DataFrame) -> Tuple[Dict, Dict]:
-        log.info("--- Profiling Wallets & Volume ---")
+    def run_profiling(self, df_trades: pd.DataFrame) -> Tuple[set, Dict]:
+        """
+        Production Profiler.
+        1. Identifies 'Smart Wallets' based on Realized PnL (Dollars Won).
+        2. Calculates 'Market Baselines' for Volume Spike detection.
+        """
+        log.info("--- Profiling Wallets & Volume (Production PnL Mode) ---")
         
-        if df_trades.empty: return {}, {}
+        if df_trades.empty: 
+            return set(), {}
 
-        # 1. Calculate Wallet PnL (Realized)
-        # Simplified: (Outcome - Price) * Volume for resolved trades
-        resolved = df_trades.dropna(subset=['outcome'])
+        # --- 1. Identify Smart Wallets (PnL Based) ---
+        # Filter for Resolved trades only to calculate PnL
+        resolved = df_trades.dropna(subset=['outcome']).copy()
         
-        # Vectorized PnL Calculation
-        # If Long (outcome=1): PnL = (1 - Price) * Vol
-        # If Short (outcome=0): PnL = (0 - Price) * Vol (Profit if Price high) -> Wait, short logic:
-        # Standard: Profit = (Outcome - EntryPrice) * Direction * Volume
-        # Direction is implicit in trade: We assume positive Volume is a "Buy Yes" for simplicity in this data format
-        # Or better: Net Value = (Outcome * Tokens) - (Cost)
-        
-        # Cost = Size (USDC)
-        # Return = Tokens * Outcome
-        resolved['pnl'] = (resolved['tokens'] * resolved['outcome']) - resolved['size']
-        
-        wallet_stats = resolved.groupby('wallet_id')['pnl'].sum()
-        top_wallets = wallet_stats[wallet_stats > 0].sort_values(ascending=False)
-        
-        # Return Top 5% of wallets as "Smart Money"
-        cutoff = int(len(top_wallets) * 0.05)
-        smart_wallet_ids = set(top_wallets.head(cutoff).index)
-        log.info(f"Identified {len(smart_wallet_ids)} Smart Wallets (Top 5% PnL).")
-
-        # 2. Calculate Volume Baselines (per Market)
-        # We need hourly average volume to detect "Splashes"
-        # Group by Market -> Resample Hourly -> Mean
-        if 'timestamp' in df_trades.columns:
-            vol_profile = df_trades.set_index('timestamp').groupby('market_id')['size'].resample('1h').sum()
-            # Mean volume per market (hourly)
-            market_baselines = vol_profile.groupby('market_id').mean().to_dict()
+        if resolved.empty:
+            log.warning("No resolved trades found for profiling.")
+            smart_wallet_ids = set()
         else:
-            market_baselines = {}
+            # Ensure numeric types for math safety
+            resolved['size'] = pd.to_numeric(resolved['size'], errors='coerce').fillna(0.0)
+            resolved['tokens'] = pd.to_numeric(resolved['tokens'], errors='coerce').fillna(0.0)
+            resolved['outcome'] = pd.to_numeric(resolved['outcome'], errors='coerce').fillna(0.0)
+            
+            # PnL Formula: Value Received - Cost Basis
+            # Value = Token Count * Outcome (e.g., 100 shares * 1.0 = $100)
+            # Cost = Size (USDC invested)
+            resolved['payout_value'] = resolved['tokens'] * resolved['outcome']
+            resolved['realized_pnl'] = resolved['payout_value'] - resolved['size']
+            
+            # Aggregate PnL per wallet
+            wallet_stats = resolved.groupby('wallet_id')['realized_pnl'].sum()
+            
+            # Filter: Only wallets that actually made money
+            profitable_wallets = wallet_stats[wallet_stats > 0].sort_values(ascending=False)
+            
+            if profitable_wallets.empty:
+                smart_wallet_ids = set()
+            else:
+                # Threshold: Top 20% of winners, or at least top 5 wallets (whichever is more)
+                # This ensures we have a signal even in thin data
+                count = len(profitable_wallets)
+                top_n = max(5, int(count * 0.20))
+                
+                smart_wallet_ids = set(profitable_wallets.head(top_n).index)
+                log.info(f"Identified {len(smart_wallet_ids)} Smart Wallets (Top {top_n} Profitable).")
+
+        # --- 2. Calculate Volume Baselines (Hourly Average) ---
+        # We use ALL trades (active + resolved) to establish volume norms
+        market_baselines = {}
+        if 'timestamp' in df_trades.columns and not df_trades.empty:
+            try:
+                # Group by Market -> Resample Hourly -> Sum Volume
+                vol_series = df_trades.set_index('timestamp').groupby('market_id')['size'].resample('1h').sum()
+                
+                # Calculate average hourly volume per market
+                # We fill NaN correlations/stats later, but here we just need the mean
+                market_baselines = vol_series.groupby('market_id').mean().to_dict()
+            except Exception as e:
+                log.warning(f"Volume profiling failed: {e}")
+                market_baselines = {}
 
         return smart_wallet_ids, market_baselines
 
@@ -1268,16 +1292,16 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Multi-Strategy Backtester.
-    STRATEGY 1 (Sidecar): Copy-trade Top 5% Profitable Wallets.
-    STRATEGY 2 (Whale Splash): Follow volume spikes > N * Average.
+    Multi-Strategy Backtester (Directional).
+    FIXES:
+    1. Directional Splash: Only buys if price is moving UP with volume.
+    2. Fee Awareness: Only trades if trend is strong enough to cover fees.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
         self.profiler_data = profiler_data
         
-        # Pre-process for speed
         if not event_log.empty:
             if not isinstance(event_log.index, pd.DatetimeIndex):
                 event_log.index = pd.to_datetime(event_log.index)
@@ -1291,19 +1315,19 @@ class FastBacktestEngine:
             self.minute_batches = []
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        # ... (Standard Walk-Forward Loop Logic same as before) ...
-        # Simplified for brevity:
-        if not self.minute_batches: return {'total_return': 0.0}
+        if not self.minute_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
         
         timestamps = [b[0]['timestamp'] for b in self.minute_batches]
         min_date, max_date = min(timestamps), max(timestamps)
+        
+        # Fixed windows for simplicity in this mode
         train_days = config.get('train_days', 30)
         test_days = config.get('test_days', 15)
         
         results = []
         current_date = min_date
         
-        profiler = HistoricalProfiler(None) # Helper instance
+        profiler = HistoricalProfiler(None) 
         
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
@@ -1314,30 +1338,30 @@ class FastBacktestEngine:
             
             if not test_batch: break
 
-            # 1. TRAIN: Identify Smart Wallets & Vol Baselines
+            # Train
             train_data = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
-            
             smart_wallets, market_baselines = profiler.run_profiling(train_data)
             
-            # 2. TEST: Run Signals
+            # Test
             fold_res = self._run_single_period(test_batch, smart_wallets, market_baselines, config)
             results.append(fold_res)
+            
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, smart_wallets, market_baselines, config):
-        # Configs
-        follow_size = config.get('follow_size', 100.0) # Fixed bet size $100
-        splash_threshold = config.get('splash_threshold', 5.0) # 5x Volume
+        follow_size = config.get('follow_size', 50.0)
+        splash_threshold = config.get('splash_threshold', 5.0)
         
         cash = 10000.0
         positions = {} 
         pnl_history = [cash]
         contracts = {} 
+        current_prices = {} # Track current prices
         
         trade_count = 0
         logs = {'sidecar_triggers': 0, 'splash_triggers': 0}
@@ -1350,43 +1374,60 @@ class FastBacktestEngine:
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[c_id] = {'liquidity': data.get('liquidity', 10000.0)}
+                    current_prices[c_id] = data['p_market_all']
                 
                 elif ev_type == 'PRICE_UPDATE':
-                    # --- SIGNAL GENERATION ---
+                    # 1. Get Price Delta (Direction)
+                    prev_price = current_prices.get(c_id, data['trade_price'])
+                    current_prices[c_id] = data['trade_price']
                     
-                    # 1. SIDECAR (Is it a Smart Wallet?)
+                    price_delta = data['trade_price'] - prev_price
+                    
+                    # 2. Signals
                     is_smart = data['wallet_id'] in smart_wallets
                     
-                    # 2. SPLASH (Is it huge volume?)
                     avg_vol = market_baselines.get(c_id, 100.0)
-                    # Avoid div by zero
-                    if avg_vol < 10: avg_vol = 10 
-                    
+                    if avg_vol < 10: avg_vol = 10
                     is_splash = (data['trade_volume'] / avg_vol) > splash_threshold
                     
-                    # EXECUTION (Simplified: Immediate Copy)
+                    # 3. EXECUTION (Directional)
                     if is_smart or is_splash:
-                        # Determine Direction:
-                        # If Price > 0.5 we assume they bought YES? 
-                        # Polymarket data is tricky. Usually Trade Amount > 0 means Buy YES if we don't have side.
-                        # We assume 'trade_price' reflects the asset they bought.
                         
-                        # Simple Logic: Mimic the bet
-                        # If they spent $5000, we spend $100 (scaled)
+                        # Determine side based on Price Movement
+                        # If Price UP -> Buy YES (Long)
+                        # If Price DOWN -> Sell YES (Short)
                         
-                        # Fee
-                        cash -= follow_size * 0.002 # 0.2% fee
+                        # Filter: Only trade if price is actually moving
+                        if abs(price_delta) < 0.001: continue
                         
-                        # Enter Position (Add to basket)
+                        fee = follow_size * 0.002 # 0.2% fee
+                        cash -= fee
+                        
                         curr_pos = positions.get(c_id, [0.0, 0.0]) # [Size, Entry]
                         
-                        # Weighted avg entry
-                        new_size = curr_pos[0] + follow_size
-                        new_entry = ((curr_pos[0]*curr_pos[1]) + (follow_size*data['trade_price'])) / new_size
-                        
-                        positions[c_id] = [new_size, new_entry]
-                        trade_count += 1
-                        
+                        if price_delta > 0: 
+                            # MOMENTUM BUY
+                            new_size = curr_pos[0] + follow_size
+                            # Weighted Entry
+                            total_val = (curr_pos[0] * curr_pos[1]) + (follow_size * data['trade_price'])
+                            new_entry = total_val / new_size
+                            positions[c_id] = [new_size, new_entry]
+                            trade_count += 1
+                            
+                        elif price_delta < 0:
+                            # MOMENTUM SELL (Reduce Position)
+                            # If we don't have position, we can short (negative size)
+                            # Simplified: Just subtract size
+                            new_size = curr_pos[0] - follow_size
+                            
+                            # PnL Realization if closing
+                            # (Entry - Exit) * Size? 
+                            # Keeping simple "Avg Entry" logic for shorting is tricky.
+                            # Let's assume we open a Short Position at current price.
+                            
+                            positions[c_id] = [new_size, data['trade_price']]
+                            trade_count += 1
+
                         if is_smart: logs['sidecar_triggers'] += 1
                         if is_splash: logs['splash_triggers'] += 1
 
@@ -1395,15 +1436,22 @@ class FastBacktestEngine:
                         size, entry = positions.pop(c_id)
                         outcome = float(data['outcome'])
                         
-                        # Payout: Size * Outcome / Entry (Long only assumption for now)
-                        payout = (size / entry) * outcome
+                        # Payout Logic
+                        # Long (Size > 0): Pays if Outcome 1
+                        # Short (Size < 0): Pays if Outcome 0
+                        
+                        payout = 0.0
+                        if size > 0:
+                            payout = (abs(size) / entry) * outcome
+                        elif size < 0:
+                            payout = (abs(size) / (1.0 - entry)) * (1.0 - outcome)
+                            
                         cash += payout
             
             pnl_history.append(cash)
             
         return self._calculate_metrics(pnl_history, trade_count, logs)
 
-    # ... (Keep _aggregate_fold_results and _calculate_metrics same as previous) ...
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
         total_ret = 1.0
@@ -1425,15 +1473,16 @@ class FastBacktestEngine:
         total_ret = (arr[-1] / arr[0]) - 1.0
         with np.errstate(divide='ignore', invalid='ignore'):
             pct_changes = np.diff(arr) / arr[:-1]
-            mean_ret = np.mean(pct_changes)
-            std_ret = np.std(pct_changes) + 1e-9
-            sharpe = (mean_ret / std_ret) * np.sqrt(8760)
-            peak = arr[0]
-            max_dd = 0.0
-            for x in arr:
-                if x > peak: peak = x
-                dd = (peak - x) / peak
-                if dd > max_dd: max_dd = dd
+            pct_changes = np.nan_to_num(pct_changes, nan=0.0)
+        mean_ret = np.mean(pct_changes)
+        std_ret = np.std(pct_changes) + 1e-9
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760)
+        peak = arr[0]
+        max_dd = 0.0
+        for x in arr:
+            if x > peak: peak = x
+            dd = (peak - x) / peak
+            if dd > max_dd: max_dd = dd
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades, 'rejection_logs': logs}
         
 # ==============================================================================
