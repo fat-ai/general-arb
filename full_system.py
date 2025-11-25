@@ -1239,15 +1239,14 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         return {'total_return': -1.0, 'sharpe_ratio': -99.0, 'max_drawdown': 1.0}
 
 # ==============================================================================
-# --- REPLACEMENT CLASS 1: FastBacktestEngine (Statistically Valid) ---
+# --- REPLACEMENT CLASS 1: FastBacktestEngine (With Conviction) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
     Production Backtester.
-    INCLUDES:
-    1. Fresh Wallet Calibration (Log-Vol Regression).
-    2. Logarithmic Opinion Pool.
-    3. Signal Amplification.
+    FIXES:
+    1. Signal Amplification: Tunable 'conviction_scalar'.
+    2. Debugging: Prints sample rejections to see WHY trades fail.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1301,19 +1300,14 @@ class FastBacktestEngine:
             
             if not test_batch: break
 
-            # TRAIN PHASE
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
             
-            # 1. Wallet Scores (Known Traders)
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
-            
-            # 2. Fresh Wallet Calibration (Unknown Traders)
             fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
             
-            # TEST PHASE
             fold_res = self._run_single_period(test_batch, fold_wallet_scores, fw_slope, fw_intercept, config)
             results.append(fold_res)
             
@@ -1326,7 +1320,8 @@ class FastBacktestEngine:
         k_scale = config.get('k_brier_scale', 1.0)
         risk_aversion = config.get('risk_aversion', 0.5)
         smart_weight_thresh = config.get('min_smart_weight', 20.0)
-        conviction_scalar = config.get('conviction_scalar', 1.0)
+        # NEW: Amplification Scalar
+        conviction_scalar = config.get('conviction_scalar', 1.0) 
         
         FEE_RATE = config.get('fee_rate', 0.001)
         BASE_SLIPPAGE = config.get('slippage', 0.001)
@@ -1344,11 +1339,10 @@ class FastBacktestEngine:
         def logit(p): return np.log(max(p, 1e-9) / max(1.0 - p, 1e-9))
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
         
-        # Helper to predict Brier for new wallets
         def predict_fresh_brier(trade_val_usd):
             log_vol = np.log(trade_val_usd + 1.0)
             pred = fw_intercept + (fw_slope * log_vol)
-            return max(0.05, min(pred, 0.35)) # Clamp
+            return max(0.05, min(pred, 0.35))
         
         for batch in batches:
             needs_rebalance = False
@@ -1371,10 +1365,7 @@ class FastBacktestEngine:
                         current_prices[c_id] = data['p_market_all']
                         w_id = data.get('wallet_id')
                         
-                        # 1. Try Historical Brier
                         brier = wallet_scores.get((w_id, 'default_topic'))
-                        
-                        # 2. If Unknown, use Regression Model
                         if brier is None:
                             trade_val = data['trade_price'] * data['trade_volume']
                             brier = predict_fresh_brier(trade_val)
@@ -1389,10 +1380,15 @@ class FastBacktestEngine:
                         tracker['w_sum'] += weight
                         
                         if tracker['w_sum'] > smart_weight_thresh:
+                            # 1. Smart Money View
                             smart_logit = tracker['w_logit_sum'] / tracker['w_sum']
+                            
+                            # 2. Market View
                             market_p = min(max(current_prices[c_id], 0.001), 0.999)
                             market_logit = logit(market_p)
                             
+                            # 3. SCIENTIFIC AMPLIFICATION
+                            # Scale the disagreement by conviction_scalar
                             diff = smart_logit - market_logit
                             final_logit = market_logit + (diff * conviction_scalar)
                             
@@ -1453,6 +1449,10 @@ class FastBacktestEngine:
             
             if abs(M - Q) < threshold: 
                 logs['low_edge'] += 1
+                
+                # DEBUG: If random check hits, print WHY we rejected it
+                if np.random.random() < 0.00001: # Rare print
+                    print(f"DEBUG REJECT: Edge={abs(M-Q):.4f} < Thresh={threshold:.4f} (M={M:.2f}, Q={Q:.2f})")
                 continue
             
             f = 0.0
@@ -1486,7 +1486,6 @@ class FastBacktestEngine:
             
             std = np.sqrt(qs * (1 - qs))
             cov = np.outer(std, std) * corr
-            # Avoid NaN in cov
             cov = np.nan_to_num(cov, nan=0.0)
             
             port_var = np.dot(np.abs(fs), np.dot(cov, np.abs(fs)))
@@ -1502,6 +1501,10 @@ class FastBacktestEngine:
 
         return basket
 
+    # ... (Keep _execute_trades, _aggregate_fold_results, _calculate_metrics exactly as they were in previous robust version) ...
+    # I am omitting them to save space, but you MUST include them in the file.
+    # If you need them reposted, just ask.
+    
     def _execute_trades(self, positions, basket, current_prices, contracts, cash, fee_rate, base_slippage, logs):
         trades = 0
         for c_id in list(positions.keys()):
@@ -1640,9 +1643,15 @@ class BacktestEngine:
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
-            "kelly_edge_thresh": tune.uniform(0.005, 0.1),
+            # FIX: Force lower threshold (0.5% to 5%). 
+            # If we allow 10%, it will pick it and do 0 trades.
+            "kelly_edge_thresh": tune.uniform(0.005, 0.05),
+            
+            # FIX: Add Tunable Conviction (1x to 5x amplification)
+            "conviction_scalar": tune.uniform(1.0, 5.0),
+            
             "k_brier_scale": tune.loguniform(0.1, 10.0),
-            "min_smart_weight": tune.choice([0.5, 1.0, 5.0, 10.0]),
+            "min_smart_weight": tune.choice([0.5, 1.0, 5.0, 10.0]), 
             "risk_aversion": tune.uniform(0.1, 1.0),
             "fee_rate": 0.001,
             "train_days": tune.randint(30, 90),
