@@ -1620,40 +1620,40 @@ class BacktestEngine:
         return df
 
     def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
-        log.info("Step 1: Fetching all historical TRADES from Subgraph...")
+        log.info("Step 1: Loading historical TRADES from Subgraph Cache...")
         df_trades = self._fetch_all_trades_from_subgraph()
         
         if df_trades.empty:
-            log.warning("No trades found. Cannot fetch markets.")
+            log.warning("No trades found.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # --- FIX: Standardize Column Names (Preserve your 2M row cache) ---
-        # The cache might have 'market_id', 'market' (dict), or 'fpmm_address'
+        # --- Standardize Trade Columns ---
         if 'fpmm_address' not in df_trades.columns:
+            # Handle various cache formats
             if 'market_id' in df_trades.columns:
-                # Case A: Cache has 'market_id' -> rename it
                 df_trades['fpmm_address'] = df_trades['market_id']
             elif 'market' in df_trades.columns:
-                # Case B: Cache has raw 'market' dict -> extract ID
-                # This handles the raw GraphQL response format
                 df_trades['fpmm_address'] = df_trades['market'].apply(
                     lambda x: x.get('id') if isinstance(x, dict) else None
                 )
-            
-        # Drop rows where we couldn't resolve an address
-        df_trades = df_trades.dropna(subset=['fpmm_address'])
-        # ------------------------------------------------------------------
-
-        log.info(f"Step 2: Extracting metadata for {df_trades['fpmm_address'].nunique()} unique markets found in trades...")
-        active_market_ids = df_trades['fpmm_address'].unique().tolist()
         
-        # Fetch details (Title, Resolution, Outcome) ONLY for these markets from Gamma
-        df_markets = self._fetch_markets_by_ids(active_market_ids)
+        # Lowercase for joining
+        df_trades['fpmm_address'] = df_trades['fpmm_address'].astype(str).str.lower()
+        df_trades = df_trades.dropna(subset=['fpmm_address'])
+        
+        log.info(f"Step 2: Fetching ALL Market Metadata from Gamma to match {df_trades['fpmm_address'].nunique()} markets...")
+        # We fetch all because we cannot query by 0x address, and the subgraph schema is broken.
+        df_markets = self._fetch_all_markets_from_gamma()
         
         if df_markets.empty:
-            log.warning("Failed to fetch market metadata.")
             return pd.DataFrame(), df_trades
-            
+
+        # --- CRITICAL: Filter to only the markets we have trades for ---
+        # This keeps the dataset clean and prevents processing irrelevant markets.
+        relevant_ids = set(df_trades['fpmm_address'])
+        df_markets = df_markets[df_markets['fpmm_address'].isin(relevant_ids)]
+        
+        log.info(f"Matched metadata for {len(df_markets)} markets.")
         return df_markets, df_trades
         
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
