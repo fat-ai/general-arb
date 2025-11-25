@@ -1607,8 +1607,9 @@ class BacktestEngine:
         print("Fetching Markets", end="")
         while True:
             try:
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
-                                      params={"limit": limit, "offset": offset}, timeout=10)
+            
+                params = {"limit": limit, "offset": offset, "closed": "true"}
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
@@ -1659,56 +1660,59 @@ class BacktestEngine:
         return df
 
     def _fetch_subgraph_trades(self):
-        cache_file = self.cache_dir / f"subgraph_trades.pkl"
-        if cache_file.exists(): 
-            with open(cache_file, 'rb') as f: return pickle.load(f)
+    cache_file = self.cache_dir / f"subgraph_trades.pkl"
+    if cache_file.exists(): 
+        with open(cache_file, 'rb') as f: return pickle.load(f)
+    
+    url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
+    
+    # FIX: Sort DESC (newest first) and use timestamp filtering
+    query_template = """
+    {{
+      fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
+        id
+        timestamp
+        tradeAmount
+        outcomeTokensAmount
+        user {{ id }}
+        market {{ id }}
+      }}
+    }}
+    """
+    
+    all_rows = []
+    current_time = int(time.time())
+    time_cursor = str(current_time)
+    
+    print("Fetching Trades", end="")
+    while True:
+        try:
+            # Inject time_cursor into query
+            query = query_template.format(time_cursor=time_cursor)
+            resp = self.session.post(url, json={'query': query}, timeout=30)
             
-        url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
-        current_time = int(time.time())
-
-        query_template = """
-        {{
-          fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
-            id
-            timestamp
-            tradeAmount
-            outcomeTokensAmount
-            user {{ id }}
-            market {{ id }}
-          }}
-        }}
-        """
-        
-        # Update the loop to use timestamp paging
-        all_rows = []
-        time_cursor = str(current_time) 
-        
-        while True:
-            try:
-                # Format with time_cursor, NOT last_id
-                formatted_query = query_template.format(time_cursor=time_cursor)
-                
-                resp = self.session.post(url, json={'query': formatted_query}, timeout=30)
-                if resp.status_code != 200: break
-                
-                data = resp.json().get('data', {}).get('fpmmTransactions', [])
-                if not data: break
-                
-                all_rows.extend(data)
-                
-                # Update cursor to the timestamp of the last item retrieved
-                time_cursor = data[-1]['timestamp']
-                
-                if len(all_rows) >= 50000: break # Stop after 50k recent trades
-                if len(all_rows) % 5000 == 0: log.info(f"Trades: {len(all_rows)}...")
-            except Exception as e:
-                log.error(f"Fetch error: {e}")
-                break
+            if resp.status_code != 200: break
+            data = resp.json().get('data', {}).get('fpmmTransactions', [])
             
-        df = pd.DataFrame(all_rows)
-        if not df.empty:
-            with open(cache_file, 'wb') as f: pickle.dump(df, f)
-        return df
+            if not data: break
+            all_rows.extend(data)
+            
+            # Update cursor to the oldest timestamp in this batch
+            time_cursor = data[-1]['timestamp']
+            
+            if len(all_rows) % 1000 == 0: print(".", end="", flush=True)
+            # FIX: Increase limit to ensure we cover the market window (e.g., 50k trades)
+            if len(all_rows) >= 50000: break 
+        except Exception as e:
+            log.error(f"Trade fetch failed: {e}")
+            break
+    print(" Done.")
+        
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        # Save cache
+        with open(cache_file, 'wb') as f: pickle.dump(df, f)
+    return df
 
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
