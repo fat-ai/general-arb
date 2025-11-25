@@ -1604,54 +1604,83 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        # Cache handling is now managed by the external cleaner, 
-        # but we keep the file check for subsequent runs *after* the fix.
+        # 1. Check Cache
         cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
-        if cache_file.exists(): return pd.read_parquet(cache_file)
-        
+        if cache_file.exists(): 
+            try:
+                return pd.read_parquet(cache_file)
+            except Exception:
+                pass # If cache is corrupted, fetch fresh
+
         all_rows = []
-        # FIX: We want Closed markets (for Profiler) but ordered by volume/recent
-        # Gamma API defaults to liquidity sort. We need to paginate deep enough.
         print("Fetching Closed Markets", end="")
         offset = 0
+        
+        # 2. Fetch Data
         while True:
             try:
-                # 'closed': 'true' is MANDATORY for the Profiler to work.
+                # We need 'closed' markets to get outcomes
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
-                
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", 
                                       params=params, timeout=10)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
-                
                 all_rows.extend(rows)
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                
-                # Fetching 5k closed markets gives us a good recent history
                 if offset >= 5000: break 
             except: break
         print(" Done.")
         
         if not all_rows: return pd.DataFrame()
         
+        # 3. Create DataFrame
         df = pd.DataFrame(all_rows)
-        # ... (Rest of your processing logic: rename columns, numeric conversion) ...
-        # (Ensure you keep the renaming logic from your original file here)
         
-        # Renaming block from your original code:
+        # --- FIX: ROBUST COLUMN HANDLING ---
+        # Define the mapping
         rename_map = {
-            'marketMakerAddress': 'fpmm_address', 'question': 'question', 
-            'endDate': 'resolution_timestamp', 'outcome': 'outcome', 
-            'createdAt': 'created_at', 'liquidity': 'liquidity' 
+            'marketMakerAddress': 'fpmm_address', 
+            'question': 'question', 
+            'endDate': 'resolution_timestamp', 
+            'outcome': 'outcome', 
+            'createdAt': 'created_at', 
+            'liquidity': 'liquidity' 
         }
+        
+        # Apply rename for columns that exist
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        
+        # CRITICAL FIX: Ensure 'outcome' column exists, even if API omitted it
+        if 'outcome' not in df.columns:
+            df['outcome'] = pd.NA
+            
+        # Ensure other critical columns exist
+        for col in ['fpmm_address', 'resolution_timestamp', 'created_at']:
+            if col not in df.columns:
+                df[col] = pd.NA
+
+        # 4. Safe Type Conversion
         df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
         
-        df.to_parquet(cache_file)
+        if 'liquidity' in df.columns:
+            df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(0.0)
+        else:
+            df['liquidity'] = 0.0
+
+        # 5. Timestamp Parsing
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        
+        # 6. Filter Unusable Data
+        # We can only train on markets that have a valid outcome (0 or 1) and an address
+        df = df.dropna(subset=['fpmm_address', 'outcome'])
+        
+        # Save and Return
+        if not df.empty:
+            df.to_parquet(cache_file)
+            
         return df
 
     def _fetch_subgraph_trades(self):
