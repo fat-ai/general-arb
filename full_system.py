@@ -33,6 +33,7 @@ import time
 import traceback
 import spacy
 import torch
+from scipy.stats import linregress
 
 # 1. Force PyTorch to use the Apple 'MPS' (Metal Performance Shaders) device
 if torch.backends.mps.is_available():
@@ -1145,6 +1146,41 @@ class NLPCache:
     def get_entities(self, market_id):
         return self.cache.get(str(market_id), [])
 
+def calibrate_fresh_wallet_model(profiler_data):
+    """
+    Regresses First-Trade-Size against Brier Score to find the 'Beta'.
+    Returns: (slope, intercept) for the equation: Brier = Intercept + Slope * ln(Volume)
+    """
+    if profiler_data.empty: return 0.0, 0.25
+    
+    # 1. Isolate the VERY FIRST trade for every wallet
+    df = profiler_data.sort_values('timestamp')
+    first_trades = df.groupby('wallet_id').first().reset_index()
+    
+    # 2. Filter for resolved outcomes and non-zero size
+    valid = first_trades[
+        (first_trades['outcome'].isin([0, 1])) & 
+        (first_trades['bet_price'] > 0) & 
+        (first_trades['size'] > 1.0) # Ignore dust
+    ].copy()
+    
+    if len(valid) < 10: return 0.0, 0.25 # Not enough data
+    
+    # 3. Calculate 'Single-Trade Brier'
+    valid['brier'] = (valid['bet_price'] - valid['outcome']) ** 2
+    
+    # 4. Log-Transform Volume (Trade Size * Price)
+    valid['trade_val'] = valid['size'] * valid['bet_price']
+    # Add 1.0 to avoid log(0)
+    valid['log_vol'] = np.log(valid['trade_val'] + 1.0)
+    
+    # 5. Run Regression
+    try:
+        slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
+        if np.isnan(slope) or np.isnan(intercept): return 0.0, 0.25
+        return slope, intercept
+    except:
+        return 0.0, 0.25
 
 # --- OPTIMIZATION HELPER: Vectorized Profiler ---
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
@@ -1207,10 +1243,11 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Hardened Backtester (Math-Safe).
-    FIXES:
-    1. NaN/Inf Guards: Prevents division by zero in Kelly and Liquidity math.
-    2. Cash Integrity: Checks for NaN before modifying cash.
+    Production Backtester.
+    INCLUDES:
+    1. Fresh Wallet Calibration (Log-Vol Regression).
+    2. Logarithmic Opinion Pool.
+    3. Signal Amplification.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1253,6 +1290,8 @@ class FastBacktestEngine:
         results = []
         current_date = min_date
         
+        log.info(f"Walk-Forward: {min_date.date()} -> {max_date.date()} | Train: {train_days}d, Test: {test_days}d")
+        
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
@@ -1262,23 +1301,32 @@ class FastBacktestEngine:
             
             if not test_batch: break
 
+            # TRAIN PHASE
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
+            
+            # 1. Wallet Scores (Known Traders)
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
-            fold_res = self._run_single_period(test_batch, fold_wallet_scores, config)
+            
+            # 2. Fresh Wallet Calibration (Unknown Traders)
+            fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
+            
+            # TEST PHASE
+            fold_res = self._run_single_period(test_batch, fold_wallet_scores, fw_slope, fw_intercept, config)
             results.append(fold_res)
             
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
 
-    def _run_single_period(self, batches, wallet_scores, config):
+    def _run_single_period(self, batches, wallet_scores, fw_slope, fw_intercept, config):
         kelly_thresh = config.get('kelly_edge_thresh', 0.02)
         k_scale = config.get('k_brier_scale', 1.0)
         risk_aversion = config.get('risk_aversion', 0.5)
         smart_weight_thresh = config.get('min_smart_weight', 20.0)
+        conviction_scalar = config.get('conviction_scalar', 1.0)
         
         FEE_RATE = config.get('fee_rate', 0.001)
         BASE_SLIPPAGE = config.get('slippage', 0.001)
@@ -1293,15 +1341,21 @@ class FastBacktestEngine:
         trade_count = 0
         rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0, "insufficient_funds": 0}
         
-        def logit(p): return np.log(p / (1.0 - p))
+        def logit(p): return np.log(max(p, 1e-9) / max(1.0 - p, 1e-9))
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
+        
+        # Helper to predict Brier for new wallets
+        def predict_fresh_brier(trade_val_usd):
+            log_vol = np.log(trade_val_usd + 1.0)
+            pred = fw_intercept + (fw_slope * log_vol)
+            return max(0.05, min(pred, 0.35)) # Clamp
         
         for batch in batches:
             needs_rebalance = False
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
-                c_id = data.get('contract_id') # Safe get
+                c_id = data.get('contract_id') 
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[c_id] = {
@@ -1316,7 +1370,15 @@ class FastBacktestEngine:
                     if c_id in contracts:
                         current_prices[c_id] = data['p_market_all']
                         w_id = data.get('wallet_id')
-                        brier = wallet_scores.get((w_id, 'default_topic'), 0.25)
+                        
+                        # 1. Try Historical Brier
+                        brier = wallet_scores.get((w_id, 'default_topic'))
+                        
+                        # 2. If Unknown, use Regression Model
+                        if brier is None:
+                            trade_val = data['trade_price'] * data['trade_volume']
+                            brier = predict_fresh_brier(trade_val)
+                        
                         weight = data['trade_volume'] / (brier + 0.0001)
                         
                         trade_p = min(max(data['trade_price'], 0.001), 0.999)
@@ -1327,10 +1389,14 @@ class FastBacktestEngine:
                         tracker['w_sum'] += weight
                         
                         if tracker['w_sum'] > smart_weight_thresh:
-                            avg_logit = tracker['w_logit_sum'] / tracker['w_sum']
-                            np.random.seed(42 + int(tracker['w_sum'])) 
-                            noisy_logit = avg_logit + np.random.normal(0, 0.05)
-                            contracts[c_id]['p_model'] = sigmoid(noisy_logit)
+                            smart_logit = tracker['w_logit_sum'] / tracker['w_sum']
+                            market_p = min(max(current_prices[c_id], 0.001), 0.999)
+                            market_logit = logit(market_p)
+                            
+                            diff = smart_logit - market_logit
+                            final_logit = market_logit + (diff * conviction_scalar)
+                            
+                            contracts[c_id]['p_model'] = sigmoid(final_logit)
                         else:
                             rejection_log['low_confidence'] += 1
 
@@ -1355,28 +1421,19 @@ class FastBacktestEngine:
                 cash, trades_made = self._execute_trades(positions, basket, current_prices, contracts, cash, FEE_RATE, BASE_SLIPPAGE, rejection_log)
                 trade_count += trades_made
             
-            # SAFETY CHECK: If cash becomes NaN, abort immediately to preserve logs
-            if np.isnan(cash):
-                cash = 0.0 # Bankrupt
-                break
+            if np.isnan(cash): cash = 0.0 
 
-            # Vectorized Mark-to-Market
             nav = cash
             if positions:
                 c_ids = list(positions.keys())
                 fracs = np.array([f[0] for f in positions.values()])
                 entries = np.array([f[1] for f in positions.values()])
-                
-                # Guard against zero entries
                 entries = np.where(entries < 0.001, 0.001, entries)
-                entries = np.where(entries > 0.999, 0.999, entries)
-                
                 currs = np.array([current_prices.get(cid, ent) for cid, ent in zip(c_ids, entries)])
                 bet_amts = np.abs(fracs) * 10000.0
                 
                 longs = fracs > 0
                 shorts = ~longs
-                
                 val_long = np.where(longs, bet_amts * (currs / entries), 0)
                 val_short = np.where(shorts, bet_amts * ((1 - currs) / (1 - entries)), 0)
                 nav += np.sum(val_long + val_short)
@@ -1391,8 +1448,6 @@ class FastBacktestEngine:
         
         for c_id, data in contracts.items():
             M = data['p_model']
-            
-            # --- FIX: Strict Clipping prevents DivByZero ---
             Q = prices.get(c_id, 0.5)
             Q = max(0.001, min(0.999, Q)) 
             
@@ -1422,8 +1477,6 @@ class FastBacktestEngine:
             
             n = len(ids)
             corr = np.eye(n)
-            
-            # Use cached correlation or identity
             if not self.price_corr.empty:
                 for i in range(n):
                     for j in range(i+1, n):
@@ -1433,8 +1486,7 @@ class FastBacktestEngine:
             
             std = np.sqrt(qs * (1 - qs))
             cov = np.outer(std, std) * corr
-            
-            # Safety: prevent massive numbers in cov
+            # Avoid NaN in cov
             cov = np.nan_to_num(cov, nan=0.0)
             
             port_var = np.dot(np.abs(fs), np.dot(cov, np.abs(fs)))
@@ -1452,29 +1504,24 @@ class FastBacktestEngine:
 
     def _execute_trades(self, positions, basket, current_prices, contracts, cash, fee_rate, base_slippage, logs):
         trades = 0
-        
-        # Close
         for c_id in list(positions.keys()):
             if c_id not in basket:
                 frac, entry = positions.pop(c_id)
                 curr = current_prices.get(c_id, entry)
                 trade_val = abs(frac) * 10000.0
                 
-                # --- FIX: Safer Liquidity Math ---
-                liq = float(contracts.get(c_id, {}).get('liquidity', 10000.0))
-                liq = max(liq, 100.0) # Prevent div by zero/small number
+                raw_liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+                try: liq = float(raw_liq)
+                except: liq = 10000.0
+                if liq <= 0: liq = 10000.0
                 
                 slip = base_slippage + (trade_val / liq) * 0.01
                 tx_cost = fee_rate + slip
-                
-                # Guard entry price
-                entry = max(0.001, min(0.999, entry))
                 
                 exit_val = trade_val * (curr/entry) if frac > 0 else trade_val * ((1-curr)/(1-entry))
                 cash += exit_val * (1.0 - tx_cost)
                 trades += 1
 
-        # Open/Adjust
         for c_id, target_frac in basket.items():
             current_frac, entry = positions.get(c_id, (0.0, 0.0))
             delta = target_frac - current_frac
@@ -1482,9 +1529,10 @@ class FastBacktestEngine:
             
             trade_val = abs(delta) * 10000.0
             
-            # --- FIX: Safer Liquidity Math ---
-            liq = float(contracts.get(c_id, {}).get('liquidity', 10000.0))
-            liq = max(liq, 100.0)
+            raw_liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+            try: liq = float(raw_liq)
+            except: liq = 10000.0
+            if liq <= 0: liq = 10000.0
 
             slip = base_slippage + (trade_val / liq) * 0.01
             tx_cost = fee_rate + slip
@@ -1492,18 +1540,11 @@ class FastBacktestEngine:
             if abs(target_frac) > abs(current_frac): # Buying
                 cost = trade_val * (1.0 + tx_cost)
                 if cash < cost:
-                    scale = cash / cost
-                    target_frac = current_frac + (delta * scale)
-                    cost = cash 
                     logs['insufficient_funds'] += 1
-                
-                # FIX: NaN Guard
-                if np.isnan(cost): cost = 0.0
-                
+                    continue
                 cash -= cost
             else: # Selling
                 proceeds = trade_val * (1.0 - tx_cost)
-                if np.isnan(proceeds): proceeds = 0.0
                 cash += proceeds
                 
             positions[c_id] = (target_frac, current_prices.get(c_id, 0.5))
@@ -1537,15 +1578,11 @@ class FastBacktestEngine:
 
     def _calculate_metrics(self, pnl_history, trades, logs):
         arr = np.array(pnl_history)
-        # Filter NaNs just in case
         arr = arr[~np.isnan(arr)]
-        
         if len(arr) < 2: 
             return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0, 'rejection_logs': logs}
         
         total_ret = (arr[-1] / arr[0]) - 1.0
-        
-        # Safe pct change
         with np.errstate(divide='ignore', invalid='ignore'):
             pct_changes = np.diff(arr) / arr[:-1]
             pct_changes = np.nan_to_num(pct_changes, nan=0.0)
@@ -1568,7 +1605,7 @@ class FastBacktestEngine:
             'trades': trades,
             'rejection_logs': logs
         }
-
+        
 # ==============================================================================
 # --- REPLACEMENT CLASS 2: BacktestEngine (Orchestrator) ---
 # ==============================================================================
