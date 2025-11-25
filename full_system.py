@@ -1555,11 +1555,61 @@ class BacktestEngine:
         return df_markets, df_trades
 
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
-        return self._fetch_paginated_rest(
-            cache_key="polymarket_markets_gamma",
-            base_url="https://gamma-api.polymarket.com/markets",
-            limit=500 
+        """
+        REPLACEMENT: Fetch markets from Subgraph instead of Gamma API.
+        Ensures perfect alignment with trades and includes Resolution Data.
+        """
+        query_template = """
+        {{
+          fixedProductMarketMakers(first: 1000, where: {{ id_gt: "{last_id}" }}) {{
+            id
+            question {{ title }}
+            openingDate
+            resolutionTimestamp
+            currentAnswer
+            isResolved
+          }}
+        }}
+        """
+        df = self._fetch_paginated_subgraph(
+            cache_key="polymarket_markets_subgraph",
+            subgraph_url=self._get_subgraph_url(),
+            query_template=query_template,
+            entity_name="fixedProductMarketMakers"
         )
+        
+        if df.empty: return pd.DataFrame()
+
+        # --- Rename columns to match your pipeline ---
+        # Subgraph 'id' is the fpmm_address
+        # We need to map this to the structure expected by _transform_data_to_event_log
+        
+        df = df.rename(columns={
+            'id': 'fpmm_address',
+            'resolutionTimestamp': 'resolution_timestamp',
+            'currentAnswer': 'outcome',
+            'isResolved': 'is_resolved'
+        })
+        
+        # Extract question title
+        df['question'] = df['question'].apply(lambda x: x.get('title') if isinstance(x, dict) else None)
+        
+        # Subgraph uses 'timestamp' (seconds). Convert to match expected format.
+        # Note: We create a fake 'market_id' because Subgraph keys by Address, 
+        # but your pipeline expects a separate market_id. We can just use the address.
+        df['market_id'] = df['fpmm_address'] 
+        
+        # Normalize outcome (Subgraph returns huge integers for 0/1)
+        # 0 = "0x000...00" (No), 1 = "0x00...01" (Yes)
+        def normalize_outcome(val):
+            if val is None: return pd.NA
+            if str(val).endswith('0000000000000000000000000000000000000000'): return 0
+            if str(val).endswith('0000000000000000000000000000000000000001'): return 1
+            return pd.NA
+            
+        df['outcome'] = df['outcome'].apply(normalize_outcome)
+        
+        return df
 
     def _fetch_all_trades_from_subgraph(self) -> pd.DataFrame:
         query_template = """
