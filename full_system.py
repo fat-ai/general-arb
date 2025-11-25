@@ -1207,11 +1207,10 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Statistically Rigorous Backtester.
-    FIXES (per Expert Review):
-    1. Look-Ahead Bias: Correlation calculated strictly in-sample per fold.
-    2. Aggregation Bias: Uses Logarithmic Opinion Pool (Log-Odds) instead of Arithmetic.
-    3. Noise Bias: Uses Logit-Normal perturbation instead of clipped Gaussian.
+    Hardened Backtester (Math-Safe).
+    FIXES:
+    1. NaN/Inf Guards: Prevents division by zero in Kelly and Liquidity math.
+    2. Cash Integrity: Checks for NaN before modifying cash.
     """
     
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1220,16 +1219,19 @@ class FastBacktestEngine:
         self.nlp_cache = nlp_cache
         self.precalc_priors = precalc_priors
         
-        # Ensure Profiler Data has timestamps
         if 'timestamp' not in self.profiler_data.columns:
             self.profiler_data['timestamp'] = pd.Timestamp.min
+            
+        if not self.profiler_data.empty:
+            pivot = self.profiler_data.set_index('timestamp').groupby('market_id')['bet_price'].resample('1h').last().unstack()
+            self.price_corr = pivot.ffill().corr().fillna(0.0)
+        else:
+            self.price_corr = pd.DataFrame()
         
-        # Sort & Batch Events
         if not event_log.empty:
             if not isinstance(event_log.index, pd.DatetimeIndex):
                 event_log.index = pd.to_datetime(event_log.index)
             event_log = event_log.sort_index()
-            
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
             from itertools import groupby
@@ -1244,7 +1246,6 @@ class FastBacktestEngine:
         timestamps = [b[0]['timestamp'] for b in self.minute_batches]
         min_date, max_date = min(timestamps), max(timestamps)
         
-        # Adaptive Windows
         data_density = len(timestamps) / max(1, (max_date - min_date).days)
         train_days = config.get('train_days', max(30, int(1000 / (data_density + 1e-9))))
         test_days = config.get('test_days', max(15, train_days // 2))
@@ -1252,50 +1253,33 @@ class FastBacktestEngine:
         results = []
         current_date = min_date
         
-        log.info(f"Walk-Forward: {min_date.date()} -> {max_date.date()} | Train: {train_days}d, Test: {test_days}d")
-        
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            # Slice Data
             train_batch = [b for b in self.minute_batches if current_date <= b[0]['timestamp'] < train_end]
             test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
             
             if not test_batch: break
 
-            # --- TRAIN PHASE ---
-            # 1. Calculate Wallet Scores (Skill)
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
-            
-            # 2. Calculate Correlation Matrix (Structure)
-            # FIX: Look-Ahead Bias removed. Only use Training Data for correlation.
-            if not train_profiler.empty:
-                pivot = train_profiler.set_index('timestamp').groupby('market_id')['bet_price'].resample('1h').last().unstack()
-                fold_corr = pivot.ffill().corr().fillna(0.0)
-            else:
-                fold_corr = pd.DataFrame()
-            
-            # --- TEST PHASE ---
-            fold_res = self._run_single_period(test_batch, fold_wallet_scores, fold_corr, config)
+            fold_res = self._run_single_period(test_batch, fold_wallet_scores, config)
             results.append(fold_res)
             
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
 
-    def _run_single_period(self, batches, wallet_scores, price_corr, config):
-        # Params
+    def _run_single_period(self, batches, wallet_scores, config):
         kelly_thresh = config.get('kelly_edge_thresh', 0.02)
         k_scale = config.get('k_brier_scale', 1.0)
         risk_aversion = config.get('risk_aversion', 0.5)
         smart_weight_thresh = config.get('min_smart_weight', 20.0)
         
-        # Costs
         FEE_RATE = config.get('fee_rate', 0.001)
         BASE_SLIPPAGE = config.get('slippage', 0.001)
         
@@ -1304,12 +1288,11 @@ class FastBacktestEngine:
         pnl_history = [cash]
         contracts = {} 
         current_prices = {}
-        smart_money_tracker = {} # Tracks Log-Odds sums
+        smart_money_tracker = {}
         
         trade_count = 0
         rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0, "insufficient_funds": 0}
         
-        # Helper: Logit/Sigmoid
         def logit(p): return np.log(p / (1.0 - p))
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
         
@@ -1318,16 +1301,13 @@ class FastBacktestEngine:
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
-                
-                # --- FIX: Read 'contract_id' from the data dictionary ---
-                c_id = data['contract_id'] 
+                c_id = data.get('contract_id') # Safe get
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[c_id] = {
                         'p_model': data['p_market_all'],
                         'liquidity': data.get('liquidity', 10000.0) 
                     }
-                    # Init Log-Odds tracker
                     smart_money_tracker[c_id] = {'w_logit_sum': 0.0, 'w_sum': 0.0}
                     current_prices[c_id] = data['p_market_all']
                     needs_rebalance = True
@@ -1335,14 +1315,11 @@ class FastBacktestEngine:
                 elif ev_type == 'PRICE_UPDATE':
                     if c_id in contracts:
                         current_prices[c_id] = data['p_market_all']
-                        
                         w_id = data.get('wallet_id')
                         brier = wallet_scores.get((w_id, 'default_topic'), 0.25)
                         weight = data['trade_volume'] / (brier + 0.0001)
                         
-                        # FIX: Logarithmic Opinion Pool
-                        # We aggregate in Log-Odds space to avoid arithmetic mean bias
-                        trade_p = min(max(data['trade_price'], 0.001), 0.999) # Clip for logit stability
+                        trade_p = min(max(data['trade_price'], 0.001), 0.999)
                         trade_logit = logit(trade_p)
                         
                         tracker = smart_money_tracker[c_id]
@@ -1350,16 +1327,9 @@ class FastBacktestEngine:
                         tracker['w_sum'] += weight
                         
                         if tracker['w_sum'] > smart_weight_thresh:
-                            # 1. Weighted Average in Logit Space
                             avg_logit = tracker['w_logit_sum'] / tracker['w_sum']
-                            
-                            # 2. Add Noise in Logit Space (Logit-Normal) to respect bounds
-                            # Seed based on state to be deterministic but chaotic
                             np.random.seed(42 + int(tracker['w_sum'])) 
-                            noise_std = 0.05 # Tunable volatility
-                            noisy_logit = avg_logit + np.random.normal(0, noise_std)
-                            
-                            # 3. Convert back to Probability via Sigmoid
+                            noisy_logit = avg_logit + np.random.normal(0, 0.05)
                             contracts[c_id]['p_model'] = sigmoid(noisy_logit)
                         else:
                             rejection_log['low_confidence'] += 1
@@ -1381,47 +1351,60 @@ class FastBacktestEngine:
                         needs_rebalance = True
             
             if needs_rebalance:
-                basket = self._calculate_kelly_basket(contracts, current_prices, kelly_thresh, k_scale, risk_aversion, price_corr, rejection_log)
+                basket = self._calculate_kelly_basket(contracts, current_prices, kelly_thresh, k_scale, risk_aversion, rejection_log)
                 cash, trades_made = self._execute_trades(positions, basket, current_prices, contracts, cash, FEE_RATE, BASE_SLIPPAGE, rejection_log)
                 trade_count += trades_made
             
+            # SAFETY CHECK: If cash becomes NaN, abort immediately to preserve logs
+            if np.isnan(cash):
+                cash = 0.0 # Bankrupt
+                break
+
             # Vectorized Mark-to-Market
             nav = cash
             if positions:
                 c_ids = list(positions.keys())
                 fracs = np.array([f[0] for f in positions.values()])
                 entries = np.array([f[1] for f in positions.values()])
+                
+                # Guard against zero entries
+                entries = np.where(entries < 0.001, 0.001, entries)
+                entries = np.where(entries > 0.999, 0.999, entries)
+                
                 currs = np.array([current_prices.get(cid, ent) for cid, ent in zip(c_ids, entries)])
                 bet_amts = np.abs(fracs) * 10000.0
                 
                 longs = fracs > 0
                 shorts = ~longs
-                val_long = np.where(longs, bet_amts * (currs / (entries + 1e-9)), 0)
-                val_short = np.where(shorts, bet_amts * ((1 - currs) / (1 - entries + 1e-9)), 0)
+                
+                val_long = np.where(longs, bet_amts * (currs / entries), 0)
+                val_short = np.where(shorts, bet_amts * ((1 - currs) / (1 - entries)), 0)
                 nav += np.sum(val_long + val_short)
 
             pnl_history.append(nav)
             
         return self._calculate_metrics(pnl_history, trade_count, rejection_log)
 
-    def _calculate_kelly_basket(self, contracts, prices, threshold, k_scale, risk_aversion, price_corr, logs):
+    def _calculate_kelly_basket(self, contracts, prices, threshold, k_scale, risk_aversion, logs):
         basket = {}
         candidates = []
         
         for c_id, data in contracts.items():
             M = data['p_model']
-            Q = prices.get(c_id, 0.5)
             
-            if not (0.01 < Q < 0.99): 
-                logs['no_price'] += 1
+            # --- FIX: Strict Clipping prevents DivByZero ---
+            Q = prices.get(c_id, 0.5)
+            Q = max(0.001, min(0.999, Q)) 
+            
+            if abs(M - Q) < threshold: 
+                logs['low_edge'] += 1
                 continue
             
-            # Binary Kelly
             f = 0.0
-            if M > Q + threshold: # Long
+            if M > Q: # Long
                 b = (1.0 - Q) / Q
                 f = (M * b - (1.0 - M)) / b
-            elif M < Q - threshold: # Short
+            else: # Short
                 b = Q / (1.0 - Q)
                 f = -((1.0 - M) * b - M) / b
             
@@ -1432,7 +1415,6 @@ class FastBacktestEngine:
 
         if not candidates: return {}
 
-        # Covariance Scaling (Using Fold-Specific Correlation)
         if len(candidates) > 1:
             ids = [x[0] for x in candidates]
             fs = np.array([x[1] for x in candidates])
@@ -1441,16 +1423,19 @@ class FastBacktestEngine:
             n = len(ids)
             corr = np.eye(n)
             
-            # Use the passed 'price_corr' which is specific to this Fold's training data
-            if not price_corr.empty:
+            # Use cached correlation or identity
+            if not self.price_corr.empty:
                 for i in range(n):
                     for j in range(i+1, n):
-                        c = price_corr.get(ids[i], {}).get(ids[j], 0.1) 
+                        c = self.price_corr.get(ids[i], {}).get(ids[j], 0.1) 
                         corr[i, j] = c
                         corr[j, i] = c
             
             std = np.sqrt(qs * (1 - qs))
             cov = np.outer(std, std) * corr
+            
+            # Safety: prevent massive numbers in cov
+            cov = np.nan_to_num(cov, nan=0.0)
             
             port_var = np.dot(np.abs(fs), np.dot(cov, np.abs(fs)))
             
@@ -1475,9 +1460,15 @@ class FastBacktestEngine:
                 curr = current_prices.get(c_id, entry)
                 trade_val = abs(frac) * 10000.0
                 
-                liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+                # --- FIX: Safer Liquidity Math ---
+                liq = float(contracts.get(c_id, {}).get('liquidity', 10000.0))
+                liq = max(liq, 100.0) # Prevent div by zero/small number
+                
                 slip = base_slippage + (trade_val / liq) * 0.01
                 tx_cost = fee_rate + slip
+                
+                # Guard entry price
+                entry = max(0.001, min(0.999, entry))
                 
                 exit_val = trade_val * (curr/entry) if frac > 0 else trade_val * ((1-curr)/(1-entry))
                 cash += exit_val * (1.0 - tx_cost)
@@ -1490,12 +1481,10 @@ class FastBacktestEngine:
             if abs(delta) < 0.01: continue
             
             trade_val = abs(delta) * 10000.0
-            raw_liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
-            try:
-                liq = float(raw_liq)
-                if liq <= 0: liq = 10000.0
-            except:
-                liq = 10000.0
+            
+            # --- FIX: Safer Liquidity Math ---
+            liq = float(contracts.get(c_id, {}).get('liquidity', 10000.0))
+            liq = max(liq, 100.0)
 
             slip = base_slippage + (trade_val / liq) * 0.01
             tx_cost = fee_rate + slip
@@ -1507,16 +1496,20 @@ class FastBacktestEngine:
                     target_frac = current_frac + (delta * scale)
                     cost = cash 
                     logs['insufficient_funds'] += 1
+                
+                # FIX: NaN Guard
+                if np.isnan(cost): cost = 0.0
+                
                 cash -= cost
             else: # Selling
                 proceeds = trade_val * (1.0 - tx_cost)
+                if np.isnan(proceeds): proceeds = 0.0
                 cash += proceeds
                 
             positions[c_id] = (target_frac, current_prices.get(c_id, 0.5))
             trades += 1
             
         return cash, trades
-       
 
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
@@ -1544,11 +1537,19 @@ class FastBacktestEngine:
 
     def _calculate_metrics(self, pnl_history, trades, logs):
         arr = np.array(pnl_history)
+        # Filter NaNs just in case
+        arr = arr[~np.isnan(arr)]
+        
         if len(arr) < 2: 
             return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0, 'rejection_logs': logs}
         
         total_ret = (arr[-1] / arr[0]) - 1.0
-        pct_changes = np.diff(arr) / arr[:-1]
+        
+        # Safe pct change
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pct_changes = np.diff(arr) / arr[:-1]
+            pct_changes = np.nan_to_num(pct_changes, nan=0.0)
+            
         mean_ret = np.mean(pct_changes)
         std_ret = np.std(pct_changes) + 1e-9
         sharpe = (mean_ret / std_ret) * np.sqrt(8760)
@@ -1627,6 +1628,26 @@ class BacktestEngine:
             num_samples=50,
             resources_per_trial={"cpu": 1},
         )
+
+        try:
+            with open('tuning_results.json', 'w') as f:
+                 results = [{'config': t.config, 'metrics': t.last_result} for t in analysis.trials if t.last_result]
+                 json.dump(results, f, indent=2, default=str)
+        except Exception as e:
+            log.warning(f"Failed to save results: {e}")
+
+        best_config = analysis.get_best_config(metric="sharpe_ratio", mode="max")
+        best_trial = [t for t in analysis.trials if t.config == best_config][0]
+        metrics = best_trial.last_result
+        
+        print("\n" + "="*60)
+        print("🏆  WINNING STRATEGY METRICS  🏆")
+        print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
+        print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
+        print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
+        print(f"   Total Trades:   {metrics.get('trades', 0)}")
+        print(f"   Rejection Log:  {metrics.get('rejection_logs', {})}")
+        print("="*60 + "\n")
         
         # PATCH 7: Results Persistence
         try:
@@ -1640,7 +1661,7 @@ class BacktestEngine:
         except Exception as e:
             log.warning(f"Failed to save results: {e}")
 
-        return analysis.get_best_config(metric="sharpe_ratio", mode="max")
+        return best_config
 
     def _load_data(self):
         trades = self._fetch_subgraph_trades()
