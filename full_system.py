@@ -1598,7 +1598,7 @@ class BacktestEngine:
         search_space = {
             "kelly_edge_thresh": tune.uniform(0.005, 0.1),
             "k_brier_scale": tune.loguniform(0.1, 10.0),
-            "min_smart_weight": tune.choice([5.0, 20.0, 100.0, 500.0]),
+            "min_smart_weight": tune.choice([0.5, 1.0, 5.0, 10.0]),
             "risk_aversion": tune.uniform(0.1, 1.0),
             "fee_rate": 0.001,
             "train_days": tune.randint(30, 90),
