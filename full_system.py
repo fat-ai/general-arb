@@ -1660,7 +1660,10 @@ class BacktestEngine:
 
     def _fetch_gamma_markets(self):
         cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
-        if cache_file.exists(): return pd.read_parquet(cache_file)
+        if cache_file.exists(): 
+            try:
+                return pd.read_parquet(cache_file)
+            except: pass
         
         all_rows = []
         limit, offset = 100, 0
@@ -1679,23 +1682,41 @@ class BacktestEngine:
             except: break
         print(" Done.")
         
+        if not all_rows: return pd.DataFrame()
+        
         df = pd.DataFrame(all_rows)
+        
+        # Rename Map
         rename_map = {
             'marketMakerAddress': 'fpmm_address', 
             'question': 'question', 
             'endDate': 'resolution_timestamp', 
             'outcome': 'outcome', 
             'createdAt': 'created_at',
-            # PATCH 2: Fetch Liquidity
             'liquidity': 'liquidity' 
         }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
+        # --- FIX: Ensure columns exist before processing ---
+        # If the API didn't return 'outcome' (e.g. all markets are active), create it as NaN
+        if 'outcome' not in df.columns:
+            df['outcome'] = pd.NA
+
+        if 'resolution_timestamp' not in df.columns:
+            df['resolution_timestamp'] = pd.NA
+
+        if 'created_at' not in df.columns:
+            df['created_at'] = pd.NA
+            
+        if 'liquidity' not in df.columns:
+            df['liquidity'] = 10000.0
+
+        # --- Process ---
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        
+        # Safe numeric conversion
         df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
-        # Default liquidity if missing
-        if 'liquidity' not in df.columns: df['liquidity'] = 10000.0 
         
         df.to_parquet(cache_file)
         return df
