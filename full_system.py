@@ -1605,16 +1605,19 @@ class BacktestEngine:
         all_rows = []
         limit, offset = 100, 0
         print("Fetching Markets", end="")
+      
         while True:
             try:
-            
-                params = {"limit": limit, "offset": offset, "closed": "true"}
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
+                # FIX: Add 'closed': 'true' to get markets with outcomes for training
+                # FIX: Add 'limit': 1000 to get enough data faster
+                params = {"limit": 1000, "offset": offset, "closed": "true"}
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
+                                      params=params, timeout=10)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
                 all_rows.extend(rows)
-                offset += limit
+                offset += 1000 # match the limit
                 if offset % 1000 == 0: print(".", end="", flush=True)
                 if offset > 50000: break
             except: break
@@ -1660,13 +1663,15 @@ class BacktestEngine:
         return df
 
     def _fetch_subgraph_trades(self):
+        # 1. Check Cache
         cache_file = self.cache_dir / f"subgraph_trades.pkl"
         if cache_file.exists(): 
             with open(cache_file, 'rb') as f: return pickle.load(f)
-        
+            
         url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
         
-        # FIX: Sort DESC (newest first) and use timestamp filtering
+        # 2. QUERY UPDATE: Sort DESC (Newest first) to match Gamma Markets
+        # We use timestamp_lt to page backwards from NOW.
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
@@ -1681,36 +1686,44 @@ class BacktestEngine:
         """
         
         all_rows = []
-        current_time = int(time.time())
-        time_cursor = str(current_time)
+        import time
+        # Start from NOW
+        time_cursor = int(time.time())
         
-        print("Fetching Trades", end="")
+        log.info("Fetching Trades (Reverse Chronological)...")
+        
         while True:
             try:
-                # Inject time_cursor into query
+                # Format query with current cursor
                 query = query_template.format(time_cursor=time_cursor)
                 resp = self.session.post(url, json={'query': query}, timeout=30)
                 
-                if resp.status_code != 200: break
+                if resp.status_code != 200: 
+                    log.warning(f"Goldsky Error: {resp.status_code}")
+                    break
+                    
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
-                
                 if not data: break
+                
                 all_rows.extend(data)
                 
                 # Update cursor to the oldest timestamp in this batch
                 time_cursor = data[-1]['timestamp']
                 
-                if len(all_rows) % 1000 == 0: print(".", end="", flush=True)
-                # FIX: Increase limit to ensure we cover the market window (e.g., 50k trades)
-                if len(all_rows) >= 50000: break 
+                if len(all_rows) % 5000 == 0: 
+                    print(f"Trades fetched: {len(all_rows)}...", end="\r")
+                
+                # Fetch at least 50k recent trades to ensure overlap
+                if len(all_rows) >= 50000: break
+                
             except Exception as e:
                 log.error(f"Trade fetch failed: {e}")
                 break
-        print(" Done.")
-            
+                
+        print(f"Total Trades Fetched: {len(all_rows)}")
         df = pd.DataFrame(all_rows)
+        
         if not df.empty:
-            # Save cache
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
 
