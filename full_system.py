@@ -1664,30 +1664,46 @@ class BacktestEngine:
             with open(cache_file, 'rb') as f: return pickle.load(f)
             
         url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
-        query_template = """
-        {{
-          fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id
-            timestamp
-            tradeAmount
-            outcomeTokensAmount
-            user {{ id }}
-            market {{ id }}
-          }}
-        }}
-        """
-        all_rows = []
-        last_id = ""
-        while True:
-            try:
-                resp = self.session.post(url, json={'query': query_template.format(last_id=last_id)}, timeout=30)
-                if resp.status_code != 200: break
-                data = resp.json().get('data', {}).get('fpmmTransactions', [])
-                if not data: break
-                all_rows.extend(data)
-                last_id = data[-1]['id']
-                if len(all_rows) % 5000 == 0: log.info(f"Trades: {len(all_rows)}...")
-            except: break
+        current_time = int(time.time())
+
+    query_template = """
+    {{
+      fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
+        id
+        timestamp
+        tradeAmount
+        outcomeTokensAmount
+        user {{ id }}
+        market {{ id }}
+      }}
+    }}
+    """
+    
+    # Update the loop to use timestamp paging
+    all_rows = []
+    time_cursor = str(current_time) 
+    
+    while True:
+        try:
+            # Format with time_cursor, NOT last_id
+            formatted_query = query_template.format(time_cursor=time_cursor)
+            
+            resp = self.session.post(url, json={'query': formatted_query}, timeout=30)
+            if resp.status_code != 200: break
+            
+            data = resp.json().get('data', {}).get('fpmmTransactions', [])
+            if not data: break
+            
+            all_rows.extend(data)
+            
+            # Update cursor to the timestamp of the last item retrieved
+            time_cursor = data[-1]['timestamp']
+            
+            if len(all_rows) >= 50000: break # Stop after 50k recent trades
+            if len(all_rows) % 5000 == 0: log.info(f"Trades: {len(all_rows)}...")
+        except Exception as e:
+            log.error(f"Fetch error: {e}")
+            break
             
         df = pd.DataFrame(all_rows)
         if not df.empty:
