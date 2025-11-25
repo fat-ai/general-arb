@@ -1638,6 +1638,14 @@ class BacktestEngine:
     def _load_data(self):
         trades = self._fetch_subgraph_trades()
         if trades.empty: return pd.DataFrame(), pd.DataFrame()
+
+        if 'market_id' not in trades.columns:
+            if 'market' in trades.columns:
+                trades['market_id'] = trades['market'].apply(lambda x: x.get('id') if isinstance(x, dict) else None)
+            else:
+                log.error("Trades data missing 'market_id' or 'market' column.")
+                return pd.DataFrame(), pd.DataFrame()
+                
         trades['fpmm_address'] = trades['market_id'].str.lower()
         trades = trades.dropna(subset=['fpmm_address'])
         
