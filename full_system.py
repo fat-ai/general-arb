@@ -1173,7 +1173,36 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     
     return scores.to_dict()
 
+def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
+    """
+    Worker function for Ray Tune. 
+    Retrieves data from shared memory (Object store) to save RAM/Time.
+    """
+    import traceback
+    try:
+        # Helper to unwrap Ray Objects if needed
+        def get_ref(obj):
+            if isinstance(obj, ray.ObjectRef):
+                return ray.get(obj)
+            return obj
 
+        # 1. Fetch Data
+        event_log = get_ref(event_log_ref)
+        profiler_data = get_ref(profiler_ref)
+        nlp_cache = get_ref(nlp_cache_ref)
+        priors = get_ref(priors_ref)
+
+        # 2. Initialize Engine
+        engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
+        
+        # 3. Run Trial
+        return engine.run_trial(config)
+
+    except Exception as e:
+        print(f"!!!!! WORKER CRASH !!!!!")
+        traceback.print_exc()
+        return {'irr': -1.0, 'sharpe_ratio': 0.0, 'brier_score': 1.0}
+        
 # ==============================================================================
 # --- REPLACEMENT CLASS 1: FastBacktestEngine (Logic Fixed) ---
 # ==============================================================================
