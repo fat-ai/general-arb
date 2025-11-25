@@ -1538,20 +1538,104 @@ class BacktestEngine:
     def _get_subgraph_url(self) -> str:
         return "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
 
-    # --- ETL Methods (Preserved) ---
-    def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
-        log.info("Fetching all market details from Polymarket Gamma API...")
-        df_markets = self._fetch_all_markets_from_gamma()
-        if df_markets.empty:
-            return pd.DataFrame(), pd.DataFrame()
+    def _fetch_markets_by_ids(self, market_ids: list) -> pd.DataFrame:
+        """
+        Fetches metadata for a specific list of Market IDs from Gamma.
+        Bypasses pagination limits by asking for exact IDs.
+        """
+        # Cache check
+        today = datetime.now().strftime('%Y-%m-%d')
+        cache_file = self.cache_dir / f"polymarket_markets_metadata_{today}.parquet"
+        
+        if cache_file.exists():
+            try:
+                return pd.read_parquet(cache_file)
+            except Exception:
+                pass
 
-        log.info("Fetching all trades from Polymarket FPMM Subgraph...")
+        all_rows = []
+        chunk_size = 20 # Keep URL length safe
+        
+        total = len(market_ids)
+        log.info(f"Querying Gamma API for {total} markets in chunks of {chunk_size}...")
+
+        for i in range(0, total, chunk_size):
+            chunk = market_ids[i:i + chunk_size]
+            id_str = ",".join(chunk)
+            
+            try:
+                # Gamma allows ?id=0x1,0x2...
+                url = f"https://gamma-api.polymarket.com/markets?id={id_str}"
+                resp = requests.get(url, timeout=10)
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    all_rows.extend(data)
+                else:
+                    log.warning(f"Gamma Failed for chunk {i}: {resp.status_code}")
+                    
+            except Exception as e:
+                log.error(f"Error fetching chunk {i}: {e}")
+                
+            # Rate limit politeness
+            time.sleep(0.1)
+
+        if not all_rows:
+            return pd.DataFrame()
+
+        # --- Transform to match Pipeline ---
+        df = pd.DataFrame(all_rows)
+        
+        # Rename columns to match what the engine expects
+        # Gamma Keys: 'conditionId', 'question', 'endDate', 'resolved', 'outcome'
+        rename_map = {
+            'conditionId': 'market_id',
+            'marketMakerAddress': 'fpmm_address', # Crucial: This links to trades
+            'question': 'question',
+            'createdAt': 'created_at',
+            'endDate': 'resolution_timestamp', # Gamma often uses endDate as resolution
+            'outcome': 'outcome'
+        }
+        
+        # Only rename columns that exist
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+        
+        # Normalize Data
+        if 'fpmm_address' in df.columns:
+            df['fpmm_address'] = df['fpmm_address'].str.lower()
+            
+        # Ensure we have a resolution timestamp
+        if 'resolution_timestamp' in df.columns:
+            df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+            
+        # Ensure outcome is numeric (Gamma sends "1" or "0" string sometimes)
+        if 'outcome' in df.columns:
+            df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
+            
+        # Save cache
+        df.to_parquet(cache_file)
+        return df
+
+    def _load_data_from_polymarket(self) -> (pd.DataFrame, pd.DataFrame):
+        log.info("Step 1: Fetching all historical TRADES from Subgraph...")
+        # We fetch trades FIRST because they are the "Source of Truth" for what actually happened.
         df_trades = self._fetch_all_trades_from_subgraph()
         
         if df_trades.empty:
-            log.warning("No trades found from Polymarket Subgraph.")
-            df_trades = pd.DataFrame(columns=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'market'])
+            log.warning("No trades found. Cannot fetch markets.")
+            return pd.DataFrame(), pd.DataFrame()
+
+        log.info(f"Step 2: Extracting metadata for {df_trades['fpmm_address'].nunique()} unique markets found in trades...")
+        # Get the unique IDs of markets that actually had activity
+        active_market_ids = df_trades['fpmm_address'].unique().tolist()
         
+        # Fetch details (Title, Resolution, Outcome) ONLY for these markets from Gamma
+        df_markets = self._fetch_markets_by_ids(active_market_ids)
+        
+        if df_markets.empty:
+            log.warning("Failed to fetch market metadata.")
+            return pd.DataFrame(), df_trades
+            
         return df_markets, df_trades
 
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
@@ -1638,13 +1722,20 @@ class BacktestEngine:
         return df
 
     def _fetch_all_trades_from_subgraph(self) -> pd.DataFrame:
+        # This query is known to work on the Goldsky endpoint
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
-            id, timestamp, tradeAmount, outcomeTokensAmount, user, market {{ id }}
+            id
+            timestamp
+            tradeAmount
+            outcomeTokensAmount
+            user {{ id }}
+            market {{ id }}
           }}
         }}
         """
+  
         df = self._fetch_paginated_subgraph(
             cache_key="polymarket_trades",
             subgraph_url=self._get_subgraph_url(),
