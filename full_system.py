@@ -1490,8 +1490,13 @@ class FastBacktestEngine:
             if abs(delta) < 0.01: continue
             
             trade_val = abs(delta) * 10000.0
-            
-            liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+            raw_liq = contracts.get(c_id, {}).get('liquidity', 10000.0)
+            try:
+                liq = float(raw_liq)
+                if liq <= 0: liq = 10000.0
+            except:
+                liq = 10000.0
+
             slip = base_slippage + (trade_val / liq) * 0.01
             tx_cost = fee_rate + slip
             
@@ -1511,6 +1516,7 @@ class FastBacktestEngine:
             trades += 1
             
         return cash, trades
+       
 
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0}
@@ -1698,8 +1704,6 @@ class BacktestEngine:
         }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        # --- FIX: Ensure columns exist before processing ---
-        # If the API didn't return 'outcome' (e.g. all markets are active), create it as NaN
         if 'outcome' not in df.columns:
             df['outcome'] = pd.NA
 
@@ -1709,7 +1713,9 @@ class BacktestEngine:
         if 'created_at' not in df.columns:
             df['created_at'] = pd.NA
             
-        if 'liquidity' not in df.columns:
+        if 'liquidity' in df.columns:
+            df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(10000.0)
+        else:
             df['liquidity'] = 10000.0
 
         # --- Process ---
