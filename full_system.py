@@ -34,6 +34,14 @@ import traceback
 import spacy
 import torch
 from scipy.stats import linregress
+import shutil  
+
+def force_clear_cache(cache_dir):
+    path = Path(cache_dir)
+    if path.exists():
+        print(f"⚠️ CLEARING CACHE at {path} to ensure data alignment...")
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
 
 # 1. Force PyTorch to use the Apple 'MPS' (Metal Performance Shaders) device
 if torch.backends.mps.is_available():
@@ -1596,82 +1604,64 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
+        # Cache handling is now managed by the external cleaner, 
+        # but we keep the file check for subsequent runs *after* the fix.
         cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
-        if cache_file.exists(): 
-            try:
-                return pd.read_parquet(cache_file)
-            except: pass
+        if cache_file.exists(): return pd.read_parquet(cache_file)
         
         all_rows = []
-        limit, offset = 100, 0
-        print("Fetching Markets", end="")
-      
+        # FIX: We want Closed markets (for Profiler) but ordered by volume/recent
+        # Gamma API defaults to liquidity sort. We need to paginate deep enough.
+        print("Fetching Closed Markets", end="")
+        offset = 0
         while True:
             try:
-                # FIX: Add 'closed': 'true' to get markets with outcomes for training
-                # FIX: Add 'limit': 1000 to get enough data faster
+                # 'closed': 'true' is MANDATORY for the Profiler to work.
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
+                
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", 
                                       params=params, timeout=10)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
+                
                 all_rows.extend(rows)
-                offset += 1000 # match the limit
+                offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                if offset > 50000: break
+                
+                # Fetching 5k closed markets gives us a good recent history
+                if offset >= 5000: break 
             except: break
         print(" Done.")
         
         if not all_rows: return pd.DataFrame()
         
         df = pd.DataFrame(all_rows)
+        # ... (Rest of your processing logic: rename columns, numeric conversion) ...
+        # (Ensure you keep the renaming logic from your original file here)
         
-        # Rename Map
+        # Renaming block from your original code:
         rename_map = {
-            'marketMakerAddress': 'fpmm_address', 
-            'question': 'question', 
-            'endDate': 'resolution_timestamp', 
-            'outcome': 'outcome', 
-            'createdAt': 'created_at',
-            'liquidity': 'liquidity' 
+            'marketMakerAddress': 'fpmm_address', 'question': 'question', 
+            'endDate': 'resolution_timestamp', 'outcome': 'outcome', 
+            'createdAt': 'created_at', 'liquidity': 'liquidity' 
         }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-        
-        if 'outcome' not in df.columns:
-            df['outcome'] = pd.NA
-
-        if 'resolution_timestamp' not in df.columns:
-            df['resolution_timestamp'] = pd.NA
-
-        if 'created_at' not in df.columns:
-            df['created_at'] = pd.NA
-            
-        if 'liquidity' in df.columns:
-            df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(10000.0)
-        else:
-            df['liquidity'] = 10000.0
-
-        # --- Process ---
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
-        
-        # Safe numeric conversion
         df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
         
         df.to_parquet(cache_file)
         return df
 
     def _fetch_subgraph_trades(self):
-        # 1. Check Cache
         cache_file = self.cache_dir / f"subgraph_trades.pkl"
         if cache_file.exists(): 
             with open(cache_file, 'rb') as f: return pickle.load(f)
             
         url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
         
-        # 2. QUERY UPDATE: Sort DESC (Newest first) to match Gamma Markets
-        # We use timestamp_lt to page backwards from NOW.
+        # FIX: Sort DESC (Newest first) and use timestamp filtering
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
@@ -1687,42 +1677,32 @@ class BacktestEngine:
         
         all_rows = []
         import time
-        # Start from NOW
-        time_cursor = int(time.time())
+        current_time = int(time.time())
+        time_cursor = str(current_time)
         
-        log.info("Fetching Trades (Reverse Chronological)...")
-        
+        print("Fetching Trades (Reverse Chronological)", end="")
         while True:
             try:
-                # Format query with current cursor
-                query = query_template.format(time_cursor=time_cursor)
-                resp = self.session.post(url, json={'query': query}, timeout=30)
+                formatted_query = query_template.format(time_cursor=time_cursor)
+                resp = self.session.post(url, json={'query': formatted_query}, timeout=30)
+                if resp.status_code != 200: break
                 
-                if resp.status_code != 200: 
-                    log.warning(f"Goldsky Error: {resp.status_code}")
-                    break
-                    
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
                 
                 all_rows.extend(data)
+                time_cursor = data[-1]['timestamp'] # Move cursor to end of batch
                 
-                # Update cursor to the oldest timestamp in this batch
-                time_cursor = data[-1]['timestamp']
+                if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
                 
-                if len(all_rows) % 5000 == 0: 
-                    print(f"Trades fetched: {len(all_rows)}...", end="\r")
-                
-                # Fetch at least 50k recent trades to ensure overlap
-                if len(all_rows) >= 50000: break
-                
+                # Fetch 50k trades to ensure we overlap with the 5k markets
+                if len(all_rows) >= 50000: break 
             except Exception as e:
-                log.error(f"Trade fetch failed: {e}")
+                log.error(f"Fetch error: {e}")
                 break
-                
-        print(f"Total Trades Fetched: {len(all_rows)}")
-        df = pd.DataFrame(all_rows)
+        print(" Done.")
         
+        df = pd.DataFrame(all_rows)
         if not df.empty:
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
@@ -2093,19 +2073,21 @@ def run_c6_demo():
         log.error(f"C6 Demo Failed: {e}", exc_info=True)
 
 def run_c7_demo():
-    """Runs the C7 Backtest/Tuning demo"""
     log.info("--- (DEMO) Running Component 7 (Production) Demo ---")
     
+    # 1. Nuke the cache to fix the "Triple Disconnect"
+    force_clear_cache("polymarket_cache") 
+    
     try:
-        backtester = BacktestEngine(
-            historical_data_path="." # Save to current directory
-        )
+        backtester = BacktestEngine(historical_data_path=".")
+        
+        # Optional: Run the diagnosis provided in your prompt
+        # backtester.diagnose_data() 
+        
         best_params = backtester.run_tuning_job()
         log.info(f"--- C7 Demo Complete. Best params: {best_params} ---")
     except Exception as e:
         log.error(f"C7 Demo Failed: {e}", exc_info=True)
-        if "dune" in str(e): log.info("Hint: Run 'pip install dune-client' and set DUNE_API_KEY")
-        if "ray" in str(e): log.info("Hint: Run 'pip install \"ray[tune]\" pandas'")
 
 def run_c8_demo():
     """Launches the C8 Dashboard"""
