@@ -1658,12 +1658,13 @@ class BacktestEngine:
         
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
         """
-        Fetches ALL markets from Gamma API via pagination.
-        This bypasses the 'Batch ID' 422 error and the Subgraph Schema errors.
+        Fetches markets from Gamma REST API using ONLY strict pagination parameters.
+        Removes all optional parameters that cause 422 errors.
         """
-        # Cache check (Parquet for speed)
+        # 1. Check Cache
         today = datetime.now().strftime('%Y-%m-%d')
-        cache_file = self.cache_dir / f"polymarket_markets_gamma_full_{today}.parquet"
+        # We use a new cache filename to ensure we don't load previous partial/broken attempts
+        cache_file = self.cache_dir / f"polymarket_markets_gamma_strict_{today}.parquet"
         
         if cache_file.exists():
             try:
@@ -1677,48 +1678,54 @@ class BacktestEngine:
         offset = 0
         base_url = "https://gamma-api.polymarket.com/markets"
         
-        log.info("Downloading Market Catalog from Gamma...")
+        log.info("Downloading Market Catalog from Gamma REST API (Strict Mode)...")
         
+        # 2. Loop through REST Pages
         while True:
             try:
-                # We order by 'newest' to get active ones, but we fetch deep to get history
-                params = {"limit": limit, "offset": offset, "order": "newest"}
+                # STRICT: Only pass limit and offset. 
+                # No 'order', no 'sort', no filters that risk 422s.
+                params = {"limit": limit, "offset": offset}
+                
                 resp = requests.get(base_url, params=params, timeout=10)
                 
                 if resp.status_code != 200:
-                    log.warning(f"Gamma API Error: {resp.status_code}")
+                    # Log the specific error text from the API to debug if it fails
+                    log.error(f"Gamma API Error at offset {offset}: {resp.status_code} - {resp.text}")
                     break
                     
                 rows = resp.json()
                 if not rows:
+                    # End of list
                     break
                 
                 all_rows.extend(rows)
                 offset += limit
                 
-                # Safety break to prevent infinite loops (Gamma has ~10k-20k relevant markets)
-                if offset > 20000: 
-                    log.info("Hit safety limit of 20k markets.")
+                # Polymarket has roughly ~15k-20k relevant historical markets.
+                # We set a high ceiling to ensure we don't cut off history.
+                if offset > 100000: 
+                    log.info("Hit safety limit of 100k markets.")
                     break
                     
                 if offset % 1000 == 0:
-                    print(f".", end="", flush=True) # Progress indicator
+                    print(f".", end="", flush=True) 
                     
             except Exception as e:
                 log.error(f"Fetch failed at offset {offset}: {e}")
                 break
 
         if not all_rows:
+            log.error("Gamma returned 0 rows.")
             return pd.DataFrame()
             
         print(" Done.")
         df = pd.DataFrame(all_rows)
 
-        # --- RENAME & CLEANUP ---
-        # Map Gamma fields to Pipeline fields
+        # 3. Rename & Clean (Strict mapping based on known Gamma response keys)
         rename_map = {
-            'conditionId': 'market_id',       # Gamma's internal ID (keep for reference)
-            'marketMakerAddress': 'fpmm_address', # CRITICAL: This is what we join on
+            'conditionId': 'market_id',
+            'marketMakerAddress': 'fpmm_address', # Join Key
             'question': 'question',
             'createdAt': 'created_at',
             'endDate': 'resolution_timestamp',
@@ -1726,23 +1733,23 @@ class BacktestEngine:
             'resolved': 'is_resolved'
         }
         
+        # Only rename columns that actually exist in the response
         df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         
-        # Normalize Join Key
+        # Lowercase address for joining
         if 'fpmm_address' in df.columns:
             df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
         else:
-            log.warning("Gamma data missing 'marketMakerAddress'. Join will fail.")
+            log.warning("Gamma data missing 'marketMakerAddress'. Join with trades will fail.")
             
-        # Normalize Timestamp
+        # Normalize Timestamps
         if 'resolution_timestamp' in df.columns:
             df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
 
-        # Normalize Outcome (Gamma returns strings like "0.5", "1", "0")
+        # Normalize Outcomes
         def clean_outcome(val):
             try:
                 f = float(val)
-                # If 0 or 1, keep. If 0.5 or other, treat as unresolved/tie for now
                 if f == 0.0: return 0
                 if f == 1.0: return 1
                 return pd.NA
@@ -1752,7 +1759,7 @@ class BacktestEngine:
         if 'outcome' in df.columns:
             df['outcome'] = df['outcome'].apply(clean_outcome)
 
-        # Save to cache
+        # 4. Save Cache
         df.to_parquet(cache_file)
         return df
         
