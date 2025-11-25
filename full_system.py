@@ -1561,7 +1561,7 @@ class BacktestEngine:
         """
         query_template = """
         {{
-          fixedProductMarketMakers(first: 1000, where: {{ id_gt: "{last_id}" }}) {{
+          fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
             id
             question {{ title }}
             openingDate
@@ -1714,27 +1714,67 @@ class BacktestEngine:
 
     def _fetch_paginated_subgraph(self, cache_key: str, subgraph_url: str, query_template: str, entity_name: str) -> pd.DataFrame:
         today = datetime.now().strftime('%Y-%m-%d')
+        # Check cache (using pickle as per your current setup)
         cache_file = self.cache_dir / f"{cache_key}_{today}.pkl"
         if cache_file.exists():
-            with open(cache_file, 'rb') as f: return pickle.load(f)
-        
+            try:
+                with open(cache_file, 'rb') as f: 
+                    log.info(f"Loaded {cache_key} from cache.")
+                    return pickle.load(f)
+            except Exception:
+                log.warning("Cache corrupted, re-fetching.")
+
         try:
             all_rows = []
             last_id = "" 
+            page_num = 0
+            
             while True:
                 query_body = query_template.format(last_id=last_id)
-                response = requests.post(subgraph_url, json={'query': query_body})
-                data = response.json().get('data', {})
+                
+                # --- Robust Request ---
+                response = requests.post(
+                    subgraph_url, 
+                    json={'query': query_body},
+                    headers={'User-Agent': 'Mozilla/5.0'}, # Anti-bot protection often blocks blank UAs
+                    timeout=30 
+                )
+                
+                # --- Error Trapping ---
+                if response.status_code != 200:
+                    log.error(f"Subgraph HTTP Error {response.status_code}: {response.text}")
+                    break
+                
+                resp_json = response.json()
+                if 'errors' in resp_json:
+                    log.error(f"GraphQL Syntax Error: {resp_json['errors']}")
+                    break
+                
+                data = resp_json.get('data', {})
+                if not data:
+                    log.warning(f"Empty data received. Full response: {resp_json}")
+                    break
+                    
                 rows = data.get(entity_name, [])
-                if not rows: break
+                if not rows: 
+                    break
+                
                 all_rows.extend(rows)
                 last_id = rows[-1]['id'] 
+                page_num += 1
+                if page_num % 5 == 0:
+                    log.info(f"Fetched {len(all_rows)} rows so far...")
 
-            if not all_rows: return pd.DataFrame()
+            if not all_rows: 
+                log.error("Fetched 0 rows from Subgraph. Check Query or URL.")
+                return pd.DataFrame()
+
             df = pd.DataFrame(all_rows)
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
             return df
-        except Exception:
+            
+        except Exception as e:
+            log.error(f"FATAL Subgraph Failure: {e}", exc_info=True)
             return pd.DataFrame()
 
     def _transform_data_to_event_log(self, df_markets, df_trades) -> (pd.DataFrame, pd.DataFrame):
