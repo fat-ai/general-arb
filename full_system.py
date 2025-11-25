@@ -1556,11 +1556,11 @@ class BacktestEngine:
 
     def _fetch_all_markets_from_gamma(self) -> pd.DataFrame:
         """
-        REPLACEMENT: Robust Subgraph Fetcher (Schema v2).
+        REPLACEMENT: Robust Subgraph Fetcher (Gnosis V2 Schema).
         Fixed to match the specific fields available on the Goldsky Endpoint.
         """
-        # --- 1. The Correct Query for this Subgraph Version ---
-        # We fetch the 'condition' to get the payout (outcome).
+        # --- 1. The Correct Query for Gnosis/Polymarket FPMM ---
+        # We fetch 'title' (question) and 'condition' (outcome data).
         query_template = """
         {{
           fixedProductMarketMakers(first: 1000, orderBy: id, orderDirection: asc, where: {{ id_gt: "{last_id}" }}) {{
@@ -1584,19 +1584,20 @@ class BacktestEngine:
         
         if df.empty: return pd.DataFrame()
 
-        # --- 2. Rename & Clean Columns ---
+        # --- 2. Rename Columns to match Pipeline ---
         df = df.rename(columns={
             'id': 'fpmm_address',
             'creationTimestamp': 'created_at',
             'title': 'question'
         })
         
-        # Ensure ID alignment
+        # Ensure ID alignment (Subgraph uses address as ID)
         df['market_id'] = df['fpmm_address']
         
-        # --- 3. Extract Outcomes from 'Condition' ---
-        # The subgraph stores outcome in 'payoutNumerators' inside the condition object.
-        # Format: ["10000...", "0"] means outcome 0 won. ["0", "10000..."] means outcome 1 won.
+        # --- 3. Extract Outcomes from 'Condition' (The Truth Source) ---
+        # The subgraph stores outcome in 'payoutNumerators'.
+        # Format: ["10000...", "0"] means Outcome 0 won.
+        # Format: ["0", "10000..."] means Outcome 1 won.
         
         def parse_outcome(row):
             cond = row.get('condition')
@@ -1605,37 +1606,34 @@ class BacktestEngine:
             payouts = cond.get('payoutNumerators', [])
             if not payouts or len(payouts) < 2: return pd.NA
             
-            # Convert to float to handle large strings safely
+            # Check for non-zero payouts to determine winner
             try:
                 p0 = float(payouts[0])
                 p1 = float(payouts[1])
                 
-                if p0 > p1: return 0
-                if p1 > p0: return 1
-                return pd.NA # Tie or not resolved
+                # If both are 0, it's unresolved.
+                if p0 == 0 and p1 == 0: return pd.NA
+                
+                # If one is greater, that side won.
+                if p0 > p1: return 0  # No / Long Short
+                if p1 > p0: return 1  # Yes / Long Long
+                
+                return pd.NA # Tie or weird state
             except:
                 return pd.NA
 
         df['outcome'] = df.apply(parse_outcome, axis=1)
         
-        # --- 4. Infer Resolution Timestamp ---
-        # Since 'resolutionTimestamp' is missing in this schema, we assume 
-        # that if an outcome exists, the market is resolved.
-        # We will allow the pipeline to infer the exact time from the last trade later,
-        # or default to created_at + 30 days if needed.
-        # For the Backtester, we MUST have a resolution_timestamp for resolved markets.
+        # --- 4. Fix "Right Censoring" (Crucial) ---
+        # The subgraph is missing 'resolutionTimestamp'. 
+        # If we leave it null, the backtest drops the market.
+        # If we set it to 'created_at', the backtest closes the market before trades happen.
+        # FIX: For all resolved markets, set resolution to NOW. 
+        # This forces the backtest to replay ALL historical trades before resolving.
         
-        # Heuristic: If resolved, set resolution time to a dummy future date (it will be corrected by trade logs)
-        # OR better: We leave it NaT, and the pipeline drops it? No, we need it.
-        # Let's set it to 'created_at' for now, and rely on the Trade Event Logic to place it correctly.
-        
-        # BETTER FIX: Use the 'creationTimestamp' as a baseline, and if 'outcome' is set,
-        # we mark it as resolved.
         df['resolution_timestamp'] = pd.NA
         resolved_mask = df['outcome'].notna()
-        # We temporarily set resolution to created_at so it passes the 'dropna' check later.
-        # In a real heavy production system, we'd join with trades to get max(timestamp).
-        df.loc[resolved_mask, 'resolution_timestamp'] = df.loc[resolved_mask, 'created_at'] 
+        df.loc[resolved_mask, 'resolution_timestamp'] = datetime.now()
 
         return df
 
