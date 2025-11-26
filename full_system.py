@@ -1265,25 +1265,19 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 
 
 # ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Sizing Optimized) ---
-# ==============================================================================
-# ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Fully Configurable Exit) ---
-# ==============================================================================
-# ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Time-Corrected Metrics) ---
-# ==============================================================================
-# ==============================================================================
 # --- CORE ENGINE: FastBacktestEngine (Percentage vs Kelly) ---
+# ==============================================================================
+# ==============================================================================
+# --- CORE ENGINE: FastBacktestEngine (Full Logic Matrix) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
     Statistically Rigorous Backtester.
-    Logic:
-    1. Signal: Log-Odds Consensus.
-    2. Sizing: Compares 'Dynamic Kelly' vs 'Fixed Percentage'.
-       (Fixed Dollar betting removed as it is mathematically inferior).
-    3. Execution: Buy & Hold (Consensus Exit).
+    
+    TUNABLE PARAMETERS:
+    1. use_smart_exit (bool): Close position if Smart Money consensus flips?
+    2. stop_loss (float/None): Close position if unrealized loss > X%?
+    3. sizing (tuple): ("kelly", fraction) OR ("fixed_pct", fraction).
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
@@ -1353,14 +1347,20 @@ class FastBacktestEngine:
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
-        # Params
+        # --- PARAMETERS ---
         splash_thresh = config.get('splash_threshold', 2.0)
         edge_thresh = config.get('edge_threshold', 0.01)
         
-        # Sizing Config: ("mode", value)
-        # e.g. ("kelly", 0.5) or ("fixed_pct", 0.05)
+        # Sizing
         sizing_config = config.get('sizing', ("kelly", 0.25))
         sizing_mode, sizing_val = sizing_config
+        
+        # Exits
+        use_smart_exit = config.get('use_smart_exit', False)
+        stop_loss_pct = config.get('stop_loss')
+        # Sanitize stop loss (if >= 1.0 it means 100% loss allowed, effectively None)
+        if stop_loss_pct is not None and stop_loss_pct >= 1.0: 
+            stop_loss_pct = None
         
         cash = 10000.0
         positions = {} 
@@ -1371,6 +1371,7 @@ class FastBacktestEngine:
         tracker = {}
         prices = {}
         
+        # Pre-load Active Markets
         for cid, life in self.market_lifecycle.items():
             if life['start'] < start_time and life['end'] > start_time:
                 contracts[cid] = {'p_model': 0.5, 'liquidity': life['liquidity']}
@@ -1428,50 +1429,56 @@ class FastBacktestEngine:
                             p_model = contracts[cid]['p_model']
                             edge = p_model - current_p
                             
-                            # --- ENTRY ---
+                            # --- ENTRY LOGIC ---
                             if abs(edge) > edge_thresh and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 target_f = 0.0
                                 
-                                # --- DUAL SIZING LOGIC ---
                                 if sizing_mode == "fixed_pct":
-                                    # Consistency Strategy: Always bet X%
                                     target_f = sizing_val
-                                    
                                 elif sizing_mode == "kelly":
-                                    # Conviction Strategy: Bet based on Edge
-                                    if side == 1: # Long
-                                        num = p_model - current_p
-                                        den = 1.0 - current_p
-                                    else: # Short
-                                        num = current_p - p_model
-                                        den = current_p
-                                    
+                                    if side == 1: num, den = (p_model - current_p), (1.0 - current_p)
+                                    else: num, den = (current_p - p_model), current_p
                                     raw_f = 0.0
                                     if den > 0.01: raw_f = num / den
-                                    target_f = raw_f * sizing_val # sizing_val is the Fraction (e.g. 0.5)
+                                    target_f = raw_f * sizing_val 
 
-                                # Global Risk Cap (20% max per trade to prevent ruin)
+                                # Risk Cap (20% max per trade)
                                 target_f = min(max(target_f, 0.0), 0.20)
-                                
                                 cost = cash * target_f
                                 
-                                # Minimum bet size to avoid dust
                                 if cost > 5.0:
                                     cash -= cost
                                     positions[cid] = {'side': side, 'size': cost, 'entry': current_p}
                                     trade_count += 1
                                     
-                            # --- EXIT ---
+                            # --- EXIT LOGIC ---
                             elif cid in positions:
                                 pos = positions[cid]
-                                if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
+                                should_close = False
+                                
+                                # 1. Smart Exit (Signal Flip)
+                                if use_smart_exit:
+                                    if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
+                                        should_close = True
+                                
+                                # 2. Stop Loss (Drawdown Limit)
+                                if not should_close and stop_loss_pct is not None:
                                     if pos['side'] == 1:
                                         pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
                                     else:
                                         pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
-                                    pnl_pct = max(pnl_pct, -1.0)
-                                    cash += pos['size'] * (1.0 + pnl_pct)
+                                    
+                                    if pnl_pct < -stop_loss_pct:
+                                        should_close = True
+                                
+                                if should_close:
+                                    if pos['side'] == 1:
+                                        final_pnl = (current_p - pos['entry']) / max(pos['entry'], 0.01)
+                                    else:
+                                        final_pnl = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
+                                    final_pnl = max(final_pnl, -1.0)
+                                    cash += pos['size'] * (1.0 + final_pnl)
                                     del positions[cid]
 
                 elif ev_type == 'RESOLUTION':
@@ -1513,13 +1520,7 @@ class FastBacktestEngine:
             drawdowns.append(r['max_drawdown'])
             trades += r['trades']
         avg_sharpe = np.mean(sharpes) if sharpes else 0.0
-        return {
-            'total_return': total_ret - 1.0,
-            'sharpe_ratio': avg_sharpe,
-            'max_drawdown': max(drawdowns) if drawdowns else 0.0,
-            'trades': trades,
-            'rejection_logs': {}
-        }
+        return {'total_return': total_ret - 1.0, 'sharpe_ratio': avg_sharpe, 'max_drawdown': max(drawdowns) if drawdowns else 0.0, 'trades': trades, 'rejection_logs': {}}
 
     def _calculate_metrics(self, pnl_history, trades):
         if len(pnl_history) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
@@ -1584,7 +1585,7 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-        log.info("--- Starting Kelly vs Fixed Sizing Analysis ---")
+        log.info("--- Starting Full Strategy Optimization (Sizing, Exit, Stop-Loss) ---")
         
         df_markets, df_trades = self._load_data()
         if df_markets.empty: return None
@@ -1594,43 +1595,48 @@ class BacktestEngine:
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
+            # Locked Logic
             "splash_threshold": tune.choice([2.0]),
             "edge_threshold": tune.choice([0.01]),
-            "train_days": tune.choice([41]),
-            "test_days": tune.choice([42]),
+            
+            # Longer Window for statistical significance
+            "train_days": tune.choice([60]),
+            "test_days": tune.choice([120]),
             "seed": 42,
             
-            # COMPARISON:
-            # Kelly Fractions (Dynamic) vs Fixed Percentages (Static)
+            # 1. Sizing Options (Dynamic vs Static)
             "sizing": tune.choice([
-                # Dynamic Strategies
-                ("kelly", 1.0),   # Aggressive
-                ("kelly", 0.5),   # Moderate
-                ("kelly", 0.25),  # Conservative
-                
-                # Static Strategies
-                ("fixed_pct", 0.10), # Aggressive
-                ("fixed_pct", 0.05), # Moderate
-                ("fixed_pct", 0.02)  # Conservative
-            ])
+                ("kelly", 1.0), ("kelly", 0.5), ("kelly", 0.25),
+                ("fixed_pct", 0.10), ("fixed_pct", 0.05), ("fixed_pct", 0.02)
+            ]),
+            
+            # 2. Smart Exit (Toggle)
+            "use_smart_exit": tune.choice([True, False]),
+            
+            # 3. Stop Loss (None = 100%)
+            "stop_loss": tune.choice([None, 0.10, 0.15, 0.25, 0.35])
         }
         
         def objective_function(config):
             results = ray_backtest_wrapper(config, ray.put(event_log), ray.put(profiler_data), ray.put(None), ray.put({}))
             ret = results.get('total_return', 0.0)
             dd = results.get('max_drawdown', 1.0)
+            
+            # Smart Score: Rewards Return, Penalizes Drawdown
             smart_score = ret / (dd + 0.01)
+            
             metrics = results.copy()
             metrics['smart_score'] = smart_score
             tune.report(metrics)
 
         searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
         
+        # Higher sample count to cover combinations
         analysis = tune.run(
             objective_function,
             config=search_space,
             search_alg=searcher,
-            num_samples=30, 
+            num_samples=60, 
             resources_per_trial={"cpu": 1},
         )
 
@@ -1639,14 +1645,13 @@ class BacktestEngine:
         metrics = best_trial.last_result
         
         mode, val = best_config['sizing']
-        if mode == "kelly":
-            display_str = f"Kelly Fraction {val}x"
-        else:
-            display_str = f"Fixed {val*100}%"
+        sizing_str = f"Kelly {val}x" if mode == "kelly" else f"Fixed {val*100}%"
         
         print("\n" + "="*60)
-        print("🏆  MONEY MANAGEMENT CHAMPION  🏆")
-        print(f"   Strategy:       {display_str}")
+        print("🏆  GRAND CHAMPION STRATEGY  🏆")
+        print(f"   Sizing:         {sizing_str}")
+        print(f"   Smart Exit:     {best_config['use_smart_exit']}")
+        print(f"   Stop Loss:      {best_config['stop_loss']}")
         print(f"   Smart Score:    {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
         print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
