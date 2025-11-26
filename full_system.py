@@ -1268,16 +1268,15 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 # --- CORE ENGINE: FastBacktestEngine (Fixed Key Access) ---
 # ==============================================================================
 # ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Production Logic) ---
+# --- CORE ENGINE: FastBacktestEngine (Sizing Optimized) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Statistically Rigorous Backtester (Production Grade).
+    Statistically Rigorous Backtester (Sizing Optimized).
     FEATURES:
-    1. Logarithmic Opinion Pool: Aggregates 'Smart Money' signals in Log-Odds space.
-    2. Dynamic Weighting: Weights trades by inverse Brier Score (Accuracy).
-    3. State-Awareness: Pre-loads active markets to prevent '0 trades' on rolling windows.
-    4. Robust Data Handling: Manages missing keys and types safely.
+    1. Hybrid Sizing: Supports Fixed ($) and Compounding (%) betting.
+    2. State-Awareness: Pre-loads active markets to prevent '0 trades' errors.
+    3. Robust Keys: Handles data dictionary access safely.
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
@@ -1285,13 +1284,10 @@ class FastBacktestEngine:
         self.market_lifecycle = {}
         
         # --- 1. Build Market Lifecycle Index ---
-        # This ensures we know about markets created before the test window starts.
         if not event_log.empty:
-            # Filter efficiently
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
             
             for ts, row in new_contracts.iterrows():
-                # Access data safely
                 data = row['data']
                 cid = data.get('contract_id')
                 if cid:
@@ -1301,18 +1297,15 @@ class FastBacktestEngine:
                         'liquidity': data.get('liquidity', 10000.0)
                     }
             
-            # Update end times from resolutions
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
             for ts, row in resolutions.iterrows():
                 cid = row['data'].get('contract_id')
                 if cid in self.market_lifecycle:
                     self.market_lifecycle[cid]['end'] = ts
 
-            # Batch events by minute for performance
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
             from itertools import groupby
-            # Group by YYYYMMDDHHMM
             for key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H%M')):
                 self.minute_batches.append(list(group))
         else:
@@ -1331,12 +1324,10 @@ class FastBacktestEngine:
         results = []
         current_date = min_date
         
-        # Walk-Forward Loop
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            # Slice Data
             test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
             
             if not test_batch:
@@ -1344,16 +1335,12 @@ class FastBacktestEngine:
                 continue
 
             # --- TRAIN PHASE ---
-            # Isolate history for profiling (Strict separation)
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
             
-            # 1. Calculate Skill (Brier Scores)
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=3)
-            
-            # 2. Calibrate Fresh Wallet Model (Regression)
             fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
             
             # --- TEST PHASE ---
@@ -1369,7 +1356,7 @@ class FastBacktestEngine:
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
         # Strategy Parameters
         splash_thresh = config.get('splash_threshold', 2.0)
-        edge_thresh = config.get('edge_threshold', 0.02)
+        edge_thresh = config.get('edge_threshold', 0.01)
         follow_size = config.get('follow_size', 100.0)
         
         cash = 10000.0
@@ -1377,9 +1364,9 @@ class FastBacktestEngine:
         pnl_history = [cash]
         trade_count = 0
         
-        # --- State Initialization ---
+        # State Initialization
         contracts = {}
-        tracker = {} # Stores {w_sum, w_log_sum}
+        tracker = {}
         prices = {}
         
         # Pre-load active markets
@@ -1389,7 +1376,6 @@ class FastBacktestEngine:
                 tracker[cid] = {'w_sum': 0.0, 'w_log_sum': 0.0}
                 prices[cid] = 0.5
 
-        # Helper: Logit/Sigmoid with clipping for stability
         def logit(p): 
             p = max(0.001, min(p, 0.999))
             return np.log(p / (1.0 - p))
@@ -1397,7 +1383,6 @@ class FastBacktestEngine:
         def sigmoid(x): 
             return 1.0 / (1.0 + np.exp(-x))
 
-        # --- Event Loop ---
         for batch in batches:
             for event in batch:
                 ev_type = event['event_type']
@@ -1415,71 +1400,58 @@ class FastBacktestEngine:
                     if cid in contracts:
                         prices[cid] = data.get('p_market_all', 0.5)
                         
-                        # 1. Identify Trader
                         w_id = data.get('wallet_id')
                         vol = data.get('trade_volume', 0.0)
                         trade_price = data.get('trade_price', 0.5)
                         
-                        # 2. Determine Skill Weight
-                        # Try specific topic first (if available), else default
+                        # Dynamic Weighting
                         brier = wallet_scores.get((w_id, 'default_topic'))
-                        
                         if brier is None:
-                            # Unknown wallet: Use regression based on bet size
-                            # "Skin in the game" hypothesis
                             val_usd = vol * trade_price
                             log_val = np.log(val_usd + 1.0)
                             pred_brier = fw_intercept + (fw_slope * log_val)
-                            # Clamp to reasonable range (0.05 best, 0.35 random/bad)
                             brier = max(0.05, min(pred_brier, 0.35))
                         
-                        # Weight = Volume / Error (Higher volume + Lower Error = Higher Weight)
                         weight = vol / (brier + 0.0001)
                         
-                        # 3. Update Logarithmic Pool
                         trade_logit = logit(trade_price)
-                        
                         tracker[cid]['w_sum'] += weight
                         tracker[cid]['w_log_sum'] += (trade_logit * weight)
                         
-                        # 4. Check Signal Conviction
                         if tracker[cid]['w_sum'] > splash_thresh:
-                            # Weighted Average in Log-Odds Space
                             avg_logit = tracker[cid]['w_log_sum'] / tracker[cid]['w_sum']
-                            
-                            # Add slight uncertainty (Logit-Normal noise)
-                            # This prevents overfitting to exact history
                             noisy_logit = avg_logit + np.random.normal(0, 0.05)
-                            
                             contracts[cid]['p_model'] = sigmoid(noisy_logit)
                             
-                            # 5. Execute Trade (If Edge Exists)
+                            # EXECUTION LOGIC
                             p_model = contracts[cid]['p_model']
                             p_market = prices[cid]
                             edge = p_model - p_market
                             
-                            # Basic Entry Logic
                             if abs(edge) > edge_thresh and cid not in positions:
                                 side = 1 if edge > 0 else -1
-                                cost = follow_size
-                                if cash >= cost:
+                                
+                                # --- SIZING LOGIC (Fixed vs Compounding) ---
+                                if follow_size < 1.0:
+                                    # Percentage sizing (e.g., 0.05 = 5% of cash)
+                                    cost = cash * follow_size
+                                else:
+                                    # Fixed sizing (e.g., 500 = $500)
+                                    cost = follow_size
+                                
+                                # Basic check to avoid bankruptcy
+                                cost = min(cost, cash * 0.95)
+                                
+                                if cost > 5.0: # Minimum bet $5
                                     cash -= cost
                                     positions[cid] = {'side': side, 'size': cost, 'entry': p_market}
                                     trade_count += 1
                                     
-                            # Basic Exit Logic (Edge decay or Reversal)
                             elif cid in positions:
                                 pos = positions[cid]
-                                # If we are Long (1) and edge becomes negative (<0) -> Sell
-                                # If we are Short (-1) and edge becomes positive (>0) -> Cover
                                 if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
-                                    # Calculate PnL
-                                    # Approx: Size * (1 + % diff)
-                                    # Short PnL: Entry - Current
                                     pnl_pct = (p_market - pos['entry']) * pos['side']
-                                    # Cap max loss at -100%
                                     pnl_pct = max(pnl_pct, -1.0)
-                                    
                                     ret_val = pos['size'] * (1.0 + pnl_pct)
                                     cash += ret_val
                                     del positions[cid]
@@ -1489,97 +1461,56 @@ class FastBacktestEngine:
                         if cid in positions:
                             pos = positions.pop(cid)
                             outcome = float(data.get('outcome', 0.0))
-                            
-                            # Payout Logic
-                            # Long (side 1): win if outcome=1
-                            # Short (side -1): win if outcome=0
                             is_win = (pos['side'] == 1 and outcome > 0.5) or (pos['side'] == -1 and outcome < 0.5)
                             
                             if is_win:
-                                # ROI depends on entry price
-                                # If bought at 0.4, payout is 1.0 -> 2.5x
-                                # If sold at 0.6, payout is 0.0 (keep collateral) -> 1.66x
-                                if pos['side'] == 1:
-                                    roi = 1.0 / max(pos['entry'], 0.01)
-                                else:
-                                    roi = 1.0 / max(1.0 - pos['entry'], 0.01)
-                                
+                                if pos['side'] == 1: roi = 1.0 / max(pos['entry'], 0.01)
+                                else: roi = 1.0 / max(1.0 - pos['entry'], 0.01)
                                 cash += pos['size'] * roi
                         
-                        # Cleanup
                         del contracts[cid]
                         if cid in tracker: del tracker[cid]
                         if cid in prices: del prices[cid]
             
-            # Mark-to-Market (Daily NAV)
-            # Value active positions at current market price
             open_pnl = 0.0
             for cid, pos in positions.items():
                 curr = prices.get(cid, pos['entry'])
                 pnl_pct = (curr - pos['entry']) * pos['side']
                 open_pnl += pos['size'] * (1.0 + pnl_pct)
-                
             pnl_history.append(cash + open_pnl)
 
         return self._calculate_metrics(pnl_history, trade_count, {})
 
     def _aggregate_fold_results(self, results):
-        if not results: 
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
-        
+        if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         total_ret = 1.0
         sharpes = []
         drawdowns = []
         trades = 0
-        
         for r in results:
             total_ret *= (1.0 + r['total_return'])
             sharpes.append(r['sharpe_ratio'])
             drawdowns.append(r['max_drawdown'])
             trades += r['trades']
-            
-        return {
-            'total_return': total_ret - 1.0,
-            'sharpe_ratio': np.mean(sharpes) if sharpes else 0.0,
-            'max_drawdown': max(drawdowns) if drawdowns else 0.0,
-            'trades': trades,
-            'rejection_logs': {}
-        }
+        return {'total_return': total_ret - 1.0, 'sharpe_ratio': np.mean(sharpes) if sharpes else 0.0, 'max_drawdown': max(drawdowns) if drawdowns else 0.0, 'trades': trades, 'rejection_logs': {}}
 
     def _calculate_metrics(self, pnl_history, trades, logs):
         arr = np.array(pnl_history)
-        if len(arr) < 2: 
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
-        
+        if len(arr) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         total_ret = (arr[-1] / arr[0]) - 1.0
-        
-        # Log-returns for numerical stability
         with np.errstate(divide='ignore', invalid='ignore'):
             pct_changes = np.diff(arr) / arr[:-1]
-            pct_changes = np.nan_to_num(pct_changes, nan=0.0, posinf=0.0, neginf=0.0)
-        
+            pct_changes = np.nan_to_num(pct_changes, nan=0.0)
         mean_ret = np.mean(pct_changes)
         std_ret = np.std(pct_changes) + 1e-9
-        
-        # Annualize (Minute data -> 525,600 minutes/year)
-        # But our loop might skip time, so sqrt(minutes actually simulated) is safer.
-        # Standard crypto convention: sqrt(365 * 24 * 60) ~ 724
         sharpe = (mean_ret / std_ret) * 724.0
-        
-        # Max Drawdown
         peak = arr[0]
         max_dd = 0.0
         for x in arr:
             if x > peak: peak = x
             dd = (peak - x) / peak
             if dd > max_dd: max_dd = dd
-            
-        return {
-            'total_return': total_ret, 
-            'sharpe_ratio': sharpe, 
-            'max_drawdown': max_dd, 
-            'trades': trades
-        }
+        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades}
 
 # ==============================================================================
 # --- HELPER: Ray Wrapper (Global) ---
@@ -1613,30 +1544,18 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 # --- REPLACEMENT CLASS 1: FastBacktestEngine (With Conviction) ---
 # ==============================================================================
+
 # ==============================================================================
-# --- REPLACEMENT CLASS 1: FastBacktestEngine (Dual Strategy) ---
+# --- ORCHESTRATOR: BacktestEngine (Sensitivity Analysis Config) ---
 # ==============================================================================
 class BacktestEngine:
     """
-    Orchestrator.
-    FIXED:
-    1. Robust Column Handling (Prevents KeyError: 'outcome').
-    2. Deep Fetching (10k Markets, 100k Trades) to force intersection.
-    3. Aggressive Cache Clearing.
+    Orchestrator for Sizing Sweep.
     """
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
-        
-        # --- CACHE NUKE: Force clean slate every run ---
-        if self.cache_dir.exists():
-            try:
-                shutil.rmtree(self.cache_dir)
-                print(f"⚠️ Cache cleared at {self.cache_dir}")
-            except Exception as e:
-                print(f"⚠️ Could not clear cache: {e}")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
@@ -1645,36 +1564,36 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-        log.info("--- Starting Production Tuning (Bayesian) ---")
+        log.info("--- Starting Sizing Sensitivity Analysis ---")
         
+        # Load Data
         df_markets, df_trades = self._load_data()
+        if df_markets.empty: return None
         
-        if df_markets.empty:
-            log.error("❌ CRITICAL: No overlapping markets found. Cannot run tuning.")
-            return None
-            
-        log.info(f"✅ Data Loaded. Overlapping Markets: {len(df_markets)}")
-        
+        # Transform
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         
+        # --- SENSITIVITY ANALYSIS SEARCH SPACE ---
+        # We lock the logic parameters to the "Winners" from the previous run.
+        # We vary 'follow_size' to test capitalization strategies.
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
-            # Lower the splash threshold (maybe we need smaller cumulative volume to trigger)
-            "splash_threshold": tune.choice([1.0, 2.0, 5.0]), 
+            # Fixed Winners
+            "splash_threshold": tune.choice([2.0]),
+            "edge_threshold": tune.choice([0.01]),
+            "train_days": tune.choice([41]),
+            "test_days": tune.choice([42]),
             
-            # Lower the edge requirement implicitly (or allow smaller edges)
-            # We can't tune the hardcoded 0.05 edge in the logic unless we expose it.
-            # ACTION: We must expose 'edge_threshold' to the tuner.
-            "edge_threshold": tune.choice([0.01, 0.02, 0.05]), # <--- ADD THIS
+            # The Variable: Sizing
+            # > 1.0 = Fixed Dollars ($100, $500, $1000, $2000)
+            # < 1.0 = Percentage of Equity (1%, 2%, 5%, 10%)
+            "follow_size": tune.choice([100.0, 500.0, 1000.0, 2000.0, 0.01, 0.02, 0.05, 0.10]),
             
-            "follow_size": tune.choice([50.0, 100.0, 200.0]),
-            "train_days": tune.randint(30, 90),
-            "test_days": tune.randint(15, 45),
             "seed": 42
         }
         
-        searcher = HyperOptSearch(metric="sharpe_ratio", mode="max", random_state_seed=42)
+        searcher = HyperOptSearch(metric="total_return", mode="max", random_state_seed=42)
         
         ev_ref = ray.put(event_log)
         prof_ref = ray.put(profiler_data)
@@ -1685,24 +1604,25 @@ class BacktestEngine:
             lambda cfg: ray_backtest_wrapper(cfg, ev_ref, prof_ref, nlp_ref, priors_ref),
             config=search_space,
             search_alg=searcher,
-            num_samples=20,
+            num_samples=30, # Enough to hit all sizing options multiple times
             resources_per_trial={"cpu": 1},
         )
 
-        best_config = analysis.get_best_config(metric="sharpe_ratio", mode="max")
+        best_config = analysis.get_best_config(metric="total_return", mode="max")
+        best_trial = [t for t in analysis.trials if t.config == best_config][0]
+        metrics = best_trial.last_result
         
-        if best_config:
-            best_trial = [t for t in analysis.trials if t.config == best_config][0]
-            metrics = best_trial.last_result
-            print("\n" + "="*60)
-            print("🏆  WINNING STRATEGY METRICS  🏆")
-            print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
-            print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
-            print(f"   Total Trades:   {metrics.get('trades', 0)}")
-            print("="*60 + "\n")
-            
-        return best_config
+        print("\n" + "="*60)
+        print("🏆  OPTIMAL SIZING RESULT  🏆")
+        print(f"   Best Size:      {best_config['follow_size']} " + ("(USD)" if best_config['follow_size'] > 1 else "(% Equity)"))
+        print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
+        print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
+        print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
+        print(f"   Total Trades:   {metrics.get('trades', 0)}")
+        print("="*60 + "\n")
 
+        return best_config
+        
     def _load_data(self):
         trades = self._fetch_subgraph_trades()
         if trades.empty: 
