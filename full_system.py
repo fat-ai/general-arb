@@ -1263,14 +1263,12 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     
     return scores.to_dict()
 
-# ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (The Logic) ---
-# ==============================================================================
-# ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (State-Aware) ---
-# ==============================================================================
+
 # ==============================================================================
 # --- CORE ENGINE: FastBacktestEngine (Instrumented) ---
+# ==============================================================================
+# ==============================================================================
+# --- CORE ENGINE: FastBacktestEngine (Fixed Key Access) ---
 # ==============================================================================
 class FastBacktestEngine:
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -1285,16 +1283,16 @@ class FastBacktestEngine:
         
         # Build Lifecycle
         if not event_log.empty:
-            # Faster Vectorized Lifecycle Build
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
             print(f"[DEBUG ENGINE] Found {len(new_contracts)} NEW_CONTRACT events.")
             
             for ts, row in new_contracts.iterrows():
-                self.market_lifecycle[row['data']['contract_id']] = {
-                    'start': ts, 'end': pd.Timestamp.max, 'liquidity': row['data'].get('liquidity', 10000)
+                # FIX: Access data dict correctly
+                data = row['data']
+                self.market_lifecycle[data['contract_id']] = {
+                    'start': ts, 'end': pd.Timestamp.max, 'liquidity': data.get('liquidity', 10000)
                 }
             
-            # Batching
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
             from itertools import groupby
@@ -1306,7 +1304,6 @@ class FastBacktestEngine:
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
         if not self.minute_batches:
-            print("[DEBUG ENGINE] No batches to run.")
             return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         
         timestamps = [b[0]['timestamp'] for b in self.minute_batches]
@@ -1319,7 +1316,7 @@ class FastBacktestEngine:
         current_date = min_date
         
         # --- DEBUG 2: Loop Logic ---
-        print(f"[DEBUG ENGINE] Loop Start: {current_date}, End: {max_date}")
+        # print(f"[DEBUG ENGINE] Loop Start: {current_date}, End: {max_date}")
         
         loops_run = 0
         while current_date + timedelta(days=train_days + test_days) <= max_date:
@@ -1327,21 +1324,12 @@ class FastBacktestEngine:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            # Fast Slicing (Timestamps are sorted)
-            # We can optimize this, but for now let's just see if it finds anything
             test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
             
             if not test_batch:
-                # print(f"[DEBUG ENGINE] Loop {loops_run}: No test data for {train_end} -> {test_end}")
                 current_date += timedelta(days=test_days)
                 continue
 
-            # --- TRAIN PHASE ---
-            train_profiler = self.profiler_data[
-                (self.profiler_data['timestamp'] >= current_date) & 
-                (self.profiler_data['timestamp'] < train_end)
-            ]
-            
             # --- TEST PHASE ---
             fold_res = self._run_single_period(
                 test_batch, {}, pd.DataFrame(), config, 0, 0.25, start_time=train_end
@@ -1353,65 +1341,56 @@ class FastBacktestEngine:
             results.append(fold_res)
             current_date += timedelta(days=test_days)
             
-        print(f"[DEBUG ENGINE] Total Loops Run: {loops_run}. Total Results: {len(results)}")
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, wallet_scores, price_corr, config, fw_slope, fw_intercept, start_time):
         splash_thresh = config.get('splash_threshold', 5.0)
-        edge_thresh = config.get('edge_threshold', 0.01) # Force low threshold
+        edge_thresh = config.get('edge_threshold', 0.01)
         follow_size = config.get('follow_size', 100.0)
         
         cash = 10000.0
         positions = {}
         trades = 0
+        pnl_history = [cash]
         
         # Pre-load State
         contracts = {}
         tracker = {}
         prices = {}
         
-        # Pre-load logic check
-        active_count = 0
         for c_id, life in self.market_lifecycle.items():
             if life['start'] < start_time and life['end'] > start_time:
                 contracts[c_id] = {'p_model': 0.5, 'liquidity': life['liquidity']}
-                tracker[c_id] = {'w_sum': 0.0, 'w_log': 0.0}
+                tracker[c_id] = {'w_sum': 0.0}
                 prices[c_id] = 0.5
-                active_count += 1
-        
-        # If no active contracts, we can't trade
-        if active_count == 0 and len(batches) > 0:
-             # Check if batches have new contracts
-             pass
 
         for batch in batches:
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
-                cid = event['contract_id']
+                
+                # --- FIX: Correct Key Access ---
+                # cid is inside data, NOT event
+                cid = data.get('contract_id') 
                 
                 if ev_type == 'NEW_CONTRACT':
                     contracts[cid] = {'p_model': 0.5, 'liquidity': data.get('liquidity', 10000)}
-                    tracker[cid] = {'w_sum': 0.0, 'w_log': 0.0}
+                    tracker[cid] = {'w_sum': 0.0}
                     prices[cid] = 0.5
                 
                 elif ev_type == 'PRICE_UPDATE':
                     if cid in contracts:
-                        prices[cid] = data['p_market_all']
-                        # --- SIMPLIFIED SIGNAL LOGIC FOR DEBUGGING ---
-                        # Always assume "Smart" for now to test execution
-                        # Weight = Volume
-                        vol = data['trade_volume']
+                        prices[cid] = data.get('p_market_all', 0.5) # Safety get
+                        
+                        vol = data.get('trade_volume', 0.0)
                         tracker[cid]['w_sum'] += vol
                         
-                        # If we see volume, move model away from price to trigger trade
                         if tracker[cid]['w_sum'] > splash_thresh:
-                            # Artificial Signal Generation:
-                            # If market is 0.5, model becomes 0.9
-                            # This guarantees an edge > edge_thresh
+                            # Artificial Signal: Force model to be contrarian to price
+                            # If price < 0.5, model = 0.9 (Buy)
+                            # If price > 0.5, model = 0.1 (Sell)
                             contracts[cid]['p_model'] = 0.9 if prices[cid] < 0.5 else 0.1
                             
-                            # EXECUTE IMMEDIATELY
                             edge = contracts[cid]['p_model'] - prices[cid]
                             if abs(edge) > edge_thresh and cid not in positions:
                                 positions[cid] = {'size': follow_size, 'entry': prices[cid]}
@@ -1420,16 +1399,60 @@ class FastBacktestEngine:
                                 
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
-                        # Fake PnL for mechanics check
-                        cash += follow_size * 1.5 
+                        # Fake PnL: Assume we won 50% of bets
+                        # This is just to test mechanism, not profitability
+                        cash += follow_size * 1.2
                         del positions[cid]
                     if cid in contracts: del contracts[cid]
+            
+            # Mark to Market
+            pnl_history.append(cash + len(positions) * follow_size)
 
-        return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': trades, 'max_drawdown': 0.0}
+        return self._calculate_metrics(pnl_history, trades, {})
 
     def _aggregate_fold_results(self, results):
-        total_trades = sum(r['trades'] for r in results)
-        return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': total_trades, 'max_drawdown': 0.0}
+        if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+        
+        total_ret = 1.0
+        sharpes = []
+        drawdowns = []
+        trades = 0
+        
+        for r in results:
+            total_ret *= (1.0 + r['total_return'])
+            sharpes.append(r['sharpe_ratio'])
+            drawdowns.append(r['max_drawdown'])
+            trades += r['trades']
+            
+        return {
+            'total_return': total_ret - 1.0,
+            'sharpe_ratio': np.mean(sharpes) if sharpes else 0.0,
+            'max_drawdown': max(drawdowns) if drawdowns else 0.0,
+            'trades': trades,
+            'rejection_logs': {}
+        }
+
+    def _calculate_metrics(self, pnl_history, trades, logs):
+        arr = np.array(pnl_history)
+        if len(arr) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+        
+        total_ret = (arr[-1] / arr[0]) - 1.0
+        pct_changes = np.diff(arr) / arr[:-1]
+        # Handle divide by zero/NaN
+        pct_changes = np.nan_to_num(pct_changes, 0.0)
+        
+        mean_ret = np.mean(pct_changes)
+        std_ret = np.std(pct_changes) + 1e-9
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760 * 60)
+        
+        peak = arr[0]
+        max_dd = 0.0
+        for x in arr:
+            if x > peak: peak = x
+            dd = (peak - x) / peak
+            if dd > max_dd: max_dd = dd
+            
+        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades}
 
 # ==============================================================================
 # --- HELPER: Ray Wrapper (Global) ---
