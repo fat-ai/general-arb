@@ -1572,9 +1572,6 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # ==============================================================================
 # --- ORCHESTRATOR: BacktestEngine (Sensitivity Analysis Config) ---
 # ==============================================================================
-# ==============================================================================
-# --- ORCHESTRATOR: BacktestEngine (The "Middle Path" Sweep) ---
-# ==============================================================================
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
@@ -1588,7 +1585,7 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-        log.info("--- Starting Long-Window 'Middle Path' Analysis ---")
+        log.info("--- Starting Full Strategy Optimization (Sizing, Exit, Stop-Loss) ---")
         
         df_markets, df_trades = self._load_data()
         if df_markets.empty: return None
@@ -1598,53 +1595,35 @@ class BacktestEngine:
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
-            # LOGIC TUNING
-            # Maybe 2.0 is too strict? Let's test 1.0 and 1.5 to see if we get more volume.
-            "splash_threshold": tune.choice([1.0, 1.5, 2.0]),
+            # Locked Logic
+            "splash_threshold": tune.choice([2.0]),
             "edge_threshold": tune.choice([0.01]),
-            "use_smart_exit": tune.choice([True, False]),
             
-            # STRESS TEST WINDOW (Locked)
+            # Longer Window for statistical significance
             "train_days": tune.choice([60]),
             "test_days": tune.choice([120]),
             "seed": 42,
             
-            # SIZING: The "Middle Ground"
-            # We test the gap between 0.25x (Too safe) and 1.0x (Too risky)
+            # 1. Sizing Options (Dynamic vs Static)
             "sizing": tune.choice([
-                # Dynamic Kelly Middle Ground
-                ("kelly", 0.30), 
-                ("kelly", 0.40), 
-                ("kelly", 0.50),
-                ("kelly", 0.60),
-                
-                # Fixed Percentage Middle Ground
-                ("fixed_pct", 0.03), # 3%
-                ("fixed_pct", 0.04), # 4%
-                ("fixed_pct", 0.05), # 5%
-                ("fixed_pct", 0.06)  # 6%
+                ("kelly", 1.0), ("kelly", 0.5), ("kelly", 0.25),
+                ("fixed_pct", 0.10), ("fixed_pct", 0.075), ("fixed_pct", 0.05), ("fixed_pct", 0.025)
             ]),
             
-            # Stop Loss (Optional Safety)
-            "stop_loss": tune.choice([None, 0.20, 0.30])
+            # 2. Smart Exit (Toggle)
+            "use_smart_exit": tune.choice([True, False]),
+            
+            # 3. Stop Loss (None = 100%)
+            "stop_loss": tune.choice([None, 0.05, 0.10, 0.15, 0.25, 0.35])
         }
         
         def objective_function(config):
             results = ray_backtest_wrapper(config, ray.put(event_log), ray.put(profiler_data), ray.put(None), ray.put({}))
-            
             ret = results.get('total_return', 0.0)
             dd = results.get('max_drawdown', 1.0)
-            sharpe = results.get('sharpe_ratio', 0.0)
             
-            # OBJECTIVE: Robust Growth
-            # We want high return, but we disqualify anything with Drawdown > 25%
-            # (A 25% hole takes 33% to dig out of. Hard but doable. >25% is death.)
-            
-            if dd > 0.25:
-                smart_score = -1.0 # Penalty zone
-            else:
-                # Reward Return * Stability
-                smart_score = ret * sharpe
+            # Smart Score: Rewards Return, Penalizes Drawdown
+            smart_score = ret / (dd + 0.01)
             
             metrics = results.copy()
             metrics['smart_score'] = smart_score
@@ -1652,11 +1631,12 @@ class BacktestEngine:
 
         searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
         
+        # Higher sample count to cover combinations
         analysis = tune.run(
             objective_function,
             config=search_space,
             search_alg=searcher,
-            num_samples=50, # High samples to find the needle in the haystack
+            num_samples=60, 
             resources_per_trial={"cpu": 1},
         )
 
@@ -1668,10 +1648,10 @@ class BacktestEngine:
         sizing_str = f"Kelly {val}x" if mode == "kelly" else f"Fixed {val*100}%"
         
         print("\n" + "="*60)
-        print("🏆  MIDDLE PATH RESULT (120 DAYS)  🏆")
-        print(f"   Strategy:       {sizing_str}")
-        print(f"   Splash Thresh:  {best_config['splash_threshold']}")
+        print("🏆  GRAND CHAMPION STRATEGY  🏆")
+        print(f"   Sizing:         {sizing_str}")
         print(f"   Smart Exit:     {best_config['use_smart_exit']}")
+        print(f"   Stop Loss:      {best_config['stop_loss']}")
         print(f"   Smart Score:    {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
         print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
