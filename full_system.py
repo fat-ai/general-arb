@@ -1412,69 +1412,101 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
-        if cache_file.exists(): return pd.read_parquet(cache_file)
+        cache_file = self.cache_dir / "gamma_markets_strict.parquet"
+        if cache_file.exists():
+            try:
+                df = pd.read_parquet(cache_file)
+                if not df.empty: return df
+            except: pass
 
         all_rows = []
-        limit, offset = 1000, 0
-        print("Fetching Markets (Closed, Newest First)", end="")
+        offset = 0
+        print("Fetching Closed Markets", end="")
+        
         while True:
             try:
-                # Closed markets, sorted by End Date (Newest first)
+                # Fetch closed markets
                 params = {
-                    "limit": limit, 
-                    "offset": offset, 
-                    "closed": "true",
-                    "order": "endDate",     
-                    "ascending": "false"
+                    "limit": 1000, "offset": offset, 
+                    "closed": "true", "order": "endDate", "ascending": "false"
                 }
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
-                                      params=params, timeout=10)
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
+                
                 rows = resp.json()
                 if not rows: break
                 all_rows.extend(rows)
-                offset += limit
+                
+                offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                # Fetch 10k markets to ensure we hit the window of the trades
-                if offset >= 10000: break
+                if offset >= 50000: break 
             except: break
         print(" Done.")
-        
+
         if not all_rows: return pd.DataFrame()
-        
+
         df = pd.DataFrame(all_rows)
         
+        # --- DEFINITIVE COLUMN MAPPING ---
+        # 1. Identifier: 'marketMakerAddress' is the standard key for the FPMM address
+        if 'marketMakerAddress' in df.columns:
+            df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
+        else:
+            # Fallback for very old/weird markets
+            print("⚠️ 'marketMakerAddress' missing, skipping these rows.")
+        
+        # 2. Outcome: IT MUST BE COMPUTED. There is no 'outcome' column.
+        # Logic: If market is closed, the 'outcomePrices' array shows who won.
+        # ["1", "0"] -> Outcome 0 won. ["0", "1"] -> Outcome 1 won.
+        
+        def derive_outcome(row):
+            # Only binary markets allowed
+            if not isinstance(row.get('outcomes'), list) or len(row['outcomes']) != 2:
+                return pd.NA
+            
+            prices = row.get('outcomePrices')
+            if not isinstance(prices, list) or len(prices) != 2:
+                return pd.NA
+                
+            try:
+                p0 = float(prices[0])
+                p1 = float(prices[1])
+                
+                # Strict check for resolution (1.0 vs 0.0)
+                if p0 > 0.99 and p1 < 0.01: return 0 # First outcome (Yes/No depend on order)
+                if p1 > 0.99 and p0 < 0.01: return 1 # Second outcome
+                return pd.NA # Not fully resolved or ambiguous
+            except:
+                return pd.NA
+
+        print("Computing outcomes from prices...")
+        df['outcome'] = df.apply(derive_outcome, axis=1)
+
+        # 3. Timestamps
         rename_map = {
-            'marketMakerAddress': 'fpmm_address', 
             'question': 'question', 
             'endDate': 'resolution_timestamp', 
-            'outcome': 'outcome', 
-            'createdAt': 'created_at',
-            'liquidity': 'liquidity' 
+            'createdAt': 'created_at', 
+            'liquidity': 'liquidity'
         }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-        
-        # --- CRITICAL FIX: SAFETY NET FOR MISSING COLUMNS ---
-        # If 'outcome' (or any other key) is missing from the API response, 
-        # this loop creates it with NaN values so the script DOES NOT CRASH.
-        expected_cols = ['fpmm_address', 'outcome', 'resolution_timestamp', 'created_at', 'liquidity']
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = pd.NA
-        # ----------------------------------------------------
+
+        # 4. Filter
+        required_cols = ['fpmm_address', 'resolution_timestamp', 'outcome']
+        # Create missing cols as NA to avoid key errors
+        for c in required_cols:
+            if c not in df.columns: df[c] = pd.NA
             
-        df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
-        df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(0.0)
-            
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        df = df.dropna(subset=required_cols)
         
-        # Filter unusable rows
-        df = df.dropna(subset=['fpmm_address', 'outcome'])
+        # 5. Type Conversions
+        df['outcome'] = pd.to_numeric(df['outcome'])
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
         
         if not df.empty:
             df.to_parquet(cache_file)
+            print(f"✅ Successfully cached {len(df)} resolved markets.")
+            
         return df
 
     def _fetch_subgraph_trades(self):
