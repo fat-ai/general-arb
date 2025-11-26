@@ -1348,6 +1348,7 @@ class FastBacktestEngine:
         # Params
         splash_thresh = config.get('splash_threshold', 5.0)
         follow_size = config.get('follow_size', 100.0)
+        edge_thresh = config.get('edge_threshold', 0.05)
         
         cash = 10000.0
         positions = {} 
@@ -1430,8 +1431,8 @@ class FastBacktestEngine:
                     Q = current_prices.get(c_id, 0.5)
                     edge = M - Q
                     
-                    # Entry
-                    if abs(edge) > 0.05 and c_id not in positions:
+                    # USE DYNAMIC THRESHOLD
+                    if abs(edge) > edge_thresh and c_id not in positions:
                         side = 1 if edge > 0 else -1
                         cost = follow_size
                         if cash >= cost:
@@ -1572,7 +1573,14 @@ class BacktestEngine:
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
-            "splash_threshold": tune.choice([2.0, 5.0, 10.0]),
+            # Lower the splash threshold (maybe we need smaller cumulative volume to trigger)
+            "splash_threshold": tune.choice([1.0, 2.0, 5.0]), 
+            
+            # Lower the edge requirement implicitly (or allow smaller edges)
+            # We can't tune the hardcoded 0.05 edge in the logic unless we expose it.
+            # ACTION: We must expose 'edge_threshold' to the tuner.
+            "edge_threshold": tune.choice([0.01, 0.02, 0.05]), # <--- ADD THIS
+            
             "follow_size": tune.choice([50.0, 100.0, 200.0]),
             "train_days": tune.randint(30, 90),
             "test_days": tune.randint(15, 45),
