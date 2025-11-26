@@ -1268,14 +1268,15 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 # --- CORE ENGINE: FastBacktestEngine (Sizing Optimized) ---
 # ==============================================================================
 # ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Dual Exit Logic) ---
+# --- CORE ENGINE: FastBacktestEngine (Fully Configurable Exit) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
     Statistically Rigorous Backtester.
-    Exits on EITHER:
-    1. Consensus Flip (Smart Money changed mind)
-    2. Stop Loss (Price moved against us too far)
+    Tunable Exits:
+    1. Smart Exit (Optional): Exit if Smart Money consensus flips.
+    2. Stop Loss (Optional): Exit if drawdown exceeds threshold.
+    3. Hold to Maturity: Default if both above are disabled.
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
@@ -1350,10 +1351,10 @@ class FastBacktestEngine:
         edge_thresh = config.get('edge_threshold', 0.01)
         follow_size = config.get('follow_size', 100.0)
         
-        # Stop Loss: If None or >= 1.0, it's effectively disabled for binary markets
-        stop_loss_pct = config.get('stop_loss')
-        if stop_loss_pct is not None and stop_loss_pct >= 1.0:
-            stop_loss_pct = None
+        # --- CONFIGURABLE EXITS ---
+        use_smart_exit = config.get('use_smart_exit', True) # True = Exit on Signal Flip
+        stop_loss_pct = config.get('stop_loss') # None = No Stop Loss
+        if stop_loss_pct is not None and stop_loss_pct >= 1.0: stop_loss_pct = None
         
         cash = 10000.0
         positions = {} 
@@ -1419,7 +1420,7 @@ class FastBacktestEngine:
                             p_model = contracts[cid]['p_model']
                             edge = p_model - current_p
                             
-                            # --- ENTRY LOGIC ---
+                            # --- ENTRY ---
                             if abs(edge) > edge_thresh and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
@@ -1432,16 +1433,17 @@ class FastBacktestEngine:
                                     positions[cid] = {'side': side, 'size': cost, 'entry': current_p}
                                     trade_count += 1
                                     
-                            # --- EXIT LOGIC (Dual Check) ---
+                            # --- EXIT CHECK ---
                             elif cid in positions:
                                 pos = positions[cid]
                                 should_close = False
                                 
-                                # 1. Check Signal Flip (Consensus Exit)
-                                if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
-                                    should_close = True
+                                # 1. Smart Exit (Optional)
+                                if use_smart_exit:
+                                    if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
+                                        should_close = True
                                 
-                                # 2. Check Stop Loss (Safety Valve)
+                                # 2. Stop Loss (Optional)
                                 if not should_close and stop_loss_pct is not None:
                                     if pos['side'] == 1:
                                         pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
@@ -1453,12 +1455,12 @@ class FastBacktestEngine:
                                 
                                 if should_close:
                                     if pos['side'] == 1:
-                                        final_pnl = (current_p - pos['entry']) / max(pos['entry'], 0.01)
+                                        pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
                                     else:
-                                        final_pnl = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
+                                        pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
                                     
-                                    final_pnl = max(final_pnl, -1.0)
-                                    cash += pos['size'] * (1.0 + final_pnl)
+                                    pnl_pct = max(pnl_pct, -1.0)
+                                    cash += pos['size'] * (1.0 + pnl_pct)
                                     del positions[cid]
 
                 elif ev_type == 'RESOLUTION':
@@ -1567,7 +1569,7 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-        log.info("--- Starting Stop-Loss vs Consensus Analysis ---")
+        log.info("--- Starting Logic Optimization (Smart Exit vs Hold) ---")
         
         df_markets, df_trades = self._load_data()
         if df_markets.empty: return None
@@ -1584,12 +1586,15 @@ class BacktestEngine:
             "test_days": tune.choice([42]),
             "seed": 42,
             
-            # Sizing (Varied)
-            "follow_size": tune.choice([0.02, 0.05, 0.08, 0.10]),
+            # Sizing (Keep it high to test robust strategy)
+            "follow_size": tune.choice([0.03, 0.05, 0.08, 0.10]),
             
-            # Stop Loss Options (Includes None/1.0 as 'No Stop Loss')
-            # 0.15 = Cut at 15% loss. 1.0 = No Cut.
-            "stop_loss": tune.choice([None, 0.10, 0.15, 0.25, 0.35, 0.50])
+            # THE CRITICAL TEST:
+            # 1. Smart Exit: True (Active) vs False (Buy & Hold)
+            "use_smart_exit": tune.choice([True, False]),
+            
+            # 2. Stop Loss: None vs Standard
+            "stop_loss": tune.choice([None, 0.15, 0.25, 0.50])
         }
         
         def objective_function(config):
@@ -1611,7 +1616,7 @@ class BacktestEngine:
             objective_function,
             config=search_space,
             search_alg=searcher,
-            num_samples=30, 
+            num_samples=40, 
             resources_per_trial={"cpu": 1},
         )
 
@@ -1620,10 +1625,10 @@ class BacktestEngine:
         metrics = best_trial.last_result
         
         print("\n" + "="*60)
-        print("🏆  HYBRID EXIT RESULT  🏆")
-        size_display = f"{best_config['follow_size'] * 100}% Equity"
-        print(f"   Best Size:      {size_display}")
-        print(f"   Best Stop-Loss: {best_config['stop_loss']}")
+        print("🏆  OPTIMIZED LOGIC RESULT  🏆")
+        print(f"   Smart Exit:     {best_config['use_smart_exit']}")
+        print(f"   Stop Loss:      {best_config['stop_loss']}")
+        print(f"   Best Size:      {best_config['follow_size'] * 100}% Equity")
         print(f"   Smart Score:    {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
         print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
