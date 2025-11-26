@@ -1567,6 +1567,9 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
 # --- ORCHESTRATOR: BacktestEngine (Sensitivity Analysis Config) ---
 # ==============================================================================
 class BacktestEngine:
+    """
+    Orchestrator for Risk-Adjusted Sizing (Ray Fix Applied).
+    """
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
@@ -1588,6 +1591,7 @@ class BacktestEngine:
         
         from ray.tune.search.hyperopt import HyperOptSearch
         
+        # 1. Define Search Space
         search_space = {
             # Lock known winners
             "splash_threshold": tune.choice([2.0]),
@@ -1604,14 +1608,24 @@ class BacktestEngine:
             "stop_loss": tune.choice([None, 0.10, 0.15, 0.20, 0.25, 0.30])
         }
         
-        # We stick to 'smart_score' (Return / Drawdown) to prioritize safety
+        # 2. Define Custom Objective Function
         def objective_function(config):
+            # Run the backtest
             results = ray_backtest_wrapper(config, ray.put(event_log), ray.put(profiler_data), ray.put(None), ray.put({}))
+            
             ret = results.get('total_return', 0.0)
             dd = results.get('max_drawdown', 1.0)
+            
+            # Smart Score: Return / (Drawdown + 1%)
             smart_score = ret / (dd + 0.01)
-            tune.report(smart_score=smart_score, **results)
+            
+            # --- FIX: Merge into a single dictionary for Ray 2.x compatibility ---
+            metrics_to_report = results.copy()
+            metrics_to_report['smart_score'] = smart_score
+            
+            tune.report(metrics_to_report)
 
+        # 3. Optimize for 'smart_score'
         searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
         
         analysis = tune.run(
@@ -1628,7 +1642,8 @@ class BacktestEngine:
         
         print("\n" + "="*60)
         print("🏆  STOP-LOSS OPTIMIZED RESULT  🏆")
-        print(f"   Best Size:      {best_config['follow_size'] * 100}% Equity")
+        size_display = f"{best_config['follow_size'] * 100}% Equity" if best_config['follow_size'] < 1.0 else f"${best_config['follow_size']}"
+        print(f"   Best Size:      {size_display}")
         print(f"   Best Stop-Loss: {best_config['stop_loss']}")
         print(f"   Smart Score:    {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
