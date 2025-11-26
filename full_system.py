@@ -1412,7 +1412,7 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        cache_file = self.cache_dir / "gamma_markets_strict.parquet"
+        cache_file = self.cache_dir / "gamma_markets_legacy.parquet"
         if cache_file.exists():
             try:
                 df = pd.read_parquet(cache_file)
@@ -1421,25 +1421,30 @@ class BacktestEngine:
 
         all_rows = []
         offset = 0
-        print("Fetching Closed Markets", end="")
+        print("Fetching Legacy Markets (Oldest First)", end="")
         
         while True:
             try:
-                # Fetch closed markets
+                # FIX: Fetch OLDER markets to match the Legacy Subgraph trades
                 params = {
-                    "limit": 1000, "offset": offset, 
-                    "closed": "true", "order": "endDate", "ascending": "false"
+                    "limit": 1000, 
+                    "offset": offset, 
+                    "closed": "true",
+                    "order": "endDate", 
+                    "ascending": "true"  # <--- CRITICAL CHANGE: Oldest first
                 }
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
                 if not rows: break
-                all_rows.extend(rows)
                 
+                all_rows.extend(rows)
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                if offset >= 50000: break 
+                
+                # Fetch deeper history to maximize overlap
+                if offset >= 20000: break 
             except: break
         print(" Done.")
 
@@ -1447,65 +1452,49 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- DEFINITIVE COLUMN MAPPING ---
-        # 1. Identifier: 'marketMakerAddress' is the standard key for the FPMM address
+        # 1. Map 'marketMakerAddress' (The Key for AMM Markets)
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
         else:
-            # Fallback for very old/weird markets
-            print("⚠️ 'marketMakerAddress' missing, skipping these rows.")
-        
-        # 2. Outcome: IT MUST BE COMPUTED. There is no 'outcome' column.
-        # Logic: If market is closed, the 'outcomePrices' array shows who won.
-        # ["1", "0"] -> Outcome 0 won. ["0", "1"] -> Outcome 1 won.
-        
-        def derive_outcome(row):
-            # Only binary markets allowed
-            if not isinstance(row.get('outcomes'), list) or len(row['outcomes']) != 2:
-                return pd.NA
-            
-            prices = row.get('outcomePrices')
-            if not isinstance(prices, list) or len(prices) != 2:
-                return pd.NA
-                
-            try:
-                p0 = float(prices[0])
-                p1 = float(prices[1])
-                
-                # Strict check for resolution (1.0 vs 0.0)
-                if p0 > 0.99 and p1 < 0.01: return 0 # First outcome (Yes/No depend on order)
-                if p1 > 0.99 and p0 < 0.01: return 1 # Second outcome
-                return pd.NA # Not fully resolved or ambiguous
-            except:
-                return pd.NA
+            # If completely missing, these are likely pure CLOB markets and won't match anyway
+            print("⚠️ 'marketMakerAddress' missing. These may be CLOB markets incompatible with legacy trades.")
+            return pd.DataFrame()
 
-        print("Computing outcomes from prices...")
+        # 2. Derive Outcome (Required for Gamma API)
+        def derive_outcome(row):
+            try:
+                # Gamma API returns 'outcomePrices' as a list of strings: ["0", "1"] or ["1", "0"]
+                # The winner is the one with price "1" (or close to it)
+                prices = row.get('outcomePrices')
+                if isinstance(prices, str): import json; prices = json.loads(prices)
+                
+                if not isinstance(prices, list) or len(prices) != 2: return pd.NA
+                
+                p0, p1 = float(prices[0]), float(prices[1])
+                if p0 > 0.95: return 0 # Outcome 0 won
+                if p1 > 0.95: return 1 # Outcome 1 won
+                return pd.NA
+            except: return pd.NA
+
         df['outcome'] = df.apply(derive_outcome, axis=1)
 
-        # 3. Timestamps
-        rename_map = {
-            'question': 'question', 
-            'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at', 
-            'liquidity': 'liquidity'
-        }
+        # 3. Rename & Filter
+        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-
-        # 4. Filter
+        
         required_cols = ['fpmm_address', 'resolution_timestamp', 'outcome']
-        # Create missing cols as NA to avoid key errors
-        for c in required_cols:
+        for c in required_cols: 
             if c not in df.columns: df[c] = pd.NA
             
         df = df.dropna(subset=required_cols)
         
-        # 5. Type Conversions
+        # 4. Final Polish
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
         
         if not df.empty:
             df.to_parquet(cache_file)
-            print(f"✅ Successfully cached {len(df)} resolved markets.")
+            print(f"✅ Successfully cached {len(df)} legacy markets.")
             
         return df
 
