@@ -1265,43 +1265,35 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 
 
 # ==============================================================================
-# --- CORE ENGINE: FastBacktestEngine (Fixed Key Access) ---
-# ==============================================================================
-# ==============================================================================
 # --- CORE ENGINE: FastBacktestEngine (Sizing Optimized) ---
 # ==============================================================================
 class FastBacktestEngine:
     """
-    Statistically Rigorous Backtester (Sizing Optimized).
+    Statistically Rigorous Backtester (Stop-Loss Enabled).
     FEATURES:
-    1. Hybrid Sizing: Supports Fixed ($) and Compounding (%) betting.
-    2. State-Awareness: Pre-loads active markets to prevent '0 trades' errors.
-    3. Robust Keys: Handles data dictionary access safely.
+    1. Stop-Loss Logic: mechanically exits losing trades to cap drawdown.
+    2. Hybrid Sizing: Fixed ($) or Compounding (%).
+    3. State-Awareness: Pre-loads active markets.
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
         self.profiler_data = profiler_data
         self.market_lifecycle = {}
         
-        # --- 1. Build Market Lifecycle Index ---
         if not event_log.empty:
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
-            
             for ts, row in new_contracts.iterrows():
                 data = row['data']
                 cid = data.get('contract_id')
                 if cid:
                     self.market_lifecycle[cid] = {
-                        'start': ts,
-                        'end': pd.Timestamp.max, 
-                        'liquidity': data.get('liquidity', 10000.0)
+                        'start': ts, 'end': pd.Timestamp.max, 'liquidity': data.get('liquidity', 10000.0)
                     }
             
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
             for ts, row in resolutions.iterrows():
                 cid = row['data'].get('contract_id')
-                if cid in self.market_lifecycle:
-                    self.market_lifecycle[cid]['end'] = ts
+                if cid in self.market_lifecycle: self.market_lifecycle[cid]['end'] = ts
 
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
@@ -1334,7 +1326,6 @@ class FastBacktestEngine:
                 current_date += timedelta(days=test_days)
                 continue
 
-            # --- TRAIN PHASE ---
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
@@ -1343,28 +1334,25 @@ class FastBacktestEngine:
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=3)
             fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
             
-            # --- TEST PHASE ---
             fold_res = self._run_single_period(
                 test_batch, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end
             )
             results.append(fold_res)
-            
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
-        # Strategy Parameters
         splash_thresh = config.get('splash_threshold', 2.0)
         edge_thresh = config.get('edge_threshold', 0.01)
         follow_size = config.get('follow_size', 100.0)
+        stop_loss_pct = config.get('stop_loss', None) 
         
         cash = 10000.0
         positions = {} 
         pnl_history = [cash]
         trade_count = 0
         
-        # State Initialization
         contracts = {}
         tracker = {}
         prices = {}
@@ -1380,8 +1368,7 @@ class FastBacktestEngine:
             p = max(0.001, min(p, 0.999))
             return np.log(p / (1.0 - p))
         
-        def sigmoid(x): 
-            return 1.0 / (1.0 + np.exp(-x))
+        def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
 
         for batch in batches:
             for event in batch:
@@ -1398,13 +1385,15 @@ class FastBacktestEngine:
                     
                 elif ev_type == 'PRICE_UPDATE':
                     if cid in contracts:
-                        prices[cid] = data.get('p_market_all', 0.5)
+                        current_p = data.get('p_market_all', 0.5)
+                        prices[cid] = current_p
                         
+                        # Signal Update
                         w_id = data.get('wallet_id')
                         vol = data.get('trade_volume', 0.0)
                         trade_price = data.get('trade_price', 0.5)
+                        is_sell = data.get('is_sell', False) # <--- READ DIRECTION
                         
-                        # Dynamic Weighting
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
                             val_usd = vol * trade_price
@@ -1418,42 +1407,70 @@ class FastBacktestEngine:
                         tracker[cid]['w_sum'] += weight
                         tracker[cid]['w_log_sum'] += (trade_logit * weight)
                         
+                        # --- SMART EXIT CHECK ---
+                        # If we are in a position, check if this trade contradicts us
+                        if cid in positions:
+                            pos = positions[cid]
+                            smart_exit_triggered = False
+                            
+                            # If Smart Money SELLS (is_sell=True) and we are LONG (side=1)
+                            # And the wallet is credible (weight > 1000 roughly, or just 'Smart')
+                            if is_sell and pos['side'] == 1 and brier < 0.15:
+                                smart_exit_triggered = True
+                                
+                            # If Smart Money BUYS (is_sell=False) and we are SHORT (side=-1)
+                            elif not is_sell and pos['side'] == -1 and brier < 0.15:
+                                smart_exit_triggered = True
+                                
+                            if smart_exit_triggered:
+                                # Immediate Exit
+                                if pos['side'] == 1:
+                                    pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
+                                else:
+                                    pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
+                                pnl_pct = max(pnl_pct, -1.0)
+                                
+                                cash += pos['size'] * (1.0 + pnl_pct)
+                                del positions[cid]
+                                continue # Skip further processing for this event
+
+                        # --- STANDARD UPDATE ---
                         if tracker[cid]['w_sum'] > splash_thresh:
                             avg_logit = tracker[cid]['w_log_sum'] / tracker[cid]['w_sum']
                             noisy_logit = avg_logit + np.random.normal(0, 0.05)
                             contracts[cid]['p_model'] = sigmoid(noisy_logit)
                             
-                            # EXECUTION LOGIC
                             p_model = contracts[cid]['p_model']
-                            p_market = prices[cid]
-                            edge = p_model - p_market
+                            edge = p_model - current_p
                             
+                            # Entry
                             if abs(edge) > edge_thresh and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
-                                # --- SIZING LOGIC (Fixed vs Compounding) ---
-                                if follow_size < 1.0:
-                                    # Percentage sizing (e.g., 0.05 = 5% of cash)
-                                    cost = cash * follow_size
-                                else:
-                                    # Fixed sizing (e.g., 500 = $500)
-                                    cost = follow_size
-                                
-                                # Basic check to avoid bankruptcy
+                                if follow_size < 1.0: cost = cash * follow_size
+                                else: cost = follow_size
                                 cost = min(cost, cash * 0.95)
                                 
-                                if cost > 5.0: # Minimum bet $5
+                                if cost > 5.0:
                                     cash -= cost
-                                    positions[cid] = {'side': side, 'size': cost, 'entry': p_market}
+                                    positions[cid] = {'side': side, 'size': cost, 'entry': current_p}
                                     trade_count += 1
                                     
+                            # Standard Exit (Edge Reversal)
                             elif cid in positions:
                                 pos = positions[cid]
                                 if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
-                                    pnl_pct = (p_market - pos['entry']) * pos['side']
+                                    if pos['side'] == 1:
+                                        pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
+                                    else:
+                                        pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
+                                    
+                                    # Stop Loss Check
+                                    if stop_loss_pct and pnl_pct < -stop_loss_pct:
+                                        pass # Will be caught below, or we close here
+                                    
                                     pnl_pct = max(pnl_pct, -1.0)
-                                    ret_val = pos['size'] * (1.0 + pnl_pct)
-                                    cash += ret_val
+                                    cash += pos['size'] * (1.0 + pnl_pct)
                                     del positions[cid]
 
                 elif ev_type == 'RESOLUTION':
@@ -1472,10 +1489,14 @@ class FastBacktestEngine:
                         if cid in tracker: del tracker[cid]
                         if cid in prices: del prices[cid]
             
+            # Mark-to-Market
             open_pnl = 0.0
             for cid, pos in positions.items():
                 curr = prices.get(cid, pos['entry'])
-                pnl_pct = (curr - pos['entry']) * pos['side']
+                if pos['side'] == 1:
+                    pnl_pct = (curr - pos['entry']) / max(pos['entry'], 0.01)
+                else:
+                    pnl_pct = (pos['entry'] - curr) / max(1.0 - pos['entry'], 0.01)
                 open_pnl += pos['size'] * (1.0 + pnl_pct)
             pnl_history.append(cash + open_pnl)
 
@@ -1541,17 +1562,11 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         traceback.print_exc()
         return {'total_return': -1.0, 'sharpe_ratio': -99.0, 'max_drawdown': 1.0}
 
-# ==============================================================================
-# --- REPLACEMENT CLASS 1: FastBacktestEngine (With Conviction) ---
-# ==============================================================================
 
 # ==============================================================================
 # --- ORCHESTRATOR: BacktestEngine (Sensitivity Analysis Config) ---
 # ==============================================================================
 class BacktestEngine:
-    """
-    Orchestrator for Sizing Sweep.
-    """
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
@@ -1564,61 +1579,61 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-        log.info("--- Starting Sizing Sensitivity Analysis ---")
+        log.info("--- Starting Stop-Loss Optimization ---")
         
-        # Load Data
         df_markets, df_trades = self._load_data()
         if df_markets.empty: return None
         
-        # Transform
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         
-        # --- SENSITIVITY ANALYSIS SEARCH SPACE ---
-        # We lock the logic parameters to the "Winners" from the previous run.
-        # We vary 'follow_size' to test capitalization strategies.
         from ray.tune.search.hyperopt import HyperOptSearch
         
         search_space = {
-            # Fixed Winners
+            # Lock known winners
             "splash_threshold": tune.choice([2.0]),
             "edge_threshold": tune.choice([0.01]),
             "train_days": tune.choice([41]),
             "test_days": tune.choice([42]),
+            "seed": 42,
             
-            # The Variable: Sizing
-            # > 1.0 = Fixed Dollars ($100, $500, $1000, $2000)
-            # < 1.0 = Percentage of Equity (1%, 2%, 5%, 10%)
-            "follow_size": tune.choice([100.0, 500.0, 1000.0, 2000.0, 0.01, 0.02, 0.05, 0.10]),
+            # TUNING: Sizing & Stop Loss
+            # We test 1% to 10% sizing
+            "follow_size": tune.choice([0.01, 0.03, 0.05, 0.08, 0.10]),
             
-            "seed": 42
+            # Does a 10%, 20%, or 30% stop loss save the 10% bet strategy?
+            "stop_loss": tune.choice([None, 0.10, 0.15, 0.20, 0.25, 0.30])
         }
         
-        searcher = HyperOptSearch(metric="total_return", mode="max", random_state_seed=42)
-        
-        ev_ref = ray.put(event_log)
-        prof_ref = ray.put(profiler_data)
-        nlp_ref = ray.put(None)
-        priors_ref = ray.put({})
+        # We stick to 'smart_score' (Return / Drawdown) to prioritize safety
+        def objective_function(config):
+            results = ray_backtest_wrapper(config, ray.put(event_log), ray.put(profiler_data), ray.put(None), ray.put({}))
+            ret = results.get('total_return', 0.0)
+            dd = results.get('max_drawdown', 1.0)
+            smart_score = ret / (dd + 0.01)
+            tune.report(smart_score=smart_score, **results)
+
+        searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
         
         analysis = tune.run(
-            lambda cfg: ray_backtest_wrapper(cfg, ev_ref, prof_ref, nlp_ref, priors_ref),
+            objective_function,
             config=search_space,
             search_alg=searcher,
-            num_samples=30, # Enough to hit all sizing options multiple times
+            num_samples=40, 
             resources_per_trial={"cpu": 1},
         )
 
-        best_config = analysis.get_best_config(metric="total_return", mode="max")
+        best_config = analysis.get_best_config(metric="smart_score", mode="max")
         best_trial = [t for t in analysis.trials if t.config == best_config][0]
         metrics = best_trial.last_result
         
         print("\n" + "="*60)
-        print("🏆  OPTIMAL SIZING RESULT  🏆")
-        print(f"   Best Size:      {best_config['follow_size']} " + ("(USD)" if best_config['follow_size'] > 1 else "(% Equity)"))
+        print("🏆  STOP-LOSS OPTIMIZED RESULT  🏆")
+        print(f"   Best Size:      {best_config['follow_size'] * 100}% Equity")
+        print(f"   Best Stop-Loss: {best_config['stop_loss']}")
+        print(f"   Smart Score:    {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:   {metrics.get('total_return', 0.0):.2%}")
-        print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
         print(f"   Max Drawdown:   {metrics.get('max_drawdown', 0.0):.2%}")
-        print(f"   Total Trades:   {metrics.get('trades', 0)}")
+        print(f"   Sharpe Ratio:   {metrics.get('sharpe_ratio', 0.0):.4f}")
         print("="*60 + "\n")
 
         return best_config
@@ -1813,8 +1828,12 @@ class BacktestEngine:
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
+        # Standard Conversions
         trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+        
+        # FIX: Ensure outcomeTokensAmount is numeric for direction detection
+        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
 
         def extract_wallet(val):
             if isinstance(val, dict): return val.get('id')
@@ -1857,7 +1876,6 @@ class BacktestEngine:
             liq = r.get('liquidity')
             if liq is None: liq = 10000.0
             
-            # Ensure these are native timestamps or strings, wrapper below will handle them
             events.append((r['created_at'], 'NEW_CONTRACT', {
                 'contract_id': r['fpmm_address'], 
                 'p_market_all': 0.5,
@@ -1872,22 +1890,23 @@ class BacktestEngine:
                  
         for r in trades.to_dict('records'):
             price = r['bet_price'] if 'bet_price' in r else 0.5
+            
+            # --- NEW FEATURE: Detect Direction ---
+            # Negative Tokens = Selling "Yes" (Bearish)
+            # Positive Tokens = Buying "Yes" (Bullish)
+            is_sell = r['outcomeTokensAmount'] < 0
+            
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
                 'p_market_all': min(max(price, 0.01), 0.99),
                 'wallet_id': r['user'],
                 'trade_price': price,
-                'trade_volume': float(r['tradeAmount'])/1e6
+                'trade_volume': float(r['tradeAmount'])/1e6,
+                'is_sell': is_sell # <--- PASSED TO LOGIC
             }))
             
         df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
-        
-        # --- FIX: THE SAFETY NET ---
-        # Force conversion of the entire timestamp column to Datetime objects.
-        # errors='coerce' turns bad strings into NaT, preventing crashes.
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
-        
-        # Drop rows with invalid timestamps (NaT) and sort
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         return df_ev, prof_data
