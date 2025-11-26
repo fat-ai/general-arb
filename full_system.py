@@ -1266,9 +1266,13 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 # ==============================================================================
 # --- CORE ENGINE: FastBacktestEngine (The Logic) ---
 # ==============================================================================
+# ==============================================================================
+# --- CORE ENGINE: FastBacktestEngine (State-Aware) ---
+# ==============================================================================
 class FastBacktestEngine:
     """
-    Statistically Rigorous Backtester (Optimized).
+    Statistically Rigorous Backtester with Correct State Initialization.
+    FIXED: Now pre-loads existing markets so we don't ignore active contracts.
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
@@ -1276,17 +1280,38 @@ class FastBacktestEngine:
         self.nlp_cache = nlp_cache
         self.precalc_priors = precalc_priors
         
-        # Ensure Profiler Data has timestamps
         if 'timestamp' not in self.profiler_data.columns:
             self.profiler_data['timestamp'] = pd.Timestamp.min
         
-        # Sort & Batch Events
+        # --- FIX 1: Build Market Lifecycle Index ---
+        # We need to know when every market starts and ends to pre-load them.
+        self.market_lifecycle = {}
         if not event_log.empty:
+            # Scan for NEW_CONTRACT and RESOLUTION events
+            new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
+            resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
+            
+            # Create a lookup: contract_id -> {start, end, liquidity}
+            for ts, row in new_contracts.iterrows():
+                data = row['data']
+                c_id = data['contract_id']
+                self.market_lifecycle[c_id] = {
+                    'start': ts,
+                    'end': pd.Timestamp.max, # Default to open forever
+                    'liquidity': data.get('liquidity', 10000.0)
+                }
+            
+            # Update end times
+            for ts, row in resolutions.iterrows():
+                c_id = row['data']['contract_id']
+                if c_id in self.market_lifecycle:
+                    self.market_lifecycle[c_id]['end'] = ts
+
+            # Sort & Batch Events for Replay
             if not isinstance(event_log.index, pd.DatetimeIndex):
                 event_log.index = pd.to_datetime(event_log.index)
             event_log = event_log.sort_index()
             
-            # Create Minute Batches for speed
             records = event_log.reset_index().to_dict('records')
             self.minute_batches = []
             from itertools import groupby
@@ -1296,7 +1321,8 @@ class FastBacktestEngine:
             self.minute_batches = []
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        if not self.minute_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0}
+        if not self.minute_batches: 
+            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         
         timestamps = [b[0]['timestamp'] for b in self.minute_batches]
         min_date, max_date = min(timestamps), max(timestamps)
@@ -1307,58 +1333,70 @@ class FastBacktestEngine:
         results = []
         current_date = min_date
         
-        # Walk-Forward Loop
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            # Slice Data (Batches)
             train_batch = [b for b in self.minute_batches if current_date <= b[0]['timestamp'] < train_end]
             test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
             
             if not test_batch: break
 
             # --- TRAIN PHASE ---
-            # 1. Calculate Wallet Scores
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
             ]
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
             
-            # 2. Correlation Matrix (No Look-Ahead)
             if not train_profiler.empty:
                 pivot = train_profiler.set_index('timestamp').groupby('market_id')['bet_price'].resample('1h').last().unstack()
                 fold_corr = pivot.ffill().corr().fillna(0.0)
             else:
                 fold_corr = pd.DataFrame()
 
-            # 3. Calibrate Fresh Wallet Model
             fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
             
             # --- TEST PHASE ---
-            fold_res = self._run_single_period(test_batch, fold_wallet_scores, fold_corr, config, fw_slope, fw_intercept)
+            # FIX: Pass 'train_end' (which is test_start) to initialize active markets
+            fold_res = self._run_single_period(
+                test_batch, fold_wallet_scores, fold_corr, 
+                config, fw_slope, fw_intercept, 
+                start_time=train_end # <--- NEW ARGUMENT
+            )
             results.append(fold_res)
             
             current_date += timedelta(days=test_days)
             
         return self._aggregate_fold_results(results)
 
-    def _run_single_period(self, batches, wallet_scores, price_corr, config, fw_slope, fw_intercept):
+    def _run_single_period(self, batches, wallet_scores, price_corr, config, fw_slope, fw_intercept, start_time):
         # Params
         splash_thresh = config.get('splash_threshold', 5.0)
         follow_size = config.get('follow_size', 100.0)
-        edge_thresh = config.get('edge_threshold', 0.05)
+        edge_thresh = config.get('edge_threshold', 0.02)
         
         cash = 10000.0
         positions = {} 
         pnl_history = [cash]
-        contracts = {} 
+        
+        # --- FIX 2: Pre-Load Active Contracts ---
+        # Initialize state with any market that is currently open
+        contracts = {}
+        smart_money_tracker = {}
         current_prices = {}
-        smart_money_tracker = {} # Tracks Log-Odds sums
+        
+        for c_id, lifecycle in self.market_lifecycle.items():
+            # If market started BEFORE now and ends AFTER now
+            if lifecycle['start'] < start_time and lifecycle['end'] > start_time:
+                contracts[c_id] = {
+                    'p_model': 0.5, # Reset model to neutral 
+                    'liquidity': lifecycle['liquidity']
+                }
+                smart_money_tracker[c_id] = {'w_logit_sum': 0.0, 'w_sum': 0.0}
+                current_prices[c_id] = 0.5 # Default until first tick updates it
         
         trade_count = 0
-        rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0}
         
         def logit(p): return np.log(p / (1.0 - p))
         def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
@@ -1366,7 +1404,6 @@ class FastBacktestEngine:
         for batch in batches:
             needs_rebalance = False
             
-            # 1. Process Events
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
@@ -1382,77 +1419,98 @@ class FastBacktestEngine:
                         current_prices[c_id] = data['p_market_all']
                         
                         w_id = data.get('wallet_id')
-                        trade_vol = data['trade_volume']
+                        trade_vol = data.get('trade_volume', 0.0)
+                        trade_p = data.get('trade_price', 0.5)
                         
-                        # Dynamic Brier Lookup
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
-                            # Use Regression for Fresh Wallets
-                            log_vol = np.log(trade_vol * data['trade_price'] + 1.0)
+                            log_vol = np.log(trade_vol * trade_p + 1.0)
                             brier = max(0.05, min(fw_intercept + (fw_slope * log_vol), 0.35))
                         
                         weight = trade_vol / (brier + 0.0001)
                         
-                        # Logarithmic Opinion Pool Update
-                        trade_p = min(max(data['trade_price'], 0.001), 0.999)
-                        trade_logit = logit(trade_p)
+                        trade_p_safe = min(max(trade_p, 0.001), 0.999)
+                        trade_logit = logit(trade_p_safe)
                         
                         tracker = smart_money_tracker[c_id]
                         tracker['w_logit_sum'] += trade_logit * weight
                         tracker['w_sum'] += weight
                         
-                        # Update Model Price if enough conviction
                         if tracker['w_sum'] > splash_thresh:
                             avg_logit = tracker['w_logit_sum'] / tracker['w_sum']
-                            # Add Noise (Logit-Normal)
-                            noisy_logit = avg_logit + np.random.normal(0, 0.05)
+                            # Low noise for testing
+                            noisy_logit = avg_logit + np.random.normal(0, 0.02) 
                             contracts[c_id]['p_model'] = sigmoid(noisy_logit)
                             needs_rebalance = True
 
                 elif ev_type == 'RESOLUTION':
                     if c_id in contracts:
                         if c_id in positions:
-                            frac, entry = positions.pop(c_id)
+                            # Simple resolution PnL
+                            pos = positions.pop(c_id)
                             outcome = float(data['outcome']) 
-                            bet_amt = abs(frac) # frac is actual $ amount here for simplicity? No, frac is fraction of kelly.
-                            # Let's simplify: 'positions' stores (number_of_shares, entry_price)
-                            # Actually, let's stick to the simple "Follow Strategy":
-                            # If we bet, we bet 'follow_size' USD.
-                            pass # Resolution handled in PnL step below
+                            
+                            # If Long (Side 1) and Outcome 1 -> Profit
+                            # If Short (Side -1) and Outcome 0 -> Profit
+                            payout_mult = 0.0
+                            if pos['side'] == 1: payout_mult = outcome
+                            else: payout_mult = 1.0 - outcome
+                            
+                            # Payout = Size / Entry * 1.0 (if win)
+                            # Simplified: We bought 'size' worth of tokens.
+                            # Tokens = Size / Entry. Value = Tokens * Outcome.
+                            tokens = pos['size'] / pos['entry']
+                            value = tokens * payout_mult
+                            cash += value
                         
                         if c_id in contracts: del contracts[c_id]
                         if c_id in smart_money_tracker: del smart_money_tracker[c_id]
                         if c_id in current_prices: del current_prices[c_id]
 
-            # 2. Execution Logic (Simple Follower for Tuning)
+            # Execution Logic
             if needs_rebalance:
                 for c_id, data in contracts.items():
                     M = data['p_model']
                     Q = current_prices.get(c_id, 0.5)
                     edge = M - Q
                     
-                    # USE DYNAMIC THRESHOLD
+                    # ENTRY
                     if abs(edge) > edge_thresh and c_id not in positions:
                         side = 1 if edge > 0 else -1
                         cost = follow_size
                         if cash >= cost:
                             cash -= cost
+                            # Record position: Side, Size (USD), Entry Price
                             positions[c_id] = {'side': side, 'size': cost, 'entry': Q}
                             trade_count += 1
                     
-                    # Exit (Take Profit / Stop Loss)
+                    # EXIT (Dynamic)
                     elif c_id in positions:
                         pos = positions[c_id]
-                        # If edge disappears or flips
+                        # Close if edge flips or disappears
                         if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
-                            cash += pos['size'] * (1 + (Q - pos['entry']) * pos['side']) # Simplified PnL
+                            # Sell at current price Q
+                            # Value = (Size / Entry) * Q  (if Long)
+                            # Value = (Size / (1-Entry)) * (1-Q) (if Short - approx)
+                            # Using simple linear approx for backtest speed:
+                            pnl_pct = (Q - pos['entry']) * pos['side']
+                            # Cap loss at -100%
+                            if pnl_pct < -1.0: pnl_pct = -1.0
+                            
+                            ret_val = pos['size'] * (1.0 + pnl_pct)
+                            cash += ret_val
                             del positions[c_id]
 
-            # 3. Mark to Market (Approximate)
-            nav = cash + sum([p['size'] for p in positions.values()])
-            pnl_history.append(nav)
+            # Mark to Market
+            curr_val = 0.0
+            for cid, pos in positions.items():
+                curr_p = current_prices.get(cid, pos['entry'])
+                pnl_pct = (curr_p - pos['entry']) * pos['side']
+                curr_val += pos['size'] * (1.0 + pnl_pct)
+            
+            pnl_history.append(cash + curr_val)
 
-        return self._calculate_metrics(pnl_history, trade_count, rejection_log)
+        return self._calculate_metrics(pnl_history, trade_count, {})
 
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
@@ -1483,7 +1541,7 @@ class FastBacktestEngine:
         pct_changes = np.diff(arr) / arr[:-1]
         mean_ret = np.mean(pct_changes)
         std_ret = np.std(pct_changes) + 1e-9
-        sharpe = (mean_ret / std_ret) * np.sqrt(8760) # Hourly to Annualized
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760 * 60) # Minute data -> Annualized
         
         peak = arr[0]
         max_dd = 0.0
