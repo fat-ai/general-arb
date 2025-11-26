@@ -1575,39 +1575,67 @@ class BacktestEngine:
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
-        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-             trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
-             trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+        # --- FIX 1: Timestamp Safety ---
+        trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
+        trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+
+        # --- FIX 2: User ID Normalization ---
+        def extract_wallet(val):
+            if isinstance(val, dict): return val.get('id')
+            return str(val)
         
         if 'user' in trades.columns:
-            trades['user'] = trades['user'].apply(lambda x: x.get('id') if isinstance(x, dict) else str(x))
+            trades['user'] = trades['user'].apply(extract_wallet)
 
+        # Filter Wash Trades
+        log.info("Filtering Wash Trades...")
+        # Use assignment instead of inplace to avoid potential SettingWithCopy warnings
         trades = trades.sort_values(['fpmm_address', 'user', 'timestamp'])
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
-        trades = trades[~((trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60))].copy()
         
+        trades['is_wash'] = (trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60)
+        trades = trades[~trades['is_wash']].drop(columns=['prev_user', 'time_delta', 'is_wash'])
+        
+        # Intersection
         common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
         markets = markets[markets['fpmm_address'].isin(common_ids)]
         trades = trades[trades['fpmm_address'].isin(common_ids)]
         
+        # Profiler Data
         prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
         prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
+        
         prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
         prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
         
         outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
-        prof_data = prof_data[prof_data['outcome'].isin([0, 1])]
+        
+        # Suspicious Resolutions Filter
+        trade_counts = trades.groupby('fpmm_address').size()
+        prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
+        suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 10)
+        prof_data = prof_data[~suspicious]
+        # Ensure outcome is strictly 0 or 1
+        prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
         prof_data['entity_type'] = 'default_topic'
         
+        # Create Events
         events = []
         for r in markets.to_dict('records'):
+            # --- FIX 3: Robust Liquidity Handling ---
+            # Handle case where key exists but value is None
+            liq = r.get('liquidity')
+            if liq is None: liq = 10000.0
+            
             events.append((r['created_at'], 'NEW_CONTRACT', {
                 'contract_id': r['fpmm_address'], 
-                'liquidity': float(r.get('liquidity', 10000.0))
+                'p_market_all': 0.5,
+                'liquidity': float(liq)
             }))
+            
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
                  events.append((r['resolution_timestamp'], 'RESOLUTION', {
                      'contract_id': r['fpmm_address'], 
@@ -1615,10 +1643,12 @@ class BacktestEngine:
                  }))
                  
         for r in trades.to_dict('records'):
+            price = r['bet_price'] if 'bet_price' in r else 0.5
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
+                'p_market_all': min(max(price, 0.01), 0.99),
                 'wallet_id': r['user'],
-                'trade_price': r['bet_price'],
+                'trade_price': price,
                 'trade_volume': float(r['tradeAmount'])/1e6
             }))
             
@@ -1626,7 +1656,6 @@ class BacktestEngine:
         df_ev = df_ev.set_index('timestamp').sort_index()
         
         return df_ev, prof_data
-
   
         
 # ==============================================================================
