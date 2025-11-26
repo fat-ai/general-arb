@@ -1302,14 +1302,23 @@ class BacktestEngine:
     """
     Orchestrator.
     FIXED:
-    1. Synchronized Data Fetching (Newest Markets + Newest Trades).
-    2. Robust Column Handling.
-    3. Debug Logging for Intersection.
+    1. Robust Column Handling (Prevents KeyError: 'outcome').
+    2. Deep Fetching (10k Markets, 100k Trades) to force intersection.
+    3. Aggressive Cache Clearing.
     """
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
         self.cache_dir = Path(self.historical_data_path) / "polymarket_cache"
+        
+        # --- CACHE NUKE: Force clean slate every run ---
+        if self.cache_dir.exists():
+            try:
+                shutil.rmtree(self.cache_dir)
+                print(f"⚠️ Cache cleared at {self.cache_dir}")
+            except Exception as e:
+                print(f"⚠️ Could not clear cache: {e}")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
@@ -1318,46 +1327,26 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-       
         log.info("--- Starting Production Tuning (Bayesian) ---")
         
-        # Load Data with diagnostics
         df_markets, df_trades = self._load_data()
         
-        # DIAGNOSTIC LOGGING
-        log.info(f"📊 Markets loaded: {len(df_markets)}")
-        log.info(f"📊 Trades loaded: {len(df_trades)}")
-        
         if df_markets.empty:
-            log.error("❌ CRITICAL: No markets data available. Cannot run tuning.")
-            log.error("Check if Gamma API returned valid closed markets with outcomes.")
+            log.error("❌ CRITICAL: No overlapping markets found. Cannot run tuning.")
             return None
             
-        if df_trades.empty:
-            log.error("❌ CRITICAL: No trades data available. Cannot run tuning.")
-            return None
+        log.info(f"✅ Data Loaded. Overlapping Markets: {len(df_markets)}")
         
-        log.info(f"✅ Data Loaded. Markets: {len(df_markets)}, Trades: {len(df_trades)}")
-        
-        # Transform and check again
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         
-        log.info(f"📊 Event log size: {len(event_log)}")
-        log.info(f"📊 Profiler data size: {len(profiler_data)}")
-        
-        if event_log.empty:
-            log.error("❌ Event log is empty after transformation!")
-            return None
-        
-        # Bayesian Search Space
         from ray.tune.search.hyperopt import HyperOptSearch
-
+        
         search_space = {
-        "splash_threshold": tune.choice([2.0, 5.0, 10.0]),
-        "follow_size": tune.choice([50.0, 100.0, 200.0]),
-        "train_days": tune.randint(30, 90),
-        "test_days": tune.randint(15, 45),
-        "seed": 42
+            "splash_threshold": tune.choice([2.0, 5.0, 10.0]),
+            "follow_size": tune.choice([50.0, 100.0, 200.0]),
+            "train_days": tune.randint(30, 90),
+            "test_days": tune.randint(15, 45),
+            "seed": 42
         }
         
         searcher = HyperOptSearch(metric="sharpe_ratio", mode="max", random_state_seed=42)
@@ -1374,7 +1363,7 @@ class BacktestEngine:
             num_samples=20,
             resources_per_trial={"cpu": 1},
         )
-    
+
         best_config = analysis.get_best_config(metric="sharpe_ratio", mode="max")
         
         if best_config:
@@ -1388,170 +1377,115 @@ class BacktestEngine:
             print("="*60 + "\n")
             
         return best_config
-    
+
     def _load_data(self):
-        log.info("🔄 Step 1: Fetching trades...")
         trades = self._fetch_subgraph_trades()
-        
-        log.info(f"   → Fetched {len(trades)} raw trade records")
-        
-        if trades.empty:
-            log.error("❌ Trades data is empty!")
+        if trades.empty: 
+            log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
-    
-        # Extract market_id
+
         if 'market' in trades.columns:
-            trades['market_id'] = trades['market'].apply(
-                lambda x: x.get('id') if isinstance(x, dict) else None
-            )
+            trades['market_id'] = trades['market'].apply(lambda x: x.get('id') if isinstance(x, dict) else None)
         
         if 'market_id' not in trades.columns:
-            log.error("❌ Trades missing 'market_id' column!")
+            log.error("Trades data missing 'market_id'.")
             return pd.DataFrame(), pd.DataFrame()
-        
+                
         trades['fpmm_address'] = trades['market_id'].str.lower()
         trades = trades.dropna(subset=['fpmm_address'])
         
         valid_ids = set(trades['fpmm_address'])
-        log.info(f"   → {len(valid_ids)} unique markets found in trades")
+        print(f"DEBUG: Found {len(valid_ids)} unique markets in trades.")
         
-        log.info("🔄 Step 2: Fetching markets...")
         markets = self._fetch_gamma_markets()
-        
-        log.info(f"   → Fetched {len(markets)} market records")
-        
-        if markets.empty:
-            log.error("❌ Markets data is empty!")
+        if markets.empty: 
+            log.error("Markets data is empty.")
             return pd.DataFrame(), trades
-        
+            
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
-        # Show sample IDs for debugging
-        if len(markets) > 0:
-            log.info(f"   → Sample market IDs: {list(markets['fpmm_address'].head(3))}")
-        if len(trades) > 0:
-            log.info(f"   → Sample trade IDs: {list(trades['fpmm_address'].head(3))}")
-        
-        # Intersection
-        log.info("🔄 Step 3: Finding intersection...")
+        # Intersection Logic
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
-        log.info(f"   ✅ Intersection: {len(markets)} markets match trades")
-        
-        if markets.empty:
-            log.error("❌ ZERO markets after intersection!")
-            log.error("   This means no closed markets from Gamma overlap with recent trades from Goldsky")
-            log.error("   Possible causes:")
-            log.error("   1. Time window mismatch (fetching old trades vs new markets)")
-            log.error("   2. Market ID format mismatch")
-            log.error("   3. Not enough closed markets with outcomes")
+        print(f"DEBUG: Intersection complete. {len(markets)} markets remain after matching with trades.")
         
         return markets, trades
 
-    def diagnose_data(self):
-        """Run this to understand what data you're getting"""
-        print("\n" + "="*60)
-        print("🔍 DATA DIAGNOSTIC REPORT")
-        print("="*60)
+    def _fetch_gamma_markets(self):
+        cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
+        if cache_file.exists(): return pd.read_parquet(cache_file)
+
+        all_rows = []
+        limit, offset = 1000, 0
+        print("Fetching Markets (Closed, Newest First)", end="")
+        while True:
+            try:
+                # Closed markets, sorted by End Date (Newest first)
+                params = {
+                    "limit": limit, 
+                    "offset": offset, 
+                    "closed": "true",
+                    "order": "endDate",     
+                    "ascending": "false"
+                }
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", 
+                                      params=params, timeout=10)
+                if resp.status_code != 200: break
+                rows = resp.json()
+                if not rows: break
+                all_rows.extend(rows)
+                offset += limit
+                if offset % 1000 == 0: print(".", end="", flush=True)
+                # Fetch 10k markets to ensure we hit the window of the trades
+                if offset >= 10000: break
+            except: break
+        print(" Done.")
         
-        trades = self._fetch_subgraph_trades()
-        print(f"\n📦 TRADES:")
-        print(f"   Total records: {len(trades)}")
-        if not trades.empty:
-            print(f"   Columns: {list(trades.columns)}")
-            print(f"   Date range: {trades['timestamp'].min()} to {trades['timestamp'].max()}")
-            if 'market' in trades.columns:
-                sample_market = trades.iloc[0]['market']
-                print(f"   Sample market field: {sample_market}")
+        if not all_rows: return pd.DataFrame()
         
-        markets = self._fetch_gamma_markets()
-        print(f"\n📦 MARKETS:")
-        print(f"   Total records: {len(markets)}")
-        if not markets.empty:
-            print(f"   Columns: {list(markets.columns)}")
-            print(f"   Markets with outcomes: {markets['outcome'].notna().sum()}")
-            print(f"   Outcome values: {markets['outcome'].value_counts()}")
-            if 'resolution_timestamp' in markets.columns:
-                print(f"   Resolution range: {markets['resolution_timestamp'].min()} to {markets['resolution_timestamp'].max()}")
+        df = pd.DataFrame(all_rows)
         
-        print("="*60 + "\n")
+        rename_map = {
+            'marketMakerAddress': 'fpmm_address', 
+            'question': 'question', 
+            'endDate': 'resolution_timestamp', 
+            'outcome': 'outcome', 
+            'createdAt': 'created_at',
+            'liquidity': 'liquidity' 
+        }
+        df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        def _fetch_gamma_markets(self):
-            cache_file = self.cache_dir / f"gamma_markets_strict.parquet"
-            # Force fresh fetch if previous run failed/was empty
-            if cache_file.exists():
-                try:
-                    df = pd.read_parquet(cache_file)
-                    if not df.empty: return df
-                except: pass
-    
-            all_rows = []
-            limit, offset = 1000, 0
-            print("Fetching Markets (Closed, Newest First)", end="")
-            while True:
-                try:
-                    # FIX: Added 'order' and 'ascending' to align with recent trades
-                    params = {
-                        "limit": limit, 
-                        "offset": offset, 
-                        "closed": "true",
-                        "order": "endDate",     # Sort by resolution date
-                        "ascending": "false"    # Newest first
-                    }
-                    resp = self.session.get("https://gamma-api.polymarket.com/markets", 
-                                          params=params, timeout=10)
-                    if resp.status_code != 200: break
-                    rows = resp.json()
-                    if not rows: break
-                    all_rows.extend(rows)
-                    offset += limit
-                    if offset % 1000 == 0: print(".", end="", flush=True)
-                    # Fetch more markets to increase intersection chance
-                    if offset > 10000: break
-                except: break
-            print(" Done.")
+        # --- CRITICAL FIX: SAFETY NET FOR MISSING COLUMNS ---
+        # If 'outcome' (or any other key) is missing from the API response, 
+        # this loop creates it with NaN values so the script DOES NOT CRASH.
+        expected_cols = ['fpmm_address', 'outcome', 'resolution_timestamp', 'created_at', 'liquidity']
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = pd.NA
+        # ----------------------------------------------------
             
-            if not all_rows: return pd.DataFrame()
+        df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
+        df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(0.0)
             
-            df = pd.DataFrame(all_rows)
-            
-            rename_map = {
-                'marketMakerAddress': 'fpmm_address', 
-                'question': 'question', 
-                'endDate': 'resolution_timestamp', 
-                'outcome': 'outcome', 
-                'createdAt': 'created_at',
-                'liquidity': 'liquidity' 
-            }
-            df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-            
-            # Safe Column Creation
-            for col in ['outcome', 'resolution_timestamp', 'created_at', 'fpmm_address']:
-                if col not in df.columns: df[col] = pd.NA
-                
-            df['outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
-            if 'liquidity' in df.columns:
-                df['liquidity'] = pd.to_numeric(df['liquidity'], errors='coerce').fillna(0.0)
-                
-            df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-            df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
-            
-            df = df.dropna(subset=['fpmm_address', 'outcome'])
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce').dt.tz_localize(None)
+        
+        # Filter unusable rows
+        df = df.dropna(subset=['fpmm_address', 'outcome'])
+        
+        if not df.empty:
             df.to_parquet(cache_file)
-            return df
+        return df
 
     def _fetch_subgraph_trades(self):
         cache_file = self.cache_dir / f"subgraph_trades.pkl"
-        # Force fresh fetch if previous run was empty
         if cache_file.exists(): 
             try:
-                df = pickle.load(open(cache_file, "rb"))
-                if not df.empty: return df
+                return pickle.load(open(cache_file, "rb"))
             except: pass
             
         url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
         
-        # FIX: Descending Sort + Timestamp paging
         query_template = """
         {{
           fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
@@ -1579,7 +1513,8 @@ class BacktestEngine:
                 time_cursor = data[-1]['timestamp']
                 
                 if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
-                if len(all_rows) >= 50000: break
+                # Fetch 100k trades to force overlap with closed markets
+                if len(all_rows) >= 100000: break
             except: break
         print(" Done.")
             
@@ -1588,30 +1523,53 @@ class BacktestEngine:
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
 
+    def diagnose_data(self):
+    """Run this to understand what data you're getting"""
+    print("\n" + "="*60)
+    print("🔍 DATA DIAGNOSTIC REPORT")
+    print("="*60)
+    
+    trades = self._fetch_subgraph_trades()
+    print(f"\n📦 TRADES:")
+    print(f"   Total records: {len(trades)}")
+    if not trades.empty:
+        print(f"   Columns: {list(trades.columns)}")
+        print(f"   Date range: {trades['timestamp'].min()} to {trades['timestamp'].max()}")
+        if 'market' in trades.columns:
+            sample_market = trades.iloc[0]['market']
+            print(f"   Sample market field: {sample_market}")
+    
+    markets = self._fetch_gamma_markets()
+    print(f"\n📦 MARKETS:")
+    print(f"   Total records: {len(markets)}")
+    if not markets.empty:
+        print(f"   Columns: {list(markets.columns)}")
+        print(f"   Markets with outcomes: {markets['outcome'].notna().sum()}")
+        print(f"   Outcome values: {markets['outcome'].value_counts()}")
+        if 'resolution_timestamp' in markets.columns:
+            print(f"   Resolution range: {markets['resolution_timestamp'].min()} to {markets['resolution_timestamp'].max()}")
+    
+    print("="*60 + "\n")
+    
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
-        # Ensure timestamp is datetime
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
              trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
              trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
         
-        # Extract Wallet ID
         if 'user' in trades.columns:
             trades['user'] = trades['user'].apply(lambda x: x.get('id') if isinstance(x, dict) else str(x))
 
-        # Filter Wash Trades
         trades = trades.sort_values(['fpmm_address', 'user', 'timestamp'])
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
         trades = trades[~((trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60))].copy()
         
-        # Intersection Check
         common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
         markets = markets[markets['fpmm_address'].isin(common_ids)]
         trades = trades[trades['fpmm_address'].isin(common_ids)]
         
-        # Create Profiler Data
         prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
         prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
         prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
@@ -1623,7 +1581,6 @@ class BacktestEngine:
         prof_data = prof_data[prof_data['outcome'].isin([0, 1])]
         prof_data['entity_type'] = 'default_topic'
         
-        # Create Events
         events = []
         for r in markets.to_dict('records'):
             events.append((r['created_at'], 'NEW_CONTRACT', {
@@ -1648,6 +1605,8 @@ class BacktestEngine:
         df_ev = df_ev.set_index('timestamp').sort_index()
         
         return df_ev, prof_data
+
+  
         
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
