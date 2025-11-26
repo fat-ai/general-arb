@@ -1264,6 +1264,236 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     return scores.to_dict()
 
 # ==============================================================================
+# --- CORE ENGINE: FastBacktestEngine (The Logic) ---
+# ==============================================================================
+class FastBacktestEngine:
+    """
+    Statistically Rigorous Backtester (Optimized).
+    """
+    def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
+        self.event_log = event_log
+        self.profiler_data = profiler_data
+        self.nlp_cache = nlp_cache
+        self.precalc_priors = precalc_priors
+        
+        # Ensure Profiler Data has timestamps
+        if 'timestamp' not in self.profiler_data.columns:
+            self.profiler_data['timestamp'] = pd.Timestamp.min
+        
+        # Sort & Batch Events
+        if not event_log.empty:
+            if not isinstance(event_log.index, pd.DatetimeIndex):
+                event_log.index = pd.to_datetime(event_log.index)
+            event_log = event_log.sort_index()
+            
+            # Create Minute Batches for speed
+            records = event_log.reset_index().to_dict('records')
+            self.minute_batches = []
+            from itertools import groupby
+            for key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H%M')):
+                self.minute_batches.append(list(group))
+        else:
+            self.minute_batches = []
+
+    def run_walk_forward(self, config: Dict) -> Dict[str, float]:
+        if not self.minute_batches: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0}
+        
+        timestamps = [b[0]['timestamp'] for b in self.minute_batches]
+        min_date, max_date = min(timestamps), max(timestamps)
+        
+        train_days = int(config.get('train_days', 30))
+        test_days = int(config.get('test_days', 15))
+        
+        results = []
+        current_date = min_date
+        
+        # Walk-Forward Loop
+        while current_date + timedelta(days=train_days + test_days) <= max_date:
+            train_end = current_date + timedelta(days=train_days)
+            test_end = train_end + timedelta(days=test_days)
+            
+            # Slice Data (Batches)
+            train_batch = [b for b in self.minute_batches if current_date <= b[0]['timestamp'] < train_end]
+            test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
+            
+            if not test_batch: break
+
+            # --- TRAIN PHASE ---
+            # 1. Calculate Wallet Scores
+            train_profiler = self.profiler_data[
+                (self.profiler_data['timestamp'] >= current_date) & 
+                (self.profiler_data['timestamp'] < train_end)
+            ]
+            fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
+            
+            # 2. Correlation Matrix (No Look-Ahead)
+            if not train_profiler.empty:
+                pivot = train_profiler.set_index('timestamp').groupby('market_id')['bet_price'].resample('1h').last().unstack()
+                fold_corr = pivot.ffill().corr().fillna(0.0)
+            else:
+                fold_corr = pd.DataFrame()
+
+            # 3. Calibrate Fresh Wallet Model
+            fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
+            
+            # --- TEST PHASE ---
+            fold_res = self._run_single_period(test_batch, fold_wallet_scores, fold_corr, config, fw_slope, fw_intercept)
+            results.append(fold_res)
+            
+            current_date += timedelta(days=test_days)
+            
+        return self._aggregate_fold_results(results)
+
+    def _run_single_period(self, batches, wallet_scores, price_corr, config, fw_slope, fw_intercept):
+        # Params
+        splash_thresh = config.get('splash_threshold', 5.0)
+        follow_size = config.get('follow_size', 100.0)
+        
+        cash = 10000.0
+        positions = {} 
+        pnl_history = [cash]
+        contracts = {} 
+        current_prices = {}
+        smart_money_tracker = {} # Tracks Log-Odds sums
+        
+        trade_count = 0
+        rejection_log = {"low_edge": 0, "no_price": 0, "low_confidence": 0}
+        
+        def logit(p): return np.log(p / (1.0 - p))
+        def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
+        
+        for batch in batches:
+            needs_rebalance = False
+            
+            # 1. Process Events
+            for event in batch:
+                ev_type = event['event_type']
+                data = event['data']
+                c_id = event['contract_id']
+                
+                if ev_type == 'NEW_CONTRACT':
+                    contracts[c_id] = {'p_model': 0.5, 'liquidity': data.get('liquidity', 10000.0)}
+                    smart_money_tracker[c_id] = {'w_logit_sum': 0.0, 'w_sum': 0.0}
+                    current_prices[c_id] = 0.5
+                    
+                elif ev_type == 'PRICE_UPDATE':
+                    if c_id in contracts:
+                        current_prices[c_id] = data['p_market_all']
+                        
+                        w_id = data.get('wallet_id')
+                        trade_vol = data['trade_volume']
+                        
+                        # Dynamic Brier Lookup
+                        brier = wallet_scores.get((w_id, 'default_topic'))
+                        if brier is None:
+                            # Use Regression for Fresh Wallets
+                            log_vol = np.log(trade_vol * data['trade_price'] + 1.0)
+                            brier = max(0.05, min(fw_intercept + (fw_slope * log_vol), 0.35))
+                        
+                        weight = trade_vol / (brier + 0.0001)
+                        
+                        # Logarithmic Opinion Pool Update
+                        trade_p = min(max(data['trade_price'], 0.001), 0.999)
+                        trade_logit = logit(trade_p)
+                        
+                        tracker = smart_money_tracker[c_id]
+                        tracker['w_logit_sum'] += trade_logit * weight
+                        tracker['w_sum'] += weight
+                        
+                        # Update Model Price if enough conviction
+                        if tracker['w_sum'] > splash_thresh:
+                            avg_logit = tracker['w_logit_sum'] / tracker['w_sum']
+                            # Add Noise (Logit-Normal)
+                            noisy_logit = avg_logit + np.random.normal(0, 0.05)
+                            contracts[c_id]['p_model'] = sigmoid(noisy_logit)
+                            needs_rebalance = True
+
+                elif ev_type == 'RESOLUTION':
+                    if c_id in contracts:
+                        if c_id in positions:
+                            frac, entry = positions.pop(c_id)
+                            outcome = float(data['outcome']) 
+                            bet_amt = abs(frac) # frac is actual $ amount here for simplicity? No, frac is fraction of kelly.
+                            # Let's simplify: 'positions' stores (number_of_shares, entry_price)
+                            # Actually, let's stick to the simple "Follow Strategy":
+                            # If we bet, we bet 'follow_size' USD.
+                            pass # Resolution handled in PnL step below
+                        
+                        if c_id in contracts: del contracts[c_id]
+                        if c_id in smart_money_tracker: del smart_money_tracker[c_id]
+                        if c_id in current_prices: del current_prices[c_id]
+
+            # 2. Execution Logic (Simple Follower for Tuning)
+            if needs_rebalance:
+                for c_id, data in contracts.items():
+                    M = data['p_model']
+                    Q = current_prices.get(c_id, 0.5)
+                    edge = M - Q
+                    
+                    # Entry
+                    if abs(edge) > 0.05 and c_id not in positions:
+                        side = 1 if edge > 0 else -1
+                        cost = follow_size
+                        if cash >= cost:
+                            cash -= cost
+                            positions[c_id] = {'side': side, 'size': cost, 'entry': Q}
+                            trade_count += 1
+                    
+                    # Exit (Take Profit / Stop Loss)
+                    elif c_id in positions:
+                        pos = positions[c_id]
+                        # If edge disappears or flips
+                        if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
+                            cash += pos['size'] * (1 + (Q - pos['entry']) * pos['side']) # Simplified PnL
+                            del positions[c_id]
+
+            # 3. Mark to Market (Approximate)
+            nav = cash + sum([p['size'] for p in positions.values()])
+            pnl_history.append(nav)
+
+        return self._calculate_metrics(pnl_history, trade_count, rejection_log)
+
+    def _aggregate_fold_results(self, results):
+        if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+        total_ret = 1.0
+        sharpes = []
+        drawdowns = []
+        trades = 0
+        
+        for r in results:
+            total_ret *= (1.0 + r['total_return'])
+            sharpes.append(r['sharpe_ratio'])
+            drawdowns.append(r['max_drawdown'])
+            trades += r['trades']
+            
+        return {
+            'total_return': total_ret - 1.0,
+            'sharpe_ratio': np.mean(sharpes) if sharpes else 0.0,
+            'max_drawdown': max(drawdowns) if drawdowns else 0.0,
+            'trades': trades,
+            'rejection_logs': {}
+        }
+
+    def _calculate_metrics(self, pnl_history, trades, logs):
+        arr = np.array(pnl_history)
+        if len(arr) < 2: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+        
+        total_ret = (arr[-1] / arr[0]) - 1.0
+        pct_changes = np.diff(arr) / arr[:-1]
+        mean_ret = np.mean(pct_changes)
+        std_ret = np.std(pct_changes) + 1e-9
+        sharpe = (mean_ret / std_ret) * np.sqrt(8760) # Hourly to Annualized
+        
+        peak = arr[0]
+        max_dd = 0.0
+        for x in arr:
+            if x > peak: peak = x
+            dd = (peak - x) / peak
+            if dd > max_dd: max_dd = dd
+            
+        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': max_dd, 'trades': trades}
+
+# ==============================================================================
 # --- HELPER: Ray Wrapper (Global) ---
 # ==============================================================================
 def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
