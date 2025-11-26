@@ -1524,32 +1524,32 @@ class BacktestEngine:
         return df
 
     def diagnose_data(self):
-    """Run this to understand what data you're getting"""
-    print("\n" + "="*60)
-    print("🔍 DATA DIAGNOSTIC REPORT")
-    print("="*60)
-    
-    trades = self._fetch_subgraph_trades()
-    print(f"\n📦 TRADES:")
-    print(f"   Total records: {len(trades)}")
-    if not trades.empty:
-        print(f"   Columns: {list(trades.columns)}")
-        print(f"   Date range: {trades['timestamp'].min()} to {trades['timestamp'].max()}")
-        if 'market' in trades.columns:
-            sample_market = trades.iloc[0]['market']
-            print(f"   Sample market field: {sample_market}")
-    
-    markets = self._fetch_gamma_markets()
-    print(f"\n📦 MARKETS:")
-    print(f"   Total records: {len(markets)}")
-    if not markets.empty:
-        print(f"   Columns: {list(markets.columns)}")
-        print(f"   Markets with outcomes: {markets['outcome'].notna().sum()}")
-        print(f"   Outcome values: {markets['outcome'].value_counts()}")
-        if 'resolution_timestamp' in markets.columns:
-            print(f"   Resolution range: {markets['resolution_timestamp'].min()} to {markets['resolution_timestamp'].max()}")
-    
-    print("="*60 + "\n")
+        """Run this to understand what data you're getting"""
+        print("\n" + "="*60)
+        print("🔍 DATA DIAGNOSTIC REPORT")
+        print("="*60)
+        
+        trades = self._fetch_subgraph_trades()
+        print(f"\n📦 TRADES:")
+        print(f"   Total records: {len(trades)}")
+        if not trades.empty:
+            print(f"   Columns: {list(trades.columns)}")
+            print(f"   Date range: {trades['timestamp'].min()} to {trades['timestamp'].max()}")
+            if 'market' in trades.columns:
+                sample_market = trades.iloc[0]['market']
+                print(f"   Sample market field: {sample_market}")
+        
+        markets = self._fetch_gamma_markets()
+        print(f"\n📦 MARKETS:")
+        print(f"   Total records: {len(markets)}")
+        if not markets.empty:
+            print(f"   Columns: {list(markets.columns)}")
+            print(f"   Markets with outcomes: {markets['outcome'].notna().sum()}")
+            print(f"   Outcome values: {markets['outcome'].value_counts()}")
+            if 'resolution_timestamp' in markets.columns:
+                print(f"   Resolution range: {markets['resolution_timestamp'].min()} to {markets['resolution_timestamp'].max()}")
+        
+        print("="*60 + "\n")
     
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
