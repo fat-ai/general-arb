@@ -1412,7 +1412,7 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        cache_file = self.cache_dir / "gamma_markets_legacy.parquet"
+        cache_file = self.cache_dir / "gamma_markets_legacy_v2.parquet"
         if cache_file.exists():
             try:
                 df = pd.read_parquet(cache_file)
@@ -1425,25 +1425,20 @@ class BacktestEngine:
         
         while True:
             try:
-                # FIX: Fetch OLDER markets to match the Legacy Subgraph trades
+                # Fetch OLDER markets to match the Legacy Subgraph trades
                 params = {
-                    "limit": 1000, 
-                    "offset": offset, 
-                    "closed": "true",
-                    "order": "endDate", 
-                    "ascending": "true"  # <--- CRITICAL CHANGE: Oldest first
+                    "limit": 1000, "offset": offset, 
+                    "closed": "true", "order": "endDate", "ascending": "true" 
                 }
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
                 if not rows: break
-                
                 all_rows.extend(rows)
+                
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                
-                # Fetch deeper history to maximize overlap
                 if offset >= 20000: break 
             except: break
         print(" Done.")
@@ -1452,27 +1447,22 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # 1. Map 'marketMakerAddress' (The Key for AMM Markets)
+        # 1. Map 'marketMakerAddress'
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
         else:
-            # If completely missing, these are likely pure CLOB markets and won't match anyway
-            print("⚠️ 'marketMakerAddress' missing. These may be CLOB markets incompatible with legacy trades.")
+            print("⚠️ 'marketMakerAddress' missing. Skipping batch.")
             return pd.DataFrame()
 
-        # 2. Derive Outcome (Required for Gamma API)
+        # 2. Derive Outcome
         def derive_outcome(row):
             try:
-                # Gamma API returns 'outcomePrices' as a list of strings: ["0", "1"] or ["1", "0"]
-                # The winner is the one with price "1" (or close to it)
                 prices = row.get('outcomePrices')
                 if isinstance(prices, str): import json; prices = json.loads(prices)
-                
                 if not isinstance(prices, list) or len(prices) != 2: return pd.NA
-                
                 p0, p1 = float(prices[0]), float(prices[1])
-                if p0 > 0.95: return 0 # Outcome 0 won
-                if p1 > 0.95: return 1 # Outcome 1 won
+                if p0 > 0.95: return 0 
+                if p1 > 0.95: return 1 
                 return pd.NA
             except: return pd.NA
 
@@ -1482,15 +1472,16 @@ class BacktestEngine:
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        required_cols = ['fpmm_address', 'resolution_timestamp', 'outcome']
+        required_cols = ['fpmm_address', 'resolution_timestamp', 'created_at', 'outcome']
         for c in required_cols: 
             if c not in df.columns: df[c] = pd.NA
             
         df = df.dropna(subset=required_cols)
         
-        # 4. Final Polish
+        # 4. Final Polish (FIXED: Added created_at conversion)
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None) # <--- THE MISSING LINE
         
         if not df.empty:
             df.to_parquet(cache_file)
@@ -1575,11 +1566,9 @@ class BacktestEngine:
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
-        # --- FIX 1: Timestamp Safety ---
         trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
 
-        # --- FIX 2: User ID Normalization ---
         def extract_wallet(val):
             if isinstance(val, dict): return val.get('id')
             return str(val)
@@ -1587,9 +1576,7 @@ class BacktestEngine:
         if 'user' in trades.columns:
             trades['user'] = trades['user'].apply(extract_wallet)
 
-        # Filter Wash Trades
         log.info("Filtering Wash Trades...")
-        # Use assignment instead of inplace to avoid potential SettingWithCopy warnings
         trades = trades.sort_values(['fpmm_address', 'user', 'timestamp'])
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
@@ -1597,12 +1584,10 @@ class BacktestEngine:
         trades['is_wash'] = (trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60)
         trades = trades[~trades['is_wash']].drop(columns=['prev_user', 'time_delta', 'is_wash'])
         
-        # Intersection
         common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
         markets = markets[markets['fpmm_address'].isin(common_ids)]
         trades = trades[trades['fpmm_address'].isin(common_ids)]
         
-        # Profiler Data
         prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
         prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
         
@@ -1613,23 +1598,19 @@ class BacktestEngine:
         outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
-        # Suspicious Resolutions Filter
         trade_counts = trades.groupby('fpmm_address').size()
         prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
         suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 10)
         prof_data = prof_data[~suspicious]
-        # Ensure outcome is strictly 0 or 1
         prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
         prof_data['entity_type'] = 'default_topic'
         
-        # Create Events
         events = []
         for r in markets.to_dict('records'):
-            # --- FIX 3: Robust Liquidity Handling ---
-            # Handle case where key exists but value is None
             liq = r.get('liquidity')
             if liq is None: liq = 10000.0
             
+            # Ensure these are native timestamps or strings, wrapper below will handle them
             events.append((r['created_at'], 'NEW_CONTRACT', {
                 'contract_id': r['fpmm_address'], 
                 'p_market_all': 0.5,
@@ -1652,8 +1633,15 @@ class BacktestEngine:
                 'trade_volume': float(r['tradeAmount'])/1e6
             }))
             
-        df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data']).dropna(subset=['timestamp'])
-        df_ev = df_ev.set_index('timestamp').sort_index()
+        df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        
+        # --- FIX: THE SAFETY NET ---
+        # Force conversion of the entire timestamp column to Datetime objects.
+        # errors='coerce' turns bad strings into NaT, preventing crashes.
+        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
+        
+        # Drop rows with invalid timestamps (NaT) and sort
+        df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         return df_ev, prof_data
   
