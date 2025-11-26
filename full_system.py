@@ -1478,10 +1478,12 @@ class BacktestEngine:
             
         df = df.dropna(subset=required_cols)
         
-        # 4. Final Polish (FIXED: Added created_at conversion)
+        # 4. Final Polish (FIXED: Robust Date Parsing)
         df['outcome'] = pd.to_numeric(df['outcome'])
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None) # <--- THE MISSING LINE
+        
+        # FIX: Use 'mixed' format and force UTC to handle inconsistent API strings
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
         
         if not df.empty:
             df.to_parquet(cache_file)
