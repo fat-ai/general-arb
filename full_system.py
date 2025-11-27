@@ -1664,7 +1664,7 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets (Resolved in Last 6 Months)
+        # 1. Fetch ALL Markets (Resolved in Last 6 Months)
         markets = self._fetch_gamma_markets(days_back=180)
         if markets.empty: 
             log.error("No markets found in window.")
@@ -1672,26 +1672,21 @@ class BacktestEngine:
         
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
-        # 2. Filter for Active Markets (Fix: Use 'volumeNum' instead of 'volume')
-        # We filter out markets with 0 volume to avoid wasting API calls
-        if 'volumeNum' in markets.columns:
-            active_mask = markets['volumeNum'] > 0
-        else:
-            # Fallback: clean the string column
-            vol_clean = pd.to_numeric(markets['volume'], errors='coerce').fillna(0)
-            active_mask = vol_clean > 0
-            
-        active_markets = markets[active_mask]['fpmm_address'].unique()
+        # 2. Fetch Trades for ALL markets (No Filtering)
+        # User requested "ALL trades and ALL markets". 
+        # We explicitly grab the unique IDs from the fetched market list.
+        active_markets = markets['fpmm_address'].unique()
         
-        print(f"DEBUG: Fetching CLOB trades for {len(active_markets)} active markets (filtered from {len(markets)})...")
+        print(f"DEBUG: Fetching CLOB trades for ALL {len(active_markets)} markets (This may take time)...")
         
-        # 3. Fetch Trades
+        # Fetch
         trades = self._fetch_gamma_trades_parallel(list(active_markets))
         
         if trades.empty:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
+        # 3. Final Intersection (Ensure integrity)
         valid_ids = set(trades['fpmm_address'])
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
@@ -1789,38 +1784,33 @@ class BacktestEngine:
     def _fetch_gamma_trades_parallel(self, market_ids):
         """
         Fetches trades for a list of markets using ThreadPool.
-        FIXES: 
-        1. Manually injects 'fpmm_address' (Market ID) into rows.
-        2. robustly parses mixed timestamp formats.
+        Robust against missing columns ('size', 'price') and mixed date formats.
         """
         import concurrent.futures 
         
-        cache_file = self.cache_dir / "gamma_trades_clob_recent.pkl"
-        # Skip cache to force fresh fetch with fixes
+        cache_file = self.cache_dir / "gamma_trades_clob_full.pkl"
+        # Skip cache to ensure fresh data fetch
         
         all_trades = []
         print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
         
-        # Use 10 workers to be safe with rate limits
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Map future -> market_id so we can inject it back
-            future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
+        # Increased workers slightly for larger batch, but keeping safe for API limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+            future_to_id = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
             completed = 0
-            for future in concurrent.futures.as_completed(future_to_mid):
-                mid = future_to_mid[future]
+            for future in concurrent.futures.as_completed(future_to_id):
+                mid = future_to_id[future]
                 data = future.result()
                 
                 if data and isinstance(data, list):
-                    # CRITICAL FIX: Inject the Market ID into every trade record
-                    # The API doesn't return it, so we must add it here.
+                    # Inject Market ID immediately to prevent data loss
                     for row in data:
                         row['fpmm_address'] = mid
-                    
                     all_trades.extend(data)
                     
                 completed += 1
-                if completed % 50 == 0: print(".", end="", flush=True)
+                if completed % 100 == 0: print(".", end="", flush=True)
                 
         print(" Done.")
         
@@ -1828,64 +1818,64 @@ class BacktestEngine:
         
         df = pd.DataFrame(all_trades)
         
-        # --- SCHEMA NORMALIZATION ---
+        # --- DEFENSIVE SCHEMA NORMALIZATION ---
         
-        # 1. Timestamp (Robust Fix)
-        # Check likely columns
-        ts_col = None
-        if 'timestamp' in df.columns: ts_col = 'timestamp'
-        elif 'time' in df.columns: ts_col = 'time'
-        elif 'createdAt' in df.columns: ts_col = 'createdAt'
+        # 1. Ensure Critical Columns Exist (Fill with 0/Null if missing to prevent KeyError)
+        expected_cols = ['size', 'price', 'side', 'timestamp', 'time', 'createdAt']
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = None # Initialize if missing
         
-        if ts_col:
-            # Coerce to datetime with mixed format support
-            df['timestamp'] = pd.to_datetime(df[ts_col], format='mixed', utc=True, errors='coerce')
-            # Remove timezone for compatibility
-            if df['timestamp'].dt.tz is not None:
-                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-        else:
-            log.error("Trades missing timestamp column. Dropping batch.")
-            return pd.DataFrame()
-
-        # 2. User
+        # 2. Timestamp Parsing
+        # Prioritize 'timestamp' -> 'time' -> 'createdAt'
+        # Use 'combine_first' to coalesce columns
+        df['final_ts'] = df['timestamp'].combine_first(df['time']).combine_first(df['createdAt'])
+        
+        # Robust datetime conversion
+        df['timestamp'] = pd.to_datetime(df['final_ts'], format='mixed', utc=True, errors='coerce')
+        # Strip timezone
+        if df['timestamp'].dt.tz is not None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+            
+        # 3. User (Taker/Maker)
         if 'taker_address' in df.columns:
             df['user'] = df['taker_address']
         elif 'taker' in df.columns:
             df['user'] = df['taker']
         else:
             df['user'] = 'unknown'
-        
-        # 3. Market ID (Ensure lowercase)
+            
+        # 4. Market ID (Sanitize)
         if 'fpmm_address' in df.columns:
-            df['fpmm_address'] = df['fpmm_address'].str.lower()
+            df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
         else:
-            # Should not happen due to injection above
-            return pd.DataFrame()
-        
-        # 4. Amounts
+            return pd.DataFrame() # Should not happen due to injection
+            
+        # 5. Numeric Conversion (Size/Price)
         df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
         df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         
+        # 6. Calculation
         # USD Volume
         df['tradeAmount'] = df['size'] * df['price'] * 1e6 
         
-        # Outcome Tokens (+/-)
-        if 'side' in df.columns:
-            df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
-        else:
-            df['side_mult'] = 1
-            
+        # Outcome Tokens
+        df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
         df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
         
-        # Final Columns
+        # 7. Final Filter
         final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
+        
+        # Ensure output columns exist
         for c in final_cols:
-            if c not in df.columns: df[c] = None
+            if c not in df.columns: df[c] = 0
             
-        df = df[final_cols].dropna(subset=['timestamp', 'fpmm_address'])
+        # Drop rows where timestamp failed to parse
+        df = df[final_cols].dropna(subset=['timestamp'])
         
         with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
+        
     def _fetch_subgraph_trades(self, days_back=200):
         import time
         
