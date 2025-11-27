@@ -1698,7 +1698,7 @@ class BacktestEngine:
         return markets, trades
 
     def _fetch_gamma_markets(self):
-        cache_file = self.cache_dir / "gamma_markets_legacy_v2.parquet"
+        cache_file = self.cache_dir / "gamma_markets_newest.parquet"
         if cache_file.exists():
             try:
                 df = pd.read_parquet(cache_file)
@@ -1707,14 +1707,14 @@ class BacktestEngine:
 
         all_rows = []
         offset = 0
-        print("Fetching Legacy Markets (Oldest First)", end="")
+        print("Fetching Markets (Newest First)...", end="")
         
         while True:
             try:
-                # Fetch OLDER markets to match the Legacy Subgraph trades
+                # Order by endDate Descending (Newest First)
                 params = {
                     "limit": 1000, "offset": offset, 
-                    "closed": "true", "order": "endDate", "ascending": "true" 
+                    "closed": "true", "order": "endDate", "ascending": "false" 
                 }
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
@@ -1725,6 +1725,7 @@ class BacktestEngine:
                 
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
+                # Cap at 20k to ensure we get enough coverage
                 if offset >= 20000: break 
             except: break
         print(" Done.")
@@ -1733,14 +1734,11 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # 1. Map 'marketMakerAddress'
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
         else:
-            print("⚠️ 'marketMakerAddress' missing. Skipping batch.")
             return pd.DataFrame()
 
-        # 2. Derive Outcome
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1753,8 +1751,7 @@ class BacktestEngine:
             except: return pd.NA
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
-
-        # 3. Rename & Filter
+        
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
@@ -1763,34 +1760,25 @@ class BacktestEngine:
             if c not in df.columns: df[c] = pd.NA
             
         df = df.dropna(subset=required_cols)
-        
-        # 4. Final Polish (FIXED: Robust Date Parsing)
         df['outcome'] = pd.to_numeric(df['outcome'])
-        
-        # FIX: Use 'mixed' format and force UTC to handle inconsistent API strings
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
         
         if not df.empty:
             df.to_parquet(cache_file)
-            print(f"✅ Successfully cached {len(df)} legacy markets.")
             
         return df
 
     def _fetch_subgraph_trades(self, days_back=200):
-        """
-        Adaptive Fetcher: Finds the 'Latest' trade in the DB and fetches backward from THERE.
-        Fixes the '0 records' bug caused by filtering dead data with live timestamps.
-        """
         import time
         
-        # Start cursor at "Now" just to get the latest available trade
+        # ANCHOR: Current System Time (NOW)
         time_cursor = int(time.time())
         
-        # We will determine the cutoff dynamically once we see the first data point
-        cutoff_time = None 
+        # Stop fetching if we go past this date
+        cutoff_time = time_cursor - (days_back * 24 * 60 * 60)
         
-        cache_file = self.cache_dir / f"subgraph_trades_adaptive_{days_back}d.pkl"
+        cache_file = self.cache_dir / f"subgraph_trades_recent_{days_back}d.pkl"
         if cache_file.exists(): 
             try:
                 return pickle.load(open(cache_file, "rb"))
@@ -1811,9 +1799,8 @@ class BacktestEngine:
         }}
         """
         all_rows = []
-        print(f"Fetching Trades (Adaptive Window)...", end="")
         
-        first_batch = True
+        print(f"Fetching Trades from NOW ({time_cursor}) back to {cutoff_time}...", end="")
         
         while True:
             try:
@@ -1823,49 +1810,34 @@ class BacktestEngine:
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
                 
-                # --- ADAPTIVE LOGIC START ---
-                # On the very first batch, we look at the timestamp of the newest trade.
-                # We anchor our "200 days" backward from THIS point, not "Today".
-                if first_batch:
-                    newest_ts = int(data[0]['timestamp'])
-                    cutoff_time = newest_ts - (days_back * 24 * 60 * 60)
-                    
-                    # Log the detected window for sanity
-                    newest_date = datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d')
-                    cutoff_date = datetime.fromtimestamp(cutoff_time).strftime('%Y-%m-%d')
-                    print(f" [Anchor: {newest_date} -> Cutoff: {cutoff_date}] ", end="")
-                    
-                    first_batch = False
-                # --- ADAPTIVE LOGIC END ---
-
                 all_rows.extend(data)
                 
+                # Update cursor
                 last_ts = int(data[-1]['timestamp'])
                 
                 # Stop if we passed the cutoff
-                if cutoff_time is not None and last_ts < cutoff_time:
-                    break
+                if last_ts < cutoff_time: break
                 
                 # Stop if API returns partial page (end of data)
-                if len(data) < 1000:
-                    break
+                if len(data) < 1000: break
                 
-                # Stop if infinite loop (cursor didn't move)
+                # Safety break
                 if last_ts >= time_cursor: break
+                
                 time_cursor = last_ts
                 
                 if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
                 
             except Exception as e:
-                log.error(f"Fetch loop error: {e}")
+                log.error(f"Fetch error: {e}")
                 break
                 
         print(f" Done. Fetched {len(all_rows)} trades.")
             
         df = pd.DataFrame(all_rows)
         
-        if not df.empty and cutoff_time is not None:
-            # Filter strictly to our calculated window
+        if not df.empty:
+            # Filter strictly to the requested window
             df['ts_int'] = df['timestamp'].astype(int)
             df = df[df['ts_int'] >= cutoff_time]
             
