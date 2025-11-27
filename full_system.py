@@ -1781,17 +1781,16 @@ class BacktestEngine:
     def _fetch_gamma_trades_parallel(self, market_ids):
         """
         Fetches trades for a list of markets using ThreadPool.
+        Robust to mixed datetime formats from the API.
         """
         import concurrent.futures 
         
         cache_file = self.cache_dir / "gamma_trades_clob_recent.pkl"
-        # To force a fresh fetch (since schema changed), we skip loading cache this time
-        # if cache_file.exists(): ... (Skipped)
-
+        # Skip cache check to force retry with correct parsing
+        
         all_trades = []
         print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
         
-        # Use 10 workers to be polite to the API (avoid connection pool warnings)
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_id = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
@@ -1809,63 +1808,56 @@ class BacktestEngine:
         
         df = pd.DataFrame(all_trades)
         
-        # --- SCHEMA NORMALIZATION ---
-        # 1. Timestamp: Check likely candidates
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-        elif 'time' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['time']) # Auto-detect format
-        elif 'createdAt' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['createdAt'])
+        # --- SCHEMA NORMALIZATION & ROBUST DATE PARSING ---
+        
+        # 1. Timestamp Logic
+        # We prioritize columns but assume nothing about the format (int or string)
+        ts_col = None
+        if 'timestamp' in df.columns: ts_col = 'timestamp'
+        elif 'time' in df.columns: ts_col = 'time'
+        elif 'createdAt' in df.columns: ts_col = 'createdAt'
+        
+        if ts_col:
+            # Check if numeric (Unix seconds)
+            if pd.api.types.is_numeric_dtype(df[ts_col]):
+                df['timestamp'] = pd.to_datetime(df[ts_col], unit='s')
+            else:
+                # It's a string. Use mixed format to handle ISO8601 variants
+                df['timestamp'] = pd.to_datetime(df[ts_col], format='mixed', utc=True)
+            
+            # Remove timezone information to ensure compatibility with other naive datetimes in the system
+            if df['timestamp'].dt.tz is not None:
+                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         else:
             log.error(f"Trades missing timestamp column! Found: {df.columns}")
             return pd.DataFrame()
-            
+
         # 2. User (Taker)
-        if 'taker_address' in df.columns:
-            df['user'] = df['taker_address']
-        elif 'taker' in df.columns:
-            df['user'] = df['taker']
-        elif 'maker_address' in df.columns: # Fallback if we captured maker side
-            df['user'] = df['maker_address']
-        else:
-            df['user'] = 'unknown'
+        df['user'] = df['taker_address'] if 'taker_address' in df.columns else df.get('taker', 'unknown')
         
         # 3. Market ID (fpmm_address)
-        # Map 'asset_id' or 'market' to 'fpmm_address'
         if 'market' in df.columns:
             df['fpmm_address'] = df['market'].str.lower()
-        elif 'asset_id' in df.columns:
-            df['fpmm_address'] = df['asset_id'].astype(str).str.lower()
         elif 'market_id' in df.columns:
             df['fpmm_address'] = df['market_id'].str.lower()
+        elif 'asset_id' in df.columns:
+             df['fpmm_address'] = df['asset_id'].astype(str).str.lower()
         else:
-            # Last resort: If we requested these IDs, maybe we can infer? 
-            # No, safer to drop.
             return pd.DataFrame()
         
         # 4. Amounts
-        # CLOB: size (Tokens), price (USD)
-        # Ensure numeric
         df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
         df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         
-        # Engine expects: tradeAmount (USD Volume), outcomeTokensAmount (+/- Tokens)
-        # Scale to 1e6 / 1e18 to match the Legacy format the Engine expects
+        # Convert to USD Volume (1e6 scale)
         df['tradeAmount'] = df['size'] * df['price'] * 1e6 
         
-        # Side: BUY vs SELL
-        # If side column exists
-        if 'side' in df.columns:
-            df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
-        else:
-            df['side_mult'] = 1 # Default to Buy if missing
-            
+        # Outcome Tokens
+        df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
         df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
         
-        # Filter cols
+        # Filter
         final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
-        # Ensure all exist
         for c in final_cols:
             if c not in df.columns: df[c] = None
             
