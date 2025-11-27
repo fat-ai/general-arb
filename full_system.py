@@ -1782,18 +1782,17 @@ class BacktestEngine:
         """
         Fetches trades for a list of markets using ThreadPool.
         """
-        import concurrent.futures # Import locally if not at top level
+        import concurrent.futures 
         
         cache_file = self.cache_dir / "gamma_trades_clob_recent.pkl"
-        if cache_file.exists():
-            try: return pickle.load(open(cache_file, "rb"))
-            except: pass
+        # To force a fresh fetch (since schema changed), we skip loading cache this time
+        # if cache_file.exists(): ... (Skipped)
 
         all_trades = []
         print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
         
-        # Use 20 threads for fast I/O
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # Use 10 workers to be polite to the API (avoid connection pool warnings)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_id = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
             completed = 0
@@ -1802,7 +1801,7 @@ class BacktestEngine:
                 if data:
                     all_trades.extend(data)
                 completed += 1
-                if completed % 50 == 0: print(".", end="", flush=True)
+                if completed % 10 == 0: print(".", end="", flush=True)
                 
         print(" Done.")
         
@@ -1810,38 +1809,67 @@ class BacktestEngine:
         
         df = pd.DataFrame(all_trades)
         
-        # MAPPING CLOB SCHEMA TO ENGINE SCHEMA
-        # 1. Timestamp
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s') if 'timestamp' in df.columns else pd.to_datetime(df['time'])
-        
+        # --- SCHEMA NORMALIZATION ---
+        # 1. Timestamp: Check likely candidates
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        elif 'time' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['time']) # Auto-detect format
+        elif 'createdAt' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['createdAt'])
+        else:
+            log.error(f"Trades missing timestamp column! Found: {df.columns}")
+            return pd.DataFrame()
+            
         # 2. User (Taker)
-        df['user'] = df['taker_address'] if 'taker_address' in df.columns else df.get('taker', 'unknown')
+        if 'taker_address' in df.columns:
+            df['user'] = df['taker_address']
+        elif 'taker' in df.columns:
+            df['user'] = df['taker']
+        elif 'maker_address' in df.columns: # Fallback if we captured maker side
+            df['user'] = df['maker_address']
+        else:
+            df['user'] = 'unknown'
         
-        # 3. Market ID (Handle Mapping)
+        # 3. Market ID (fpmm_address)
+        # Map 'asset_id' or 'market' to 'fpmm_address'
         if 'market' in df.columns:
             df['fpmm_address'] = df['market'].str.lower()
+        elif 'asset_id' in df.columns:
+            df['fpmm_address'] = df['asset_id'].astype(str).str.lower()
         elif 'market_id' in df.columns:
             df['fpmm_address'] = df['market_id'].str.lower()
-        elif 'asset_id' in df.columns:
-             df['fpmm_address'] = df['asset_id'].astype(str) # Fallback
+        else:
+            # Last resort: If we requested these IDs, maybe we can infer? 
+            # No, safer to drop.
+            return pd.DataFrame()
         
         # 4. Amounts
-        df['size'] = pd.to_numeric(df['size'], errors='coerce')
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
+        # CLOB: size (Tokens), price (USD)
+        # Ensure numeric
+        df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
+        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         
-        # Convert to USD Volume (1e6 scale for USDC compatibility)
+        # Engine expects: tradeAmount (USD Volume), outcomeTokensAmount (+/- Tokens)
+        # Scale to 1e6 / 1e18 to match the Legacy format the Engine expects
         df['tradeAmount'] = df['size'] * df['price'] * 1e6 
         
-        # Outcome Tokens: +Size for Buy, -Size for Sell
-        df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+        # Side: BUY vs SELL
+        # If side column exists
+        if 'side' in df.columns:
+            df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+        else:
+            df['side_mult'] = 1 # Default to Buy if missing
+            
         df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
         
+        # Filter cols
         final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
-        # Ensure columns exist
+        # Ensure all exist
         for c in final_cols:
-            if c not in df.columns: df[c] = 0
+            if c not in df.columns: df[c] = None
             
-        df = df[final_cols]
+        df = df[final_cols].dropna(subset=['timestamp', 'fpmm_address'])
         
         with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
