@@ -1664,81 +1664,79 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # Request 200 days of history relative to the DATA's end date
-        trades = self._fetch_subgraph_trades(days_back=200)
-        
-        if trades.empty: 
-            log.error("Trades data is empty.")
-            return pd.DataFrame(), pd.DataFrame()
-
-        if 'market' in trades.columns:
-            trades['market_id'] = trades['market'].apply(lambda x: x.get('id') if isinstance(x, dict) else None)
-        
-        if 'market_id' not in trades.columns:
-            log.error("Trades data missing 'market_id'.")
-            return pd.DataFrame(), pd.DataFrame()
-                
-        trades['fpmm_address'] = trades['market_id'].str.lower()
-        trades = trades.dropna(subset=['fpmm_address'])
-        
-        valid_ids = set(trades['fpmm_address'])
-        
-        markets = self._fetch_gamma_markets()
+        # 1. Fetch Markets (Resolved in Last 6 Months)
+        markets = self._fetch_gamma_markets(days_back=180)
         if markets.empty: 
-            log.error("Markets data is empty.")
-            return pd.DataFrame(), trades
-            
+            log.error("No markets found in window.")
+            return pd.DataFrame(), pd.DataFrame()
+        
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
-        # Filter markets to only those found in our trade history
+        # 2. Fetch Trades for these markets via Gamma API (Parallel)
+        # Filter for markets with volume to avoid wasting API calls on dead markets
+        # (Gamma API requires fetching trades per-market)
+        active_markets = markets[markets['volume'] > 0]['fpmm_address'].unique()
+        
+        print(f"DEBUG: Fetching CLOB trades for {len(active_markets)} active markets...")
+        trades = self._fetch_gamma_trades_parallel(list(active_markets))
+        
+        if trades.empty:
+            log.error("Trades data is empty.")
+            return pd.DataFrame(), pd.DataFrame()
+            
+        valid_ids = set(trades['fpmm_address'])
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
-        print(f"DEBUG: Intersection complete. {len(markets)} markets remain after matching with trades.")
-        
+        print(f"DEBUG: Data Load Complete. {len(markets)} Markets, {len(trades)} Trades.")
         return markets, trades
 
-    def _fetch_gamma_markets(self):
-        cache_file = self.cache_dir / "gamma_markets_newest.parquet"
+    def _fetch_gamma_markets(self, days_back=180):
+        cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d.parquet"
         if cache_file.exists():
-            try:
-                df = pd.read_parquet(cache_file)
-                if not df.empty: return df
+            try: return pd.read_parquet(cache_file)
             except: pass
 
         all_rows = []
         offset = 0
-        print("Fetching Markets (Newest First)...", end="")
+        print("Fetching Recent Markets...", end="")
+        
+        # Calculate cutoff date
+        cutoff_ts = datetime.now() - timedelta(days=days_back)
         
         while True:
             try:
-                # Order by endDate Descending (Newest First)
+                # Newest First (descending)
                 params = {
                     "limit": 1000, "offset": offset, 
                     "closed": "true", "order": "endDate", "ascending": "false" 
                 }
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
-                
                 rows = resp.json()
                 if not rows: break
-                all_rows.extend(rows)
                 
+                # Check date of last item to see if we went back far enough
+                last_date_str = rows[-1].get('endDate')
+                if last_date_str:
+                    last_date = pd.to_datetime(last_date_str).replace(tzinfo=None)
+                    if last_date < cutoff_ts:
+                        all_rows.extend(rows)
+                        break # Stop fetching
+                
+                all_rows.extend(rows)
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                # Cap at 20k to ensure we get enough coverage
-                if offset >= 20000: break 
+                if offset >= 20000: break # Safety cap
             except: break
         print(" Done.")
 
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
-        
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
-        else:
-            return pd.DataFrame()
-
+        
+        # Standardize Outcome Calculation
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1751,22 +1749,101 @@ class BacktestEngine:
             except: return pd.NA
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
-        
-        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity'}
+        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+        
         required_cols = ['fpmm_address', 'resolution_timestamp', 'created_at', 'outcome']
-        for c in required_cols: 
-            if c not in df.columns: df[c] = pd.NA
-            
         df = df.dropna(subset=required_cols)
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
         
-        if not df.empty:
-            df.to_parquet(cache_file)
+        # Strict Date Filter
+        df = df[df['resolution_timestamp'] >= cutoff_ts]
+        
+        if not df.empty: df.to_parquet(cache_file)
+        return df
+
+    def _fetch_single_market_trades(self, market_id):
+        """Worker function for parallel fetch"""
+        try:
+            # Gamma API: /events?market_id=X&type=Trade
+            url = "https://gamma-api.polymarket.com/events"
+            params = {"market_id": market_id, "type": "Trade", "limit": 1000} 
+            resp = self.session.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+        except: pass
+        return []
+
+    def _fetch_gamma_trades_parallel(self, market_ids):
+        """
+        Fetches trades for a list of markets using ThreadPool.
+        """
+        import concurrent.futures # Import locally if not at top level
+        
+        cache_file = self.cache_dir / "gamma_trades_clob_recent.pkl"
+        if cache_file.exists():
+            try: return pickle.load(open(cache_file, "rb"))
+            except: pass
+
+        all_trades = []
+        print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
+        
+        # Use 20 threads for fast I/O
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_id = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_id):
+                data = future.result()
+                if data:
+                    all_trades.extend(data)
+                completed += 1
+                if completed % 50 == 0: print(".", end="", flush=True)
+                
+        print(" Done.")
+        
+        if not all_trades: return pd.DataFrame()
+        
+        df = pd.DataFrame(all_trades)
+        
+        # MAPPING CLOB SCHEMA TO ENGINE SCHEMA
+        # 1. Timestamp
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s') if 'timestamp' in df.columns else pd.to_datetime(df['time'])
+        
+        # 2. User (Taker)
+        df['user'] = df['taker_address'] if 'taker_address' in df.columns else df.get('taker', 'unknown')
+        
+        # 3. Market ID (Handle Mapping)
+        if 'market' in df.columns:
+            df['fpmm_address'] = df['market'].str.lower()
+        elif 'market_id' in df.columns:
+            df['fpmm_address'] = df['market_id'].str.lower()
+        elif 'asset_id' in df.columns:
+             df['fpmm_address'] = df['asset_id'].astype(str) # Fallback
+        
+        # 4. Amounts
+        df['size'] = pd.to_numeric(df['size'], errors='coerce')
+        df['price'] = pd.to_numeric(df['price'], errors='coerce')
+        
+        # Convert to USD Volume (1e6 scale for USDC compatibility)
+        df['tradeAmount'] = df['size'] * df['price'] * 1e6 
+        
+        # Outcome Tokens: +Size for Buy, -Size for Sell
+        df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+        df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
+        
+        final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
+        # Ensure columns exist
+        for c in final_cols:
+            if c not in df.columns: df[c] = 0
+            
+        df = df[final_cols]
+        
+        with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
 
     def _fetch_subgraph_trades(self, days_back=200):
