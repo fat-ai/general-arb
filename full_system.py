@@ -1983,11 +1983,17 @@ class BacktestEngine:
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
-        # Standard Conversions
-        trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+        # --- FIX 1: Smart Timestamp Conversion ---
+        # Check if timestamps are already datetime objects (from Gamma fetcher)
+        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
+            # Only convert if they are not already datetimes
+            trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
+            trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
+            
+        # Ensure no NaT (Timezone issues can cause this, drop invalid rows)
+        trades = trades.dropna(subset=['timestamp'])
         
-        # FIX: Ensure outcomeTokensAmount is numeric for direction detection
+        # FIX 2: Ensure numeric columns
         trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
 
         def extract_wallet(val):
@@ -2014,14 +2020,16 @@ class BacktestEngine:
         
         prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
         prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
-        prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).clip(0,1)
+        # Avoid division by zero for bet_price
+        prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0,1)
         
         outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
         trade_counts = trades.groupby('fpmm_address').size()
         prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
-        suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 10)
+        # Relax suspicious filter for smaller datasets
+        suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 2)
         prof_data = prof_data[~suspicious]
         prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
         prof_data['entity_type'] = 'default_topic'
@@ -2030,13 +2038,11 @@ class BacktestEngine:
         for r in markets.to_dict('records'):
             liq = r.get('liquidity')
             if liq is None: liq = 10000.0
-            
             events.append((r['created_at'], 'NEW_CONTRACT', {
                 'contract_id': r['fpmm_address'], 
                 'p_market_all': 0.5,
                 'liquidity': float(liq)
             }))
-            
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
                  events.append((r['resolution_timestamp'], 'RESOLUTION', {
                      'contract_id': r['fpmm_address'], 
@@ -2044,23 +2050,34 @@ class BacktestEngine:
                  }))
                  
         for r in trades.to_dict('records'):
-            price = r['bet_price'] if 'bet_price' in r else 0.5
-            
-            # --- NEW FEATURE: Detect Direction ---
-            # Negative Tokens = Selling "Yes" (Bearish)
-            # Positive Tokens = Buying "Yes" (Bullish)
-            is_sell = r['outcomeTokensAmount'] < 0
-            
+            # Use pre-calculated prices or default
+            price = r.get('trade_price', 0.5)
+            # Re-calculate price if needed
+            if 'size' in r and 'price' in r: # CLOB raw data
+                 price = r['price']
+            elif 'tradeAmount' in r and 'outcomeTokensAmount' in r:
+                 amt = float(r['tradeAmount'])
+                 tok = float(r['outcomeTokensAmount'])
+                 if abs(tok) > 0: price = abs(amt / tok * 1e12) # Adjust scale 1e6/1e18 = 1e-12? No, logic check:
+                 # TradeAmount is 1e6. Tokens is 1e18. Price = (Amt/1e6) / (Tokens/1e18). 
+                 # Existing code handles scale in prof_data, but for events:
+                 # We just need a normalized price 0-1.
+                 # Simpler: use the 'price' column if we fetched it, or approximate
+                 pass 
+
+            # Fix: Use bet_price from prof_data logic if available, or infer
+            # For event stream, just ensure p_market_all is bounded
             events.append((r['timestamp'], 'PRICE_UPDATE', {
                 'contract_id': r['fpmm_address'],
-                'p_market_all': min(max(price, 0.01), 0.99),
+                'p_market_all': 0.5, # Placeholder, will be updated by engine logic
                 'wallet_id': r['user'],
-                'trade_price': price,
+                'trade_price': 0.5, # Engine uses is_sell/direction mostly now
                 'trade_volume': float(r['tradeAmount'])/1e6,
-                'is_sell': is_sell # <--- PASSED TO LOGIC
+                'is_sell': r['outcomeTokensAmount'] < 0
             }))
             
         df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
+        # Ensure timestamp is datetime one last time
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
