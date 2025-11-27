@@ -1664,8 +1664,7 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # Request 200 days of history to safely cover the 
-        # 60-day Train + 120-day Test window (+ buffer)
+        # Request 200 days of history relative to NOW
         trades = self._fetch_subgraph_trades(days_back=200)
         
         if trades.empty: 
@@ -1683,7 +1682,6 @@ class BacktestEngine:
         trades = trades.dropna(subset=['fpmm_address'])
         
         valid_ids = set(trades['fpmm_address'])
-        # print(f"DEBUG: Found {len(valid_ids)} unique markets in trades.")
         
         markets = self._fetch_gamma_markets()
         if markets.empty: 
@@ -1692,7 +1690,6 @@ class BacktestEngine:
             
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
-        # Intersection Logic
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
         print(f"DEBUG: Intersection complete. {len(markets)} markets remain after matching with trades.")
@@ -1781,13 +1778,13 @@ class BacktestEngine:
 
     def _fetch_subgraph_trades(self, days_back=200):
         """
-        Fetches trades going back 'days_back' from a fixed point in time.
-        Ensures complete coverage for the 120-day test window.
+        Fetches trades going back 'days_back' from NOW.
         """
-        # Fixed reference time (Nov 26, 2024) to ensure every run uses the exact same "End Date"
-        # This stops the results from drifting when you run the script minutes apart.
-        reference_time = 1732615000 
-        cutoff_time = reference_time - (days_back * 24 * 60 * 60)
+        import time
+        
+        # 1. Dynamic Start Time (NOW)
+        current_time = int(time.time())
+        cutoff_time = current_time - (days_back * 24 * 60 * 60)
         
         cache_file = self.cache_dir / f"subgraph_trades_{days_back}d.pkl"
         if cache_file.exists(): 
@@ -1810,9 +1807,9 @@ class BacktestEngine:
         }}
         """
         all_rows = []
-        time_cursor = reference_time
+        time_cursor = current_time
         
-        print(f"Fetching Trades from {time_cursor} back to {cutoff_time}...", end="")
+        print(f"Fetching Trades from NOW ({time_cursor}) back to {cutoff_time}...", end="")
         
         while True:
             try:
@@ -1824,16 +1821,23 @@ class BacktestEngine:
                 
                 all_rows.extend(data)
                 
-                # Update cursor to the oldest record in this batch
-                new_cursor = int(data[-1]['timestamp'])
+                # Timestamp of the OLDEST trade in this batch
+                last_ts = int(data[-1]['timestamp'])
                 
-                # CHECK: Have we gone back far enough?
-                if new_cursor < cutoff_time:
+                # 1. Stop if we have gone back far enough
+                if last_ts < cutoff_time:
                     break
                 
-                # Loop safety
-                if new_cursor >= time_cursor: break
-                time_cursor = new_cursor
+                # 2. Stop if the API gave us less than we asked for (End of History)
+                if len(data) < 1000:
+                    break
+                
+                # 3. Loop Safety: Ensure we are actually moving backward
+                if last_ts >= time_cursor:
+                    break
+                    
+                # Update cursor for next page
+                time_cursor = last_ts
                 
                 if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
                 
@@ -1846,13 +1850,14 @@ class BacktestEngine:
         df = pd.DataFrame(all_rows)
         
         if not df.empty:
-            # Filter to strictly within our window to clean up the edges
+            # Filter strictly to window
             df['ts_int'] = df['timestamp'].astype(int)
             df = df[df['ts_int'] >= cutoff_time]
             
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
             
         return df
+        
     def diagnose_data(self):
         """Run this to understand what data you're getting"""
         print("\n" + "="*60)
