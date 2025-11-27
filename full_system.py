@@ -1770,108 +1770,166 @@ class BacktestEngine:
         return df
 
     def _fetch_single_market_trades(self, market_id):
-        """Worker function for parallel fetch"""
-        try:
-            # Gamma API: /events?market_id=X&type=Trade
-            url = "https://gamma-api.polymarket.com/events"
-            params = {"market_id": market_id, "type": "Trade", "limit": 1000} 
-            resp = self.session.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                return resp.json()
-        except: pass
-        return []
+        """
+        Worker function: Fetches ALL trades for a specific market ID.
+        Includes Pagination (offset) and robust Retry logic.
+        """
+        import time
+        import requests
+        from requests.adapters import HTTPAdapter, Retry
+        
+        # 1. Setup Local Session (Thread-Safe)
+        # We cannot share self.session across threads reliably without a huge pool
+        session = requests.Session()
+        retries = Retry(
+            total=5, 
+            backoff_factor=0.5, 
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"]
+        )
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        all_market_trades = []
+        offset = 0
+        batch_size = 1000
+        
+        # 2. Pagination Loop
+        while True:
+            try:
+                url = "https://gamma-api.polymarket.com/events"
+                params = {
+                    "market_id": market_id, 
+                    "type": "Trade", 
+                    "limit": batch_size, 
+                    "offset": offset
+                }
+                
+                # 3. Request with explicit timeout
+                resp = session.get(url, params=params, timeout=10)
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    
+                    # Empty response means we are done
+                    if not data: 
+                        break
+                        
+                    all_market_trades.extend(data)
+                    
+                    # If we got less than requested, we reached the end
+                    if len(data) < batch_size:
+                        break
+                        
+                    # Move cursor
+                    offset += batch_size
+                    
+                    # Safety Cap: Don't fetch > 50k trades per market (avoids infinite loops)
+                    if offset > 50000: 
+                        break
+                        
+                elif resp.status_code == 429:
+                    # Rate limit hit - Sleep and Retry same offset
+                    time.sleep(2)
+                    continue
+                else:
+                    # Non-recoverable error (404, 400, etc)
+                    # log.warning(f"Market {market_id} error: {resp.status_code}")
+                    break
+                    
+            except Exception as e:
+                # Network error - abort this market
+                break
+        
+        return all_market_trades
 
     def _fetch_gamma_trades_parallel(self, market_ids):
         """
         Fetches trades for a list of markets using ThreadPool.
-        Robust against missing columns ('size', 'price') and mixed date formats.
+        Robust against missing columns and schema issues.
         """
         import concurrent.futures 
         
-        cache_file = self.cache_dir / "gamma_trades_clob_full.pkl"
-        # Skip cache to ensure fresh data fetch
+        cache_file = self.cache_dir / "gamma_trades_clob_full_v2.pkl"
+        # Skip cache to force fresh fetch
         
         all_trades = []
-        print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
+        # Reduce threads to 8 to be kinder to the API and prevent 429s
+        max_workers = 8 
         
-        # Increased workers slightly for larger batch, but keeping safe for API limits
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-            future_to_id = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
+        print(f"Downloading Trades for {len(market_ids)} markets ({max_workers} threads)...", end="")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
             completed = 0
-            for future in concurrent.futures.as_completed(future_to_id):
-                mid = future_to_id[future]
-                data = future.result()
-                
-                if data and isinstance(data, list):
-                    # Inject Market ID immediately to prevent data loss
-                    for row in data:
-                        row['fpmm_address'] = mid
-                    all_trades.extend(data)
+            for future in concurrent.futures.as_completed(future_to_mid):
+                mid = future_to_mid[future]
+                try:
+                    data = future.result()
+                    if data:
+                        # Inject Market ID immediately
+                        for row in data:
+                            row['fpmm_address'] = mid
+                        all_trades.extend(data)
+                except Exception as e:
+                    pass
                     
                 completed += 1
-                if completed % 100 == 0: print(".", end="", flush=True)
+                if completed % 50 == 0: print(".", end="", flush=True)
                 
-        print(" Done.")
+        print(f" Done. Fetched {len(all_trades)} trades.")
         
         if not all_trades: return pd.DataFrame()
         
         df = pd.DataFrame(all_trades)
         
-        # --- DEFENSIVE SCHEMA NORMALIZATION ---
+        # --- SCHEMA NORMALIZATION (Previous Robust Logic) ---
         
-        # 1. Ensure Critical Columns Exist (Fill with 0/Null if missing to prevent KeyError)
-        expected_cols = ['size', 'price', 'side', 'timestamp', 'time', 'createdAt']
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = None # Initialize if missing
+        # 1. Timestamp
+        ts_col = None
+        if 'timestamp' in df.columns: ts_col = 'timestamp'
+        elif 'time' in df.columns: ts_col = 'time'
+        elif 'createdAt' in df.columns: ts_col = 'createdAt'
         
-        # 2. Timestamp Parsing
-        # Prioritize 'timestamp' -> 'time' -> 'createdAt'
-        # Use 'combine_first' to coalesce columns
-        df['final_ts'] = df['timestamp'].combine_first(df['time']).combine_first(df['createdAt'])
-        
-        # Robust datetime conversion
-        df['timestamp'] = pd.to_datetime(df['final_ts'], format='mixed', utc=True, errors='coerce')
-        # Strip timezone
-        if df['timestamp'].dt.tz is not None:
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-            
-        # 3. User (Taker/Maker)
-        if 'taker_address' in df.columns:
-            df['user'] = df['taker_address']
-        elif 'taker' in df.columns:
-            df['user'] = df['taker']
+        if ts_col:
+            df['timestamp'] = pd.to_datetime(df[ts_col], format='mixed', utc=True, errors='coerce')
+            if df['timestamp'].dt.tz is not None:
+                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         else:
-            df['user'] = 'unknown'
-            
-        # 4. Market ID (Sanitize)
+            log.error("Trades missing timestamp column.")
+            return pd.DataFrame()
+
+        # 2. User
+        if 'taker_address' in df.columns: df['user'] = df['taker_address']
+        elif 'taker' in df.columns: df['user'] = df['taker']
+        else: df['user'] = 'unknown'
+        
+        # 3. Market ID
         if 'fpmm_address' in df.columns:
             df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
         else:
-            return pd.DataFrame() # Should not happen due to injection
+            return pd.DataFrame()
             
-        # 5. Numeric Conversion (Size/Price)
+        # 4. Amounts
         df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
         df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
         
-        # 6. Calculation
-        # USD Volume
+        # USD Volume (1e6 scale)
         df['tradeAmount'] = df['size'] * df['price'] * 1e6 
         
         # Outcome Tokens
-        df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+        if 'side' in df.columns:
+            df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+        else:
+            df['side_mult'] = 1
+            
         df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
         
-        # 7. Final Filter
         final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
-        
-        # Ensure output columns exist
         for c in final_cols:
-            if c not in df.columns: df[c] = 0
+            if c not in df.columns: df[c] = None
             
-        # Drop rows where timestamp failed to parse
-        df = df[final_cols].dropna(subset=['timestamp'])
+        df = df[final_cols].dropna(subset=['timestamp', 'fpmm_address'])
         
         with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
