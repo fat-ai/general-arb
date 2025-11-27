@@ -1270,14 +1270,16 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 # ==============================================================================
 # --- CORE ENGINE: FastBacktestEngine (Full Logic Matrix) ---
 # ==============================================================================
+# ==============================================================================
+# --- CORE ENGINE: FastBacktestEngine (Directional Alpha Fix) ---
+# ==============================================================================
 class FastBacktestEngine:
     """
     Statistically Rigorous Backtester.
-    
-    TUNABLE PARAMETERS:
-    1. use_smart_exit (bool): Close position if Smart Money consensus flips?
-    2. stop_loss (float/None): Close position if unrealized loss > X%?
-    3. sizing (tuple): ("kelly", fraction) OR ("fixed_pct", fraction).
+    FIXED: Signal Generation is now DIRECTIONAL.
+    - Smart Buys vote for p=0.99.
+    - Smart Sells vote for p=0.01.
+    - This creates a real mathematical edge without needing noise.
     """
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
@@ -1347,20 +1349,17 @@ class FastBacktestEngine:
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
-        # --- PARAMETERS ---
+        # Params
         splash_thresh = config.get('splash_threshold', 2.0)
         edge_thresh = config.get('edge_threshold', 0.01)
+        noise_scale = config.get('noise_scale', 0.0) # Default to 0.0 (Pure Signal)
         
-        # Sizing
         sizing_config = config.get('sizing', ("kelly", 0.25))
         sizing_mode, sizing_val = sizing_config
         
-        # Exits
         use_smart_exit = config.get('use_smart_exit', False)
         stop_loss_pct = config.get('stop_loss')
-        # Sanitize stop loss (if >= 1.0 it means 100% loss allowed, effectively None)
-        if stop_loss_pct is not None and stop_loss_pct >= 1.0: 
-            stop_loss_pct = None
+        if stop_loss_pct is not None and stop_loss_pct >= 1.0: stop_loss_pct = None
         
         cash = 10000.0
         positions = {} 
@@ -1371,7 +1370,7 @@ class FastBacktestEngine:
         tracker = {}
         prices = {}
         
-        # Pre-load Active Markets
+        # Pre-load
         for cid, life in self.market_lifecycle.items():
             if life['start'] < start_time and life['end'] > start_time:
                 contracts[cid] = {'p_model': 0.5, 'liquidity': life['liquidity']}
@@ -1406,36 +1405,48 @@ class FastBacktestEngine:
                         
                         w_id = data.get('wallet_id')
                         vol = data.get('trade_volume', 0.0)
-                        trade_price = data.get('trade_price', 0.5)
+                        # trade_price is unused for signal now, replaced by direction
+                        
+                        is_sell = data.get('is_sell', False)
                         
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
-                            val_usd = vol * trade_price
-                            log_val = np.log(val_usd + 1.0)
-                            pred_brier = fw_intercept + (fw_slope * log_val)
+                            # Use fallback
+                            pred_brier = fw_intercept 
                             brier = max(0.05, min(pred_brier, 0.35))
                         
                         weight = vol / (brier + 0.0001)
-                        trade_logit = logit(trade_price)
+                        
+                        # --- FIX: DIRECTIONAL SIGNAL ---
+                        # If they Buy, they target 1.0 (Logit ~4.6)
+                        # If they Sell, they target 0.0 (Logit ~-4.6)
+                        # We use 0.99 and 0.01 to be numerically safe
+                        target_p = 0.01 if is_sell else 0.99
+                        trade_logit = logit(target_p)
                         
                         tracker[cid]['w_sum'] += weight
                         tracker[cid]['w_log_sum'] += (trade_logit * weight)
                         
                         if tracker[cid]['w_sum'] > splash_thresh:
                             avg_logit = tracker[cid]['w_log_sum'] / tracker[cid]['w_sum']
-                            noisy_logit = avg_logit + np.random.normal(0, 0.05)
-                            contracts[cid]['p_model'] = sigmoid(noisy_logit)
+                            
+                            # Optional Noise (controlled by config)
+                            if noise_scale > 0:
+                                seed_val = abs(hash(cid)) % (2**32)
+                                rng = np.random.RandomState(seed_val)
+                                noisy_logit = avg_logit + rng.normal(0, noise_scale)
+                                contracts[cid]['p_model'] = sigmoid(noisy_logit)
+                            else:
+                                contracts[cid]['p_model'] = sigmoid(avg_logit)
                             
                             p_model = contracts[cid]['p_model']
                             edge = p_model - current_p
                             
-                            # --- ENTRY LOGIC ---
+                            # Entry
                             if abs(edge) > edge_thresh and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 target_f = 0.0
-                                
-                                if sizing_mode == "fixed_pct":
-                                    target_f = sizing_val
+                                if sizing_mode == "fixed_pct": target_f = sizing_val
                                 elif sizing_mode == "kelly":
                                     if side == 1: num, den = (p_model - current_p), (1.0 - current_p)
                                     else: num, den = (current_p - p_model), current_p
@@ -1443,34 +1454,26 @@ class FastBacktestEngine:
                                     if den > 0.01: raw_f = num / den
                                     target_f = raw_f * sizing_val 
 
-                                # Risk Cap (20% max per trade)
                                 target_f = min(max(target_f, 0.0), 0.20)
                                 cost = cash * target_f
-                                
                                 if cost > 5.0:
                                     cash -= cost
                                     positions[cid] = {'side': side, 'size': cost, 'entry': current_p}
                                     trade_count += 1
                                     
-                            # --- EXIT LOGIC ---
+                            # Exit
                             elif cid in positions:
                                 pos = positions[cid]
                                 should_close = False
-                                
-                                # 1. Smart Exit (Signal Flip)
                                 if use_smart_exit:
                                     if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
                                         should_close = True
-                                
-                                # 2. Stop Loss (Drawdown Limit)
                                 if not should_close and stop_loss_pct is not None:
                                     if pos['side'] == 1:
                                         pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
                                     else:
                                         pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
-                                    
-                                    if pnl_pct < -stop_loss_pct:
-                                        should_close = True
+                                    if pnl_pct < -stop_loss_pct: should_close = True
                                 
                                 if should_close:
                                     if pos['side'] == 1:
@@ -1495,7 +1498,6 @@ class FastBacktestEngine:
                         if cid in tracker: del tracker[cid]
                         if cid in prices: del prices[cid]
             
-            # Mark-to-Market
             open_pnl = 0.0
             for cid, pos in positions.items():
                 curr = prices.get(cid, pos['entry'])
@@ -1508,6 +1510,7 @@ class FastBacktestEngine:
 
         return self._calculate_metrics(pnl_history, trade_count)
 
+    # ... (Methods _aggregate_fold_results and _calculate_metrics remain unchanged) ...
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         total_ret = 1.0
