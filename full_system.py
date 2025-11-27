@@ -1856,7 +1856,7 @@ class BacktestEngine:
         print(f"Downloading Trades...", end="")
         
         # Use 15 workers
-        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
             completed = 0
