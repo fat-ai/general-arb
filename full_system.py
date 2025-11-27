@@ -1664,7 +1664,7 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # Request 200 days of history relative to NOW
+        # Request 200 days of history relative to the DATA's end date
         trades = self._fetch_subgraph_trades(days_back=200)
         
         if trades.empty: 
@@ -1690,6 +1690,7 @@ class BacktestEngine:
             
         markets['fpmm_address'] = markets['fpmm_address'].str.lower()
         
+        # Filter markets to only those found in our trade history
         markets = markets[markets['fpmm_address'].isin(valid_ids)]
         
         print(f"DEBUG: Intersection complete. {len(markets)} markets remain after matching with trades.")
@@ -1778,15 +1779,18 @@ class BacktestEngine:
 
     def _fetch_subgraph_trades(self, days_back=200):
         """
-        Fetches trades going back 'days_back' from NOW.
+        Adaptive Fetcher: Finds the 'Latest' trade in the DB and fetches backward from THERE.
+        Fixes the '0 records' bug caused by filtering dead data with live timestamps.
         """
         import time
         
-        # 1. Dynamic Start Time (NOW)
-        current_time = int(time.time())
-        cutoff_time = current_time - (days_back * 24 * 60 * 60)
+        # Start cursor at "Now" just to get the latest available trade
+        time_cursor = int(time.time())
         
-        cache_file = self.cache_dir / f"subgraph_trades_{days_back}d.pkl"
+        # We will determine the cutoff dynamically once we see the first data point
+        cutoff_time = None 
+        
+        cache_file = self.cache_dir / f"subgraph_trades_adaptive_{days_back}d.pkl"
         if cache_file.exists(): 
             try:
                 return pickle.load(open(cache_file, "rb"))
@@ -1807,9 +1811,9 @@ class BacktestEngine:
         }}
         """
         all_rows = []
-        time_cursor = current_time
+        print(f"Fetching Trades (Adaptive Window)...", end="")
         
-        print(f"Fetching Trades from NOW ({time_cursor}) back to {cutoff_time}...", end="")
+        first_batch = True
         
         while True:
             try:
@@ -1819,24 +1823,35 @@ class BacktestEngine:
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
                 
+                # --- ADAPTIVE LOGIC START ---
+                # On the very first batch, we look at the timestamp of the newest trade.
+                # We anchor our "200 days" backward from THIS point, not "Today".
+                if first_batch:
+                    newest_ts = int(data[0]['timestamp'])
+                    cutoff_time = newest_ts - (days_back * 24 * 60 * 60)
+                    
+                    # Log the detected window for sanity
+                    newest_date = datetime.fromtimestamp(newest_ts).strftime('%Y-%m-%d')
+                    cutoff_date = datetime.fromtimestamp(cutoff_time).strftime('%Y-%m-%d')
+                    print(f" [Anchor: {newest_date} -> Cutoff: {cutoff_date}] ", end="")
+                    
+                    first_batch = False
+                # --- ADAPTIVE LOGIC END ---
+
                 all_rows.extend(data)
                 
-                # Timestamp of the OLDEST trade in this batch
                 last_ts = int(data[-1]['timestamp'])
                 
-                # 1. Stop if we have gone back far enough
-                if last_ts < cutoff_time:
+                # Stop if we passed the cutoff
+                if cutoff_time is not None and last_ts < cutoff_time:
                     break
                 
-                # 2. Stop if the API gave us less than we asked for (End of History)
+                # Stop if API returns partial page (end of data)
                 if len(data) < 1000:
                     break
                 
-                # 3. Loop Safety: Ensure we are actually moving backward
-                if last_ts >= time_cursor:
-                    break
-                    
-                # Update cursor for next page
+                # Stop if infinite loop (cursor didn't move)
+                if last_ts >= time_cursor: break
                 time_cursor = last_ts
                 
                 if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
@@ -1849,8 +1864,8 @@ class BacktestEngine:
             
         df = pd.DataFrame(all_rows)
         
-        if not df.empty:
-            # Filter strictly to window
+        if not df.empty and cutoff_time is not None:
+            # Filter strictly to our calculated window
             df['ts_int'] = df['timestamp'].astype(int)
             df = df[df['ts_int'] >= cutoff_time]
             
