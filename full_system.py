@@ -1664,37 +1664,33 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch ALL Markets (Resolved in Last 6 Months)
+        # 1. Fetch Markets
         markets = self._fetch_gamma_markets(days_back=180)
         if markets.empty: 
-            log.error("No markets found in window.")
+            log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        markets['fpmm_address'] = markets['fpmm_address'].str.lower()
+        markets['contract_id'] = markets['contract_id'].astype(str).str.lower()
         
-        # 2. Fetch Trades for ALL markets (No Filtering)
-        # User requested "ALL trades and ALL markets". 
-        # We explicitly grab the unique IDs from the fetched market list.
-        active_markets = markets['fpmm_address'].unique()
+        # 2. Fetch Trades for ALL markets using the correct ID
+        # Use 'contract_id' which is unique (size ~9978)
+        active_ids = markets['contract_id'].unique()
         
-        print(f"DEBUG: Fetching CLOB trades for ALL {len(active_markets)} markets (This may take time)...")
-        
-        # Fetch
-        trades = self._fetch_gamma_trades_parallel(list(active_markets))
+        print(f"DEBUG: Fetching trades for {len(active_ids)} markets (ALL)...")
+        trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
         if trades.empty:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
-        # 3. Final Intersection (Ensure integrity)
-        valid_ids = set(trades['fpmm_address'])
-        markets = markets[markets['fpmm_address'].isin(valid_ids)]
+        valid_ids = set(trades['contract_id'])
+        markets = markets[markets['contract_id'].isin(valid_ids)]
         
         print(f"DEBUG: Data Load Complete. {len(markets)} Markets, {len(trades)} Trades.")
         return markets, trades
-
+        
     def _fetch_gamma_markets(self, days_back=180):
-        cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d.parquet"
+        cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d_v2.parquet"
         if cache_file.exists():
             try: return pd.read_parquet(cache_file)
             except: pass
@@ -1708,7 +1704,6 @@ class BacktestEngine:
         
         while True:
             try:
-                # Newest First (descending)
                 params = {
                     "limit": 1000, "offset": offset, 
                     "closed": "true", "order": "endDate", "ascending": "false" 
@@ -1718,28 +1713,37 @@ class BacktestEngine:
                 rows = resp.json()
                 if not rows: break
                 
-                # Check date of last item to see if we went back far enough
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
                     last_date = pd.to_datetime(last_date_str).replace(tzinfo=None)
                     if last_date < cutoff_ts:
                         all_rows.extend(rows)
-                        break # Stop fetching
+                        break
                 
                 all_rows.extend(rows)
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                if offset >= 20000: break # Safety cap
+                if offset >= 20000: break 
             except: break
         print(" Done.")
 
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
+        
+        # --- KEY FIX: Use 'id' as the unique identifier ---
+        if 'id' in df.columns:
+            df = df.rename(columns={'id': 'contract_id'})
+        else:
+            log.error("Market data missing 'id' column.")
+            return pd.DataFrame()
+        
+        # Fill fpmm_address with contract_id just in case legacy code checks it
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
-        
-        # Standardize Outcome Calculation
+        else:
+            df['fpmm_address'] = df['contract_id']
+
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1757,13 +1761,13 @@ class BacktestEngine:
         
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
         
-        required_cols = ['fpmm_address', 'resolution_timestamp', 'created_at', 'outcome']
+        # Removed 'fpmm_address' from required cols to support CLOB
+        required_cols = ['contract_id', 'resolution_timestamp', 'created_at', 'outcome']
         df = df.dropna(subset=required_cols)
+        
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
-        
-        # Strict Date Filter
         df = df[df['resolution_timestamp'] >= cutoff_ts]
         
         if not df.empty: df.to_parquet(cache_file)
@@ -1843,48 +1847,38 @@ class BacktestEngine:
         return all_market_trades
 
     def _fetch_gamma_trades_parallel(self, market_ids):
-        """
-        Fetches trades for a list of markets using ThreadPool.
-        Robust against missing columns and schema issues.
-        """
         import concurrent.futures 
         
         cache_file = self.cache_dir / "gamma_trades_clob_full_v2.pkl"
-        # Skip cache to force fresh fetch
+        # Skip cache
         
         all_trades = []
-        # Reduce threads to 8 to be kinder to the API and prevent 429s
-        max_workers = 8 
+        print(f"Downloading Trades...", end="")
         
-        print(f"Downloading Trades for {len(market_ids)} markets ({max_workers} threads)...", end="")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Use 15 workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
             future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
             
             completed = 0
             for future in concurrent.futures.as_completed(future_to_mid):
                 mid = future_to_mid[future]
-                try:
-                    data = future.result()
-                    if data:
-                        # Inject Market ID immediately
-                        for row in data:
-                            row['fpmm_address'] = mid
-                        all_trades.extend(data)
-                except Exception as e:
-                    pass
+                data = future.result()
+                
+                if data and isinstance(data, list):
+                    for row in data:
+                        row['contract_id'] = mid # Inject ID
+                    all_trades.extend(data)
                     
                 completed += 1
-                if completed % 50 == 0: print(".", end="", flush=True)
+                if completed % 100 == 0: print(".", end="", flush=True)
                 
-        print(f" Done. Fetched {len(all_trades)} trades.")
+        print(" Done.")
         
         if not all_trades: return pd.DataFrame()
         
         df = pd.DataFrame(all_trades)
         
-        # --- SCHEMA NORMALIZATION (Previous Robust Logic) ---
-        
+        # Schema Normalization
         # 1. Timestamp
         ts_col = None
         if 'timestamp' in df.columns: ts_col = 'timestamp'
@@ -1896,40 +1890,33 @@ class BacktestEngine:
             if df['timestamp'].dt.tz is not None:
                 df['timestamp'] = df['timestamp'].dt.tz_localize(None)
         else:
-            log.error("Trades missing timestamp column.")
             return pd.DataFrame()
 
         # 2. User
-        if 'taker_address' in df.columns: df['user'] = df['taker_address']
-        elif 'taker' in df.columns: df['user'] = df['taker']
-        else: df['user'] = 'unknown'
+        df['user'] = df.get('taker_address', df.get('taker', 'unknown'))
         
-        # 3. Market ID
-        if 'fpmm_address' in df.columns:
-            df['fpmm_address'] = df['fpmm_address'].astype(str).str.lower()
+        # 3. Contract ID
+        if 'contract_id' in df.columns:
+            df['contract_id'] = df['contract_id'].astype(str).str.lower()
         else:
             return pd.DataFrame()
             
         # 4. Amounts
         df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
         df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
-        
-        # USD Volume (1e6 scale)
         df['tradeAmount'] = df['size'] * df['price'] * 1e6 
         
-        # Outcome Tokens
+        df['side_mult'] = 1
         if 'side' in df.columns:
             df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
-        else:
-            df['side_mult'] = 1
             
         df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
         
-        final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'fpmm_address']
-        for c in final_cols:
+        final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
+        for c in final_cols: 
             if c not in df.columns: df[c] = None
             
-        df = df[final_cols].dropna(subset=['timestamp', 'fpmm_address'])
+        df = df[final_cols].dropna(subset=['timestamp', 'contract_id'])
         
         with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
@@ -2041,52 +2028,43 @@ class BacktestEngine:
     def _transform_to_events(self, markets, trades):
         log.info("Transforming Data...")
         
-        # --- CRITICAL FIX: Check before converting ---
-        # If timestamps are already datetime objects (from the new fetcher), skip conversion.
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
             trades['timestamp'] = pd.to_numeric(trades['timestamp'], errors='coerce')
             trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s')
-            
-        # Drop any rows where timestamp failed
         trades = trades.dropna(subset=['timestamp'])
-        
-        # Ensure numeric amounts
         trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
 
         def extract_wallet(val):
             if isinstance(val, dict): return val.get('id')
             return str(val)
-        
         if 'user' in trades.columns:
             trades['user'] = trades['user'].apply(extract_wallet)
 
         log.info("Filtering Wash Trades...")
-        trades = trades.sort_values(['fpmm_address', 'user', 'timestamp'])
+        # Use contract_id for sorting
+        trades = trades.sort_values(['contract_id', 'user', 'timestamp'])
         trades['prev_user'] = trades['user'].shift(1)
         trades['time_delta'] = trades['timestamp'].diff().dt.total_seconds()
-        
         trades['is_wash'] = (trades['prev_user'] == trades['user']) & (trades['time_delta'] < 60)
         trades = trades[~trades['is_wash']].drop(columns=['prev_user', 'time_delta', 'is_wash'])
         
-        common_ids = set(markets['fpmm_address']).intersection(set(trades['fpmm_address']))
-        markets = markets[markets['fpmm_address'].isin(common_ids)]
-        trades = trades[trades['fpmm_address'].isin(common_ids)]
+        # Join on contract_id
+        common_ids = set(markets['contract_id']).intersection(set(trades['contract_id']))
+        markets = markets[markets['contract_id'].isin(common_ids)]
+        trades = trades[trades['contract_id'].isin(common_ids)]
         
-        prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'fpmm_address', 'timestamp']].copy()
+        prof_data = trades[['user', 'tradeAmount', 'outcomeTokensAmount', 'contract_id', 'timestamp']].copy()
         prof_data.columns = ['wallet_id', 'size', 'tokens', 'market_id', 'timestamp']
         
         prof_data['size'] = pd.to_numeric(prof_data['size'], errors='coerce') / 1e6
         prof_data['tokens'] = pd.to_numeric(prof_data['tokens'], errors='coerce') / 1e18
-        # Handle division by zero safely
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0,1)
         
-        outcome_map = markets.set_index('fpmm_address')['outcome'].to_dict()
+        outcome_map = markets.set_index('contract_id')['outcome'].to_dict()
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
-        trade_counts = trades.groupby('fpmm_address').size()
+        trade_counts = trades.groupby('contract_id').size()
         prof_data['trade_count'] = prof_data['market_id'].map(trade_counts)
-        
-        # Relaxed suspicious filter for this dataset
         suspicious = (prof_data['outcome'].isin([0,1])) & (prof_data['trade_count'] < 1)
         prof_data = prof_data[~suspicious]
         prof_data = prof_data[prof_data['outcome'].between(0, 1, inclusive='both')]
@@ -2097,24 +2075,22 @@ class BacktestEngine:
             liq = r.get('liquidity')
             if liq is None: liq = 10000.0
             events.append((r['created_at'], 'NEW_CONTRACT', {
-                'contract_id': r['fpmm_address'], 
+                'contract_id': r['contract_id'], 
                 'p_market_all': 0.5,
                 'liquidity': float(liq)
             }))
             if pd.notna(r['resolution_timestamp']) and pd.notna(r['outcome']):
                  events.append((r['resolution_timestamp'], 'RESOLUTION', {
-                     'contract_id': r['fpmm_address'], 
+                     'contract_id': r['contract_id'], 
                      'outcome': r['outcome']
                  }))
                  
         for r in trades.to_dict('records'):
-            # Use pre-calculated prices if available from CLOB
             price = 0.5
-            if 'size' in r and 'price' in r:
-                 price = r['price']
+            if 'size' in r and 'price' in r: price = r['price']
             
             events.append((r['timestamp'], 'PRICE_UPDATE', {
-                'contract_id': r['fpmm_address'],
+                'contract_id': r['contract_id'],
                 'p_market_all': 0.5, 
                 'wallet_id': r['user'],
                 'trade_price': price,
@@ -2123,10 +2099,8 @@ class BacktestEngine:
             }))
             
         df_ev = pd.DataFrame(events, columns=['timestamp', 'event_type', 'data'])
-        # Final safety check on index
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
-        
         return df_ev, prof_data
   
         
