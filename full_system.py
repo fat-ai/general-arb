@@ -2010,7 +2010,13 @@ class BacktestEngine:
                 elif 'createdAt' in df_chunk.columns: ts_col = 'createdAt'
                 
                 if ts_col:
-                    df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], format='mixed', utc=True, errors='coerce')
+                    # FIX: Handle Integer timestamps (Gamma Trades) as Seconds
+                    if ts_col == 'timestamp':
+                        df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], unit='s', errors='coerce')
+                    else:
+                        # Handle ISO Strings (Markets/Other)
+                        df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], format='mixed', utc=True, errors='coerce')
+                    
                     df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
                 
                 # 2. User & ID
