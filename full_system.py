@@ -1399,9 +1399,18 @@ class FastBacktestEngine:
                     prices[cid] = 0.5
                     
                 elif ev_type == 'PRICE_UPDATE':
+                    if cid not in contracts:
+                        contracts[cid] = {'p_model': 0.5, 'liquidity': 10000.0}
+                        tracker[cid] = {'w_sum': 0.0, 'w_log_sum': 0.0}
+                        prices[cid] = 0.5
+                        
                     if cid in contracts:
                         prices[cid] = data.get('p_market_all', 0.5)
                         current_p = prices[cid]
+
+                        w_id = str(data.get('wallet_id')) 
+                        vol = data.get('trade_volume', 0.0)
+                        is_sell = data.get('is_sell', False)
                         
                         w_id = data.get('wallet_id')
                         vol = data.get('trade_volume', 0.0)
@@ -2146,8 +2155,8 @@ class BacktestEngine:
         
         # 5. Build Profiler Data
         prof_data = pd.DataFrame({
-            'wallet_id': trades['user'],
-            'market_id': trades['contract_id'],
+            'wallet_id': trades['user'].astype(str), 
+            'market_id': trades['contract_id'].astype(str),
             'timestamp': trades['timestamp'],
             'size': (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype('float32'),
             'tokens': (pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce') / 1e18).astype('float32')
