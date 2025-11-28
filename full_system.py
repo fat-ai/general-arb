@@ -1775,29 +1775,56 @@ class BacktestEngine:
         # Calculate cutoff date
         cutoff_ts = datetime.now() - timedelta(days=days_back)
         
+        start_history_date = datetime.now() - timedelta(days=days_back + 50)
+
         while True:
             try:
                 params = {
-                    "limit": 1000, "offset": offset, 
-                    "closed": "true", "order": "endDate", "ascending": "false" 
+                    "limit": 1000, 
+                    "offset": offset, 
+                    "closed": "true", 
+                    "order": "endDate", 
+                    
+                    # FIX 1: Sort Oldest -> Newest to avoid the "Future Clog"
+                    "ascending": "true" 
                 }
+                
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
                 
+                # Check the date of the LAST item in this batch
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
                     last_date = pd.to_datetime(last_date_str).replace(tzinfo=None)
-                    if last_date < cutoff_ts:
-                        all_rows.extend(rows)
+                    
+                    # FIX 2: Stop if we have gone past "Now" into the future
+                    if last_date > datetime.now():
+                        # We might still want the rows in this batch that are < Now, 
+                        # but we stop fetching more.
+                        all_rows.extend([r for r in rows if pd.to_datetime(r.get('endDate')).replace(tzinfo=None) <= datetime.now()])
                         break
                 
-                all_rows.extend(rows)
+                # Filter: Only keep rows that are inside our desired window
+                # (Optimization: Don't store data from 2018 if we only want 2024)
+                relevant_rows = []
+                for r in rows:
+                    d = pd.to_datetime(r.get('endDate')).replace(tzinfo=None)
+                    if d >= start_history_date:
+                        relevant_rows.append(r)
+                
+                all_rows.extend(relevant_rows)
+                
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-             
-            except: break
+                
+                # Safety break (optional, can increase to 100k if needed)
+                if offset >= 50000: break 
+                
+            except Exception as e: 
+                log.error(f"Market fetch error: {e}")
+                break
         print(" Done.")
 
         if not all_rows: return pd.DataFrame()
