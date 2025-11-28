@@ -1861,11 +1861,20 @@ class BacktestEngine:
     def _fetch_gamma_trades_parallel(self, market_ids):
         import concurrent.futures 
         
+        # 1. Setup Cache Path
         cache_file = self.cache_dir / "gamma_trades_clob_full_v2.pkl"
-        # Skip cache
+        
+        # --- FIX: ENABLE CACHE LOADING ---
+        if cache_file.exists():
+            print(f"Loading trades from cache: {cache_file}")
+            try: 
+                return pickle.load(open(cache_file, "rb"))
+            except Exception as e:
+                print(f"Cache load failed ({e}), re-downloading...")
+        # ---------------------------------
         
         all_trades = []
-        print(f"Downloading Trades...", end="")
+        print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
         
         # Use 10 workers
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -1930,6 +1939,7 @@ class BacktestEngine:
             
         df = df[final_cols].dropna(subset=['timestamp', 'contract_id'])
         
+        # Save to cache for next time
         with open(cache_file, 'wb') as f: pickle.dump(df, f)
         return df
         
