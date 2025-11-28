@@ -1615,11 +1615,41 @@ class BacktestEngine:
             log.error("❌ CRITICAL: Data load failed. Cannot run tuning.")
             return None
       
-        
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+
+        if event_log.empty:
+            log.error("❌ Event log is empty after transformation.")
+            return None
+
+        min_date = event_log.index.min()
+        max_date = event_log.index.max()
+        total_days = (max_date - min_date).days
+
+        log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
+        
+        if total_days < 150:
+            log.error(f"❌ Not enough data ({total_days}< 150 days) to run backtest.")
+            return None
+
+        safe_train = max(5, int(total_days * 0.33))
+        safe_test = max(5, int(total_days * 0.60))
+
+        if (safe_train + safe_test) >= total_days:
+            safe_test = total_days - safe_train - 2 
+            
+        log.info(f"⚙️  ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
 
         import gc
         del df_markets, df_trades
+        gc.collect()
+
+        log.info("Uploading data to Ray Object Store...")
+        event_log_ref = ray.put(event_log)
+        profiler_ref = ray.put(profiler_data)
+        nlp_cache_ref = ray.put(None)
+        priors_ref = ray.put({})
+        
+        del event_log, profiler_data
         gc.collect()
         
         from ray.tune.search.hyperopt import HyperOptSearch
@@ -1703,7 +1733,7 @@ class BacktestEngine:
         
     def _load_data(self):
         # 1. Fetch Markets
-        markets = self._fetch_gamma_markets(days_back=180)
+        markets = self._fetch_gamma_markets(days_back=200)
         if markets.empty: 
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
@@ -1727,7 +1757,7 @@ class BacktestEngine:
         print(f"DEBUG: Data Load Complete. {len(markets)} Markets, {len(trades)} Trades.")
         return markets, trades
         
-    def _fetch_gamma_markets(self, days_back=180):
+    def _fetch_gamma_markets(self, days_back=200):
         cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d_v2.parquet"
         if cache_file.exists():
             try: return pd.read_parquet(cache_file)
@@ -1830,7 +1860,7 @@ class BacktestEngine:
         offset = 0
         batch_size = 1000
         
-        # STOPPING CRITERIA: 185 days ago (buffer for 180d backtest)
+        # STOPPING CRITERIA: 200 days ago (buffer for 200d backtest)
         # We calculate this once, outside the loop
         cutoff_ts = (datetime.now() - timedelta(days=185)).timestamp()
         
