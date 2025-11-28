@@ -2039,7 +2039,22 @@ class BacktestEngine:
                 else:
                     df_chunk['side_mult'] = 1
                     
-                df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18 
+                # --- EMERGENCY FIX: Guarantee 'size' exists ---
+                if 'size' not in df_chunk.columns:
+                    # Check for known aliases first
+                    if 'shares' in df_chunk.columns:
+                        df_chunk['size'] = df_chunk['shares']
+                    elif 'taker_amount' in df_chunk.columns:
+                        df_chunk['size'] = df_chunk['taker_amount']
+                    else:
+                        # If nothing exists, default to 0.0 to prevent crash
+                        df_chunk['size'] = 0.0
+                
+                # Ensure it is numeric (handles strings or mixed types)
+                df_chunk['size'] = pd.to_numeric(df_chunk['size'], errors='coerce').fillna(0.0)
+                # -----------------------------------------------
+                
+                df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18
                 
                 # Filter Columns
                 final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
