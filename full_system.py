@@ -5,7 +5,7 @@ import pandas as pd
 import scipy.optimize as opt
 from scipy.stats import qmc, norm
 from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable, ClientError # <-- FIX R6
+from neo4j.exceptions import ServiceUnavailable, ClientError
 from typing import Dict, List, Tuple, Any
 import ray
 from ray import tune
@@ -19,13 +19,10 @@ import math
 import json
 import google.generativeai as genai
 import multiprocessing
-import requests # For downloading files
-import gzip     # For decompressing .gz files
-import io       # For reading in-memory bytes
-from datetime import datetime, timedelta # For parsing timestamps# For parsing timestamps
-#from dune_client.client import DuneClient
-#from dune_client.query import QueryBase
-#from dune_client.types import QueryParameter
+import requests
+import gzip    
+import io     
+from datetime import datetime, timedelta
 from numba import njit
 import pickle
 from pathlib import Path
