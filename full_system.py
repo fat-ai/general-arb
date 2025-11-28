@@ -2512,7 +2512,7 @@ def run_c7_demo():
     log.info("--- (DEMO) Running Component 7 (Production) Demo ---")
     
     # 1. Nuke the cache to fix the "Triple Disconnect"
-    force_clear_cache("polymarket_cache") 
+    #force_clear_cache("polymarket_cache") 
     
     try:
         backtester = BacktestEngine(historical_data_path=".")
