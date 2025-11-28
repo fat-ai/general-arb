@@ -1617,6 +1617,9 @@ class BacktestEngine:
       
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
 
+        now = pd.Timestamp.now()
+        event_log = event_log[event_log.index <= now]
+
         if event_log.empty:
             log.error("❌ Event log is empty after transformation.")
             return None
