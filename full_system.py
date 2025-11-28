@@ -2084,131 +2084,143 @@ class BacktestEngine:
     
     def _transform_to_events(self, markets, trades):
         import gc
-        log.info("Transforming Data (Memory Optimized)...")
+        log.info("Transforming Data (Production Optimized)...")
         
-        # 1. Optimize Types Immediately (Slash Memory Usage by 80%)
+        # 1. Normalize Keys
+        # Ensure 'contract_id' is the primary key for both DataFrames
+        if 'fpmm_address' in markets.columns and 'contract_id' not in markets.columns:
+            markets = markets.rename(columns={'fpmm_address': 'contract_id'})
+        
+        if 'fpmm_address' in trades.columns and 'contract_id' not in trades.columns:
+            trades = trades.rename(columns={'fpmm_address': 'contract_id'})
+            
+        # 2. Optimize Types (Memory)
         # Convert IDs to categories (integers under the hood) instead of heavy strings
         for df in [markets, trades]:
-            for col in ['fpmm_address', 'user', 'contract_id']:
+            for col in ['contract_id', 'user']:
                 if col in df.columns:
                     df[col] = df[col].astype('category')
                     
-        # 2. Ensure Timestamp
+        # 3. Ensure Timestamp
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
             trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s', errors='coerce')
-        
         trades = trades.dropna(subset=['timestamp'])
         
-        # 3. Filter Logic (Vectorized)
+        # 4. Filter Logic (Vectorized)
         log.info("Filtering Data...")
         
-        # Intersection using sets of the underlying categories (fast)
-        # We must cast back to string for set intersection, but keep category in DF
-        market_ids = set(markets['fpmm_address'].astype(str))
-        trade_mkts = set(trades['fpmm_address'].astype(str))
+        # Use 'contract_id' for intersection
+        market_ids = set(markets['contract_id'].astype(str))
+        trade_mkts = set(trades['contract_id'].astype(str))
         common_ids = market_ids.intersection(trade_mkts)
         
-        markets = markets[markets['fpmm_address'].astype(str).isin(common_ids)].copy()
-        trades = trades[trades['fpmm_address'].astype(str).isin(common_ids)].copy()
+        # Filter DFs
+        markets = markets[markets['contract_id'].astype(str).isin(common_ids)].copy()
+        trades = trades[trades['contract_id'].astype(str).isin(common_ids)].copy()
         
-        # 4. Build Profiler Data (Vectorized)
-        # Avoid creating intermediate copies
+        # 5. Build Profiler Data (First, while we have raw data)
+        # We need this for Brier Score calculation in the engine
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'],
-            'market_id': trades['fpmm_address'],
+            'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
-            # Calculations
             'size': (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype('float32'),
             'tokens': (pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce') / 1e18).astype('float32')
         })
         
-        # Bet Price
+        # Bet Price Calculation
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0, 1)
         
-        # Outcome Map (Optimized)
-        # Create a lookup series
-        outcome_lookup = markets.set_index('fpmm_address')['outcome']
+        # Outcome Map
+        outcome_lookup = markets.set_index('contract_id')['outcome']
         prof_data['outcome'] = prof_data['market_id'].map(outcome_lookup).astype('float32')
-        prof_data['entity_type'] = 'default_topic' # Constant, low memory
+        prof_data['entity_type'] = 'default_topic'
         
-        # 5. Build Event Log (Direct DataFrame Construction)
-        # Instead of list-of-dicts, we build 3 DataFrames and concat. Much lighter.
+        log.info(f"Profiler Data Built: {len(prof_data)} records.")
+
+        # 6. Build Event Log (The Memory Heavy Step)
+        # We build this using lists to avoid DF overhead until the very end
         
+        events_ts = []
+        events_type = []
+        events_data = []
+
         # --- A. NEW_CONTRACT Events ---
-        df_new = pd.DataFrame({
-            'timestamp': markets['created_at'],
-            'event_type': 'NEW_CONTRACT',
-            'contract_id': markets['fpmm_address'],
-            'liquidity': markets['liquidity'].fillna(10000.0).astype('float32'),
-            'p_market_all': 0.5
-        })
+        # Convert to native lists for fast iteration
+        m_ts = markets['created_at'].tolist()
+        m_ids = markets['contract_id'].astype(str).tolist()
+        m_liq = markets['liquidity'].fillna(10000.0).astype(float).tolist()
         
-        # Pack 'data' column efficiently
-        # We define a helper to pack rows into dicts ONLY at the last second
-        def pack_new_contract(row):
-            return {
-                'contract_id': str(row['contract_id']), # Must be string for JSON/Ray
-                'p_market_all': float(row['p_market_all']),
-                'liquidity': float(row['liquidity'])
-            }
-        df_new['data'] = df_new.apply(pack_new_contract, axis=1)
-        df_new = df_new[['timestamp', 'event_type', 'data']]
+        for ts, cid, liq in zip(m_ts, m_ids, m_liq):
+            events_ts.append(ts)
+            events_type.append('NEW_CONTRACT')
+            events_data.append({
+                'contract_id': cid,
+                'p_market_all': 0.5,
+                'liquidity': liq
+            })
 
         # --- B. RESOLUTION Events ---
         resolved_mask = markets['resolution_timestamp'].notna() & markets['outcome'].notna()
-        df_res = pd.DataFrame({
-            'timestamp': markets.loc[resolved_mask, 'resolution_timestamp'],
-            'event_type': 'RESOLUTION',
-            'contract_id': markets.loc[resolved_mask, 'fpmm_address'],
-            'outcome': markets.loc[resolved_mask, 'outcome'].astype('float32')
-        })
+        r_ts = markets.loc[resolved_mask, 'resolution_timestamp'].tolist()
+        r_ids = markets.loc[resolved_mask, 'contract_id'].astype(str).tolist()
+        r_out = markets.loc[resolved_mask, 'outcome'].astype(float).tolist()
         
-        def pack_resolution(row):
-            return {
-                'contract_id': str(row['contract_id']),
-                'outcome': float(row['outcome'])
-            }
-        df_res['data'] = df_res.apply(pack_resolution, axis=1)
-        df_res = df_res[['timestamp', 'event_type', 'data']]
+        for ts, cid, out in zip(r_ts, r_ids, r_out):
+            events_ts.append(ts)
+            events_type.append('RESOLUTION')
+            events_data.append({
+                'contract_id': cid,
+                'outcome': out
+            })
+            
+        # Free up Markets RAM
+        del markets
+        gc.collect()
 
         # --- C. PRICE_UPDATE Events ---
-        # Pre-calculate fields to avoid overhead in apply
-        trades['price_calc'] = (prof_data['size'] / prof_data['tokens']).fillna(0.5).abs().clip(0.01, 0.99)
-        trades['vol_calc'] = prof_data['size']
-        trades['is_sell_calc'] = prof_data['tokens'] < 0
+        # Pre-calc columns to simple lists
+        t_ts = trades['timestamp'].tolist()
+        t_ids = trades['contract_id'].astype(str).tolist()
+        t_usr = trades['user'].astype(str).tolist()
+        t_vol = (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype(float).tolist()
         
-        df_price = pd.DataFrame({
-            'timestamp': trades['timestamp'],
-            'event_type': 'PRICE_UPDATE',
-            # We keep columns temporarily to pack them
-            'contract_id': trades['fpmm_address'],
-            'wallet_id': trades['user'],
-            'price': trades['price_calc'],
-            'vol': trades['vol_calc'],
-            'is_sell': trades['is_sell_calc']
-        })
+        # Calculate price and direction efficiently
+        # Note: We use the prof_data calculations we already made to ensure consistency
+        t_price = prof_data['bet_price'].astype(float).tolist()
+        t_tokens = prof_data['tokens'].tolist()
         
-        def pack_price(row):
-            return {
-                'contract_id': str(row['contract_id']),
-                'p_market_all': 0.5, # Placeholder
-                'wallet_id': str(row['wallet_id']),
-                'trade_price': float(row['price']),
-                'trade_volume': float(row['vol']),
-                'is_sell': bool(row['is_sell'])
-            }
-        
-        df_price['data'] = df_price.apply(pack_price, axis=1)
-        df_price = df_price[['timestamp', 'event_type', 'data']]
-
-        # 6. Merge and Sort
-        del markets, trades # Free RAM immediately
+        # Free up Trades RAM before the massive loop
+        del trades
         gc.collect()
         
-        df_ev = pd.concat([df_new, df_res, df_price], ignore_index=True)
-        df_ev = df_ev.sort_values('timestamp').set_index('timestamp')
+        # Generate Trade Dictionaries
+        # Zip is fastest way to iterate in Python
+        for ts, cid, usr, price, vol, tokens in zip(t_ts, t_ids, t_usr, t_price, t_vol, t_tokens):
+            events_ts.append(ts)
+            events_type.append('PRICE_UPDATE')
+            events_data.append({
+                'contract_id': cid,
+                'p_market_all': 0.5, # Placeholder, updated by engine
+                'wallet_id': usr,
+                'trade_price': price,
+                'trade_volume': vol,
+                'is_sell': tokens < 0
+            })
+
+        # 7. Final Assembly
+        df_ev = pd.DataFrame({
+            'timestamp': events_ts,
+            'event_type': events_type,
+            'data': events_data
+        })
+        
+        # Ensure index
+        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
+        df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
+        
         return df_ev, prof_data
   
         
