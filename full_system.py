@@ -1805,28 +1805,26 @@ class BacktestEngine:
     def _fetch_single_market_trades(self, market_id):
         """
         Worker function: Fetches ALL trades for a specific market ID.
-        Includes Pagination (offset) and robust Retry logic.
+        CORRECTED: Removes the 50k limit. Stops based on TIME (180 days).
         """
         import time
         import requests
+        from datetime import datetime, timedelta
         from requests.adapters import HTTPAdapter, Retry
         
-        # 1. Setup Local Session (Thread-Safe)
-        # We cannot share self.session across threads reliably without a huge pool
+        # 1. Setup Session
         session = requests.Session()
-        retries = Retry(
-            total=5, 
-            backoff_factor=0.5, 
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"]
-        )
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         
         all_market_trades = []
         offset = 0
         batch_size = 1000
         
-        # 2. Pagination Loop
+        # STOPPING CRITERIA: 185 days ago (buffer for 180d backtest)
+        # We calculate this once, outside the loop
+        cutoff_ts = (datetime.now() - timedelta(days=185)).timestamp()
+        
         while True:
             try:
                 url = "https://gamma-api.polymarket.com/events"
@@ -1837,40 +1835,50 @@ class BacktestEngine:
                     "offset": offset
                 }
                 
-                # 3. Request with explicit timeout
-                resp = session.get(url, params=params, timeout=10)
+                resp = session.get(url, params=params, timeout=15)
                 
                 if resp.status_code == 200:
                     data = resp.json()
                     
-                    # Empty response means we are done
                     if not data: 
-                        break
-                        
+                        break # End of history (API returned empty)
+                    
                     all_market_trades.extend(data)
                     
-                    # If we got less than requested, we reached the end
-                    if len(data) < batch_size:
-                        break
+                    # --- CRITICAL FIX: Check Time, Not Count ---
+                    # Check the timestamp of the last trade in this batch
+                    # If the last trade is older than our cutoff, we have enough data.
+                    last_trade = data[-1]
+                    
+                    # Gamma uses 'timestamp' (seconds) or 'time' (iso string)
+                    ts_val = last_trade.get('timestamp')
+                    trade_ts = None
+                    
+                    if isinstance(ts_val, (int, float)):
+                        trade_ts = float(ts_val)
+                    elif last_trade.get('time'):
+                        try:
+                            # Quick ISO parse
+                            trade_ts = pd.to_datetime(last_trade['time']).timestamp()
+                        except: pass
+                    
+                    # If we found a valid timestamp and it's older than cutoff, STOP.
+                    if trade_ts and trade_ts < cutoff_ts:
+                        break 
+                    # -------------------------------------------
+
+                    if len(data) < batch_size: 
+                        break # End of history (Partial page)
                         
-                    # Move cursor
                     offset += batch_size
                     
-                    # Safety Cap: Don't fetch > 50k trades per market (avoids infinite loops)
-                    if offset > 50000: 
-                        break
-                        
                 elif resp.status_code == 429:
-                    # Rate limit hit - Sleep and Retry same offset
                     time.sleep(2)
                     continue
                 else:
-                    # Non-recoverable error (404, 400, etc)
-                    # log.warning(f"Market {market_id} error: {resp.status_code}")
+                    # 400/500 errors -> Stop to prevent hang
                     break
-                    
-            except Exception as e:
-                # Network error - abort this market
+            except:
                 break
         
         return all_market_trades
