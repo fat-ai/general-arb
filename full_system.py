@@ -1563,8 +1563,19 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         import numpy as np
         np.random.seed(config.get('seed', 42))
 
+        results = engine.run_walk_forward(config)
+        
+        ret = results.get('total_return', 0.0)
+        dd = results.get('max_drawdown', 1.0)
+        
+        # Calculate Smart Score inside worker
+        # (Since we removed the local objective_function, we do it here)
+        smart_score = ret / (dd + 0.01)
+        
+        results['smart_score'] = smart_score
+
         # Run Walk-Forward Validation
-        return engine.run_walk_forward(config)
+        return results
 
     except Exception as e:
         print(f"!!!!! WORKER CRASH !!!!! Config: {config}")
@@ -1648,10 +1659,16 @@ class BacktestEngine:
         
         # Higher sample count to cover combinations
         analysis = tune.run(
-            objective_function,
+            tune.with_parameters(
+                ray_backtest_wrapper, # The GLOBAL function (not local)
+                event_log_ref=event_log_ref,
+                profiler_ref=profiler_ref,
+                nlp_cache_ref=nlp_cache_ref,
+                priors_ref=priors_ref
+            ),
             config=search_space,
             search_alg=searcher,
-            num_samples=60, 
+            num_samples=20, 
             resources_per_trial={"cpu": 1},
         )
 
