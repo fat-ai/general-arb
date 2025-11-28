@@ -1649,7 +1649,7 @@ class BacktestEngine:
         nlp_cache_ref = ray.put(None)
         priors_ref = ray.put({})
         
-        del event_log, profiler_data
+        
         gc.collect()
         
         from ray.tune.search.hyperopt import HyperOptSearch
@@ -1681,6 +1681,8 @@ class BacktestEngine:
         profiler_ref = ray.put(profiler_data)
         nlp_cache_ref = ray.put(None)
         priors_ref = ray.put({})
+
+        del event_log, profiler_data
         
         def objective_function(config):
             results = ray_backtest_wrapper(config, ray.put(event_log), ray.put(profiler_data), ray.put(None), ray.put({}))
