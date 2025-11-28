@@ -1776,7 +1776,8 @@ class BacktestEngine:
         cutoff_ts = datetime.now() - timedelta(days=days_back)
         
         start_history_date = datetime.now() - timedelta(days=days_back + 50)
-
+        log.info(f"Fetching markets from {start_history_date.date()} to NOW...")
+        
         while True:
             try:
                 params = {
@@ -1784,8 +1785,6 @@ class BacktestEngine:
                     "offset": offset, 
                     "closed": "true", 
                     "order": "endDate", 
-                    
-                    # FIX 1: Sort Oldest -> Newest to avoid the "Future Clog"
                     "ascending": "true" 
                 }
                 
@@ -1819,8 +1818,6 @@ class BacktestEngine:
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
                 
-                # Safety break (optional, can increase to 100k if needed)
-                if offset >= 50000: break 
                 
             except Exception as e: 
                 log.error(f"Market fetch error: {e}")
