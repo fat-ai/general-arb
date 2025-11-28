@@ -1875,7 +1875,6 @@ class BacktestEngine:
                 print(f"   Cache corrupted ({e}), starting fresh.")
         
         # 2. Determine what is left to do
-        # Filter out market_ids that are already in our DataFrame
         if not all_trades_df.empty and 'contract_id' in all_trades_df.columns:
             done_ids = set(all_trades_df['contract_id'].unique())
             todo_ids = [m for m in market_ids if m not in done_ids]
@@ -1889,7 +1888,7 @@ class BacktestEngine:
         print(f"Fetching remaining {len(todo_ids)} markets (Batch Saving Enabled)...")
         
         # 3. Batch Processing Settings
-        BATCH_SIZE = 500  # Save to disk every 500 markets
+        BATCH_SIZE = 500  
         max_workers = 10
         
         # Helper to process a batch
@@ -1925,6 +1924,7 @@ class BacktestEngine:
                 df_chunk = pd.DataFrame(raw_data)
                 
                 # --- FAST NORMALIZATION (On the chunk only) ---
+                
                 # 1. Timestamp
                 ts_col = None
                 if 'timestamp' in df_chunk.columns: ts_col = 'timestamp'
@@ -1939,9 +1939,13 @@ class BacktestEngine:
                 df_chunk['user'] = df_chunk.get('taker_address', df_chunk.get('taker', 'unknown'))
                 df_chunk['contract_id'] = df_chunk['contract_id'].astype(str).str.lower()
                 
-                # 3. Amounts
-                df_chunk['size'] = pd.to_numeric(df_chunk.get('size', 0), errors='coerce').fillna(0.0)
-                df_chunk['price'] = pd.to_numeric(df_chunk.get('price', 0), errors='coerce').fillna(0.0)
+                # 3. Amounts (FIXED: Ensure columns exist before conversion)
+                if 'size' not in df_chunk.columns: df_chunk['size'] = 0.0
+                if 'price' not in df_chunk.columns: df_chunk['price'] = 0.0
+                
+                df_chunk['size'] = pd.to_numeric(df_chunk['size'], errors='coerce').fillna(0.0)
+                df_chunk['price'] = pd.to_numeric(df_chunk['price'], errors='coerce').fillna(0.0)
+                
                 df_chunk['tradeAmount'] = df_chunk['size'] * df_chunk['price'] * 1e6 
                 
                 # Side
@@ -1949,12 +1953,14 @@ class BacktestEngine:
                     df_chunk['side_mult'] = df_chunk['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
                 else:
                     df_chunk['side_mult'] = 1
+                    
                 df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18 
                 
                 # Filter Columns
                 final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
                 for c in final_cols: 
                     if c not in df_chunk.columns: df_chunk[c] = None
+                    
                 df_chunk = df_chunk[final_cols].dropna(subset=['timestamp', 'contract_id'])
                 
                 # --- APPEND AND SAVE ---
