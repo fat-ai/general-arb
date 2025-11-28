@@ -1796,7 +1796,7 @@ class BacktestEngine:
                 all_rows.extend(rows)
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                if offset >= 20000: break 
+             
             except: break
         print(" Done.")
 
