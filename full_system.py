@@ -2018,13 +2018,14 @@ class BacktestEngine:
                 df_chunk['contract_id'] = df_chunk['contract_id'].astype(str).str.lower()
                 
                 # 3. Amounts (FIXED: Ensure columns exist before conversion)
-                if 'size' not in df_chunk.columns: df_chunk['size'] = 0.0
-                if 'price' not in df_chunk.columns: df_chunk['price'] = 0.0
+                if 'size' not in df_chunk.columns and 'shares' in df_chunk.columns:
+                    df_chunk['size'] = df_chunk['shares']
+                if 'size' not in df_chunk.columns and 'taker_amount' in df_chunk.columns:
+                    df_chunk['size'] = df_chunk['taker_amount']
                 
-                df_chunk['size'] = pd.to_numeric(df_chunk['size'], errors='coerce').fillna(0.0)
-                df_chunk['price'] = pd.to_numeric(df_chunk['price'], errors='coerce').fillna(0.0)
-                
-                df_chunk['tradeAmount'] = df_chunk['size'] * df_chunk['price'] * 1e6 
+                # fallback for price 
+                if 'price' not in df_chunk.columns and 'avgPrice' in df_chunk.columns:
+                    df_chunk['price'] = df_chunk['avgPrice']
                 
                 # Side
                 if 'side' in df_chunk.columns:
