@@ -2173,8 +2173,11 @@ class BacktestEngine:
             events_type.append('NEW_CONTRACT')
             events_data.append({
                 'contract_id': cid,
-                'p_market_all': 0.5,
-                'liquidity': liq
+                'p_market_all': price,
+                'wallet_id': usr,
+                'trade_price': price,
+                'trade_volume': vol,
+                'is_sell': tokens < 0
             })
 
         # --- B. RESOLUTION Events ---
