@@ -1412,7 +1412,7 @@ class FastBacktestEngine:
                         vol = data.get('trade_volume', 0.0)
                         is_sell = data.get('is_sell', False)
                         
-                        w_id = data.get('wallet_id')
+                
                         vol = data.get('trade_volume', 0.0)
                         # trade_price is unused for signal now, replaced by direction
                         
