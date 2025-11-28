@@ -1891,13 +1891,22 @@ class BacktestEngine:
         
         # 1. Load partial progress if available
         all_trades_df = pd.DataFrame()
+        done_ids = set()
+        
         if cache_file.exists():
             print(f"RESUMING: Loading existing cache from {cache_file}...")
             try:
-                all_trades_df = pickle.load(open(cache_file, "rb"))
-                print(f"   Loaded {len(all_trades_df)} trades.")
+                with open(cache_file, "rb") as f:
+                    all_trades_df = pickle.load(f)
+                
+                if not all_trades_df.empty and 'contract_id' in all_trades_df.columns:
+                    done_ids = set(all_trades_df['contract_id'].unique())
+                    print(f"   ✅ Cache Loaded: {len(all_trades_df)} trades covering {len(done_ids)} markets.")
+                else:
+                    print("   ⚠️ Cache loaded but appears empty or invalid columns.")
             except Exception as e:
-                print(f"   Cache corrupted ({e}), starting fresh.")
+                print(f"   ⚠️ Cache corrupted ({e}), starting fresh.")
+                all_trades_df = pd.DataFrame()
         
         # 2. Determine what is left to do
         if not all_trades_df.empty and 'contract_id' in all_trades_df.columns:
@@ -2112,39 +2121,30 @@ class BacktestEngine:
         log.info("Transforming Data (Production Optimized)...")
         
         # 1. Normalize Keys
-        # Ensure 'contract_id' is the primary key for both DataFrames
         if 'fpmm_address' in markets.columns and 'contract_id' not in markets.columns:
             markets = markets.rename(columns={'fpmm_address': 'contract_id'})
-        
         if 'fpmm_address' in trades.columns and 'contract_id' not in trades.columns:
             trades = trades.rename(columns={'fpmm_address': 'contract_id'})
             
-        # 2. Optimize Types (Memory)
-        # Convert IDs to categories (integers under the hood) instead of heavy strings
+        # 2. Optimize Types
         for df in [markets, trades]:
             for col in ['contract_id', 'user']:
-                if col in df.columns:
-                    df[col] = df[col].astype('category')
+                if col in df.columns: df[col] = df[col].astype('category')
                     
         # 3. Ensure Timestamp
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
             trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s', errors='coerce')
         trades = trades.dropna(subset=['timestamp'])
         
-        # 4. Filter Logic (Vectorized)
+        # 4. Filter Logic
         log.info("Filtering Data...")
-        
-        # Use 'contract_id' for intersection
         market_ids = set(markets['contract_id'].astype(str))
         trade_mkts = set(trades['contract_id'].astype(str))
         common_ids = market_ids.intersection(trade_mkts)
-        
-        # Filter DFs
         markets = markets[markets['contract_id'].astype(str).isin(common_ids)].copy()
         trades = trades[trades['contract_id'].astype(str).isin(common_ids)].copy()
         
-        # 5. Build Profiler Data (First, while we have raw data)
-        # We need this for Brier Score calculation in the engine
+        # 5. Build Profiler Data
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'],
             'market_id': trades['contract_id'],
@@ -2152,84 +2152,56 @@ class BacktestEngine:
             'size': (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype('float32'),
             'tokens': (pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce') / 1e18).astype('float32')
         })
-        
-        # Bet Price Calculation
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0, 1)
-        
-        # Outcome Map
         outcome_lookup = markets.set_index('contract_id')['outcome']
         prof_data['outcome'] = prof_data['market_id'].map(outcome_lookup).astype('float32')
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # 6. Build Event Log (The Memory Heavy Step)
-        # We build this using lists to avoid DF overhead until the very end
-        
-        events_ts = []
-        events_type = []
-        events_data = []
+        # 6. Build Event Log
+        events_ts, events_type, events_data = [], [], []
 
-        # --- A. NEW_CONTRACT Events ---
-        # Convert to native lists for fast iteration
+        # A. NEW_CONTRACT
         m_ts = markets['created_at'].tolist()
         m_ids = markets['contract_id'].astype(str).tolist()
         m_liq = markets['liquidity'].fillna(10000.0).astype(float).tolist()
         
         for ts, cid, liq in zip(m_ts, m_ids, m_liq):
-            events_ts.append(ts)
-            events_type.append('NEW_CONTRACT')
-            events_data.append({
-                'contract_id': cid,
-                'p_market_all': price,
-                'wallet_id': usr,
-                'trade_price': price,
-                'trade_volume': vol,
-                'is_sell': tokens < 0
-            })
+            events_ts.append(ts); events_type.append('NEW_CONTRACT')
+            events_data.append({'contract_id': cid, 'p_market_all': 0.5, 'liquidity': liq})
 
-        # --- B. RESOLUTION Events ---
+        # B. RESOLUTION
         resolved_mask = markets['resolution_timestamp'].notna() & markets['outcome'].notna()
         r_ts = markets.loc[resolved_mask, 'resolution_timestamp'].tolist()
         r_ids = markets.loc[resolved_mask, 'contract_id'].astype(str).tolist()
         r_out = markets.loc[resolved_mask, 'outcome'].astype(float).tolist()
         
         for ts, cid, out in zip(r_ts, r_ids, r_out):
-            events_ts.append(ts)
-            events_type.append('RESOLUTION')
-            events_data.append({
-                'contract_id': cid,
-                'outcome': out
-            })
+            events_ts.append(ts); events_type.append('RESOLUTION')
+            events_data.append({'contract_id': cid, 'outcome': out})
             
-        # Free up Markets RAM
-        del markets
-        gc.collect()
+        del markets; gc.collect()
 
-        # --- C. PRICE_UPDATE Events ---
-        # Pre-calc columns to simple lists
+        # C. PRICE_UPDATE (Explicit Scoping)
         t_ts = trades['timestamp'].tolist()
         t_ids = trades['contract_id'].astype(str).tolist()
         t_usr = trades['user'].astype(str).tolist()
         t_vol = (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype(float).tolist()
         
-        # Calculate price and direction efficiently
-        # Note: We use the prof_data calculations we already made to ensure consistency
-        t_price = prof_data['bet_price'].astype(float).tolist()
+        # Calculate price list explicitly
+        t_price = prof_data['bet_price'].fillna(0.5).astype(float).tolist()
         t_tokens = prof_data['tokens'].tolist()
         
-        # Free up Trades RAM before the massive loop
-        del trades
-        gc.collect()
+        del trades; gc.collect()
         
-        # Generate Trade Dictionaries
-        # Zip is fastest way to iterate in Python
+        # ZIP LOOP: 'price' is now a loop variable, so it cannot be Unbound
         for ts, cid, usr, price, vol, tokens in zip(t_ts, t_ids, t_usr, t_price, t_vol, t_tokens):
             events_ts.append(ts)
             events_type.append('PRICE_UPDATE')
             events_data.append({
                 'contract_id': cid,
-                'p_market_all': 0.5, # Placeholder, updated by engine
+                'p_market_all': price, # Guaranteed to be set by zip
                 'wallet_id': usr,
                 'trade_price': price,
                 'trade_volume': vol,
@@ -2237,18 +2209,11 @@ class BacktestEngine:
             })
 
         # 7. Final Assembly
-        df_ev = pd.DataFrame({
-            'timestamp': events_ts,
-            'event_type': events_type,
-            'data': events_data
-        })
-        
-        # Ensure index
+        df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
-        
         return df_ev, prof_data
   
         
