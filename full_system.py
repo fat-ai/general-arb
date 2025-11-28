@@ -1860,88 +1860,117 @@ class BacktestEngine:
 
     def _fetch_gamma_trades_parallel(self, market_ids):
         import concurrent.futures 
+        import gc
         
-        # 1. Setup Cache Path
         cache_file = self.cache_dir / "gamma_trades_clob_full_v2.pkl"
         
-        # --- FIX: ENABLE CACHE LOADING ---
+        # 1. Load partial progress if available
+        all_trades_df = pd.DataFrame()
         if cache_file.exists():
-            print(f"Loading trades from cache: {cache_file}")
-            try: 
-                return pickle.load(open(cache_file, "rb"))
+            print(f"RESUMING: Loading existing cache from {cache_file}...")
+            try:
+                all_trades_df = pickle.load(open(cache_file, "rb"))
+                print(f"   Loaded {len(all_trades_df)} trades.")
             except Exception as e:
-                print(f"Cache load failed ({e}), re-downloading...")
-        # ---------------------------------
+                print(f"   Cache corrupted ({e}), starting fresh.")
         
-        all_trades = []
-        print(f"Downloading Trades for {len(market_ids)} markets (Parallel)...", end="")
-        
-        # Use 10 workers
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in market_ids}
-            
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_mid):
-                mid = future_to_mid[future]
-                data = future.result()
-                
-                if data and isinstance(data, list):
-                    for row in data:
-                        row['contract_id'] = mid # Inject ID
-                    all_trades.extend(data)
-                    
-                completed += 1
-                if completed % 100 == 0: print(".", end="", flush=True)
-                
-        print(" Done.")
-        
-        if not all_trades: return pd.DataFrame()
-        
-        df = pd.DataFrame(all_trades)
-        
-        # Schema Normalization
-        # 1. Timestamp
-        ts_col = None
-        if 'timestamp' in df.columns: ts_col = 'timestamp'
-        elif 'time' in df.columns: ts_col = 'time'
-        elif 'createdAt' in df.columns: ts_col = 'createdAt'
-        
-        if ts_col:
-            df['timestamp'] = pd.to_datetime(df[ts_col], format='mixed', utc=True, errors='coerce')
-            if df['timestamp'].dt.tz is not None:
-                df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+        # 2. Determine what is left to do
+        # Filter out market_ids that are already in our DataFrame
+        if not all_trades_df.empty and 'contract_id' in all_trades_df.columns:
+            done_ids = set(all_trades_df['contract_id'].unique())
+            todo_ids = [m for m in market_ids if m not in done_ids]
         else:
-            return pd.DataFrame()
+            todo_ids = market_ids
+            
+        if not todo_ids:
+            print("All markets already fetched. Using cache.")
+            return all_trades_df
 
-        # 2. User
-        df['user'] = df.get('taker_address', df.get('taker', 'unknown'))
+        print(f"Fetching remaining {len(todo_ids)} markets (Batch Saving Enabled)...")
         
-        # 3. Contract ID
-        if 'contract_id' in df.columns:
-            df['contract_id'] = df['contract_id'].astype(str).str.lower()
-        else:
-            return pd.DataFrame()
+        # 3. Batch Processing Settings
+        BATCH_SIZE = 500  # Save to disk every 500 markets
+        max_workers = 10
+        
+        # Helper to process a batch
+        def process_batch(batch_ids):
+            batch_data = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_mid = {executor.submit(self._fetch_single_market_trades, mid): mid for mid in batch_ids}
+                completed_in_batch = 0
+                for future in concurrent.futures.as_completed(future_to_mid):
+                    mid = future_to_mid[future]
+                    try:
+                        data = future.result()
+                        if data and isinstance(data, list):
+                            for row in data:
+                                row['contract_id'] = mid
+                            batch_data.extend(data)
+                    except: pass
+                    completed_in_batch += 1
+            return batch_data
+
+        # 4. Main Loop
+        total_processed = 0
+        
+        # Chunk the todo list
+        chunks = [todo_ids[i:i + BATCH_SIZE] for i in range(0, len(todo_ids), BATCH_SIZE)]
+        
+        for i, chunk in enumerate(chunks):
+            print(f"   Processing Batch {i+1}/{len(chunks)} ({len(chunk)} markets)...", end="")
             
-        # 4. Amounts
-        df['size'] = pd.to_numeric(df['size'], errors='coerce').fillna(0.0)
-        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
-        df['tradeAmount'] = df['size'] * df['price'] * 1e6 
-        
-        df['side_mult'] = 1
-        if 'side' in df.columns:
-            df['side_mult'] = df['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+            raw_data = process_batch(chunk)
             
-        df['outcomeTokensAmount'] = df['size'] * df['side_mult'] * 1e18 
-        
-        final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
-        for c in final_cols: 
-            if c not in df.columns: df[c] = None
+            if raw_data:
+                df_chunk = pd.DataFrame(raw_data)
+                
+                # --- FAST NORMALIZATION (On the chunk only) ---
+                # 1. Timestamp
+                ts_col = None
+                if 'timestamp' in df_chunk.columns: ts_col = 'timestamp'
+                elif 'time' in df_chunk.columns: ts_col = 'time'
+                elif 'createdAt' in df_chunk.columns: ts_col = 'createdAt'
+                
+                if ts_col:
+                    df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], format='mixed', utc=True, errors='coerce')
+                    df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
+                
+                # 2. User & ID
+                df_chunk['user'] = df_chunk.get('taker_address', df_chunk.get('taker', 'unknown'))
+                df_chunk['contract_id'] = df_chunk['contract_id'].astype(str).str.lower()
+                
+                # 3. Amounts
+                df_chunk['size'] = pd.to_numeric(df_chunk.get('size', 0), errors='coerce').fillna(0.0)
+                df_chunk['price'] = pd.to_numeric(df_chunk.get('price', 0), errors='coerce').fillna(0.0)
+                df_chunk['tradeAmount'] = df_chunk['size'] * df_chunk['price'] * 1e6 
+                
+                # Side
+                if 'side' in df_chunk.columns:
+                    df_chunk['side_mult'] = df_chunk['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
+                else:
+                    df_chunk['side_mult'] = 1
+                df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18 
+                
+                # Filter Columns
+                final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
+                for c in final_cols: 
+                    if c not in df_chunk.columns: df_chunk[c] = None
+                df_chunk = df_chunk[final_cols].dropna(subset=['timestamp', 'contract_id'])
+                
+                # --- APPEND AND SAVE ---
+                all_trades_df = pd.concat([all_trades_df, df_chunk], ignore_index=True)
+                
+            # Save Checkpoint
+            with open(cache_file, 'wb') as f: pickle.dump(all_trades_df, f)
+            print(f" Saved. (Total Rows: {len(all_trades_df)})")
             
-        df = df[final_cols].dropna(subset=['timestamp', 'contract_id'])
-        
-        # Save to cache for next time
-        with open(cache_file, 'wb') as f: pickle.dump(df, f)
-        return df
+            # Free memory
+            del raw_data
+            if 'df_chunk' in locals(): del df_chunk
+            gc.collect()
+
+        print("Done. All batches processed.")
+        return all_trades_df
         
     def _fetch_subgraph_trades(self, days_back=200):
         import time
