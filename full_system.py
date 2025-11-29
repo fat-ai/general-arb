@@ -1909,6 +1909,10 @@ class BacktestEngine:
         import requests
         from datetime import datetime, timedelta
         from requests.adapters import HTTPAdapter, Retry
+
+        # Create a short ID from the market_id for logging
+        t_id = str(market_id)[-4:]
+        print(f" [T-{t_id}] Start.", end="", flush=True)
         
         # 1. Setup Session
         session = requests.Session()
@@ -1940,9 +1944,9 @@ class BacktestEngine:
                     
                     if not data: 
                         break # End of history (API returned empty)
-                    
+                    print(f" [T-{t_id}] Req Offset {offset}...", end="", flush=True)
                     all_market_trades.extend(data)
-                    
+                    print(f" [T-{t_id}] {resp.status_code} ", end="", flush=True)
                     # --- CRITICAL FIX: Check Time, Not Count ---
                     # Check the timestamp of the last trade in this batch
                     # If the last trade is older than our cutoff, we have enough data.
@@ -1971,6 +1975,7 @@ class BacktestEngine:
                     offset += batch_size
                     
                 elif resp.status_code == 429:
+                    print(f" [T-{t_id}] 429 RETRY! ", end="", flush=True)
                     time.sleep(2)
                     continue
                 else:
