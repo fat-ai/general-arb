@@ -1995,77 +1995,79 @@ class BacktestEngine:
         import requests
         from requests.adapters import HTTPAdapter, Retry
         
+        # Files
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. Identify what is already done
+        # 1. Load Completion Ledger (Resume Capability)
         done_ids = set()
-        if cache_file.exists():
-            print(f"Checking progress in {cache_file}...")
+        if ledger_file.exists():
+            print(f"Reading completion ledger from {ledger_file}...")
             try:
-                # Read just contract_id to save RAM
-                chunk_iter = pd.read_csv(cache_file, usecols=['contract_id'], chunksize=100000)
-                for chunk in chunk_iter:
-                    done_ids.update(chunk['contract_id'].unique())
-                print(f"   ✅ Found history for {len(done_ids)} markets.")
-            except Exception as e:
-                print(f"   ⚠️ CSV Read error ({e}). Starting fresh.")
+                with open(ledger_file, "r") as f:
+                    done_ids = set(line.strip() for line in f if line.strip())
+                print(f"   ✅ Verified completion for {len(done_ids)} markets.")
+            except: 
+                print("   ⚠️ Ledger error. Starting fresh.")
         
+        # Filter todo list
         todo_ids = [m for m in market_ids if m not in done_ids]
         
         if not todo_ids:
-            print("All markets fetched. Loading full dataset...")
-            return pd.read_csv(cache_file) # Types handled later
+            print("All markets verified complete. Loading dataset...")
+            # Load and De-Dupe (Vital because retries might create duplicates)
+            df = pd.read_csv(cache_file)
+            print("   De-duplicating dataset...")
+            df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
+            return df
 
-        print(f"Stream-fetching {len(todo_ids)} markets...")
+        print(f"Stream-fetching {len(todo_ids)} markets (UNCAPPED)...")
         
-        # 2. Setup CSV Writer & Lock
+        # 2. Setup CSV Writer & Locks
         file_exists = cache_file.exists()
         write_mode = 'a' if file_exists else 'w'
         
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         
-        write_lock = threading.Lock()
+        csv_lock = threading.Lock()
+        ledger_lock = threading.Lock()
         
-        # 3. Define the Worker (Writes directly to disk)
-        def fetch_and_write_worker(market_id, writer, file_handle):
+        # 3. Define the Worker
+        def fetch_and_write_worker(market_id, writer):
             session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
             offset = 0
             batch_size = 500
             t_id = str(market_id)[-4:]
             
-            # Hard cutoff (205 days ago)
+            # THE ONLY LIMIT: Time (205 Days)
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
                     params = {"market": market_id, "limit": batch_size, "offset": offset}
-                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=10)
+                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=15)
                     
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data: break
                         
-                        # --- Normalize Batch Immediately ---
                         rows = []
                         for row in data:
                             try:
-                                # A. Timestamp
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
-                                # Convert to simple ISO string
+                                # DATE CHECK: The only exit condition
                                 if isinstance(ts_val, (int, float)):
-                                    # Check cutoff
                                     if float(ts_val) < cutoff_ts: raise StopIteration
                                     ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 else:
                                     ts_str = str(ts_val)
 
-                                # B. Values
                                 price = float(row.get('price') or 0.0)
                                 sz = row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0
                                 size = float(sz)
@@ -2084,36 +2086,38 @@ class BacktestEngine:
                                     'side_mult': side_mult
                                 })
                             except StopIteration:
-                                # Re-raise to break outer loop
                                 raise 
                             except: continue
                         
-                        # --- CRITICAL: Write and Forget ---
                         if rows:
-                            with write_lock:
+                            with csv_lock:
                                 writer.writerows(rows)
-                                # Optional: file_handle.flush() # Flush occasionally, not every time
                         
+                        # Pagination Logic
                         if len(data) < batch_size: break
                         offset += batch_size
-                        if offset > 100000: break # Safety limit
                         
-                        # Print progress for whales
-                        if offset % 5000 == 0:
-                            print(f" [T-{t_id}] Offset {offset}...", end="\r")
+                        # Progress log for massive markets (every 10k trades)
+                        if offset % 10000 == 0:
+                            print(f" [T-{t_id}] Deep Offset {offset}...", end="\r")
 
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
                     else:
-                        break
+                        break # 400/500 errors
                         
                 except StopIteration:
-                    break # Hit date cutoff
+                    break # Reached the date limit
                 except Exception:
-                    break
+                    return False # Failed, do not mark as done
             
-            return True # Done
+            # Mark as Done in Ledger
+            with ledger_lock:
+                with open(ledger_file, "a") as f:
+                    f.write(f"{market_id}\n")
+            
+            return True
 
         # 4. Run Execution
         with open(cache_file, mode=write_mode, newline='') as f:
@@ -2121,27 +2125,29 @@ class BacktestEngine:
             if not file_exists:
                 writer.writeheader()
             
-            # Use max_workers=4 to prevent network congestion
+            # max_workers=4 is safer for "Whale" markets to avoid RAM spikes
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-                # Submit tasks
                 futures = [
-                    executor.submit(fetch_and_write_worker, mid, writer, f) 
+                    executor.submit(fetch_and_write_worker, mid, writer) 
                     for mid in todo_ids
                 ]
                 
-                # Monitor
                 completed = 0
-                for _ in concurrent.futures.as_completed(futures):
+                for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
-                    if completed % 100 == 0:
-                        print(f" Progress: {completed}/{len(todo_ids)} markets completed.", end="\r")
-                        f.flush() # Flush to disk periodically
+                    if completed % 50 == 0:
+                        print(f" Progress: {completed}/{len(todo_ids)} markets finished.", end="\r")
+                        f.flush()
 
         print("\n✅ Fetch complete.")
         
         # Load Final
         print("Loading full dataset...")
         df = pd.read_csv(cache_file)
+        
+        print("Sanitizing (De-duping)...")
+        df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
+        
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
         df['contract_id'] = df['contract_id'].astype('category')
         df['user'] = df['user'].astype('category')
