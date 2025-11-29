@@ -1806,13 +1806,13 @@ class BacktestEngine:
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
                     # Force parsed date to be UTC
-                    last_date = pd.to_datetime(last_date_str).tz_convert(timezone.utc)
-                    
+                
+                    last_date = pd.to_datetime(last_date_str, utc=True)
                     if last_date > now_utc:
                          # Filter safely using UTC-to-UTC comparison
                          rows = [
                              r for r in rows 
-                             if pd.to_datetime(r.get('endDate')).tz_convert(timezone.utc) <= now_utc
+                             pd.to_datetime(r.get('endDate'), utc=True) <= now_utc
                          ]
                          all_rows.extend(rows)
                          print(" Reached Present Day. Stopping.")
