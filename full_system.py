@@ -1638,16 +1638,16 @@ class BacktestEngine:
         total_days = (max_date - min_date).days
 
         log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
-        
-        if total_days < 150:
-            log.error(f"❌ Not enough data ({total_days}< 150 days) to run backtest.")
-            return None
 
         safe_train = max(5, int(total_days * 0.33))
         safe_test = max(5, int(total_days * 0.60))
 
-        if (safe_train + safe_test) >= total_days:
-            safe_test = total_days - safe_train - 2 
+        required_days = safe_train + safe_test + 2
+        
+        # 3. Dynamic Check (Replaces the 'if total_days < 150' block)
+        if total_days < required_days:
+            log.error(f"❌ Not enough data: Have {total_days} days, need {required_days} for current split.")
+            return None
             
         log.info(f"⚙️  ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
 
@@ -1877,8 +1877,8 @@ class BacktestEngine:
         df['outcome'] = pd.to_numeric(df['outcome'])
         
         # Parse timestamps as UTC then strip timezone
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], utc=True).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at'], utc=True).dt.tz_localize(None)
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
         
         # Filter to date range (all naive now)
         df = df[df['resolution_timestamp'] >= cutoff_naive]
