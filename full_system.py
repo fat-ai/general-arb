@@ -1318,6 +1318,9 @@ class FastBacktestEngine:
         
         results = []
         current_date = min_date
+
+        resolution_events = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
+        resolution_timeline = resolution_events.index
         
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
@@ -1329,11 +1332,22 @@ class FastBacktestEngine:
                 current_date += timedelta(days=test_days)
                 continue
 
+            valid_resolutions = resolution_events[resolution_events.index < train_end]
+            outcome_map = {}
+            for _, row in valid_resolutions.iterrows():
+                outcome_map[row['data']['contract_id']] = float(row['data']['outcome'])
+            
+            # Slice profiler data
             train_profiler = self.profiler_data[
                 (self.profiler_data['timestamp'] >= current_date) & 
                 (self.profiler_data['timestamp'] < train_end)
-            ]
+            ].copy()
             
+            # Apply Outcomes (trades on unresolved markets get NaN and are dropped)
+            train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
+            train_profiler = train_profiler.dropna(subset=['outcome'])
+            
+            # Now calculate scores using only legally resolved data
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=3)
             fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
             
@@ -2300,8 +2314,7 @@ class BacktestEngine:
         })
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0, 1)
         prof_data['bet_price'] = prof_data['bet_price'].replace([np.inf, -np.inf], np.nan).fillna(0).abs().clip(0, 1)
-        outcome_lookup = markets.set_index('contract_id')['outcome']
-        prof_data['outcome'] = prof_data['market_id'].map(outcome_lookup).astype('float32')
+     
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
