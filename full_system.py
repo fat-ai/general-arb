@@ -1991,6 +1991,9 @@ class BacktestEngine:
         import gc
         import csv
         import time
+        import threading
+        import requests
+        from requests.adapters import HTTPAdapter, Retry
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
@@ -1999,6 +2002,7 @@ class BacktestEngine:
         if cache_file.exists():
             print(f"Checking progress in {cache_file}...")
             try:
+                # Read just contract_id to save RAM
                 chunk_iter = pd.read_csv(cache_file, usecols=['contract_id'], chunksize=100000)
                 for chunk in chunk_iter:
                     done_ids.update(chunk['contract_id'].unique())
@@ -2010,156 +2014,137 @@ class BacktestEngine:
         
         if not todo_ids:
             print("All markets fetched. Loading full dataset...")
-            df = pd.read_csv(
-            cache_file,
-            dtype={
-                'contract_id': 'category',
-                'user': 'category',
-                'price': 'float32',
-                'size': 'float32',
-                'side_mult': 'int8'
-            },
-            parse_dates=['timestamp']
-            )
-            print(f"   ✅ Loaded {len(df)} trades from {len(df['contract_id'].unique())} markets")
-            return df
-    
+            return pd.read_csv(cache_file) # Types handled later
+
         print(f"Stream-fetching {len(todo_ids)} markets...")
         
-        # 2. Setup CSV Writer
+        # 2. Setup CSV Writer & Lock
         file_exists = cache_file.exists()
         write_mode = 'a' if file_exists else 'w'
         
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
-    
-        # 3. Execution Loop
-        max_workers = 10
         
-        # LOCK for thread-safe CSV writing
-        import threading
         write_lock = threading.Lock()
         
-        with open(cache_file, mode=write_mode, newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            if not file_exists:
-                writer.writeheader()
-                f.flush()
+        # 3. Define the Worker (Writes directly to disk)
+        def fetch_and_write_worker(market_id, writer, file_handle):
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_mid = {
-                    executor.submit(self._fetch_single_market_trades, mid): mid 
-                    for mid in todo_ids
-                }
-                
-                counter = 0
-                total_trades_saved = 0  # Track progress
-                
-                for future in concurrent.futures.as_completed(future_to_mid):
-                    mid = future_to_mid[future]
-                    counter += 1
-                    try:
-                        data = future.result()
-                        if not data:
-                            print(f" [{counter}/{len(todo_ids)}] Empty.       ", end="\r")
-                            continue
+            offset = 0
+            batch_size = 500
+            t_id = str(market_id)[-4:]
+            
+            # Hard cutoff (205 days ago)
+            cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
+            
+            while True:
+                try:
+                    params = {"market": market_id, "limit": batch_size, "offset": offset}
+                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=10)
+                    
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if not data: break
                         
-                        # --- FAST NORMALIZATION ---
-                        rows_to_write = []
+                        # --- Normalize Batch Immediately ---
+                        rows = []
                         for row in data:
                             try:
                                 # A. Timestamp
-                                ts_val = row.get('timestamp') or row.get('time') or row.get('createdAt')
+                                ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
+                                # Convert to simple ISO string
                                 if isinstance(ts_val, (int, float)):
+                                    # Check cutoff
+                                    if float(ts_val) < cutoff_ts: raise StopIteration
                                     ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 else:
                                     ts_str = str(ts_val)
-                                
-                                # B. IDs
-                                cid = str(mid).lower()
-                                usr = str(row.get('taker_address') or row.get('taker') or 'unknown')
-                                
-                                # C. Numerics
+
+                                # B. Values
                                 price = float(row.get('price') or 0.0)
-                                
-                                # Size Logic (more defensive)
                                 sz = row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0
                                 size = float(sz)
-                                
-                                # D. Derived
-                                trade_amt = size * price * 1e6
                                 
                                 side_str = str(row.get('side', '')).upper()
                                 side_mult = 1 if side_str == 'BUY' else -1
                                 
-                                tokens_amt = size * side_mult * 1e18
-                                
-                                rows_to_write.append({
+                                rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': trade_amt,
-                                    'outcomeTokensAmount': tokens_amt,
-                                    'user': usr,
-                                    'contract_id': cid,
+                                    'tradeAmount': size * price * 1e6,
+                                    'outcomeTokensAmount': size * side_mult * 1e18,
+                                    'user': str(row.get('taker_address') or row.get('taker') or 'unknown'),
+                                    'contract_id': str(market_id).lower(),
                                     'price': price,
                                     'size': size,
                                     'side_mult': side_mult
                                 })
-                            except Exception as parse_err:
-                                # Log occasional parse errors
-                                if counter < 5:  # Only log first few
-                                    log.debug(f"Row parse error: {parse_err}")
-                                continue
+                            except StopIteration:
+                                # Re-raise to break outer loop
+                                raise 
+                            except: continue
                         
-                        # THREAD-SAFE WRITE
-                        if rows_to_write:
+                        # --- CRITICAL: Write and Forget ---
+                        if rows:
                             with write_lock:
-                                writer.writerows(rows_to_write)
-                                f.flush()
-                            
-                            total_trades_saved += len(rows_to_write)
+                                writer.writerows(rows)
+                                # Optional: file_handle.flush() # Flush occasionally, not every time
                         
-                        # Better progress feedback
-                        print(f" [{counter}/{len(todo_ids)}] Saved {total_trades_saved:,} trades | Latest: {len(rows_to_write)} from {mid[:8]}...", end="\r")
+                        if len(data) < batch_size: break
+                        offset += batch_size
+                        if offset > 100000: break # Safety limit
                         
-                        # MEMORY CLEANUP
-                        del data
-                        del rows_to_write
+                        # Print progress for whales
+                        if offset % 5000 == 0:
+                            print(f" [T-{t_id}] Offset {offset}...", end="\r")
+
+                    elif resp.status_code == 429:
+                        time.sleep(2)
+                        continue
+                    else:
+                        break
                         
-                    except Exception as e:
-                        log.warning(f"Market {mid} failed: {e}")
-                    
-                    # Force GC every 100 markets
-                    if counter % 100 == 0: 
-                        gc.collect()
-    
-        print(f"\n✅ Fetch complete. Total trades saved: {total_trades_saved:,}")
+                except StopIteration:
+                    break # Hit date cutoff
+                except Exception:
+                    break
+            
+            return True # Done
+
+        # 4. Run Execution
+        with open(cache_file, mode=write_mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+            if not file_exists:
+                writer.writeheader()
+            
+            # Use max_workers=4 to prevent network congestion
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # Submit tasks
+                futures = [
+                    executor.submit(fetch_and_write_worker, mid, writer, f) 
+                    for mid in todo_ids
+                ]
+                
+                # Monitor
+                completed = 0
+                for _ in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    if completed % 100 == 0:
+                        print(f" Progress: {completed}/{len(todo_ids)} markets completed.", end="\r")
+                        f.flush() # Flush to disk periodically
+
+        print("\n✅ Fetch complete.")
         
-        # Return the Full Dataframe
-        print("Loading full dataset into memory...")
-        df = pd.read_csv(
-        cache_file,
-        dtype={
-            'contract_id': 'category',
-            'user': 'category',
-            'price': 'float32',
-            'size': 'float32',
-            'side_mult': 'int8'
-        },
-        parse_dates=['timestamp']
-        )
-        
-        # Post-process types
+        # Load Final
+        print("Loading full dataset...")
+        df = pd.read_csv(cache_file)
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
         df['contract_id'] = df['contract_id'].astype('category')
         df['user'] = df['user'].astype('category')
-        
-        # Filter invalid data
-        df = df.dropna(subset=['timestamp', 'contract_id'])
-        
-        print(f"   ✅ Loaded {len(df):,} valid trades from {df['contract_id'].nunique()} markets")
-        
         return df
         
     def _fetch_subgraph_trades(self, days_back=200):
