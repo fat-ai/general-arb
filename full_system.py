@@ -2010,7 +2010,17 @@ class BacktestEngine:
     
     if not todo_ids:
         print("All markets fetched. Loading full dataset...")
-        df = pd.read_csv(cache_file, parse_dates=['timestamp'])
+        df = pd.read_csv(
+        cache_file,
+        dtype={
+            'contract_id': 'category',
+            'user': 'category',
+            'price': 'float32',
+            'size': 'float32',
+            'side_mult': 'int8'
+        },
+        parse_dates=['timestamp']
+        )
         print(f"   ✅ Loaded {len(df)} trades from {len(df['contract_id'].unique())} markets")
         return df
 
@@ -2128,7 +2138,17 @@ class BacktestEngine:
     
     # Return the Full Dataframe
     print("Loading full dataset into memory...")
-    df = pd.read_csv(cache_file)
+    df = pd.read_csv(
+    cache_file,
+    dtype={
+        'contract_id': 'category',
+        'user': 'category',
+        'price': 'float32',
+        'size': 'float32',
+        'side_mult': 'int8'
+    },
+    parse_dates=['timestamp']
+    )
     
     # Post-process types
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
