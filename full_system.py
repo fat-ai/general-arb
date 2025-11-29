@@ -2143,13 +2143,14 @@ class BacktestEngine:
         
         # Load Final
         print("Loading full dataset...")
-        df = pd.read_csv(cache_file)
+        # FIX: Force IDs to be strings so they match the Markets DataFrame
+        df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         
         print("Sanitizing (De-duping)...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
-        df['contract_id'] = df['contract_id'].astype('category')
+        df['contract_id'] = df['contract_id'].str.lower().astype('category')
         df['user'] = df['user'].astype('category')
         return df
         
