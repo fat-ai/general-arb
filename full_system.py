@@ -2033,8 +2033,8 @@ class BacktestEngine:
         chunks = [todo_ids[i:i + BATCH_SIZE] for i in range(0, len(todo_ids), BATCH_SIZE)]
         
         dfs_accumulator = []
-        if not all_trades_df.empty:
-            dfs_accumulator.append(all_trades_df)
+        all_trades_df = None 
+        gc.collect()
             
         # Clear the heavy base variable to free RAM (we only need it in the list)
         all_trades_df = None 
@@ -2110,27 +2110,52 @@ class BacktestEngine:
             if i % 5 == 0: gc.collect()
 
             # SAVE CHECKPOINT (Infrequent)
-            if i > 0 and i % 50 == 0:
-                print(" [Checkpointing]...", end="")
-                temp_df = pd.concat(dfs_accumulator, ignore_index=True)
-                with open(cache_file, 'wb') as f: pickle.dump(temp_df, f)
-                del temp_df
-                print(" Saved.", end="")
+            # CHANGE: Flush every 10 batches (approx 5000 markets) to keep RAM low
+            if len(dfs_accumulator) >= 10:
+                print(" [Flushing to Disk]...", end="")
+                
+                # A. Load existing data from disk (if any)
+                if cache_file.exists():
+                    try:
+                        with open(cache_file, "rb") as f: main_df = pickle.load(f)
+                    except: main_df = pd.DataFrame()
+                else:
+                    main_df = pd.DataFrame()
+                
+                # B. Add the new batch
+                main_df = pd.concat([main_df] + dfs_accumulator, ignore_index=True)
+                
+                # C. Save back to disk
+                with open(cache_file, "wb") as f: pickle.dump(main_df, f)
+                
+                # D. CRITICAL: Clear memory
+                del main_df
+                dfs_accumulator = [] # Empty the list to free RAM
+                gc.collect()
+                print(" Done.", end="")
                 
             print(f" Done.")
 
         print("Finalizing data merge...", end="")
         # Final Merge
-        if dfs_accumulator:
-            all_trades_df = pd.concat(dfs_accumulator, ignore_index=True)
-        else:
-            all_trades_df = pd.DataFrame()
-            
-        # Final Save
-        with open(cache_file, 'wb') as f: pickle.dump(all_trades_df, f)
-        print(" Done.")
         
-        return all_trades_df
+        # A. Load existing data
+        if cache_file.exists():
+            try:
+                with open(cache_file, "rb") as f: main_df = pickle.load(f)
+            except: main_df = pd.DataFrame()
+        else:
+            main_df = pd.DataFrame()
+
+        # B. Add remaining items (if any)
+        if dfs_accumulator:
+            main_df = pd.concat([main_df] + dfs_accumulator, ignore_index=True)
+            
+            # Save final state
+            with open(cache_file, "wb") as f: pickle.dump(main_df, f)
+        
+        # Return the full dataset (loading fresh from disk)
+        return main_df
         
     def _fetch_subgraph_trades(self, days_back=200):
         import time
