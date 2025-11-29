@@ -1810,10 +1810,7 @@ class BacktestEngine:
                     last_date = pd.to_datetime(last_date_str, utc=True)
                     if last_date > now_utc:
                          # Filter safely using UTC-to-UTC comparison
-                         rows = [
-                             r for r in rows 
-                             pd.to_datetime(r.get('endDate'), utc=True) <= now_utc
-                         ]
+                         rows = [r for r in rows if pd.to_datetime(r.get('endDate'), utc=True) <= now_utc]
                          all_rows.extend(rows)
                          print(" Reached Present Day. Stopping.")
                          break
