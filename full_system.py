@@ -1766,20 +1766,43 @@ class BacktestEngine:
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        markets['contract_id'] = markets['contract_id'].astype(str).str.lower()
+        # FORCE NORMALIZATION (Markets)
+        # Convert to string, strip whitespace, lowercase
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
-        # 2. Fetch Trades for ALL markets using the correct ID
-        # Use 'contract_id' which is unique (size ~9978)
+        # 2. Fetch Trades
         active_ids = markets['contract_id'].unique()
-        
-        print(f"DEBUG: Fetching trades for {len(active_ids)} markets (ALL)...")
         trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
         if trades.empty:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
-        valid_ids = set(trades['contract_id'])
+        # FORCE NORMALIZATION (Trades)
+        # Ensure we are comparing apples to apples
+        if 'contract_id' in trades.columns:
+            trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
+        
+        # --- DIAGNOSTIC PRINT (Debugging) ---
+        m_sample = markets['contract_id'].iloc[0]
+        t_sample = trades['contract_id'].iloc[0]
+        print(f"\n🔍 ID DIAGNOSTIC:")
+        print(f"   Market ID Sample: '{m_sample}'")
+        print(f"   Trade ID Sample:  '{t_sample}'")
+        
+        # Check for 0x prefix mismatch
+        m_has_0x = str(m_sample).startswith('0x')
+        t_has_0x = str(t_sample).startswith('0x')
+        if m_has_0x != t_has_0x:
+            print("   ⚠️ WARNING: '0x' Prefix Mismatch detected! Attempting auto-fix...")
+            if m_has_0x and not t_has_0x:
+                trades['contract_id'] = '0x' + trades['contract_id']
+            elif not m_has_0x and t_has_0x:
+                markets['contract_id'] = '0x' + markets['contract_id']
+        # ------------------------------------
+
+        # 3. Filter
+        valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
         print(f"DEBUG: Data Load Complete. {len(markets)} Markets, {len(trades)} Trades.")
