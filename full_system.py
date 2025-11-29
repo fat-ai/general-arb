@@ -1987,29 +1987,157 @@ class BacktestEngine:
         return all_market_trades
 
     def _fetch_gamma_trades_parallel(self, market_ids):
-    import concurrent.futures 
-    import gc
-    import csv
-    import time
+        import concurrent.futures 
+        import gc
+        import csv
+        import time
+        
+        cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        
+        # 1. Identify what is already done
+        done_ids = set()
+        if cache_file.exists():
+            print(f"Checking progress in {cache_file}...")
+            try:
+                chunk_iter = pd.read_csv(cache_file, usecols=['contract_id'], chunksize=100000)
+                for chunk in chunk_iter:
+                    done_ids.update(chunk['contract_id'].unique())
+                print(f"   ✅ Found history for {len(done_ids)} markets.")
+            except Exception as e:
+                print(f"   ⚠️ CSV Read error ({e}). Starting fresh.")
+        
+        todo_ids = [m for m in market_ids if m not in done_ids]
+        
+        if not todo_ids:
+            print("All markets fetched. Loading full dataset...")
+            df = pd.read_csv(
+            cache_file,
+            dtype={
+                'contract_id': 'category',
+                'user': 'category',
+                'price': 'float32',
+                'size': 'float32',
+                'side_mult': 'int8'
+            },
+            parse_dates=['timestamp']
+            )
+            print(f"   ✅ Loaded {len(df)} trades from {len(df['contract_id'].unique())} markets")
+            return df
     
-    cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        print(f"Stream-fetching {len(todo_ids)} markets...")
+        
+        # 2. Setup CSV Writer
+        file_exists = cache_file.exists()
+        write_mode = 'a' if file_exists else 'w'
+        
+        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
+                      'contract_id', 'price', 'size', 'side_mult']
     
-    # 1. Identify what is already done
-    done_ids = set()
-    if cache_file.exists():
-        print(f"Checking progress in {cache_file}...")
-        try:
-            chunk_iter = pd.read_csv(cache_file, usecols=['contract_id'], chunksize=100000)
-            for chunk in chunk_iter:
-                done_ids.update(chunk['contract_id'].unique())
-            print(f"   ✅ Found history for {len(done_ids)} markets.")
-        except Exception as e:
-            print(f"   ⚠️ CSV Read error ({e}). Starting fresh.")
+        # 3. Execution Loop
+        max_workers = 10
+        
+        # LOCK for thread-safe CSV writing
+        import threading
+        write_lock = threading.Lock()
+        
+        with open(cache_file, mode=write_mode, newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+            if not file_exists:
+                writer.writeheader()
+                f.flush()
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_mid = {
+                    executor.submit(self._fetch_single_market_trades, mid): mid 
+                    for mid in todo_ids
+                }
+                
+                counter = 0
+                total_trades_saved = 0  # Track progress
+                
+                for future in concurrent.futures.as_completed(future_to_mid):
+                    mid = future_to_mid[future]
+                    counter += 1
+                    try:
+                        data = future.result()
+                        if not data:
+                            print(f" [{counter}/{len(todo_ids)}] Empty.       ", end="\r")
+                            continue
+                        
+                        # --- FAST NORMALIZATION ---
+                        rows_to_write = []
+                        for row in data:
+                            try:
+                                # A. Timestamp
+                                ts_val = row.get('timestamp') or row.get('time') or row.get('createdAt')
+                                if not ts_val: continue
+                                
+                                if isinstance(ts_val, (int, float)):
+                                    ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
+                                else:
+                                    ts_str = str(ts_val)
+                                
+                                # B. IDs
+                                cid = str(mid).lower()
+                                usr = str(row.get('taker_address') or row.get('taker') or 'unknown')
+                                
+                                # C. Numerics
+                                price = float(row.get('price') or 0.0)
+                                
+                                # Size Logic (more defensive)
+                                sz = row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0
+                                size = float(sz)
+                                
+                                # D. Derived
+                                trade_amt = size * price * 1e6
+                                
+                                side_str = str(row.get('side', '')).upper()
+                                side_mult = 1 if side_str == 'BUY' else -1
+                                
+                                tokens_amt = size * side_mult * 1e18
+                                
+                                rows_to_write.append({
+                                    'timestamp': ts_str,
+                                    'tradeAmount': trade_amt,
+                                    'outcomeTokensAmount': tokens_amt,
+                                    'user': usr,
+                                    'contract_id': cid,
+                                    'price': price,
+                                    'size': size,
+                                    'side_mult': side_mult
+                                })
+                            except Exception as parse_err:
+                                # Log occasional parse errors
+                                if counter < 5:  # Only log first few
+                                    log.debug(f"Row parse error: {parse_err}")
+                                continue
+                        
+                        # THREAD-SAFE WRITE
+                        if rows_to_write:
+                            with write_lock:
+                                writer.writerows(rows_to_write)
+                                f.flush()
+                            
+                            total_trades_saved += len(rows_to_write)
+                        
+                        # Better progress feedback
+                        print(f" [{counter}/{len(todo_ids)}] Saved {total_trades_saved:,} trades | Latest: {len(rows_to_write)} from {mid[:8]}...", end="\r")
+                        
+                        # MEMORY CLEANUP
+                        del data
+                        del rows_to_write
+                        
+                    except Exception as e:
+                        log.warning(f"Market {mid} failed: {e}")
+                    
+                    # Force GC every 100 markets
+                    if counter % 100 == 0: 
+                        gc.collect()
     
-    todo_ids = [m for m in market_ids if m not in done_ids]
-    
-    if not todo_ids:
-        print("All markets fetched. Loading full dataset...")
+        print(f"\n✅ Fetch complete. Total trades saved: {total_trades_saved:,}")
+        
+        # Return the Full Dataframe
+        print("Loading full dataset into memory...")
         df = pd.read_csv(
         cache_file,
         dtype={
@@ -2021,146 +2149,18 @@ class BacktestEngine:
         },
         parse_dates=['timestamp']
         )
-        print(f"   ✅ Loaded {len(df)} trades from {len(df['contract_id'].unique())} markets")
-        return df
-
-    print(f"Stream-fetching {len(todo_ids)} markets...")
-    
-    # 2. Setup CSV Writer
-    file_exists = cache_file.exists()
-    write_mode = 'a' if file_exists else 'w'
-    
-    FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
-                  'contract_id', 'price', 'size', 'side_mult']
-
-    # 3. Execution Loop
-    max_workers = 4 
-    
-    # LOCK for thread-safe CSV writing
-    import threading
-    write_lock = threading.Lock()
-    
-    with open(cache_file, mode=write_mode, newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-        if not file_exists:
-            writer.writeheader()
-            f.flush()
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_mid = {
-                executor.submit(self._fetch_single_market_trades, mid): mid 
-                for mid in todo_ids
-            }
-            
-            counter = 0
-            total_trades_saved = 0  # Track progress
-            
-            for future in concurrent.futures.as_completed(future_to_mid):
-                mid = future_to_mid[future]
-                counter += 1
-                try:
-                    data = future.result()
-                    if not data:
-                        print(f" [{counter}/{len(todo_ids)}] Empty.       ", end="\r")
-                        continue
-                    
-                    # --- FAST NORMALIZATION ---
-                    rows_to_write = []
-                    for row in data:
-                        try:
-                            # A. Timestamp
-                            ts_val = row.get('timestamp') or row.get('time') or row.get('createdAt')
-                            if not ts_val: continue
-                            
-                            if isinstance(ts_val, (int, float)):
-                                ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
-                            else:
-                                ts_str = str(ts_val)
-                            
-                            # B. IDs
-                            cid = str(mid).lower()
-                            usr = str(row.get('taker_address') or row.get('taker') or 'unknown')
-                            
-                            # C. Numerics
-                            price = float(row.get('price') or 0.0)
-                            
-                            # Size Logic (more defensive)
-                            sz = row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0
-                            size = float(sz)
-                            
-                            # D. Derived
-                            trade_amt = size * price * 1e6
-                            
-                            side_str = str(row.get('side', '')).upper()
-                            side_mult = 1 if side_str == 'BUY' else -1
-                            
-                            tokens_amt = size * side_mult * 1e18
-                            
-                            rows_to_write.append({
-                                'timestamp': ts_str,
-                                'tradeAmount': trade_amt,
-                                'outcomeTokensAmount': tokens_amt,
-                                'user': usr,
-                                'contract_id': cid,
-                                'price': price,
-                                'size': size,
-                                'side_mult': side_mult
-                            })
-                        except Exception as parse_err:
-                            # Log occasional parse errors
-                            if counter < 5:  # Only log first few
-                                log.debug(f"Row parse error: {parse_err}")
-                            continue
-                    
-                    # THREAD-SAFE WRITE
-                    if rows_to_write:
-                        with write_lock:
-                            writer.writerows(rows_to_write)
-                            f.flush()
-                        
-                        total_trades_saved += len(rows_to_write)
-                    
-                    # Better progress feedback
-                    print(f" [{counter}/{len(todo_ids)}] Saved {total_trades_saved:,} trades | Latest: {len(rows_to_write)} from {mid[:8]}...", end="\r")
-                    
-                    # MEMORY CLEANUP
-                    del data
-                    del rows_to_write
-                    
-                except Exception as e:
-                    log.warning(f"Market {mid} failed: {e}")
-                
-                # Force GC every 100 markets
-                if counter % 100 == 0: 
-                    gc.collect()
-
-    print(f"\n✅ Fetch complete. Total trades saved: {total_trades_saved:,}")
-    
-    # Return the Full Dataframe
-    print("Loading full dataset into memory...")
-    df = pd.read_csv(
-    cache_file,
-    dtype={
-        'contract_id': 'category',
-        'user': 'category',
-        'price': 'float32',
-        'size': 'float32',
-        'side_mult': 'int8'
-    },
-    parse_dates=['timestamp']
-    )
-    
-    # Post-process types
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
-    df['contract_id'] = df['contract_id'].astype('category')
-    df['user'] = df['user'].astype('category')
-    
-    # Filter invalid data
-    df = df.dropna(subset=['timestamp', 'contract_id'])
-    
-    print(f"   ✅ Loaded {len(df):,} valid trades from {df['contract_id'].nunique()} markets")
-    
-    return df
+        # Post-process types
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
+        df['contract_id'] = df['contract_id'].astype('category')
+        df['user'] = df['user'].astype('category')
+        
+        # Filter invalid data
+        df = df.dropna(subset=['timestamp', 'contract_id'])
+        
+        print(f"   ✅ Loaded {len(df):,} valid trades from {df['contract_id'].nunique()} markets")
+        
+        return df
         
     def _fetch_subgraph_trades(self, days_back=200):
         import time
