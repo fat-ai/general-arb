@@ -1215,7 +1215,7 @@ def calibrate_fresh_wallet_model(profiler_data):
         (first_trades['size'] > 1.0) # Ignore dust
     ].copy()
     
-    if len(valid) < 10: return 0.0, 0.25 # Not enough data
+    if len(valid) < 5: return 0.0, 0.25 # Not enough data
     
     # 3. Calculate 'Single-Trade Brier'
     valid['brier'] = (valid['bet_price'] - valid['outcome']) ** 2
@@ -1423,12 +1423,24 @@ class FastBacktestEngine:
                         
                         weight = vol / (brier + 0.0001)
                         
-                        # --- FIX: DIRECTIONAL SIGNAL ---
-                        # If they Buy, they target 1.0 (Logit ~4.6)
-                        # If they Sell, they target 0.0 (Logit ~-4.6)
-                        # We use 0.99 and 0.01 to be numerically safe
-                        target_p = 0.01 if is_sell else 0.99
-                        trade_logit = logit(target_p)
+
+                        # 1. Start with the CURRENT market belief (the price)
+                        # Avoid log(0)
+                        current_p_safe = max(0.01, min(current_p, 0.99))
+                        current_logit = np.log(current_p_safe / (1.0 - current_p_safe))
+                        
+                        # 2. Calculate the "Nudge" (Alpha)
+                        # A "Smart" trader pushes the price, but not to infinity.
+                        # Direction: +1 for Buy, -1 for Sell
+                        direction = -1.0 if is_sell else 1.0
+                        
+                        # Magnitude: Proportional to volume and their skill (1/brier)
+                        # We limit the max influence of any single trade to avoid spikes
+                        influence = min(weight * 0.1, 2.0) 
+                        
+                        # 3. Apply the Nudge
+                        # New Logit = Old Logit + (Direction * Influence)
+                        trade_logit = current_logit + (direction * influence)
                         
                         tracker[cid]['w_sum'] += weight
                         tracker[cid]['w_log_sum'] += (trade_logit * weight)
@@ -1660,8 +1672,8 @@ class BacktestEngine:
             "edge_threshold": tune.choice([0.01]),
             
             # Longer Window for statistical significance
-            "train_days": tune.choice([60]),
-            "test_days": tune.choice([120]),
+            "train_days": tune.choice([safe_train]),
+            "test_days": tune.choice([safe_test]),
             "seed": 42,
             
             # 1. Sizing Options (Dynamic vs Static)
@@ -1760,6 +1772,7 @@ class BacktestEngine:
         return markets, trades
         
     def _fetch_gamma_markets(self, days_back=200):
+        from datetime import datetime, timedelta, timezone
         cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d_v2.parquet"
         if cache_file.exists():
             try: return pd.read_parquet(cache_file)
@@ -1768,12 +1781,11 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         print("Fetching Recent Markets...", end="")
+        now_utc = datetime.now(timezone.utc)
+        cutoff_ts = now_utc - timedelta(days=days_back)
+        start_history_date = cutoff_ts
         
-        # Calculate cutoff date
-        cutoff_ts = datetime.now() - timedelta(days=days_back)
-        
-        start_history_date = datetime.now() - timedelta(days=days_back + 50)
-        log.info(f"Fetching markets from {start_history_date.date()} to NOW...")
+        log.info(f"Fetching markets from {start_history_date.date()} to {now_utc.date()} (UTC)...")
         
         while True:
             try:
@@ -1793,14 +1805,18 @@ class BacktestEngine:
                 # Check the date of the LAST item in this batch
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
-                    last_date = pd.to_datetime(last_date_str).replace(tzinfo=None)
+                    # Force parsed date to be UTC
+                    last_date = pd.to_datetime(last_date_str).tz_convert(timezone.utc)
                     
-                    # FIX 2: Stop if we have gone past "Now" into the future
-                    if last_date > datetime.now():
-                        # We might still want the rows in this batch that are < Now, 
-                        # but we stop fetching more.
-                        all_rows.extend([r for r in rows if pd.to_datetime(r.get('endDate')).replace(tzinfo=None) <= datetime.now()])
-                        break
+                    if last_date > now_utc:
+                         # Filter safely using UTC-to-UTC comparison
+                         rows = [
+                             r for r in rows 
+                             if pd.to_datetime(r.get('endDate')).tz_convert(timezone.utc) <= now_utc
+                         ]
+                         all_rows.extend(rows)
+                         print(" Reached Present Day. Stopping.")
+                         break
                 
                 # Filter: Only keep rows that are inside our desired window
                 # (Optimization: Don't store data from 2018 if we only want 2024)
@@ -2009,20 +2025,28 @@ class BacktestEngine:
             return batch_data
 
         # 4. Main Loop
-        total_processed = 0
         
         # Chunk the todo list
         chunks = [todo_ids[i:i + BATCH_SIZE] for i in range(0, len(todo_ids), BATCH_SIZE)]
         
+        dfs_accumulator = []
+        if not all_trades_df.empty:
+            dfs_accumulator.append(all_trades_df)
+            
+        # Clear the heavy base variable to free RAM (we only need it in the list)
+        all_trades_df = None 
+        gc.collect()
+
         for i, chunk in enumerate(chunks):
             print(f"   Processing Batch {i+1}/{len(chunks)} ({len(chunk)} markets)...", end="")
             
+            # Fetch data (This calls the worker)
             raw_data = process_batch(chunk)
             
             if raw_data:
                 df_chunk = pd.DataFrame(raw_data)
                 
-                # --- FAST NORMALIZATION (On the chunk only) ---
+                # --- [Start Normalization Logic] ---
                 
                 # 1. Timestamp
                 ts_col = None
@@ -2031,72 +2055,78 @@ class BacktestEngine:
                 elif 'createdAt' in df_chunk.columns: ts_col = 'createdAt'
                 
                 if ts_col:
-                    # FIX: Handle Integer timestamps (Gamma Trades) as Seconds
+                    # FIX: Handle Integer timestamps vs Strings
                     if ts_col == 'timestamp':
                         df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], unit='s', errors='coerce')
                     else:
-                        # Handle ISO Strings (Markets/Other)
                         df_chunk['timestamp'] = pd.to_datetime(df_chunk[ts_col], format='mixed', utc=True, errors='coerce')
-                    
                     df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
-                
-                # 2. User & ID
+
+                # 2. Safety Defaults
                 df_chunk['user'] = df_chunk.get('taker_address', df_chunk.get('taker', 'unknown'))
                 df_chunk['contract_id'] = df_chunk['contract_id'].astype(str).str.lower()
                 
-                # 3. Amounts (FIXED: Ensure columns exist before conversion)
-                if 'size' not in df_chunk.columns and 'shares' in df_chunk.columns:
-                    df_chunk['size'] = df_chunk['shares']
-                if 'size' not in df_chunk.columns and 'taker_amount' in df_chunk.columns:
-                    df_chunk['size'] = df_chunk['taker_amount']
-                
-                # fallback for price 
-                if 'price' not in df_chunk.columns and 'avgPrice' in df_chunk.columns:
-                    df_chunk['price'] = df_chunk['avgPrice']
-                
-                # Side
+                if 'price' not in df_chunk.columns: df_chunk['price'] = 0.0
+                df_chunk['price'] = pd.to_numeric(df_chunk['price'], errors='coerce').fillna(0.0)
+
+                # 3. CRITICAL SIZE FIX
+                if 'size' not in df_chunk.columns:
+                    if 'shares' in df_chunk.columns: df_chunk['size'] = df_chunk['shares']
+                    elif 'taker_amount' in df_chunk.columns: df_chunk['size'] = df_chunk['taker_amount']
+                    else: df_chunk['size'] = 0.0
+                df_chunk['size'] = pd.to_numeric(df_chunk['size'], errors='coerce').fillna(0.0)
+
+                # 4. Calcs
+                df_chunk['tradeAmount'] = df_chunk['size'] * df_chunk['price'] * 1e6
                 if 'side' in df_chunk.columns:
                     df_chunk['side_mult'] = df_chunk['side'].apply(lambda x: 1 if str(x).upper() == 'BUY' else -1)
                 else:
                     df_chunk['side_mult'] = 1
-                    
-                # --- EMERGENCY FIX: Guarantee 'size' exists ---
-                if 'size' not in df_chunk.columns:
-                    # Check for known aliases first
-                    if 'shares' in df_chunk.columns:
-                        df_chunk['size'] = df_chunk['shares']
-                    elif 'taker_amount' in df_chunk.columns:
-                        df_chunk['size'] = df_chunk['taker_amount']
-                    else:
-                        # If nothing exists, default to 0.0 to prevent crash
-                        df_chunk['size'] = 0.0
+                df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18 
                 
-                # Ensure it is numeric (handles strings or mixed types)
-                df_chunk['size'] = pd.to_numeric(df_chunk['size'], errors='coerce').fillna(0.0)
-                # -----------------------------------------------
-                
-                df_chunk['outcomeTokensAmount'] = df_chunk['size'] * df_chunk['side_mult'] * 1e18
-                
-                # Filter Columns
+                # 5. Filter Columns
                 final_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id']
                 for c in final_cols: 
                     if c not in df_chunk.columns: df_chunk[c] = None
-                    
+                
+                # Drop invalid rows and optimize types
                 df_chunk = df_chunk[final_cols].dropna(subset=['timestamp', 'contract_id'])
+                for col in ['user', 'contract_id']:
+                    df_chunk[col] = df_chunk[col].astype('category')
                 
-                # --- APPEND AND SAVE ---
-                all_trades_df = pd.concat([all_trades_df, df_chunk], ignore_index=True)
+                # --- [End Normalization Logic] ---
+
+                # OPTIMIZATION: Append to list instead of Concatenating
+                dfs_accumulator.append(df_chunk)
                 
-            # Save Checkpoint
-            with open(cache_file, 'wb') as f: pickle.dump(all_trades_df, f)
-            print(f" Saved. (Total Rows: {len(all_trades_df)})")
-            
-            # Free memory
+            # Clean up immediately
             del raw_data
             if 'df_chunk' in locals(): del df_chunk
-            gc.collect()
+            
+            # Garbage Collect every few iterations to prevent fragmentation
+            if i % 5 == 0: gc.collect()
 
-        print("Done. All batches processed.")
+            # SAVE CHECKPOINT (Infrequent)
+            if i > 0 and i % 50 == 0:
+                print(" [Checkpointing]...", end="")
+                temp_df = pd.concat(dfs_accumulator, ignore_index=True)
+                with open(cache_file, 'wb') as f: pickle.dump(temp_df, f)
+                del temp_df
+                print(" Saved.", end="")
+                
+            print(f" Done.")
+
+        print("Finalizing data merge...", end="")
+        # Final Merge
+        if dfs_accumulator:
+            all_trades_df = pd.concat(dfs_accumulator, ignore_index=True)
+        else:
+            all_trades_df = pd.DataFrame()
+            
+        # Final Save
+        with open(cache_file, 'wb') as f: pickle.dump(all_trades_df, f)
+        print(" Done.")
+        
         return all_trades_df
         
     def _fetch_subgraph_trades(self, days_back=200):
@@ -2240,6 +2270,7 @@ class BacktestEngine:
             'tokens': (pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce') / 1e18).astype('float32')
         })
         prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0, 1)
+        prof_data['bet_price'] = prof_data['bet_price'].replace([np.inf, -np.inf], np.nan).fillna(0).abs().clip(0, 1)
         outcome_lookup = markets.set_index('contract_id')['outcome']
         prof_data['outcome'] = prof_data['market_id'].map(outcome_lookup).astype('float32')
         prof_data['entity_type'] = 'default_topic'
