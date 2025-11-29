@@ -2041,7 +2041,8 @@ class BacktestEngine:
         gc.collect()
 
         for i, chunk in enumerate(chunks):
-            print(f"   Processing Batch {i+1}/{len(chunks)} ({len(chunk)} markets)...", end="")
+        
+            print(f"   Batch {i+1}/{len(chunks)} ({len(chunk)} mkts)... ", end="", flush=True)
             
             # Fetch data (This calls the worker)
             raw_data = process_batch(chunk)
