@@ -1772,20 +1772,21 @@ class BacktestEngine:
         return markets, trades
         
     def _fetch_gamma_markets(self, days_back=200):
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
         cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d_v2.parquet"
         if cache_file.exists():
             try: return pd.read_parquet(cache_file)
             except: pass
-
+    
         all_rows = []
         offset = 0
         print("Fetching Recent Markets...", end="")
-        now_utc = datetime.now(timezone.utc)
-        cutoff_ts = now_utc - timedelta(days=days_back)
-        start_history_date = cutoff_ts
         
-        log.info(f"Fetching markets from {start_history_date.date()} to {now_utc.date()} (UTC)...")
+        # Work in naive datetime (consistent with rest of code)
+        now_naive = datetime.now()
+        cutoff_naive = now_naive - timedelta(days=days_back)
+        
+        log.info(f"Fetching markets from {cutoff_naive.date()} to {now_naive.date()}...")
         
         while True:
             try:
@@ -1802,55 +1803,51 @@ class BacktestEngine:
                 rows = resp.json()
                 if not rows: break
                 
-                # Check the date of the LAST item in this batch
+                # Parse and strip timezone immediately
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
-                    # Force parsed date to be UTC
+                    last_date = pd.to_datetime(last_date_str, utc=True).tz_localize(None)
+                    if last_date > now_naive:
+                        rows = [r for r in rows 
+                               if pd.to_datetime(r.get('endDate'), utc=True).tz_localize(None) <= now_naive]
+                        all_rows.extend(rows)
+                        print(" Reached Present Day. Stopping.")
+                        break
                 
-                    last_date = pd.to_datetime(last_date_str, utc=True)
-                    if last_date > now_utc:
-                         # Filter safely using UTC-to-UTC comparison
-                         rows = [r for r in rows if pd.to_datetime(r.get('endDate'), utc=True) <= now_utc]
-                         all_rows.extend(rows)
-                         print(" Reached Present Day. Stopping.")
-                         break
-                
-                # Filter: Only keep rows that are inside our desired window
-                # (Optimization: Don't store data from 2018 if we only want 2024)
+                # Filter to date window (all naive)
                 relevant_rows = []
                 for r in rows:
-                    d = pd.to_datetime(r.get('endDate')).replace(tzinfo=None)
-                    if d >= start_history_date:
+                    d = pd.to_datetime(r.get('endDate'), utc=True).tz_localize(None)
+                    if d >= cutoff_naive:
                         relevant_rows.append(r)
                 
                 all_rows.extend(relevant_rows)
-                
                 offset += 1000
                 if offset % 1000 == 0: print(".", end="", flush=True)
-                
                 
             except Exception as e: 
                 log.error(f"Market fetch error: {e}")
                 break
+        
         print(" Done.")
-
+    
         if not all_rows: return pd.DataFrame()
-
+    
         df = pd.DataFrame(all_rows)
         
-        # --- KEY FIX: Use 'id' as the unique identifier ---
+        # Use 'id' as contract_id
         if 'id' in df.columns:
             df = df.rename(columns={'id': 'contract_id'})
         else:
             log.error("Market data missing 'id' column.")
             return pd.DataFrame()
         
-        # Fill fpmm_address with contract_id just in case legacy code checks it
+        # Set fpmm_address fallback
         if 'marketMakerAddress' in df.columns:
             df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
         else:
             df['fpmm_address'] = df['contract_id']
-
+    
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1861,21 +1858,30 @@ class BacktestEngine:
                 if p1 > 0.95: return 1 
                 return pd.NA
             except: return pd.NA
-
+    
         df['outcome'] = df.apply(derive_outcome, axis=1)
-        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity', 'volume': 'volume'}
+        rename_map = {
+            'question': 'question', 
+            'endDate': 'resolution_timestamp', 
+            'createdAt': 'created_at', 
+            'liquidity': 'liquidity', 
+            'volume': 'volume'
+        }
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
         
-        # Removed 'fpmm_address' from required cols to support CLOB
         required_cols = ['contract_id', 'resolution_timestamp', 'created_at', 'outcome']
         df = df.dropna(subset=required_cols)
         
         df['outcome'] = pd.to_numeric(df['outcome'])
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
-        df = df[df['resolution_timestamp'] >= cutoff_ts]
+        
+        # Parse timestamps as UTC then strip timezone
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], utc=True).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at'], utc=True).dt.tz_localize(None)
+        
+        # Filter to date range (all naive now)
+        df = df[df['resolution_timestamp'] >= cutoff_naive]
         
         if not df.empty: df.to_parquet(cache_file)
         return df
