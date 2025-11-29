@@ -1894,7 +1894,7 @@ class BacktestEngine:
             try:
                 url = "https://gamma-api.polymarket.com/events"
                 params = {
-                    "market_id": market_id, 
+                    "market": market_id, 
                     "type": "Trade", 
                     "limit": batch_size, 
                     "offset": offset
