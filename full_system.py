@@ -1884,7 +1884,7 @@ class BacktestEngine:
         
         all_market_trades = []
         offset = 0
-        batch_size = 1000
+        batch_size = 500
         
         # STOPPING CRITERIA: 200 days ago (buffer for 200d backtest)
         # We calculate this once, outside the loop
