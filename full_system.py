@@ -1797,29 +1797,24 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets (Sorted by Volume)
+        # 1. Fetch Markets (Now using Token IDs)
         markets = self._fetch_gamma_markets(days_back=200)
         if markets.empty: 
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        # 2. PRE-FILTER: Discard markets that resolved too long ago
-        # This saves the Trade Fetcher from checking 50k dead markets
+        # 2. PRE-FILTER by Date
         cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
-        
-        initial_count = len(markets)
         markets = markets[markets['resolution_timestamp'] >= cutoff_date].copy()
         
-        print(f"DEBUG: Pre-filtering Markets by Date...")
-        print(f"   Original Count: {initial_count}")
-        print(f"   Cutoff Date:    {cutoff_date}")
-        print(f"   Relevant Count: {len(markets)} (Discarded {initial_count - len(markets)} old markets)")
+        print(f"DEBUG: Relevant Markets Count: {len(markets)}")
         
         if markets.empty:
             log.error("❌ No markets found in the selected date window.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # 3. Fetch Trades (Only for the relevant markets)
+        # 3. Fetch Trades
+        # active_ids is now a list of Token IDs (e.g., "717607...")
         active_ids = markets['contract_id'].unique()
         trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
@@ -1827,15 +1822,11 @@ class BacktestEngine:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
-        # 4. ID Normalization Check
+        # 4. ID Normalization
         if 'contract_id' in trades.columns:
-            def clean_id(x):
-                s = str(x).strip().replace("'", "").replace('"', "").lower()
-                if '.' in s: s = s.split('.')[0]
-                return s
-            trades['contract_id'] = trades['contract_id'].apply(clean_id)
+            trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
         
-        # 5. Filter Markets to match found Trades
+        # 5. Filter
         valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
@@ -1845,41 +1836,35 @@ class BacktestEngine:
     def _fetch_gamma_markets(self, days_back=200):
         from datetime import datetime, timedelta
         import os
+        import json
         
         # Cache file
-        cache_file = self.cache_dir / f"gamma_markets_full_{days_back}d.parquet"
+        cache_file = self.cache_dir / f"gamma_markets_token_ids.parquet"
         
-        # AUTO-FIX: If we previously saved a "0 record" file, delete it.
+        # 1. DELETE OLD CACHE (Mandatory: We are changing ID format)
         if cache_file.exists():
             try:
-                df = pd.read_parquet(cache_file)
-                if df.empty or len(df) < 100:
-                    print("⚠️ Found incomplete market cache. Deleting to refetch.")
-                    os.remove(cache_file)
-                else:
-                    print(f"Loading cached markets from {cache_file}...")
-                    return df
-            except: 
+                # We force delete because we need to rebuild with Token IDs
                 os.remove(cache_file)
+            except: pass
 
         all_rows = []
         offset = 0
         
-        # Define window (Naive)
+        # Define window
         now = datetime.now()
         start_date = now - timedelta(days=days_back)
         
-        print(f"Fetching ALL markets (Newest -> Oldest) back to {start_date.date()}...")
+        print(f"Fetching GLOBAL market list (Ordered by VOLUME)...")
         
         while True:
             try:
-                # FIX: Explicitly set ascending=false to ensure Newest First
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
-                    "closed": "true", 
-                    "order": "endDate",
-                    "ascending": "false" # <--- CRITICAL FIX
+                    "closed": "true",
+                    "order": "volume",      
+                    "ascending": "false"    
                 }
                 
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
@@ -1890,50 +1875,53 @@ class BacktestEngine:
                 rows = resp.json()
                 if not rows: break
                 
-                # Check the Last Date in this batch
-                last_date_str = rows[-1].get('endDate')
-                if last_date_str:
-                    last_date = pd.to_datetime(last_date_str).tz_localize(None)
-                    
-                    # STOPPING CONDITION: We are moving backwards. 
-                    # If we hit a date older than start_date, we are done.
-                    if last_date < start_date:
-                        # Keep the ones that are still within range
-                        valid_rows = [r for r in rows if pd.to_datetime(r.get('endDate')).tz_localize(None) >= start_date]
-                        all_rows.extend(valid_rows)
-                        print(" Reached start date limit. Stopping.")
-                        break
-                
                 all_rows.extend(rows)
-                offset += 1000
-                if offset % 5000 == 0: print(f"{offset}..", end="", flush=True)
                 
-                # Safety Limit (Increased to 300k to cover full history if needed)
-                #if offset > 300000: break
+                offset += 1000
+                if offset % 5000 == 0: print(f" {offset}..", end="", flush=True)
+                
+                if offset > 50000: break
                 
             except Exception as e:
                 log.error(f"Market fetch error: {e}")
                 break
         
-        print(f" Done. Fetched {len(all_rows)} raw markets.")
+        print(f" Done. Fetched {len(all_rows)} markets.")
 
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
         
-        # --- Normalization ---
-        if 'id' in df.columns:
-            df = df.rename(columns={'id': 'contract_id'})
-        else:
-            return pd.DataFrame()
-            
-        # Strict ID cleaning
-        df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower()
+        # --- CRITICAL FIX: USE TOKEN ID AS CONTRACT ID ---
+        def extract_token_id(row):
+            try:
+                # The API returns clobTokenIds as a JSON string '["123", "456"]' 
+                # or sometimes a list depending on the endpoint version.
+                raw = row.get('clobTokenIds')
+                if not raw: return None
+                
+                if isinstance(raw, str):
+                    tokens = json.loads(raw)
+                else:
+                    tokens = raw
+                    
+                # We take the first token (usually YES) to track the market
+                if isinstance(tokens, list) and len(tokens) > 0:
+                    return str(tokens[0])
+                return None
+            except: return None
+
+        df['contract_id'] = df.apply(extract_token_id, axis=1)
+        # -------------------------------------------------
         
+        # Drop markets where we couldn't find a Token ID (Non-CLOB markets)
+        df = df.dropna(subset=['contract_id'])
+        
+        # Normalization
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
-                if isinstance(prices, str): import json; prices = json.loads(prices)
+                if isinstance(prices, str): prices = json.loads(prices)
                 if not isinstance(prices, list) or len(prices) != 2: return pd.NA
                 p0, p1 = float(prices[0]), float(prices[1])
                 if p0 > 0.95: return 0 
@@ -1943,27 +1931,20 @@ class BacktestEngine:
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         
-        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity', 'volume': 'volume'}
+        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
-        df['resolution_timestamp'] = pd.to_datetime(
-            df['resolution_timestamp'], 
-            format='mixed', 
-            utc=True, 
-            errors='coerce'
-        ).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(
-            df['created_at'], 
-            format='mixed', 
-            utc=True, 
-            errors='coerce'
-        ).dt.tz_localize(None)
         
-        # Final date filter
-        df = df[df['resolution_timestamp'] >= start_date]
+        # Dates
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
+        # Sort by Volume
+        if 'volume' in df.columns:
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
+            df = df.sort_values('volume', ascending=False)
+            
         if not df.empty: df.to_parquet(cache_file)
         return df
         
