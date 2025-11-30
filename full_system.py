@@ -2080,8 +2080,7 @@ class BacktestEngine:
             if '.' in s: s = s.split('.')[0]
             todo_ids.append(s)
             
-        # FIX: Shuffle/Reverse the list to stop checking 2020 markets first
-        # This breaks the "Oldest First" deadlock if the input list is bad.
+        # FIX: Shuffle/Reverse to break "Oldest First" deadlock
         todo_ids.reverse() 
         
         print(f"Stream-fetching {len(todo_ids)} markets (REVERSED ORDER)...")
@@ -2089,6 +2088,9 @@ class BacktestEngine:
         # 2. Setup CSV Writer
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
+        
+        # Since we deleted the file, mode is always Write ('w')
+        write_mode = 'w' 
         
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
@@ -2199,7 +2201,7 @@ class BacktestEngine:
         # 4. Run Execution
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            if not file_exists: writer.writeheader()
+            writer.writeheader() # Always write header since we start fresh
             
             # 8 Workers
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
