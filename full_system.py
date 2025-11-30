@@ -2026,13 +2026,28 @@ class BacktestEngine:
         import time
         import threading
         import requests
+        import os
         from requests.adapters import HTTPAdapter, Retry
         
         # Files
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. Load Completion Ledger (Resume Capability)
+        # --- SELF-HEALING: Check for Zombie Ledger ---
+        # If Ledger exists but CSV is missing or tiny, we are in a broken state.
+        if ledger_file.exists():
+            csv_size = cache_file.stat().st_size if cache_file.exists() else 0
+            # If CSV is smaller than 1KB but Ledger exists, it's corrupt.
+            if csv_size < 1024: 
+                print("⚠️  CORRUPTION DETECTED: Ledger claims completion, but CSV is empty.")
+                print("   Nuking cache to force fresh download...")
+                try: os.remove(ledger_file)
+                except: pass
+                try: os.remove(cache_file)
+                except: pass
+        # ---------------------------------------------
+
+        # 1. Load Completion Ledger
         done_ids = set()
         if ledger_file.exists():
             print(f"Reading completion ledger from {ledger_file}...")
@@ -2048,7 +2063,11 @@ class BacktestEngine:
         
         if not todo_ids:
             print("All markets verified complete. Loading dataset...")
-            # Load and De-Dupe (Vital because retries might create duplicates)
+            if not cache_file.exists() or cache_file.stat().st_size < 100:
+                 print("❌ CRITICAL: Ledger says done, but CSV is missing! Deleting ledger.")
+                 os.remove(ledger_file)
+                 return pd.DataFrame() # Will trigger retry on next run
+
             df = pd.read_csv(cache_file)
             print("   De-duplicating dataset...")
             df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
@@ -2076,8 +2095,10 @@ class BacktestEngine:
             batch_size = 500
             t_id = str(market_id)[-4:]
             
-            # THE ONLY LIMIT: Time (205 Days)
+            # TIME LIMIT: 205 Days
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
+            
+            found_trades = False
             
             while True:
                 try:
@@ -2094,7 +2115,7 @@ class BacktestEngine:
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
-                                # DATE CHECK: The only exit condition
+                                # DATE CHECK
                                 if isinstance(ts_val, (int, float)):
                                     if float(ts_val) < cutoff_ts: raise StopIteration
                                     ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
@@ -2123,14 +2144,13 @@ class BacktestEngine:
                             except: continue
                         
                         if rows:
+                            found_trades = True
                             with csv_lock:
                                 writer.writerows(rows)
                         
-                        # Pagination Logic
                         if len(data) < batch_size: break
                         offset += batch_size
                         
-                        # Progress log for massive markets (every 10k trades)
                         if offset % 10000 == 0:
                             print(f" [T-{t_id}] Deep Offset {offset}...", end="\r")
 
@@ -2138,14 +2158,14 @@ class BacktestEngine:
                         time.sleep(2)
                         continue
                     else:
-                        break # 400/500 errors
+                        break 
                         
                 except StopIteration:
-                    break # Reached the date limit
+                    break 
                 except Exception:
-                    return False # Failed, do not mark as done
+                    return False 
             
-            # Mark as Done in Ledger
+            # Mark as Done
             with ledger_lock:
                 with open(ledger_file, "a") as f:
                     f.write(f"{market_id}\n")
@@ -2158,8 +2178,8 @@ class BacktestEngine:
             if not file_exists:
                 writer.writeheader()
             
-            # max_workers=4 is safer for "Whale" markets to avoid RAM spikes
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # max_workers=6 to speed up recovery
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer) 
                     for mid in todo_ids
@@ -2168,7 +2188,7 @@ class BacktestEngine:
                 completed = 0
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
-                    if completed % 50 == 0:
+                    if completed % 100 == 0:
                         print(f" Progress: {completed}/{len(todo_ids)} markets finished.", end="\r")
                         f.flush()
 
@@ -2176,15 +2196,18 @@ class BacktestEngine:
         
         # Load Final
         print("Loading full dataset...")
-        # FIX: Force IDs to be strings so they match the Markets DataFrame
+        # FORCE STRING IDs to match Market Data
         df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         
         print("Sanitizing (De-duping)...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
+        
+        # Ensure standard lowercase
         df['contract_id'] = df['contract_id'].str.lower().astype('category')
         df['user'] = df['user'].astype('category')
+        
         return df
         
     def _fetch_subgraph_trades(self, days_back=200):
