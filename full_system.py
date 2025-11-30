@@ -2059,28 +2059,32 @@ class BacktestEngine:
         import threading
         import requests
         import os
+        import random
         from requests.adapters import HTTPAdapter, Retry
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. NUCLEAR CLEANUP (Mandatory)
-        # We must delete the ledger because it contains 67k "False Positives"
+        # 1. Clean Start (Mandatory for Debugging)
         if ledger_file.exists():
-            print("   ⚠️ Deleting corrupt completion ledger.")
-            os.remove(ledger_file)
+            try: os.remove(ledger_file)
+            except: pass
         if cache_file.exists():
-            print("   ⚠️ Deleting empty CSV.")
-            os.remove(cache_file)
+            try: os.remove(cache_file)
+            except: pass
 
-        # Sanitize IDs (fixes the 404 issue)
+        # Sanitize IDs
         todo_ids = []
         for m in market_ids:
             s = str(m).strip().replace("'", "").replace('"', "")
             if '.' in s: s = s.split('.')[0]
             todo_ids.append(s)
+            
+        # FIX: Shuffle/Reverse the list to stop checking 2020 markets first
+        # This breaks the "Oldest First" deadlock if the input list is bad.
+        todo_ids.reverse() 
         
-        print(f"Stream-fetching {len(todo_ids)} markets (Newest -> Oldest)...")
+        print(f"Stream-fetching {len(todo_ids)} markets (REVERSED ORDER)...")
         
         # 2. Setup CSV Writer
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2089,9 +2093,8 @@ class BacktestEngine:
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         
-        # Global debug counters
-        self.total_saved = 0
-        self.discard_reasons = [] 
+        # DIAGNOSTIC COUNTERS
+        self.debug_logs = 0
         
         # 3. Define Worker
         def fetch_and_write_worker(market_id, writer, f_handle):
@@ -2100,26 +2103,40 @@ class BacktestEngine:
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
             offset = 0
-            batch_size = 500
-            
-            # Date Cutoff: 205 Days
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # --- CRITICAL FIX: FORCE DESCENDING ORDER ---
+                    # Force Descending (Newest First)
                     params = {
                         "market": market_id, 
-                        "limit": batch_size, 
+                        "limit": 500, 
                         "offset": offset,
                         "order": "timestamp", 
-                        "ascending": "false"  # <--- MUST BE FALSE
+                        "ascending": "false" 
                     }
                     
-                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=15)
+                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=10)
                     
                     if resp.status_code == 200:
                         data = resp.json()
+                        
+                        # --- DIAGNOSTIC START ---
+                        # If this is the first batch of a market, print what we see.
+                        if offset == 0 and self.debug_logs < 10:
+                            with csv_lock: # Use lock to prevent messy printing
+                                if self.debug_logs < 10:
+                                    if not data:
+                                        print(f"   [DEBUG] Market {market_id}: API returned 0 trades.")
+                                    else:
+                                        t0 = data[0]
+                                        t_ts = float(t0.get('timestamp') or t0.get('time') or 0)
+                                        t_date = pd.to_datetime(t_ts, unit='s')
+                                        status = "ACCEPTED" if t_ts >= cutoff_ts else "REJECTED (Too Old)"
+                                        print(f"   [DEBUG] Market {market_id}: Found {len(data)} trades. Newest: {t_date} -> {status}")
+                                    self.debug_logs += 1
+                        # --- DIAGNOSTIC END ---
+
                         if not data: break
                         
                         rows = []
@@ -2128,26 +2145,17 @@ class BacktestEngine:
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
-                                # TIME CHECK
-                                trade_ts = float(ts_val) if isinstance(ts_val, (int, float)) else 0.0
+                                trade_ts = float(ts_val)
                                 
+                                # LOGIC CHECK
                                 if trade_ts < cutoff_ts: 
-                                    # DEBUG: Capture the first few discards so we know WHY
-                                    if len(self.discard_reasons) < 5:
-                                        self.discard_reasons.append(f"Market {market_id}: Trade {trade_ts} < Cutoff {cutoff_ts}")
-                                    raise StopIteration
+                                    raise StopIteration # Stop fetching this market
                                 
-                                # If we get here, the trade is VALID
-                                if isinstance(ts_val, (int, float)):
-                                    ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
-                                else:
-                                    ts_str = str(ts_val)
-
+                                # Format Row
+                                ts_str = pd.to_datetime(trade_ts, unit='s').isoformat()
                                 price = float(row.get('price') or 0.0)
                                 size = float(row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0)
-                                
-                                side_str = str(row.get('side', '')).upper()
-                                side_mult = 1 if side_str == 'BUY' else -1
+                                side_mult = 1 if str(row.get('side', '')).upper() == 'BUY' else -1
                                 
                                 rows.append({
                                     'timestamp': ts_str,
@@ -2167,10 +2175,9 @@ class BacktestEngine:
                             with csv_lock:
                                 writer.writerows(rows)
                                 f_handle.flush()
-                                self.total_saved += len(rows)
                         
-                        if len(data) < batch_size: break
-                        offset += batch_size
+                        if len(data) < 500: break
+                        offset += 500
                         
                     elif resp.status_code == 429:
                         time.sleep(2)
@@ -2181,25 +2188,21 @@ class BacktestEngine:
                 except StopIteration:
                     break 
                 except Exception:
-                    return False 
+                    break 
             
             # Mark as Done
             with ledger_lock:
                 with open(ledger_file, "a") as lf:
                     lf.write(f"{market_id}\n")
-            
             return True
 
         # 4. Run Execution
-        debug_cutoff = pd.Timestamp.now() - pd.Timedelta(days=205)
-        print(f"DEBUG: Date Cutoff is {debug_cutoff}")
-        print(f"DEBUG: API Sort Order set to DESCENDING (Newest First)")
-        
-        with open(cache_file, mode='w', newline='') as f:
+        with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            writer.writeheader()
+            if not file_exists: writer.writeheader()
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            # 8 Workers
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in todo_ids
@@ -2208,31 +2211,19 @@ class BacktestEngine:
                 completed = 0
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
-                    if completed % 100 == 0:
-                        # PRINT REAL-TIME STATS
-                        print(f" Progress: {completed}/{len(todo_ids)} checked | Saved: {self.total_saved} trades...", end="\r")
+                    if completed % 200 == 0:
+                        print(f" Progress: {completed}/{len(todo_ids)} checked...", end="\r")
 
         print("\n✅ Fetch complete.")
-        
-        # FINAL DIAGNOSTIC
-        if self.total_saved == 0:
-            print("\n❌ CRITICAL FAILURE: 0 Trades Saved.")
-            if self.discard_reasons:
-                print("   Reason: DATA TOO OLD. Examples:")
-                for r in self.discard_reasons:
-                    print(f"   - {r}")
-            else:
-                print("   Reason: API returned empty lists (Check connection/IDs).")
-            return pd.DataFrame()
         
         # Load Final
         print("Loading full dataset...")
         try:
             df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-        except pd.errors.EmptyDataError:
+        except:
             return pd.DataFrame()
             
-        print("Sanitizing (De-duping)...")
+        print(f"De-duping {len(df)} trades...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
