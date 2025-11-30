@@ -1875,7 +1875,7 @@ class BacktestEngine:
                 if offset % 5000 == 0: print(f"{offset}..", end="", flush=True)
                 
                 # Safety Limit (Increased to 300k to cover full history if needed)
-                if offset > 300000: break
+                #if offset > 300000: break
                 
             except Exception as e:
                 log.error(f"Market fetch error: {e}")
