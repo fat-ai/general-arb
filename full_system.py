@@ -1360,187 +1360,224 @@ class FastBacktestEngine:
         return self._aggregate_fold_results(results)
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
-        # Params
-        splash_thresh = config.get('splash_threshold', 2.0)
-        edge_thresh = config.get('edge_threshold', 0.01)
-        noise_scale = config.get('noise_scale', 0.0) # Default to 0.0 (Pure Signal)
-        
-        sizing_config = config.get('sizing', ("kelly", 0.25))
-        sizing_mode, sizing_val = sizing_config
-        
+        """
+        Runs the simulation for a specific fold (Train or Test).
+        Optimized with fixes for Edge Calculation, Signal Reset, and Calibration.
+        """
+        import numpy as np
+
+        # Config extraction
+        splash_thresh = config.get('splash_threshold', 10000)
         use_smart_exit = config.get('use_smart_exit', False)
-        stop_loss_pct = config.get('stop_loss')
-        if stop_loss_pct is not None and stop_loss_pct >= 1.0: stop_loss_pct = None
+        stop_loss_pct = config.get('stop_loss_pct', None)
+        sizing_mode = config.get('sizing_mode', 'kelly')
+        sizing_val = config.get('kelly_fraction', 0.25)
+        if sizing_mode == 'fixed': sizing_val = config.get('fixed_size', 10.0)
         
-        cash = 10000.0
-        positions = {} 
-        pnl_history = [(start_time, cash)]
-        trade_count = 0
+        # State
+        cash = 10000.0  # Starting portfolio for this period
+        positions = {}  # {contract_id: {'side': 1/-1, 'size': $, 'entry': p}}
         
-        contracts = {}
+        # Trackers
+        # tracker[cid] = {'buy_weight': float, 'sell_weight': float, 'last_price': float}
         tracker = {}
-        prices = {}
         
-        # Pre-load
-        for cid, life in self.market_lifecycle.items():
-            if life['start'] < start_time and life['end'] > start_time:
-                contracts[cid] = {'p_model': 0.5, 'liquidity': life['liquidity']}
-                tracker[cid] = {'w_sum': 0.0, 'w_log_sum': 0.0}
-                prices[cid] = 0.5
-
-        def logit(p): 
-            p = max(0.001, min(p, 0.999))
-            return np.log(p / (1.0 - p))
-        def sigmoid(x): return 1.0 / (1.0 + np.exp(-x))
-
-        current_batch_time = start_time
+        # Metrics
+        trade_count = 0
+        volume_traded = 0.0
+        
+        # Helper: Sigmoid for bounding
+        def sigmoid(x): return 1 / (1 + np.exp(-x))
 
         for batch in batches:
-            if batch: current_batch_time = batch[0]['timestamp']
-
+            # Sort batch by time to ensure causal order
+            # (Assuming batch is a list of events)
+            
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
                 cid = data.get('contract_id')
-                if not cid: continue 
-
-                if ev_type == 'NEW_CONTRACT':
-                    contracts[cid] = {'p_model': 0.5, 'liquidity': data.get('liquidity', 10000.0)}
-                    tracker[cid] = {'w_sum': 0.0, 'w_log_sum': 0.0}
-                    prices[cid] = 0.5
-                    
-                elif ev_type == 'PRICE_UPDATE':
-                    if cid not in contracts:
-                        contracts[cid] = {'p_model': 0.5, 'liquidity': 10000.0}
-                        tracker[cid] = {'w_sum': 0.0, 'w_log_sum': 0.0}
-                        prices[cid] = 0.5
-                        
-                    if cid in contracts:
-                        prices[cid] = data.get('p_market_all', 0.5)
-                        current_p = prices[cid]
-
-                        w_id = str(data.get('wallet_id')) 
-                        vol = data.get('trade_volume', 0.0)
-                        is_sell = data.get('is_sell', False)
-                        
                 
-                        vol = data.get('trade_volume', 0.0)
-                        # trade_price is unused for signal now, replaced by direction
-                        
-                        is_sell = data.get('is_sell', False)
-                        
-                        brier = wallet_scores.get((w_id, 'default_topic'))
-                        if brier is None:
-                            # Use fallback
-                            pred_brier = fw_intercept 
-                            brier = max(0.05, min(pred_brier, 0.35))
-                        
-                        weight = vol / (brier + 0.0001)
-                        
+                # --- A. NEW CONTRACT ---
+                if ev_type == 'NEW_CONTRACT':
+                    tracker[cid] = {
+                        'buy_weight': 0.0, 
+                        'sell_weight': 0.0, 
+                        'last_price': 0.5 # Initialize at 0.5
+                    }
 
-                        # 1. Start with the CURRENT market belief (the price)
-                        # Avoid log(0)
-                        current_p_safe = max(0.01, min(current_p, 0.99))
-                        current_logit = np.log(current_p_safe / (1.0 - current_p_safe))
+                # --- B. PRICE UPDATE (THE CORE LOGIC) ---
+                elif ev_type == 'PRICE_UPDATE':
+                    if cid not in tracker:
+                        tracker[cid] = {'buy_weight': 0.0, 'sell_weight': 0.0, 'last_price': 0.5}
+                    
+                    # 1. Get Market Info
+                    # FIX: Use data.get properly and sanitize
+                    raw_price = data.get('p_market_all', 0.5)
+                    if np.isnan(raw_price) or np.isinf(raw_price): continue
+                    
+                    current_market_price = max(0.001, min(raw_price, 0.999))
+                    
+                    # 2. Extract Signal Data
+                    w_id = str(data.get('wallet_id'))
+                    vol = float(data.get('trade_volume', 0.0))
+                    is_sell = data.get('is_sell', False)
+                    
+                    # 3. Retrieve or Calibrate Wallet Score
+                    # Lower Brier = Better. Random = 0.25. Perfect = 0.0.
+                    brier = wallet_scores.get((w_id, 'default_topic'))
+                    
+                    if brier is None:
+                        # FIX: Use Slope AND Intercept for Fresh Wallets
+                        # We log-transform volume because impact usually scales logarithmically
+                        log_vol = np.log(max(vol, 1.0))
+                        pred_brier = fw_intercept + (fw_slope * log_vol)
+                        # Clamp to reasonable bounds (0.10 is very smart, 0.35 is dumb/random)
+                        brier = max(0.10, min(pred_brier, 0.35))
+                    
+                    # 4. Convert Brier to "Implied Accuracy" (Bayesian Weight)
+                    # Heuristic: If Brier=0.25 (Random), Accuracy=0.0. If Brier=0 (Perfect), Accuracy=1.0
+                    # Formula: weight = (0.25 - brier) * Volume
+                    # Only give positive weight to traders better than random (Brier < 0.25)
+                    skill_premium = max(0.0, 0.25 - brier)
+                    weight = vol * (skill_premium * 10.0) # Scale up for impact
+                    
+                    # 5. Accumulate Sentiment
+                    if is_sell:
+                        tracker[cid]['sell_weight'] += weight
+                    else:
+                        tracker[cid]['buy_weight'] += weight
                         
-                        # 2. Calculate the "Nudge" (Alpha)
-                        # A "Smart" trader pushes the price, but not to infinity.
-                        # Direction: +1 for Buy, -1 for Sell
-                        direction = -1.0 if is_sell else 1.0
+                    total_weight = tracker[cid]['buy_weight'] + tracker[cid]['sell_weight']
+                    
+                    # 6. Check Splash Threshold
+                    if total_weight > splash_thresh:
+                        # --- GENERATE SIGNAL ---
                         
-                        # Magnitude: Proportional to volume and their skill (1/brier)
-                        # We limit the max influence of any single trade to avoid spikes
-                        influence = min(weight * 0.1, 2.0) 
+                        # Calculate Net Bullishness (-1.0 to 1.0)
+                        buy_w = tracker[cid]['buy_weight']
+                        sell_w = tracker[cid]['sell_weight']
+                        net_sentiment = (buy_w - sell_w) / (buy_w + sell_w + 1e-9)
                         
-                        # 3. Apply the Nudge
-                        # New Logit = Old Logit + (Direction * Influence)
-                        trade_logit = current_logit + (direction * influence)
+                        # Map to Probability (Centered on 0.5)
+                        # If net_sentiment is 1.0 (All Buy), p_model -> 0.9
+                        # If net_sentiment is -1.0 (All Sell), p_model -> 0.1
+                        p_model = 0.5 + (net_sentiment * 0.4) 
                         
-                        tracker[cid]['w_sum'] += weight
-                        tracker[cid]['w_log_sum'] += (trade_logit * weight)
+                        # FIX: Compare p_model to LAST price (Pre-impact) vs Current
+                        # If we think P should be 0.8, and market is 0.6, we buy.
+                        edge = p_model - current_market_price
                         
-                        if tracker[cid]['w_sum'] > splash_thresh:
-                            avg_logit = tracker[cid]['w_log_sum'] / tracker[cid]['w_sum']
-                            
-                            # Optional Noise (controlled by config)
-                            if noise_scale > 0:
-                                seed_val = abs(hash(cid)) % (2**32)
-                                rng = np.random.RandomState(seed_val)
-                                noisy_logit = avg_logit + rng.normal(0, noise_scale)
-                                contracts[cid]['p_model'] = sigmoid(noisy_logit)
-                            else:
-                                contracts[cid]['p_model'] = sigmoid(avg_logit)
-                            
-                            p_model = contracts[cid]['p_model']
-                            edge = p_model - current_p
-                            
-                            # Entry
-                            if abs(edge) > edge_thresh and cid not in positions:
+                        # --- EXECUTION LOGIC ---
+                        if abs(edge) > config.get('edge_threshold', 0.05):
+                            # Check if we already have a position
+                            if cid not in positions:
                                 side = 1 if edge > 0 else -1
-                                target_f = 0.0
-                                if sizing_mode == "fixed_pct": target_f = sizing_val
-                                elif sizing_mode == "kelly":
-                                    if side == 1: num, den = (p_model - current_p), (1.0 - current_p)
-                                    else: num, den = (current_p - p_model), current_p
-                                    raw_f = 0.0
-                                    if den > 0.01: raw_f = num / den
-                                    target_f = raw_f * sizing_val 
-
-                                target_f = min(max(target_f, 0.0), 0.20)
-                                cost = cash * target_f
-                                if cost > 5.0:
-                                    cash -= cost
-                                    positions[cid] = {'side': side, 'size': cost, 'entry': current_p}
-                                    trade_count += 1
-                                    
-                            # Exit
-                            elif cid in positions:
-                                pos = positions[cid]
-                                should_close = False
-                                if use_smart_exit:
-                                    if (pos['side'] == 1 and edge < 0) or (pos['side'] == -1 and edge > 0):
-                                        should_close = True
-                                if not should_close and stop_loss_pct is not None:
-                                    if pos['side'] == 1:
-                                        pnl_pct = (current_p - pos['entry']) / max(pos['entry'], 0.01)
-                                    else:
-                                        pnl_pct = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
-                                    if pnl_pct < -stop_loss_pct: should_close = True
                                 
-                                if should_close:
-                                    if pos['side'] == 1:
-                                        final_pnl = (current_p - pos['entry']) / max(pos['entry'], 0.01)
-                                    else:
-                                        final_pnl = (pos['entry'] - current_p) / max(1.0 - pos['entry'], 0.01)
-                                    final_pnl = max(final_pnl, -1.0)
-                                    cash += pos['size'] * (1.0 + final_pnl)
-                                    del positions[cid]
+                                # Sizing
+                                target_f = 0.0
+                                if sizing_mode == "fixed_pct": 
+                                    target_f = sizing_val
+                                elif sizing_mode == "kelly":
+                                    # Simplified Kelly for Binary: f = edge / odds
+                                    # Odds = (1-p)/p. 
+                                    # Safe fallback: f = edge / 1.0 (conservative)
+                                    target_f = abs(edge) * sizing_val
+                                elif sizing_mode == "fixed":
+                                    cost = sizing_val
+                                    target_f = -1 # Flag for fixed cash
 
+                                # Cap size
+                                if target_f > 0:
+                                    target_f = min(target_f, 0.20)
+                                    cost = cash * target_f
+                                
+                                if cost > 5.0 and cash > cost:
+                                    cash -= cost
+                                    positions[cid] = {
+                                        'side': side, 
+                                        'size': cost, 
+                                        'entry': current_market_price
+                                    }
+                                    trade_count += 1
+                                    volume_traded += cost
+                        
+                        # FIX: Reset Tracker to avoid infinite signaling
+                        # We keep a tiny bit of "momentum" (10%) but mostly reset
+                        tracker[cid]['buy_weight'] *= 0.1
+                        tracker[cid]['sell_weight'] *= 0.1
+
+                    # Update Price Tracking for Next Tick
+                    tracker[cid]['last_price'] = current_market_price
+
+                    # --- C. MANAGE POSITIONS (Stop Loss / Take Profit) ---
+                    if cid in positions:
+                        pos = positions[cid]
+                        should_close = False
+                        
+                        # Calculate PnL %
+                        curr_val = 0
+                        if pos['side'] == 1: # Long Yes
+                            # Profit if Price > Entry
+                            pnl_pct = (current_market_price - pos['entry']) / pos['entry']
+                        else: # Long No (Short Yes)
+                            # Profit if Price < Entry
+                            pnl_pct = (pos['entry'] - current_market_price) / (1.0 - pos['entry'])
+                        
+                        # Stop Loss
+                        if stop_loss_pct and pnl_pct < -stop_loss_pct:
+                            should_close = True
+                            
+                        # Smart Exit (Signal Reversal)
+                        if use_smart_exit:
+                            # Re-calculate sentiment briefly
+                            cur_net = (tracker[cid]['buy_weight'] - tracker[cid]['sell_weight'])
+                            if pos['side'] == 1 and cur_net < 0: should_close = True
+                            if pos['side'] == -1 and cur_net > 0: should_close = True
+                            
+                        if should_close:
+                            # Cash out
+                            payout = pos['size'] * (1.0 + pnl_pct)
+                            cash += payout
+                            del positions[cid]
+
+                # --- D. RESOLUTION ---
                 elif ev_type == 'RESOLUTION':
-                    if cid in contracts:
-                        if cid in positions:
-                            pos = positions.pop(cid)
-                            outcome = float(data.get('outcome', 0.0))
-                            is_win = (pos['side'] == 1 and outcome > 0.5) or (pos['side'] == -1 and outcome < 0.5)
-                            if is_win:
-                                if pos['side'] == 1: roi = 1.0 / max(pos['entry'], 0.01)
-                                else: roi = 1.0 / max(1.0 - pos['entry'], 0.01)
-                                cash += pos['size'] * roi
-                        del contracts[cid]
-                        if cid in tracker: del tracker[cid]
-                        if cid in prices: del prices[cid]
+                    if cid in positions:
+                        pos = positions[cid]
+                        outcome = float(data.get('outcome', 0))
+                        
+                        # Binary Payoff
+                        # If Long Yes (1) and Outcome 1 -> Win
+                        # If Short Yes (-1) and Outcome 0 -> Win
+                        win = False
+                        if pos['side'] == 1 and outcome == 1.0: win = True
+                        if pos['side'] == -1 and outcome == 0.0: win = True
+                        
+                        if win:
+                            # Payout is 1.00 per share.
+                            # Shares = Size / Entry
+                            if pos['side'] == 1:
+                                shares = pos['size'] / pos['entry']
+                            else:
+                                shares = pos['size'] / (1.0 - pos['entry'])
+                            
+                            cash += shares # (Shares * $1.00)
+                        
+                        del positions[cid]
+        
+        # End of Period Valuation
+        # Liquidate remaining positions at current recorded prices
+        final_value = cash
+        for cid, pos in positions.items():
+            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+            if pos['side'] == 1:
+                val = (pos['size'] / pos['entry']) * last_p
+            else:
+                val = (pos['size'] / (1-pos['entry'])) * (1-last_p)
+            final_value += val
             
-            open_pnl = 0.0
-            for cid, pos in positions.items():
-                curr = prices.get(cid, pos['entry'])
-                if pos['side'] == 1:
-                    pnl_pct = (curr - pos['entry']) / max(pos['entry'], 0.01)
-                else:
-                    pnl_pct = (pos['entry'] - curr) / max(1.0 - pos['entry'], 0.01)
-                open_pnl += pos['size'] * (1.0 + pnl_pct)
-            pnl_history.append((current_batch_time, cash + open_pnl))
-
-        return self._calculate_metrics(pnl_history, trade_count)
+        return final_value, trade_count
 
     # ... (Methods _aggregate_fold_results and _calculate_metrics remain unchanged) ...
     def _aggregate_fold_results(self, results):
@@ -1766,8 +1803,7 @@ class BacktestEngine:
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        # FORCE NORMALIZATION (Markets)
-        # Convert to string, strip whitespace, lowercase
+        # NORMALIZE MARKETS: String, Lower, No Spaces
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
         # 2. Fetch Trades
@@ -1778,34 +1814,31 @@ class BacktestEngine:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
-        # FORCE NORMALIZATION (Trades)
-        # Ensure we are comparing apples to apples
+        # NORMALIZE TRADES
         if 'contract_id' in trades.columns:
             trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
         
-        # --- DIAGNOSTIC PRINT (Debugging) ---
-        m_sample = markets['contract_id'].iloc[0]
-        t_sample = trades['contract_id'].iloc[0]
-        print(f"\n🔍 ID DIAGNOSTIC:")
-        print(f"   Market ID Sample: '{m_sample}'")
-        print(f"   Trade ID Sample:  '{t_sample}'")
-        
-        # Check for 0x prefix mismatch
-        m_has_0x = str(m_sample).startswith('0x')
-        t_has_0x = str(t_sample).startswith('0x')
-        if m_has_0x != t_has_0x:
-            print("   ⚠️ WARNING: '0x' Prefix Mismatch detected! Attempting auto-fix...")
+        # 3. AUTO-FIX ID FORMATS
+        # Check sample to see if we need to add/remove '0x'
+        if not markets.empty and not trades.empty:
+            m_sample = markets['contract_id'].iloc[0]
+            t_sample = trades['contract_id'].iloc[0]
+            
+            m_has_0x = m_sample.startswith('0x')
+            t_has_0x = t_sample.startswith('0x')
+            
             if m_has_0x and not t_has_0x:
+                print("   ⚠️ Fixing ID mismatch: Adding '0x' to trades...")
                 trades['contract_id'] = '0x' + trades['contract_id']
             elif not m_has_0x and t_has_0x:
-                markets['contract_id'] = '0x' + markets['contract_id']
-        # ------------------------------------
+                print("   ⚠️ Fixing ID mismatch: Stripping '0x' from trades...")
+                trades['contract_id'] = trades['contract_id'].str.replace('0x', '', regex=False)
 
-        # 3. Filter
+        # 4. Filter
         valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
-        print(f"DEBUG: Data Load Complete. {len(markets)} Markets, {len(trades)} Trades.")
+        print(f"DEBUG: Data Load Complete. {len(markets)} Markets matched with {len(trades)} Trades.")
         return markets, trades
         
     def _fetch_gamma_markets(self, days_back=200):
@@ -2021,61 +2054,27 @@ class BacktestEngine:
 
     def _fetch_gamma_trades_parallel(self, market_ids):
         import concurrent.futures 
-        import gc
         import csv
-        import time
         import threading
         import requests
         import os
         from requests.adapters import HTTPAdapter, Retry
         
-        # Files
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # --- SELF-HEALING: Check for Zombie Ledger ---
-        # If Ledger exists but CSV is missing or tiny, we are in a broken state.
+        # 1. CLEAN START (Delete old ledger to ensure we don't skip markets)
+        # We assume if you are running this, previous runs failed.
         if ledger_file.exists():
-            csv_size = cache_file.stat().st_size if cache_file.exists() else 0
-            # If CSV is smaller than 1KB but Ledger exists, it's corrupt.
-            if csv_size < 1024: 
-                print("⚠️  CORRUPTION DETECTED: Ledger claims completion, but CSV is empty.")
-                print("   Nuking cache to force fresh download...")
-                try: os.remove(ledger_file)
-                except: pass
-                try: os.remove(cache_file)
-                except: pass
-        # ---------------------------------------------
+            print("   ⚠️ Deleting old completion ledger to ensure full coverage.")
+            os.remove(ledger_file)
 
-        # 1. Load Completion Ledger
-        done_ids = set()
-        if ledger_file.exists():
-            print(f"Reading completion ledger from {ledger_file}...")
-            try:
-                with open(ledger_file, "r") as f:
-                    done_ids = set(line.strip() for line in f if line.strip())
-                print(f"   ✅ Verified completion for {len(done_ids)} markets.")
-            except: 
-                print("   ⚠️ Ledger error. Starting fresh.")
-        
         # Filter todo list
-        todo_ids = [m for m in market_ids if m not in done_ids]
+        todo_ids = [str(m).strip().replace("'", "").replace('"', "") for m in market_ids]
         
-        if not todo_ids:
-            print("All markets verified complete. Loading dataset...")
-            if not cache_file.exists() or cache_file.stat().st_size < 100:
-                 print("❌ CRITICAL: Ledger says done, but CSV is missing! Deleting ledger.")
-                 os.remove(ledger_file)
-                 return pd.DataFrame() # Will trigger retry on next run
-
-            df = pd.read_csv(cache_file)
-            print("   De-duplicating dataset...")
-            df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
-            return df
-
         print(f"Stream-fetching {len(todo_ids)} markets (UNCAPPED)...")
         
-        # 2. Setup CSV Writer & Locks
+        # 2. Setup CSV Writer
         file_exists = cache_file.exists()
         write_mode = 'a' if file_exists else 'w'
         
@@ -2085,8 +2084,12 @@ class BacktestEngine:
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         
-        # 3. Define the Worker
-        def fetch_and_write_worker(market_id, writer):
+        # Debug counters
+        self.empty_responses = 0
+        self.debug_printed = 0
+        
+        # 3. Define Worker
+        def fetch_and_write_worker(market_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -2095,10 +2098,8 @@ class BacktestEngine:
             batch_size = 500
             t_id = str(market_id)[-4:]
             
-            # TIME LIMIT: 205 Days
+            # Hard limit: 205 Days ago
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
-            
-            found_trades = False
             
             while True:
                 try:
@@ -2107,6 +2108,14 @@ class BacktestEngine:
                     
                     if resp.status_code == 200:
                         data = resp.json()
+                        
+                        # --- DIAGNOSTIC: Print first few empty results ---
+                        if not data and offset == 0:
+                            if self.debug_printed < 3:
+                                print(f"\n[DEBUG] Market {market_id} returned 0 trades. URL: {resp.url}")
+                                self.debug_printed += 1
+                            break
+                        
                         if not data: break
                         
                         rows = []
@@ -2115,7 +2124,7 @@ class BacktestEngine:
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
-                                # DATE CHECK
+                                # TIME CHECK
                                 if isinstance(ts_val, (int, float)):
                                     if float(ts_val) < cutoff_ts: raise StopIteration
                                     ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
@@ -2123,8 +2132,7 @@ class BacktestEngine:
                                     ts_str = str(ts_val)
 
                                 price = float(row.get('price') or 0.0)
-                                sz = row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0
-                                size = float(sz)
+                                size = float(row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0)
                                 
                                 side_str = str(row.get('side', '')).upper()
                                 side_mult = 1 if side_str == 'BUY' else -1
@@ -2144,20 +2152,22 @@ class BacktestEngine:
                             except: continue
                         
                         if rows:
-                            found_trades = True
                             with csv_lock:
                                 writer.writerows(rows)
+                                # FLUSH every batch to prevent data loss
+                                f_handle.flush()
                         
                         if len(data) < batch_size: break
                         offset += batch_size
                         
-                        if offset % 10000 == 0:
-                            print(f" [T-{t_id}] Deep Offset {offset}...", end="\r")
-
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
                     else:
+                        # Log API errors (400, 500)
+                        if self.debug_printed < 3:
+                            print(f"\n[DEBUG] API Error {resp.status_code} for {market_id}")
+                            self.debug_printed += 1
                         break 
                         
                 except StopIteration:
@@ -2167,21 +2177,23 @@ class BacktestEngine:
             
             # Mark as Done
             with ledger_lock:
-                with open(ledger_file, "a") as f:
-                    f.write(f"{market_id}\n")
+                with open(ledger_file, "a") as lf:
+                    lf.write(f"{market_id}\n")
             
             return True
 
         # 4. Run Execution
+        print(f"DEBUG: Cutoff Timestamp is {pd.Timestamp.now() - pd.Timedelta(days=205)}")
+        
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             if not file_exists:
                 writer.writeheader()
             
-            # max_workers=6 to speed up recovery
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            # Max workers = 4 for stability
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [
-                    executor.submit(fetch_and_write_worker, mid, writer) 
+                    executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in todo_ids
                 ]
                 
@@ -2189,22 +2201,23 @@ class BacktestEngine:
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
                     if completed % 100 == 0:
-                        print(f" Progress: {completed}/{len(todo_ids)} markets finished.", end="\r")
-                        f.flush()
+                        print(f" Progress: {completed}/{len(todo_ids)} markets checked.", end="\r")
 
         print("\n✅ Fetch complete.")
         
         # Load Final
         print("Loading full dataset...")
-        # FORCE STRING IDs to match Market Data
-        df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-        
+        try:
+            # Force String IDs to match Markets
+            df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        except pd.errors.EmptyDataError:
+            print("❌ CRITICAL: CSV is empty. The API returned no data.")
+            return pd.DataFrame()
+            
         print("Sanitizing (De-duping)...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
-        
-        # Ensure standard lowercase
         df['contract_id'] = df['contract_id'].str.lower().astype('category')
         df['user'] = df['user'].astype('category')
         
