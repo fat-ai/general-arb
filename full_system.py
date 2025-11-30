@@ -1810,12 +1810,23 @@ class BacktestEngine:
         
     def _fetch_gamma_markets(self, days_back=200):
         from datetime import datetime, timedelta
+        import os
         
         # Cache file
         cache_file = self.cache_dir / f"gamma_markets_full_{days_back}d.parquet"
+        
+        # AUTO-FIX: If we previously saved a "0 record" file, delete it.
         if cache_file.exists():
-            print(f"Loading cached markets from {cache_file}...")
-            return pd.read_parquet(cache_file)
+            try:
+                df = pd.read_parquet(cache_file)
+                if df.empty or len(df) < 100:
+                    print("⚠️ Found incomplete market cache. Deleting to refetch.")
+                    os.remove(cache_file)
+                else:
+                    print(f"Loading cached markets from {cache_file}...")
+                    return df
+            except: 
+                os.remove(cache_file)
 
         all_rows = []
         offset = 0
@@ -1828,13 +1839,13 @@ class BacktestEngine:
         
         while True:
             try:
-                # Removed 'ascending': 'true'. Default is Newest First.
-                # We will fetch backwards until we hit the start date.
+                # FIX: Explicitly set ascending=false to ensure Newest First
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
                     "closed": "true", 
-                    "order": "endDate"
+                    "order": "endDate",
+                    "ascending": "false" # <--- CRITICAL FIX
                 }
                 
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
@@ -1850,7 +1861,8 @@ class BacktestEngine:
                 if last_date_str:
                     last_date = pd.to_datetime(last_date_str).tz_localize(None)
                     
-                    # STOPPING CONDITION: If we passed our start date (going backwards)
+                    # STOPPING CONDITION: We are moving backwards. 
+                    # If we hit a date older than start_date, we are done.
                     if last_date < start_date:
                         # Keep the ones that are still within range
                         valid_rows = [r for r in rows if pd.to_datetime(r.get('endDate')).tz_localize(None) >= start_date]
@@ -1862,8 +1874,8 @@ class BacktestEngine:
                 offset += 1000
                 if offset % 5000 == 0: print(f"{offset}..", end="", flush=True)
                 
-                # Safety Limit (e.g., 200k markets)
-                if offset > 200000: break
+                # Safety Limit (Increased to 300k to cover full history if needed)
+                if offset > 300000: break
                 
             except Exception as e:
                 log.error(f"Market fetch error: {e}")
@@ -1876,15 +1888,14 @@ class BacktestEngine:
         df = pd.DataFrame(all_rows)
         
         # --- Normalization ---
-        # 1. ID Standardization
         if 'id' in df.columns:
             df = df.rename(columns={'id': 'contract_id'})
         else:
             return pd.DataFrame()
             
+        # Strict ID cleaning
         df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower()
         
-        # 2. Outcome Derivation
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1898,22 +1909,20 @@ class BacktestEngine:
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         
-        # 3. Column Renaming
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        # 4. Filter Valid
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
         df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
         
-        # 5. Final Date Filter
+        # Final date filter
         df = df[df['resolution_timestamp'] >= start_date]
         
         if not df.empty: df.to_parquet(cache_file)
         return df
-
+        
     def _fetch_single_market_trades(self, market_id):
         """
         Worker function: Fetches ALL trades for a specific market ID.
