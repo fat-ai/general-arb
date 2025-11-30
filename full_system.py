@@ -1810,81 +1810,81 @@ class BacktestEngine:
         
     def _fetch_gamma_markets(self, days_back=200):
         from datetime import datetime, timedelta
-        cache_file = self.cache_dir / f"gamma_markets_recent_{days_back}d_v2.parquet"
+        
+        # Cache file
+        cache_file = self.cache_dir / f"gamma_markets_full_{days_back}d.parquet"
         if cache_file.exists():
-            try: return pd.read_parquet(cache_file)
-            except: pass
-    
+            print(f"Loading cached markets from {cache_file}...")
+            return pd.read_parquet(cache_file)
+
         all_rows = []
         offset = 0
-        print("Fetching Recent Markets...", end="")
         
-        # Work in naive datetime (consistent with rest of code)
-        now_naive = datetime.now()
-        cutoff_naive = now_naive - timedelta(days=days_back)
+        # Define window (Naive)
+        now = datetime.now()
+        start_date = now - timedelta(days=days_back)
         
-        log.info(f"Fetching markets from {cutoff_naive.date()} to {now_naive.date()}...")
+        print(f"Fetching ALL markets (Newest -> Oldest) back to {start_date.date()}...")
         
         while True:
             try:
+                # Removed 'ascending': 'true'. Default is Newest First.
+                # We will fetch backwards until we hit the start date.
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
                     "closed": "true", 
-                    "order": "endDate", 
-                    "ascending": "true" 
+                    "order": "endDate"
                 }
                 
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=10)
-                if resp.status_code != 200: break
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
+                if resp.status_code != 200: 
+                    print(f"Warning: API Error {resp.status_code}")
+                    break
+                
                 rows = resp.json()
                 if not rows: break
                 
-                # Parse and strip timezone immediately
+                # Check the Last Date in this batch
                 last_date_str = rows[-1].get('endDate')
                 if last_date_str:
-                    last_date = pd.to_datetime(last_date_str, utc=True).tz_localize(None)
-                    if last_date > now_naive:
-                        rows = [r for r in rows 
-                               if pd.to_datetime(r.get('endDate'), utc=True).tz_localize(None) <= now_naive]
-                        all_rows.extend(rows)
-                        print(" Reached Present Day. Stopping.")
+                    last_date = pd.to_datetime(last_date_str).tz_localize(None)
+                    
+                    # STOPPING CONDITION: If we passed our start date (going backwards)
+                    if last_date < start_date:
+                        # Keep the ones that are still within range
+                        valid_rows = [r for r in rows if pd.to_datetime(r.get('endDate')).tz_localize(None) >= start_date]
+                        all_rows.extend(valid_rows)
+                        print(" Reached start date limit. Stopping.")
                         break
                 
-                # Filter to date window (all naive)
-                relevant_rows = []
-                for r in rows:
-                    d = pd.to_datetime(r.get('endDate'), utc=True).tz_localize(None)
-                    if d >= cutoff_naive:
-                        relevant_rows.append(r)
-                
-                all_rows.extend(relevant_rows)
+                all_rows.extend(rows)
                 offset += 1000
-                if offset % 1000 == 0: print(".", end="", flush=True)
+                if offset % 5000 == 0: print(f"{offset}..", end="", flush=True)
                 
-            except Exception as e: 
+                # Safety Limit (e.g., 200k markets)
+                if offset > 200000: break
+                
+            except Exception as e:
                 log.error(f"Market fetch error: {e}")
                 break
         
-        print(" Done.")
-    
+        print(f" Done. Fetched {len(all_rows)} raw markets.")
+
         if not all_rows: return pd.DataFrame()
-    
+
         df = pd.DataFrame(all_rows)
         
-        # Use 'id' as contract_id
+        # --- Normalization ---
+        # 1. ID Standardization
         if 'id' in df.columns:
             df = df.rename(columns={'id': 'contract_id'})
         else:
-            log.error("Market data missing 'id' column.")
             return pd.DataFrame()
+            
+        df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower()
         
-        # Set fpmm_address fallback
-        if 'marketMakerAddress' in df.columns:
-            df = df.rename(columns={'marketMakerAddress': 'fpmm_address'})
-        else:
-            df['fpmm_address'] = df['contract_id']
-    
+        # 2. Outcome Derivation
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1895,30 +1895,21 @@ class BacktestEngine:
                 if p1 > 0.95: return 1 
                 return pd.NA
             except: return pd.NA
-    
+
         df['outcome'] = df.apply(derive_outcome, axis=1)
-        rename_map = {
-            'question': 'question', 
-            'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at', 
-            'liquidity': 'liquidity', 
-            'volume': 'volume'
-        }
+        
+        # 3. Column Renaming
+        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'liquidity': 'liquidity', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
-        
-        required_cols = ['contract_id', 'resolution_timestamp', 'created_at', 'outcome']
-        df = df.dropna(subset=required_cols)
-        
+        # 4. Filter Valid
+        df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
         
-        # Parse timestamps as UTC then strip timezone
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at'], format='mixed', utc=True).dt.tz_localize(None)
-        
-        # Filter to date range (all naive now)
-        df = df[df['resolution_timestamp'] >= cutoff_naive]
+        # 5. Final Date Filter
+        df = df[df['resolution_timestamp'] >= start_date]
         
         if not df.empty: df.to_parquet(cache_file)
         return df
@@ -2283,104 +2274,88 @@ class BacktestEngine:
     
     def _transform_to_events(self, markets, trades):
         import gc
-        log.info("Transforming Data (Production Optimized)...")
+        log.info("Transforming Data (Robust Mode)...")
         
-        # 1. Normalize Keys
-        if 'fpmm_address' in markets.columns and 'contract_id' not in markets.columns:
-            markets = markets.rename(columns={'fpmm_address': 'contract_id'})
-        if 'fpmm_address' in trades.columns and 'contract_id' not in trades.columns:
-            trades = trades.rename(columns={'fpmm_address': 'contract_id'})
-            
-        # 2. Optimize Types
-        for df in [markets, trades]:
-            for col in ['contract_id', 'user']:
-                if col in df.columns: df[col] = df[col].astype('category')
-                    
-        # 3. Ensure Timestamp
-        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-            trades['timestamp'] = pd.to_datetime(trades['timestamp'], unit='s', errors='coerce')
-        trades = trades.dropna(subset=['timestamp'])
+        # 1. Ensure IDs are standard strings
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
+        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
         
-        # 4. Filter Logic
-        log.info("Filtering Data...")
-        market_ids = set(markets['contract_id'].astype(str))
-        trade_mkts = set(trades['contract_id'].astype(str))
+        # 2. Filter to Common IDs
+        market_ids = set(markets['contract_id'])
+        trade_mkts = set(trades['contract_id'])
         common_ids = market_ids.intersection(trade_mkts)
-        markets = markets[markets['contract_id'].astype(str).isin(common_ids)].copy()
-        trades = trades[trades['contract_id'].astype(str).isin(common_ids)].copy()
         
-        # 5. Build Profiler Data
+        log.info(f"   Markets: {len(market_ids)}, Trades: {len(trades)}")
+        log.info(f"   Common IDs: {len(common_ids)}")
+        
+        if len(common_ids) == 0:
+            log.error("❌ NO COMMON IDS FOUND. Check ID formats (e.g. 0x prefix).")
+            return pd.DataFrame(), pd.DataFrame()
+            
+        markets = markets[markets['contract_id'].isin(common_ids)].copy()
+        trades = trades[trades['contract_id'].isin(common_ids)].copy()
+        
+        # 3. Build Profiler Data
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'].astype(str), 
-            'market_id': trades['contract_id'].astype(str),
+            'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
-            'size': (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype('float32'),
-            'tokens': (pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce') / 1e18).astype('float32')
+            'size': trades['size'].astype('float32'),
+            'tokens': trades['outcomeTokensAmount'].astype('float32')
         })
-        prof_data['bet_price'] = (prof_data['size'] / prof_data['tokens']).fillna(0).abs().clip(0, 1)
-        prof_data['bet_price'] = prof_data['bet_price'].replace([np.inf, -np.inf], np.nan).fillna(0).abs().clip(0, 1)
-     
+        
+        # Calculate Price safely
+        # Avoid division by zero and infinite values
+        price_series = (prof_data['size'] / prof_data['tokens'])
+        prof_data['bet_price'] = price_series.replace([np.inf, -np.inf], np.nan).fillna(0).abs().clip(0, 1)
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # 6. Build Event Log
+        # 4. Build Event Log
         events_ts, events_type, events_data = [], [], []
 
         # A. NEW_CONTRACT
-        m_ts = markets['created_at'].tolist()
-        m_ids = markets['contract_id'].astype(str).tolist()
-        m_liq = markets['liquidity'].fillna(10000.0).astype(float).tolist()
-        
-        for ts, cid, liq in zip(m_ts, m_ids, m_liq):
-            events_ts.append(ts); events_type.append('NEW_CONTRACT')
-            events_data.append({'contract_id': cid, 'p_market_all': 0.5, 'liquidity': liq})
+        for _, row in markets.iterrows():
+            events_ts.append(row['created_at'])
+            events_type.append('NEW_CONTRACT')
+            events_data.append({'contract_id': row['contract_id'], 'p_market_all': 0.5, 'liquidity': float(row.get('liquidity', 0))})
 
         # B. RESOLUTION
-        resolved_mask = markets['resolution_timestamp'].notna() & markets['outcome'].notna()
-        r_ts = markets.loc[resolved_mask, 'resolution_timestamp'].tolist()
-        r_ids = markets.loc[resolved_mask, 'contract_id'].astype(str).tolist()
-        r_out = markets.loc[resolved_mask, 'outcome'].astype(float).tolist()
-        
-        for ts, cid, out in zip(r_ts, r_ids, r_out):
-            events_ts.append(ts); events_type.append('RESOLUTION')
-            events_data.append({'contract_id': cid, 'outcome': out})
-            
-        del markets; gc.collect()
+        for _, row in markets.iterrows():
+            events_ts.append(row['resolution_timestamp'])
+            events_type.append('RESOLUTION')
+            events_data.append({'contract_id': row['contract_id'], 'outcome': float(row['outcome'])})
 
-        # C. PRICE_UPDATE (Explicit Scoping)
+        # C. PRICE_UPDATE (Explicit Iteration to avoid Zip misalignment)
+        # Sort trades by time first
+        trades = trades.sort_values('timestamp')
+        
+        # Vectorized preparation
         t_ts = trades['timestamp'].tolist()
-        t_ids = trades['contract_id'].astype(str).tolist()
-        t_usr = trades['user'].astype(str).tolist()
-        t_vol = (pd.to_numeric(trades['tradeAmount'], errors='coerce') / 1e6).astype(float).tolist()
+        t_cid = trades['contract_id'].tolist()
+        t_uid = trades['user'].astype(str).tolist()
+        t_vol = trades['tradeAmount'].tolist()
+        t_price = prof_data['bet_price'].tolist() # Aligned because prof_data is built from trades
+        t_tokens = trades['outcomeTokensAmount'].tolist()
         
-        # Calculate price list explicitly
-        t_price = prof_data['bet_price'].fillna(0.5).astype(float).tolist()
-        t_tokens = prof_data['tokens'].tolist()
-        
-        del trades; gc.collect()
-        
-        # ZIP LOOP: 'price' is now a loop variable, so it cannot be Unbound
-        for ts, cid, usr, price, vol, tokens in zip(t_ts, t_ids, t_usr, t_price, t_vol, t_tokens):
-            events_ts.append(ts)
+        for i in range(len(trades)):
+            events_ts.append(t_ts[i])
             events_type.append('PRICE_UPDATE')
             events_data.append({
-                'contract_id': cid,
-                'p_market_all': price, # Guaranteed to be set by zip
-                'wallet_id': usr,
-                'trade_price': price,
-                'trade_volume': vol,
-                'is_sell': tokens < 0
+                'contract_id': t_cid[i],
+                'p_market_all': t_price[i],
+                'wallet_id': t_uid[i],
+                'trade_volume': float(t_vol[i]),
+                'is_sell': t_tokens[i] < 0
             })
 
-        # 7. Final Assembly
+        # 5. Final Assembly
         df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
-        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'], errors='coerce')
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
-  
         
 # ==============================================================================
 # ### COMPONENT 8: Operational Dashboard (Production-Ready) ###
