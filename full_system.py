@@ -1914,8 +1914,18 @@ class BacktestEngine:
         
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp']).dt.tz_localize(None)
-        df['created_at'] = pd.to_datetime(df['created_at']).dt.tz_localize(None)
+        df['resolution_timestamp'] = pd.to_datetime(
+            df['resolution_timestamp'], 
+            format='mixed', 
+            utc=True, 
+            errors='coerce'
+        ).dt.tz_localize(None)
+        df['created_at'] = pd.to_datetime(
+            df['created_at'], 
+            format='mixed', 
+            utc=True, 
+            errors='coerce'
+        ).dt.tz_localize(None)
         
         # Final date filter
         df = df[df['resolution_timestamp'] >= start_date]
