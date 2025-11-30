@@ -1797,36 +1797,25 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets (Now using Token IDs)
+        # 1. Fetch Markets (Now with Token IDs)
         markets = self._fetch_gamma_markets(days_back=200)
         if markets.empty: 
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        # 2. PRE-FILTER by Date
+        # 2. Date Filter
         cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
         markets = markets[markets['resolution_timestamp'] >= cutoff_date].copy()
         
-        print(f"DEBUG: Relevant Markets Count: {len(markets)}")
-        
-        if markets.empty:
-            log.error("❌ No markets found in the selected date window.")
-            return pd.DataFrame(), pd.DataFrame()
-
         # 3. Fetch Trades
-        # active_ids is now a list of Token IDs (e.g., "717607...")
         active_ids = markets['contract_id'].unique()
         trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
         if trades.empty:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
-            
-        # 4. ID Normalization
-        if 'contract_id' in trades.columns:
-            trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
         
-        # 5. Filter
+        # 4. Filter Markets to match found Trades
         valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
@@ -1838,27 +1827,22 @@ class BacktestEngine:
         import os
         import json
         
-        # Cache file
-        cache_file = self.cache_dir / f"gamma_markets_token_ids.parquet"
+        # Cache file - Changing name to enforce a clean start
+        cache_file = self.cache_dir / "gamma_markets_token_ids.parquet"
         
-        # 1. DELETE OLD CACHE (Mandatory: We are changing ID format)
+        # 1. DELETE OLD CACHE (Mandatory to fix ID types)
         if cache_file.exists():
-            try:
-                # We force delete because we need to rebuild with Token IDs
-                os.remove(cache_file)
+            try: os.remove(cache_file)
             except: pass
 
         all_rows = []
         offset = 0
         
-        # Define window
-        now = datetime.now()
-        start_date = now - timedelta(days=days_back)
-        
-        print(f"Fetching GLOBAL market list (Ordered by VOLUME)...")
+        print(f"Fetching ACTIVE market list (Ordered by VOLUME)...")
         
         while True:
             try:
+                # Volume sort guarantees we get the active markets first
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
@@ -1880,6 +1864,7 @@ class BacktestEngine:
                 offset += 1000
                 if offset % 5000 == 0: print(f" {offset}..", end="", flush=True)
                 
+                # 50k markets is plenty
                 if offset > 50000: break
                 
             except Exception as e:
@@ -1892,29 +1877,24 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- CRITICAL FIX: USE TOKEN ID AS CONTRACT ID ---
-        def extract_token_id(row):
+        # --- CRITICAL: EXTRACT TOKEN ID ---
+        # We need the "Yes" token ID to query the Data API
+        def extract_token(row):
             try:
-                # The API returns clobTokenIds as a JSON string '["123", "456"]' 
-                # or sometimes a list depending on the endpoint version.
                 raw = row.get('clobTokenIds')
                 if not raw: return None
+                if isinstance(raw, str): tokens = json.loads(raw)
+                else: tokens = raw
                 
-                if isinstance(raw, str):
-                    tokens = json.loads(raw)
-                else:
-                    tokens = raw
-                    
-                # We take the first token (usually YES) to track the market
                 if isinstance(tokens, list) and len(tokens) > 0:
                     return str(tokens[0])
                 return None
             except: return None
 
-        df['contract_id'] = df.apply(extract_token_id, axis=1)
-        # -------------------------------------------------
+        df['contract_id'] = df.apply(extract_token, axis=1)
+        # ----------------------------------
         
-        # Drop markets where we couldn't find a Token ID (Non-CLOB markets)
+        # Drop markets that don't have CLOB tokens
         df = df.dropna(subset=['contract_id'])
         
         # Normalization
@@ -1937,10 +1917,8 @@ class BacktestEngine:
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
         
-        # Dates
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
-        # Sort by Volume
         if 'volume' in df.columns:
             df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
             df = df.sort_values('volume', ascending=False)
@@ -2040,101 +2018,83 @@ class BacktestEngine:
         import threading
         import requests
         import os
+        import time
         from requests.adapters import HTTPAdapter, Retry
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. DELETE OLD LEDGERS (Force check)
+        # 1. DELETE OLD LEDGERS (Mandatory for retry)
         if ledger_file.exists():
             try: os.remove(ledger_file)
             except: pass
             
-        # Sanitize IDs
-        todo_ids = []
-        for m in market_ids:
-            s = str(m).strip().replace("'", "").replace('"', "")
-            if '.' in s: s = s.split('.')[0]
-            todo_ids.append(s)
-            
-        print(f"Stream-fetching {len(todo_ids)} markets (Linear Order - Newest First)...")
+        # IDs are Token IDs. Ensure they are clean strings.
+        todo_ids = [str(m).strip().replace("'", "").replace('"', "") for m in market_ids]
+        
+        print(f"Stream-fetching {len(todo_ids)} markets via DATA API...")
         
         # 2. Setup CSV Writer
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         
-        # Always Append if file exists, Write if new
         write_mode = 'a' if cache_file.exists() else 'w'
         
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         
-        # 3. Define Worker
+        # 3. Define Worker (DATA API VERSION)
         def fetch_and_write_worker(market_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            offset = 0
+            cursor_ts = None 
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
-            
-            # TRACKING FOR LOGGING
-            found_any = False
-            first_ts_debug = None
             
             while True:
                 try:
-                    # FORCE NEWEST FIRST (Essential for date logic)
-                    params = {
-                        "market": market_id, 
-                        "limit": 500, 
-                        "offset": offset,
-                        "order": "timestamp", 
-                        "ascending": "false" 
-                    }
+                    # --- SUCCESSFUL ENDPOINT FROM DIAGNOSTIC ---
+                    url = "https://data-api.polymarket.com/trades"
                     
-                    resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=10)
+                    params = {
+                        "asset_id": market_id, 
+                        "limit": 100
+                    }
+                    if cursor_ts:
+                        params["max_timestamp"] = cursor_ts
+                    
+                    resp = session.get(url, params=params, timeout=10)
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        
-                        # LOGGING: Print the status of the first batch
-                        if offset == 0:
-                            if not data:
-                                print(f" [Mkt {market_id}] 0 Trades (Empty).")
-                            else:
-                                t0 = data[0]
-                                ts_val = t0.get('timestamp') or t0.get('time')
-                                ts_float = float(ts_val) if ts_val else 0
-                                ts_readable = pd.to_datetime(ts_float, unit='s')
-                                
-                                if ts_float < cutoff_ts:
-                                    print(f" [Mkt {market_id}] TOO OLD: {ts_readable} < Cutoff. Skipping.")
-                                else:
-                                    print(f" [Mkt {market_id}] SAVING: Found trades from {ts_readable}...")
-
-                        if not data: break
+                        if not data or not isinstance(data, list): break
                         
                         rows = []
+                        last_ts = None
+                        
                         for row in data:
                             try:
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
                                 trade_ts = float(ts_val)
+                                last_ts = trade_ts
+                                
                                 if trade_ts < cutoff_ts: raise StopIteration
                                 
                                 ts_str = pd.to_datetime(trade_ts, unit='s').isoformat()
                                 price = float(row.get('price') or 0.0)
-                                size = float(row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0)
+                                size = float(row.get('size') or row.get('sz') or 0.0)
                                 side_mult = 1 if str(row.get('side', '')).upper() == 'BUY' else -1
+                                user = str(row.get('maker_address') or row.get('taker_address') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
                                     'tradeAmount': size * price * 1e6,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
-                                    'user': str(row.get('taker_address') or row.get('taker') or 'unknown'),
-                                    'contract_id': str(market_id).lower(),
+                                    'user': user,
+                                    'contract_id': str(market_id),
                                     'price': price,
                                     'size': size,
                                     'side_mult': side_mult
@@ -2144,31 +2104,26 @@ class BacktestEngine:
                             except: continue
                         
                         if rows:
-                            found_any = True
                             with csv_lock:
                                 writer.writerows(rows)
                                 f_handle.flush()
                         
-                        if len(data) < 500: break
-                        offset += 500
+                        if len(data) < 100: break
+                        if last_ts: cursor_ts = int(last_ts) - 1
+                        else: break
                         
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
                     else:
-                        print(f" [Mkt {market_id}] API ERROR {resp.status_code}")
                         break 
-                        
                 except StopIteration:
                     break 
-                except Exception as e:
-                    print(f" [Mkt {market_id}] ERROR: {e}")
+                except Exception:
                     break 
             
-            # Mark as Done
             with ledger_lock:
-                with open(ledger_file, "a") as lf:
-                    lf.write(f"{market_id}\n")
+                with open(ledger_file, "a") as lf: lf.write(f"{market_id}\n")
             return True
 
         # 4. Run Execution
@@ -2177,13 +2132,18 @@ class BacktestEngine:
             if not cache_file.exists() or cache_file.stat().st_size == 0:
                 writer.writeheader()
             
-            # 5 Workers - Enough to be fast, low enough to read logs
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # 4 Workers for safety
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in todo_ids
                 ]
-                concurrent.futures.wait(futures)
+                
+                completed = 0
+                for f_res in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    if completed % 50 == 0:
+                        print(f" Progress: {completed}/{len(todo_ids)} checked...", end="\r")
 
         print("\n✅ Fetch complete.")
         
@@ -2194,11 +2154,11 @@ class BacktestEngine:
         except:
             return pd.DataFrame()
             
-        print(f"Sanitizing {len(df)} trades...")
+        print(f"De-duping {len(df)} trades...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
-        df['contract_id'] = df['contract_id'].str.lower().astype('category')
+        df['contract_id'] = df['contract_id'].astype(str).str.strip().astype('category')
         df['user'] = df['user'].astype('category')
         
         return df
