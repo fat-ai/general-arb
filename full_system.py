@@ -2063,59 +2063,62 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. CLEAN START (Delete old ledger to ensure we don't skip markets)
-        # We assume if you are running this, previous runs failed.
+        # 1. NUCLEAR CLEANUP (Mandatory)
+        # We must delete the ledger because it contains 67k "False Positives"
         if ledger_file.exists():
-            print("   ⚠️ Deleting old completion ledger to ensure full coverage.")
+            print("   ⚠️ Deleting corrupt completion ledger.")
             os.remove(ledger_file)
+        if cache_file.exists():
+            print("   ⚠️ Deleting empty CSV.")
+            os.remove(cache_file)
 
-        # Filter todo list
-        todo_ids = [str(m).strip().replace("'", "").replace('"', "") for m in market_ids]
+        # Sanitize IDs (fixes the 404 issue)
+        todo_ids = []
+        for m in market_ids:
+            s = str(m).strip().replace("'", "").replace('"', "")
+            if '.' in s: s = s.split('.')[0]
+            todo_ids.append(s)
         
-        print(f"Stream-fetching {len(todo_ids)} markets (UNCAPPED)...")
+        print(f"Stream-fetching {len(todo_ids)} markets (Newest -> Oldest)...")
         
         # 2. Setup CSV Writer
-        file_exists = cache_file.exists()
-        write_mode = 'a' if file_exists else 'w'
-        
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         
-        # Debug counters
-        self.empty_responses = 0
-        self.debug_printed = 0
+        # Global debug counters
+        self.total_saved = 0
+        self.discard_reasons = [] 
         
         # 3. Define Worker
         def fetch_and_write_worker(market_id, writer, f_handle):
             session = requests.Session()
-            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 504])
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
             offset = 0
             batch_size = 500
-            t_id = str(market_id)[-4:]
             
-            # Hard limit: 205 Days ago
+            # Date Cutoff: 205 Days
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    params = {"market": market_id, "limit": batch_size, "offset": offset}
+                    # --- CRITICAL FIX: FORCE DESCENDING ORDER ---
+                    params = {
+                        "market": market_id, 
+                        "limit": batch_size, 
+                        "offset": offset,
+                        "order": "timestamp", 
+                        "ascending": "false"  # <--- MUST BE FALSE
+                    }
+                    
                     resp = session.get("https://gamma-api.polymarket.com/trades", params=params, timeout=15)
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        
-                        # --- DIAGNOSTIC: Print first few empty results ---
-                        if not data and offset == 0:
-                            if self.debug_printed < 3:
-                                print(f"\n[DEBUG] Market {market_id} returned 0 trades. URL: {resp.url}")
-                                self.debug_printed += 1
-                            break
-                        
                         if not data: break
                         
                         rows = []
@@ -2125,8 +2128,16 @@ class BacktestEngine:
                                 if not ts_val: continue
                                 
                                 # TIME CHECK
+                                trade_ts = float(ts_val) if isinstance(ts_val, (int, float)) else 0.0
+                                
+                                if trade_ts < cutoff_ts: 
+                                    # DEBUG: Capture the first few discards so we know WHY
+                                    if len(self.discard_reasons) < 5:
+                                        self.discard_reasons.append(f"Market {market_id}: Trade {trade_ts} < Cutoff {cutoff_ts}")
+                                    raise StopIteration
+                                
+                                # If we get here, the trade is VALID
                                 if isinstance(ts_val, (int, float)):
-                                    if float(ts_val) < cutoff_ts: raise StopIteration
                                     ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 else:
                                     ts_str = str(ts_val)
@@ -2154,8 +2165,8 @@ class BacktestEngine:
                         if rows:
                             with csv_lock:
                                 writer.writerows(rows)
-                                # FLUSH every batch to prevent data loss
                                 f_handle.flush()
+                                self.total_saved += len(rows)
                         
                         if len(data) < batch_size: break
                         offset += batch_size
@@ -2164,10 +2175,6 @@ class BacktestEngine:
                         time.sleep(2)
                         continue
                     else:
-                        # Log API errors (400, 500)
-                        if self.debug_printed < 3:
-                            print(f"\n[DEBUG] API Error {resp.status_code} for {market_id}")
-                            self.debug_printed += 1
                         break 
                         
                 except StopIteration:
@@ -2183,15 +2190,15 @@ class BacktestEngine:
             return True
 
         # 4. Run Execution
-        print(f"DEBUG: Cutoff Timestamp is {pd.Timestamp.now() - pd.Timedelta(days=205)}")
+        debug_cutoff = pd.Timestamp.now() - pd.Timedelta(days=205)
+        print(f"DEBUG: Date Cutoff is {debug_cutoff}")
+        print(f"DEBUG: API Sort Order set to DESCENDING (Newest First)")
         
-        with open(cache_file, mode=write_mode, newline='') as f:
+        with open(cache_file, mode='w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            if not file_exists:
-                writer.writeheader()
+            writer.writeheader()
             
-            # Max workers = 4 for stability
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in todo_ids
@@ -2201,17 +2208,27 @@ class BacktestEngine:
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
                     if completed % 100 == 0:
-                        print(f" Progress: {completed}/{len(todo_ids)} markets checked.", end="\r")
+                        # PRINT REAL-TIME STATS
+                        print(f" Progress: {completed}/{len(todo_ids)} checked | Saved: {self.total_saved} trades...", end="\r")
 
         print("\n✅ Fetch complete.")
+        
+        # FINAL DIAGNOSTIC
+        if self.total_saved == 0:
+            print("\n❌ CRITICAL FAILURE: 0 Trades Saved.")
+            if self.discard_reasons:
+                print("   Reason: DATA TOO OLD. Examples:")
+                for r in self.discard_reasons:
+                    print(f"   - {r}")
+            else:
+                print("   Reason: API returned empty lists (Check connection/IDs).")
+            return pd.DataFrame()
         
         # Load Final
         print("Loading full dataset...")
         try:
-            # Force String IDs to match Markets
             df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         except pd.errors.EmptyDataError:
-            print("❌ CRITICAL: CSV is empty. The API returned no data.")
             return pd.DataFrame()
             
         print("Sanitizing (De-duping)...")
