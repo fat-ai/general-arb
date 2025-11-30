@@ -1827,10 +1827,10 @@ class BacktestEngine:
         import os
         import json
         
-        # Cache file - Changing name to enforce a clean start
-        cache_file = self.cache_dir / "gamma_markets_token_ids.parquet"
+        # Cache file
+        cache_file = self.cache_dir / "gamma_markets_unsorted.parquet"
         
-        # 1. DELETE OLD CACHE (Mandatory to fix ID types)
+        # 1. Force Clean Start
         if cache_file.exists():
             try: os.remove(cache_file)
             except: pass
@@ -1838,17 +1838,15 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching ACTIVE market list (Ordered by VOLUME)...")
+        print(f"Fetching GLOBAL market list (Default Order)...")
         
         while True:
             try:
-                # Volume sort guarantees we get the active markets first
+                # REMOVED: order="volume"
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
-                    "closed": "true",
-                    "order": "volume",      
-                    "ascending": "false"    
+                    "closed": "true"
                 }
                 
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
@@ -1864,7 +1862,7 @@ class BacktestEngine:
                 offset += 1000
                 if offset % 5000 == 0: print(f" {offset}..", end="", flush=True)
                 
-                # 50k markets is plenty
+                # Cap at 50k to avoid fetching 2018 markets
                 if offset > 50000: break
                 
             except Exception as e:
@@ -1877,8 +1875,7 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- CRITICAL: EXTRACT TOKEN ID ---
-        # We need the "Yes" token ID to query the Data API
+        # --- EXTRACT TOKEN ID (Required for Data API) ---
         def extract_token(row):
             try:
                 raw = row.get('clobTokenIds')
@@ -1892,9 +1889,8 @@ class BacktestEngine:
             except: return None
 
         df['contract_id'] = df.apply(extract_token, axis=1)
-        # ----------------------------------
+        # ------------------------------------------------
         
-        # Drop markets that don't have CLOB tokens
         df = df.dropna(subset=['contract_id'])
         
         # Normalization
@@ -1919,10 +1915,6 @@ class BacktestEngine:
         
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
-        if 'volume' in df.columns:
-            df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
-            df = df.sort_values('volume', ascending=False)
-            
         if not df.empty: df.to_parquet(cache_file)
         return df
         
@@ -2024,15 +2016,16 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. DELETE OLD LEDGERS (Mandatory for retry)
+        # 1. Clean Start
         if ledger_file.exists():
             try: os.remove(ledger_file)
             except: pass
             
-        # IDs are Token IDs. Ensure they are clean strings.
+        # IDs are Token IDs. Clean them.
         todo_ids = [str(m).strip().replace("'", "").replace('"', "") for m in market_ids]
         
         print(f"Stream-fetching {len(todo_ids)} markets via DATA API...")
+        print("Waiting for first data connection...")
         
         # 2. Setup CSV Writer
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2043,7 +2036,10 @@ class BacktestEngine:
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         
-        # 3. Define Worker (DATA API VERSION)
+        # FEEDBACK FLAGS
+        self.first_success = False
+        
+        # 3. Define Worker
         def fetch_and_write_worker(market_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
@@ -2054,7 +2050,7 @@ class BacktestEngine:
             
             while True:
                 try:
-                    # --- SUCCESSFUL ENDPOINT FROM DIAGNOSTIC ---
+                    # USE DATA API (Verified Working)
                     url = "https://data-api.polymarket.com/trades"
                     
                     params = {
@@ -2107,6 +2103,10 @@ class BacktestEngine:
                             with csv_lock:
                                 writer.writerows(rows)
                                 f_handle.flush()
+                                # IMMEDIATE FEEDBACK
+                                if not self.first_success:
+                                    print(f"\n✅ SUCCESS: Connected! Saving trades for Asset {market_id}...")
+                                    self.first_success = True
                         
                         if len(data) < 100: break
                         if last_ts: cursor_ts = int(last_ts) - 1
@@ -2132,7 +2132,7 @@ class BacktestEngine:
             if not cache_file.exists() or cache_file.stat().st_size == 0:
                 writer.writeheader()
             
-            # 4 Workers for safety
+            # 4 Workers
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
@@ -2142,7 +2142,7 @@ class BacktestEngine:
                 completed = 0
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
-                    if completed % 50 == 0:
+                    if completed % 100 == 0:
                         print(f" Progress: {completed}/{len(todo_ids)} checked...", end="\r")
 
         print("\n✅ Fetch complete.")
