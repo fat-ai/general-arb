@@ -1797,16 +1797,29 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets
+        # 1. Fetch Markets (Sorted by Volume)
         markets = self._fetch_gamma_markets(days_back=200)
         if markets.empty: 
             log.error("No markets found.")
             return pd.DataFrame(), pd.DataFrame()
         
-        # NORMALIZE MARKETS: String, Lower, No Spaces
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
+        # 2. PRE-FILTER: Discard markets that resolved too long ago
+        # This saves the Trade Fetcher from checking 50k dead markets
+        cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
         
-        # 2. Fetch Trades
+        initial_count = len(markets)
+        markets = markets[markets['resolution_timestamp'] >= cutoff_date].copy()
+        
+        print(f"DEBUG: Pre-filtering Markets by Date...")
+        print(f"   Original Count: {initial_count}")
+        print(f"   Cutoff Date:    {cutoff_date}")
+        print(f"   Relevant Count: {len(markets)} (Discarded {initial_count - len(markets)} old markets)")
+        
+        if markets.empty:
+            log.error("❌ No markets found in the selected date window.")
+            return pd.DataFrame(), pd.DataFrame()
+
+        # 3. Fetch Trades (Only for the relevant markets)
         active_ids = markets['contract_id'].unique()
         trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
@@ -1814,27 +1827,15 @@ class BacktestEngine:
             log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
             
-        # NORMALIZE TRADES
+        # 4. ID Normalization Check
         if 'contract_id' in trades.columns:
-            trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
+            def clean_id(x):
+                s = str(x).strip().replace("'", "").replace('"', "").lower()
+                if '.' in s: s = s.split('.')[0]
+                return s
+            trades['contract_id'] = trades['contract_id'].apply(clean_id)
         
-        # 3. AUTO-FIX ID FORMATS
-        # Check sample to see if we need to add/remove '0x'
-        if not markets.empty and not trades.empty:
-            m_sample = markets['contract_id'].iloc[0]
-            t_sample = trades['contract_id'].iloc[0]
-            
-            m_has_0x = m_sample.startswith('0x')
-            t_has_0x = t_sample.startswith('0x')
-            
-            if m_has_0x and not t_has_0x:
-                print("   ⚠️ Fixing ID mismatch: Adding '0x' to trades...")
-                trades['contract_id'] = '0x' + trades['contract_id']
-            elif not m_has_0x and t_has_0x:
-                print("   ⚠️ Fixing ID mismatch: Stripping '0x' from trades...")
-                trades['contract_id'] = trades['contract_id'].str.replace('0x', '', regex=False)
-
-        # 4. Filter
+        # 5. Filter Markets to match found Trades
         valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
