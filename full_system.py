@@ -2443,7 +2443,7 @@ class BacktestEngine:
             events_type.append('NEW_CONTRACT')
             
             liq = row.get('liquidity')
-            safe_liq = float(liq) if liq is not None else 0.0
+            safe_liq = float(liq) if liq is not None and float(liq) > 0 else 10000.0
             
             events_data.append({
                 'contract_id': row['contract_id'], 
