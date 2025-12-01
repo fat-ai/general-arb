@@ -2377,7 +2377,11 @@ class BacktestEngine:
         import gc
 
         log.info("Transforming Data (Robust Mode)...")
+        markets['created_at'] = pd.to_datetime(markets['created_at'], errors='coerce').dt.tz_localize(None)
+        markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
+        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         
+
         # 1. Ensure IDs are standard strings
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
