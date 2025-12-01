@@ -1862,8 +1862,8 @@ class BacktestEngine:
         import os
         import json
         
-        # New cache file to ensure fresh start
-        cache_file = self.cache_dir / "gamma_markets_decimal_tokens.parquet"
+        # New cache file
+        cache_file = self.cache_dir / "gamma_markets_strict_tokens.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1872,11 +1872,10 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching GLOBAL market list (Gamma API)...")
+        print(f"Fetching GLOBAL market list...")
         
         while True:
             try:
-                # Gamma API is reliable for the LIST
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
                 if resp.status_code != 200: break
@@ -1894,21 +1893,31 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- EXTRACT DECIMAL TOKEN ID ---
+        # --- STRICT DECIMAL TOKEN ID EXTRACTION ---
         def extract_token(row):
             try:
                 raw = row.get('clobTokenIds')
                 if not raw: return None
-                if isinstance(raw, str): tokens = json.loads(raw)
-                else: tokens = raw
+                
+                # Parse JSON if needed
+                if isinstance(raw, str): 
+                    try: tokens = json.loads(raw)
+                    except: return None
+                else: 
+                    tokens = raw
+                
                 if isinstance(tokens, list) and len(tokens) > 0:
-                    # Return the raw Decimal String (e.g. "8777...")
-                    return str(tokens[0])
+                    val = tokens[0]
+                    # CRITICAL: Force to integer first, then string
+                    # This removes '1.23e+20' formatting
+                    if isinstance(val, float):
+                        return str(int(val))
+                    return str(val).strip()
                 return None
             except: return None
 
         df['contract_id'] = df.apply(extract_token, axis=1)
-        # --------------------------------
+        # ------------------------------------------
 
         # Normalization
         def derive_outcome(row):
@@ -2038,9 +2047,8 @@ class BacktestEngine:
             try: os.remove(cache_file)
             except: pass
             
-        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH (Decimal IDs)...")
+        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
         
-        # URL Verified in Diagnostic
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2051,40 +2059,39 @@ class BacktestEngine:
         ledger_lock = threading.Lock()
         self.first_success = False
         
+        # Debug counter
+        self.debug_printed = False
+        
         def fetch_and_write_worker(token_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # Use Decimal ID string directly
-            token_str = str(token_id).strip()
-            if not token_str.isdigit():
-                with ledger_lock:
-                    with open(ledger_file, "a") as lf: lf.write(f"{token_id}\n")
+            # PARANOID FORMATTING
+            # Ensure it is a clean integer string. No decimals. No 'e+'.
+            try:
+                token_str = str(int(float(str(token_id))))
+            except:
                 return False
+
+            # DEBUG: Print the first ID to ensure it looks right
+            if not self.debug_printed:
+                print(f"DEBUG: Checking Format -> Input: {token_id} | Output: {token_str}")
+                self.debug_printed = True
 
             last_ts = 9999999999
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # DUAL QUERY: Fetch trades where Token is Maker OR Taker
-                    # This captures 100% of volume.
+                    # Query makerAssetId (Proven to work in Diagnostic)
                     query = """
                     query($token: String!, $max_ts: BigInt!) {
-                      asMaker: orderFilledEvents(
+                      orderFilledEvents(
                         first: 1000
                         orderBy: timestamp
                         orderDirection: desc
                         where: { makerAssetId: $token, timestamp_lt: $max_ts }
-                      ) {
-                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
-                      }
-                      asTaker: orderFilledEvents(
-                        first: 1000
-                        orderBy: timestamp
-                        orderDirection: desc
-                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
                       ) {
                         timestamp, makerAmountFilled, takerAmountFilled, maker, taker
                       }
@@ -2098,60 +2105,35 @@ class BacktestEngine:
                         r_json = resp.json()
                         if 'errors' in r_json: break 
                         
-                        # Merge Lists
-                        batch_maker = r_json.get('data', {}).get('asMaker', [])
-                        batch_taker = r_json.get('data', {}).get('asTaker', [])
-                        combined = batch_maker + batch_taker
+                        data = r_json.get('data', {}).get('orderFilledEvents', [])
+                        if not data: break # End of History
                         
-                        if not combined: break # End of History
-                        
-                        # Process Batch
                         rows = []
                         min_batch_ts = last_ts
                         
-                        for row in combined:
+                        for row in data:
                             try:
                                 ts_val = float(row['timestamp'])
                                 min_batch_ts = min(min_batch_ts, ts_val)
                                 
                                 if ts_val < cutoff_ts: continue
                                 
-                                # METRICS CALCULATION
-                                # We know 'token_str' is the outcome token.
-                                # But we don't know if it was in makerAmount or takerAmount.
-                                # Since we ran 2 queries, we need to know WHICH list this row came from.
-                                # However, raw rows look identical.
+                                # METRICS
+                                # Note: In this table, makerAmountFilled is usually the Outcome Token Amount
+                                size = float(row.get('makerAmountFilled') or 0.0)
+                                usdc = float(row.get('takerAmountFilled') or 0.0)
                                 
-                                # Heuristic: One amount is usually ~0-1 (Price/USDC) and one is huge (Size).
-                                # But safest way: We treat Price = (Other Amount) / (Token Amount)
-                                # Since we don't strictly know which is which without checking AssetID again (which we didn't query to save bandwidth),
-                                # we rely on the fact that prices are usually < 1.0.
+                                if size == 0: continue
                                 
-                                amt1 = float(row['makerAmountFilled'])
-                                amt2 = float(row['takerAmountFilled'])
-                                
-                                if amt1 == 0 or amt2 == 0: continue
-                                
-                                # Ratio Calculation
-                                ratio = amt1 / amt2
-                                if ratio < 1.01:
-                                    price = ratio
-                                    size = amt2
-                                else:
-                                    price = amt2 / amt1
-                                    size = amt1
-                                    
-                                # Direction:
-                                # If Price is rising? No.
-                                # Default to 1 for volume aggregation. Backtest logic handles price impact.
-                                side_mult = 1 
+                                price = usdc / size if size > 0 else 0.0
+                                side_mult = 1 # Graph doesn't specify side easily, assume 1 (Net Volume)
                                 
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 user = str(row.get('taker') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': size * price * 1e6,
+                                    'tradeAmount': usdc * 1e6,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
                                     'contract_id': token_str,
@@ -2166,11 +2148,9 @@ class BacktestEngine:
                                 writer.writerows(rows)
                                 f_handle.flush()
                                 if not self.first_success:
-                                    print(f"\n✅ SUCCESS: Connected to Market {token_str[:5]}...")
+                                    print(f"\n✅ SUCCESS: Connected to Market {token_str[:5]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
-                        # Pagination Logic
-                        # If we aren't moving back in time, we stop.
                         if int(min_batch_ts) >= int(last_ts): break
                         last_ts = min_batch_ts
                         if min_batch_ts < cutoff_ts: break
@@ -2190,8 +2170,7 @@ class BacktestEngine:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
-            # Use 8 Workers for speed
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in market_ids
