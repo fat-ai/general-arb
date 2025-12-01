@@ -1540,7 +1540,7 @@ class FastBacktestEngine:
                         
                         # Calc Edge
                         raw_net = tracker[cid]['net_weight']
-                        net_sentiment = np.tanh(raw_net / 50000.0) 
+                        net_sentiment = np.tanh(raw_net / 5000.0) 
                         p_model = 0.5 + (net_sentiment * 0.4) 
                         edge = p_model - prev_price 
                         
