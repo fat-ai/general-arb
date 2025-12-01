@@ -1334,57 +1334,107 @@ class FastBacktestEngine:
             self.minute_batches = []
 
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
-        if not self.minute_batches:
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
+        """
+        Rolling Walk-Forward Optimization (Dictionary Compatible).
+        """
+        import numpy as np
+        from datetime import timedelta
         
-        timestamps = [b[0]['timestamp'] for b in self.minute_batches]
-        min_date, max_date = min(timestamps), max(timestamps)
-        
-        train_days = int(config.get('train_days', 30))
-        test_days = int(config.get('test_days', 15))
-        
-        results = []
-        current_date = min_date
+        # 1. Setup Time Boundaries
+        if self.event_log.empty:
+            return {'total_return': 0.0, 'sharpe': 0.0, 'trades': 0}
 
-        resolution_events = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
-        resolution_timeline = resolution_events.index
+        min_date = self.event_log.index.min()
+        max_date = self.event_log.index.max()
         
+        train_days = config.get('train_days', 60)
+        test_days = config.get('test_days', 120)
+        
+        current_date = min_date
+        
+        # Performance Tracking
+        total_pnl = 0.0
+        total_trades = 0
+        capital = 10000.0
+        equity_curve = [capital]
+        
+        all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
+        
+        # --- WALK FORWARD LOOP ---
         while current_date + timedelta(days=train_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_end = train_end + timedelta(days=test_days)
             
-            test_batch = [b for b in self.minute_batches if train_end <= b[0]['timestamp'] < test_end]
+            # A. Prepare Training Data
+            train_mask = (self.profiler_data['timestamp'] >= current_date) & \
+                         (self.profiler_data['timestamp'] < train_end)
+            train_profiler = self.profiler_data[train_mask].copy()
             
-            if not test_batch:
-                current_date += timedelta(days=test_days)
-                continue
-
-            valid_resolutions = resolution_events[resolution_events.index < train_end]
+            valid_res = all_resolutions[all_resolutions.index < train_end]
             outcome_map = {}
-            for _, row in valid_resolutions.iterrows():
+            for _, row in valid_res.iterrows():
                 outcome_map[row['data']['contract_id']] = float(row['data']['outcome'])
             
-            # Slice profiler data
-            train_profiler = self.profiler_data[
-                (self.profiler_data['timestamp'] >= current_date) & 
-                (self.profiler_data['timestamp'] < train_end)
-            ].copy()
-            
-            # Apply Outcomes (trades on unresolved markets get NaN and are dropped)
             train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
             train_profiler = train_profiler.dropna(subset=['outcome'])
             
-            # Now calculate scores using only legally resolved data
-            fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=3)
-            fw_slope, fw_intercept = calibrate_fresh_wallet_model(train_profiler)
+            # B. Calibrate Models
+            fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
+            # Use 'self.' to call method
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler)
             
-            fold_res = self._run_single_period(
-                test_batch, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end
-            )
-            results.append(fold_res)
+            # C. Run Test Simulation
+            test_slice = self.event_log[(self.event_log.index >= train_end) & 
+                                        (self.event_log.index < test_end)]
+            
+            if not test_slice.empty:
+                batches = []
+                grouped = test_slice.groupby(pd.Grouper(freq='1min'))
+                for _, group in grouped:
+                    if not group.empty:
+                        batch_events = []
+                        for ts, row in group.iterrows():
+                            ev = {'event_type': row['event_type'], 'data': row['data']}
+                            batch_events.append(ev)
+                        batches.append(batch_events)
+
+                # RUN SIMULATION
+                # --- FIX: Handle Dictionary Return ---
+                result = self._run_single_period(
+                    batches, 
+                    fold_wallet_scores, 
+                    config, 
+                    fw_slope, 
+                    fw_intercept, 
+                    start_time=train_end
+                )
+                
+                # Extract values from dict
+                pnl = result['final_value']
+                trades = result['trades']
+                # -------------------------------------
+                
+                # Update Globals
+                profit = pnl - 10000.0 
+                total_pnl += profit
+                total_trades += trades
+                capital += profit
+                equity_curve.append(capital)
+            
+            # Slide Window
             current_date += timedelta(days=test_days)
-            
-        return self._aggregate_fold_results(results)
+        
+        # Metrics Calculation
+        returns = pd.Series(equity_curve).pct_change().dropna()
+        sharpe = 0.0
+        if len(returns) > 1 and returns.std() > 0:
+            sharpe = (returns.mean() / returns.std()) * np.sqrt(len(returns))
+        
+        return {
+            'total_return': (capital - 10000.0) / 10000.0,
+            'sharpe': sharpe,
+            'trades': total_trades
+        }
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
         """
@@ -1425,23 +1475,19 @@ class FastBacktestEngine:
 
                 # --- B. PRICE UPDATE ---
                 elif ev_type == 'PRICE_UPDATE':
-                    cid = data.get('contract_id')
-                    
+                    # Initialize if missing (e.g. we missed the NEW_CONTRACT event)
                     if cid not in tracker:
                         tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
 
-                    # 1. Price Impact Logic
+                    # 1. Update Price
                     new_price = data.get('p_market_all', 0.5)
                     prev_price = tracker[cid]['last_price']
-                    price_delta = new_price - prev_price
                     
-                    # Validate Direction
-                    if abs(price_delta) < 0.000001:
-                        trade_direction = -1.0 if data.get('is_sell') else 1.0
-                    else:
-                        trade_direction = np.sign(price_delta)
+                    # 2. Determine Direction (Trust Token Flow)
+                    is_sell = data.get('is_sell', False)
+                    trade_direction = -1.0 if is_sell else 1.0
                     
-                    # 2. Weight Calculation
+                    # 3. Calculate Weight
                     w_id = str(data.get('wallet_id'))
                     vol = float(data.get('trade_volume', 0.0))
                     
@@ -1454,10 +1500,10 @@ class FastBacktestEngine:
                     skill_premium = max(0.0, 0.25 - brier)
                     weight = vol * (skill_premium * 10.0)
                     
-                    # 3. Accumulate
+                    # 4. Accumulate
                     tracker[cid]['net_weight'] += (weight * trade_direction)
                     
-                    # 4. Generate Signal
+                    # 5. Generate Signal
                     if abs(tracker[cid]['net_weight']) > splash_thresh:
                         raw_net = tracker[cid]['net_weight']
                         net_sentiment = np.tanh(raw_net / 50000.0) 
@@ -1465,7 +1511,6 @@ class FastBacktestEngine:
                         
                         edge = p_model - prev_price 
                         
-                        # --- EXECUTION ---
                         if abs(edge) > config.get('edge_threshold', 0.05):
                             if cid not in positions:
                                 side = 1 if edge > 0 else -1
@@ -1481,38 +1526,48 @@ class FastBacktestEngine:
                                     cost = cash * target_f
                                 
                                 if cost > 5.0 and cash > cost:
-                                    # SAFETY: Clip entry price
                                     safe_entry = max(0.001, min(new_price, 0.999))
-                                    
-                                    # EXPLICIT SHARE CALCULATION
-                                    if side == 1:
-                                        shares = cost / safe_entry
-                                    else:
-                                        shares = cost / (1.0 - safe_entry)
+                                    if side == 1: shares = cost / safe_entry
+                                    else: shares = cost / (1.0 - safe_entry)
 
                                     cash -= cost
                                     positions[cid] = {
                                         'side': side, 
-                                        'size': cost,     
+                                        'size': cost, 
                                         'shares': shares, 
                                         'entry': safe_entry
                                     }
                                     trade_count += 1
                                     volume_traded += cost
                         
-                        # FIX: Full Reset to 0 (No path dependency)
-                        tracker[cid]['net_weight'] = 0.0
+                        tracker[cid]['net_weight'] = 0.0 # Full Reset
 
                     tracker[cid]['last_price'] = new_price
 
-                # --- C. POSITIONS ---
+                # --- C. RESOLUTION (Moved UP to prioritize payout) ---
+                elif ev_type == 'RESOLUTION':
+                    if cid in positions:
+                        pos = positions[cid]
+                        outcome = float(data.get('outcome', 0))
+                        
+                        win = False
+                        if pos['side'] == 1 and outcome == 1.0: win = True
+                        if pos['side'] == -1 and outcome == 0.0: win = True
+                        
+                        if win:
+                            # 1 Share pays $1.00
+                            cash += pos['shares']
+                        
+                        del positions[cid]
+
+                # --- D. POSITION MANAGEMENT (Only if NOT a resolution) ---
                 elif cid in positions:
                     pos = positions[cid]
                     should_close = False
                     
-                    curr_p = data.get('p_market_all') if ev_type == 'PRICE_UPDATE' else tracker.get(cid, {}).get('last_price', 0.5)
+                    # Use last known price since this isn't a price update
+                    curr_p = tracker.get(cid, {}).get('last_price', 0.5)
 
-                    # PnL Calculation
                     if pos['side'] == 1: 
                         pnl_pct = (curr_p - pos['entry']) / pos['entry']
                     else: 
@@ -1526,13 +1581,11 @@ class FastBacktestEngine:
                         if pos['side'] == -1 and cur_net > splash_thresh/2: should_close = True
                         
                     if should_close:
-                        if pos['side'] == 1:
-                            payout = pos['shares'] * curr_p
-                        else:
-                            payout = pos['shares'] * (1.0 - curr_p)
+                        if pos['side'] == 1: payout = pos['shares'] * curr_p
+                        else: payout = pos['shares'] * (1.0 - curr_p)
                         cash += payout
                         del positions[cid]
-
+                        
                 # --- D. RESOLUTION ---
                 if ev_type == 'RESOLUTION':
                     if cid in positions:
@@ -1558,7 +1611,13 @@ class FastBacktestEngine:
                 val = pos['shares'] * (1.0 - last_p)
             final_value += val
             
-        return final_value, trade_count
+        return {
+            'final_value': final_value,
+            'total_return': (final_value / 10000.0) - 1.0,
+            'trades': trade_count,
+            'sharpe_ratio': 0.0, # Placeholder for tuning engine
+            'max_drawdown': 0.0
+        }
         
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
