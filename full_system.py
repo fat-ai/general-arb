@@ -2527,13 +2527,31 @@ class BacktestEngine:
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
         
         # 4. BUILD PROFILER DATA
+        # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'].astype(str), 
             'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
             'usdc_vol': trades['tradeAmount'].astype('float32'),
-            'tokens': trades['outcomeTokensAmount'].astype('float32')
+            'tokens': trades['outcomeTokensAmount'].astype('float32'),
+            # FIX: Load the pre-calculated price directly
+            'price': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32')
         })
+
+        # MAP OUTCOMES (Preserve Index)
+        outcome_map = markets.set_index('contract_id')['outcome']
+        outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        
+        # FIX: Use the 'price' column directly instead of calculating it
+        prof_data['bet_price'] = prof_data['price']
+        
+        # Remove bad data
+        prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] < 1.0)]
+        
+        prof_data['entity_type'] = 'default_topic'
+        
+        log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
         # --- FIX: MAP OUTCOMES (PRESERVE INDEX) ---
         # We use .map() instead of .merge() to ensure prof_data keeps the 
