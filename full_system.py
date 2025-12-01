@@ -1501,7 +1501,7 @@ class FastBacktestEngine:
                         else:
                             market_liq[cid] = 10000.0 
                             
-                if cid not in market_prices: market_prices[cid] = 0.5
+                    if cid not in market_prices: market_prices[cid] = 0.5
                     # Initialize if missing (e.g. we missed the NEW_CONTRACT event)
                     if cid not in tracker:
                         tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
