@@ -2527,52 +2527,28 @@ class BacktestEngine:
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
         
         # 4. BUILD PROFILER DATA
-        # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'].astype(str), 
             'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
             'usdc_vol': trades['tradeAmount'].astype('float32'),
             'tokens': trades['outcomeTokensAmount'].astype('float32'),
-            # FIX: Load the pre-calculated price directly
-            'price': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32')
+            # FIX: Load the REAL price from CSV. No calculation needed.
+            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float32')
         })
 
-        # MAP OUTCOMES (Preserve Index)
+        # MAP OUTCOMES
         outcome_map = markets.set_index('contract_id')['outcome']
         outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         
-        # FIX: Use the 'price' column directly instead of calculating it
-        prof_data['bet_price'] = prof_data['price']
+        # FIX: Assign Price Directly
+        # We fill NaNs with 0.5 only if absolutely necessary
+        prof_data['bet_price'] = prof_data['price'].fillna(0.5)
         
-        # Remove bad data
-        prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] < 1.0)]
+        # Filter invalid prices (guard against data errors)
+        prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] <= 1.0)]
         
-        prof_data['entity_type'] = 'default_topic'
-        
-        log.info(f"Profiler Data Built: {len(prof_data)} records.")
-
-        # --- FIX: MAP OUTCOMES (PRESERVE INDEX) ---
-        # We use .map() instead of .merge() to ensure prof_data keeps the 
-        # exact same index as the 'trades' dataframe.
-        # 1. Create a reference Series: Index=ID, Value=Outcome
-        outcome_map = markets.set_index('contract_id')['outcome']
-        # 2. Drop duplicates to avoid mapping errors
-        outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
-        # 3. Map values safely
-        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
-        # ------------------------------------------
-        
-        # Price Calculation
-        valid_mask = (prof_data['tokens'] != 0) & (prof_data['usdc_vol'] > 0)
-        prof_data['bet_price'] = np.where(
-            valid_mask,
-            (prof_data['usdc_vol'] / prof_data['tokens'].abs()).clip(0.001, 0.999),
-            np.nan
-        )
-        
-        prof_data = prof_data.dropna(subset=['bet_price'])
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
@@ -2587,6 +2563,7 @@ class BacktestEngine:
             events_type.append('NEW_CONTRACT')
             
             liq = row.get('liquidity')
+            # GHOST MARKET FIX: Default to 10k
             safe_liq = float(liq) if liq is not None and float(liq) > 0 else 10000.0
             
             events_data.append({
@@ -2606,11 +2583,7 @@ class BacktestEngine:
             })
 
         # C. PRICE_UPDATE
-        # Align trades with profiler data index
         trades = trades.sort_values('timestamp')
-        
-        # KEY STEP: This relies on indices matching.
-        # Since we removed .merge(), prof_data.index is now a valid subset of trades.index.
         aligned_trades = trades.loc[prof_data.index]
         
         t_ts = aligned_trades['timestamp'].tolist()
