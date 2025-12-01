@@ -1906,14 +1906,18 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- FIX: USE STANDARD NUMERIC ID ---
-        # We explicitly grab the 'id' field (e.g. "1005")
-        if 'id' in df.columns:
-            df['contract_id'] = df['id'].astype(str).str.strip().str.replace(".0", "")
-        else:
-            print("❌ Error: 'id' field missing from API.")
-            return pd.DataFrame()
-        # ------------------------------------
+        def extract_token(row):
+            try:
+                raw = row.get('clobTokenIds')
+                if not raw: return None
+                if isinstance(raw, str): tokens = json.loads(raw)
+                else: tokens = raw
+                if isinstance(tokens, list) and len(tokens) > 0:
+                    return str(tokens[0])
+                return None
+            except: return None
+
+        df['contract_id'] = df.apply(extract_token, axis=1)
 
         # Normalization
         def derive_outcome(row):
@@ -2063,42 +2067,59 @@ class BacktestEngine:
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # OFFSET PAGINATION: Guarantees no loops
             offset = 0
-            cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
+            # Track the last timestamp we saw to detect loops
+            last_batch_max_ts = -1.0
+            
+            # Safety: Some APIs cap offset at 10k or 100k. 
+            # We'll run until the API stops giving us new data.
             
             while True:
                 try:
-                    url = "https://gamma-api.polymarket.com/trades"
+                    # DATA API (Known to have data)
+                    url = "https://data-api.polymarket.com/trades"
                     
                     params = {
-                        "market": market_id, 
-                        "limit": 500,         
-                        "offset": offset,     
-                        "order": "timestamp",
-                        "ascending": "false" 
+                        "asset_id": market_id, # Token ID
+                        "limit": 500,
+                        "offset": offset
                     }
                     
                     resp = session.get(url, params=params, timeout=10)
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        if not data: break # End of list
+                        if not data: break # End of Data
                         
+                        # --- LOOP PROTECTION / DATE MONITORING ---
+                        # Get the timestamp of the first item in this new batch
+                        current_max_ts_val = data[0].get('timestamp') or data[0].get('time')
+                        if not current_max_ts_val: break
+                        
+                        current_max_ts = float(current_max_ts_val)
+                        
+                        # If the newest trade in this batch is the same (or newer) than 
+                        # the newest trade in the previous batch, the API ignored our offset.
+                        # STOP IMMEDIATELY.
+                        if last_batch_max_ts > 0 and current_max_ts >= last_batch_max_ts:
+                            # Loop Detected. The API is sending Page 1 again.
+                            break
+                        
+                        last_batch_max_ts = current_max_ts
+                        # -----------------------------------------
+
                         rows = []
                         for row in data:
                             try:
                                 ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
-                                trade_ts = float(ts_val)
-                                if trade_ts < cutoff_ts: raise StopIteration 
-                                
-                                ts_str = pd.to_datetime(trade_ts, unit='s').isoformat()
+                                # Format Row
+                                ts_str = pd.to_datetime(float(ts_val), unit='s').isoformat()
                                 price = float(row.get('price') or 0.0)
-                                size = float(row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0)
+                                size = float(row.get('size') or row.get('sz') or 0.0)
                                 side_mult = 1 if str(row.get('side', '')).upper() == 'BUY' else -1
-                                user = str(row.get('taker_address') or row.get('taker') or 'unknown')
+                                user = str(row.get('maker_address') or row.get('taker_address') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
@@ -2110,8 +2131,6 @@ class BacktestEngine:
                                     'size': size,
                                     'side_mult': side_mult
                                 })
-                            except StopIteration:
-                                raise 
                             except: continue
                         
                         if rows:
@@ -2125,20 +2144,13 @@ class BacktestEngine:
                         if len(data) < 500: break
                         offset += 500
                         
-                        # Safety break to prevent runaways (optional)
-                        if offset > 100000: break 
-                        
-                    elif resp.status_code == 404:
-                        # Market not found in Trades DB. Stop.
-                        break
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
                     else:
+                        # 400/404/500 -> Stop
                         break 
                         
-                except StopIteration:
-                    break 
                 except Exception:
                     break 
             
