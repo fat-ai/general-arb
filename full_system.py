@@ -1453,268 +1453,268 @@ class FastBacktestEngine:
         }
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
-    """
-    FIXED VERSION: Trades now fire correctly with proper weight calculation and thresholds.
-    
-    KEY FIXES:
-    1. Weight calculation scaled to match threshold (1000x multiplier)
-    2. Threshold raised to 50-200 range (realistic for accumulated weight)
-    3. Net weight checked BEFORE reset
-    4. Price safety uses IF blocks (not continue)
-    5. Volume validation added
-    """
-    import numpy as np
-    
-    # --- CONFIG EXTRACTION ---
-    splash_thresh = config.get('splash_threshold', 100.0)  # FIX: Raised from 2.0 to 100.0
-    use_smart_exit = config.get('use_smart_exit', False)
-    stop_loss_pct = config.get('stop_loss_pct', None)
-    sizing_mode = config.get('sizing_mode', 'kelly')
-    sizing_val = config.get('kelly_fraction', 0.25)
-    if sizing_mode == 'fixed': 
-        sizing_val = config.get('fixed_size', 10.0)
-    
-    # --- STATE INIT ---
-    cash = 10000.0
-    positions = {}
-    tracker = {}
-    market_liq = {}
-    market_prices = {}
-    trade_count = 0
-    volume_traded = 0.0
-    
-    # Diagnostics
-    debug_signals = []
-    rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0}
-    
-    # --- BATCH PROCESSING ---
-    for batch_idx, batch in enumerate(batches):
-        for event in batch:
-            ev_type = event['event_type']
-            data = event['data']
-            cid = data.get('contract_id')
-            
-            # ==================== A. NEW CONTRACT ====================
-            if ev_type == 'NEW_CONTRACT':
-                tracker[cid] = {
-                    'net_weight': 0.0,
-                    'last_price': 0.5
-                }
+        """
+        FIXED VERSION: Trades now fire correctly with proper weight calculation and thresholds.
+        
+        KEY FIXES:
+        1. Weight calculation scaled to match threshold (1000x multiplier)
+        2. Threshold raised to 50-200 range (realistic for accumulated weight)
+        3. Net weight checked BEFORE reset
+        4. Price safety uses IF blocks (not continue)
+        5. Volume validation added
+        """
+        import numpy as np
+        
+        # --- CONFIG EXTRACTION ---
+        splash_thresh = config.get('splash_threshold', 100.0)  # FIX: Raised from 2.0 to 100.0
+        use_smart_exit = config.get('use_smart_exit', False)
+        stop_loss_pct = config.get('stop_loss_pct', None)
+        sizing_mode = config.get('sizing_mode', 'kelly')
+        sizing_val = config.get('kelly_fraction', 0.25)
+        if sizing_mode == 'fixed': 
+            sizing_val = config.get('fixed_size', 10.0)
+        
+        # --- STATE INIT ---
+        cash = 10000.0
+        positions = {}
+        tracker = {}
+        market_liq = {}
+        market_prices = {}
+        trade_count = 0
+        volume_traded = 0.0
+        
+        # Diagnostics
+        debug_signals = []
+        rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0}
+        
+        # --- BATCH PROCESSING ---
+        for batch_idx, batch in enumerate(batches):
+            for event in batch:
+                ev_type = event['event_type']
+                data = event['data']
+                cid = data.get('contract_id')
                 
-            # ==================== B. PRICE UPDATE (TRADE SIGNAL) ====================
-            elif ev_type == 'PRICE_UPDATE':
-                # --- 1. STATE INIT ---
-                if cid not in market_liq:
-                    market_liq[cid] = known_liquidity.get(cid, 10000.0) if known_liquidity else 10000.0
-                if cid not in market_prices:
-                    market_prices[cid] = 0.5
-                if cid not in tracker:
-                    tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
-                
-                new_price = data.get('p_market_all', 0.5)
-                prev_price = tracker[cid]['last_price']
-                tracker[cid]['last_price'] = new_price
-                
-                # --- 2. CALCULATE WEIGHT (FIXED FORMULA) ---
-                vol = float(data.get('trade_volume', 0.0))
-                
-                # FIX: Validate volume
-                if vol < 1.0:
-                    rejection_log['low_volume'] += 1
-                    continue
-                
-                is_sell = data.get('is_sell', False)
-                trade_direction = -1.0 if is_sell else 1.0
-                w_id = str(data.get('wallet_id'))
-                
-                # Get Brier Score (Historical or Fresh Model)
-                brier = wallet_scores.get((w_id, 'default_topic'))
-                if brier is None:
-                    log_vol = np.log(max(vol, 1.0))
-                    pred_brier = fw_intercept + (fw_slope * log_vol)
-                    brier = max(0.10, min(pred_brier, 0.35))
-                
-                # FIX: Skill Premium Calculation (Now Scales to 0-1000+)
-                # Old: (0.25 - brier) * 10 + 0.01 → Max ~2.5
-                # New: Use exponential scaling for smart money
-                skill_premium = max(0.0, 0.25 - brier)
-                
-                # FIX: Weight now scaled to match threshold (100-200 range)
-                weight = vol * (skill_premium * 1000.0 + 1.0)  # Min 1x vol, Max 1250x vol
-                
-                # Accumulate Net Weight
-                tracker[cid]['net_weight'] += (weight * trade_direction)
-                
-                # --- 3. CHECK SPLASH THRESHOLD ---
-                abs_net_weight = abs(tracker[cid]['net_weight'])
-                
-                if abs_net_weight > splash_thresh:
-                    # Log the signal BEFORE reset
-                    debug_signals.append({
-                        'market': cid[:8],
-                        'net_weight': tracker[cid]['net_weight'],
-                        'threshold': splash_thresh
-                    })
+                # ==================== A. NEW CONTRACT ====================
+                if ev_type == 'NEW_CONTRACT':
+                    tracker[cid] = {
+                        'net_weight': 0.0,
+                        'last_price': 0.5
+                    }
                     
-                    # --- Calculate Edge ---
-                    raw_net = tracker[cid]['net_weight']
-                    net_sentiment = np.tanh(raw_net / 5000.0)
-                    p_model = 0.5 + (net_sentiment * 0.4)
-                    edge = p_model - prev_price
+                # ==================== B. PRICE UPDATE (TRADE SIGNAL) ====================
+                elif ev_type == 'PRICE_UPDATE':
+                    # --- 1. STATE INIT ---
+                    if cid not in market_liq:
+                        market_liq[cid] = known_liquidity.get(cid, 10000.0) if known_liquidity else 10000.0
+                    if cid not in market_prices:
+                        market_prices[cid] = 0.5
+                    if cid not in tracker:
+                        tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
                     
-                    # FIX: Reset weight AFTER checking, BEFORE trade logic
-                    tracker[cid]['net_weight'] = 0.0
+                    new_price = data.get('p_market_all', 0.5)
+                    prev_price = tracker[cid]['last_price']
+                    tracker[cid]['last_price'] = new_price
                     
-                    # --- 4. EDGE FILTER ---
-                    edge_thresh = config.get('edge_threshold', 0.05)
-                    if abs(edge) < edge_thresh:
-                        rejection_log['low_edge'] += 1
+                    # --- 2. CALCULATE WEIGHT (FIXED FORMULA) ---
+                    vol = float(data.get('trade_volume', 0.0))
+                    
+                    # FIX: Validate volume
+                    if vol < 1.0:
+                        rejection_log['low_volume'] += 1
                         continue
                     
-                    # --- 5. PRICE SAFETY CHECK (FIXED: No continue) ---
-                    is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
-                    is_not_in_position = (cid not in positions)
+                    is_sell = data.get('is_sell', False)
+                    trade_direction = -1.0 if is_sell else 1.0
+                    w_id = str(data.get('wallet_id'))
                     
-                    # FIX: Use IF block instead of continue
-                    if is_safe_price and is_not_in_position:
-                        side = 1 if edge > 0 else -1
+                    # Get Brier Score (Historical or Fresh Model)
+                    brier = wallet_scores.get((w_id, 'default_topic'))
+                    if brier is None:
+                        log_vol = np.log(max(vol, 1.0))
+                        pred_brier = fw_intercept + (fw_slope * log_vol)
+                        brier = max(0.10, min(pred_brier, 0.35))
+                    
+                    # FIX: Skill Premium Calculation (Now Scales to 0-1000+)
+                    # Old: (0.25 - brier) * 10 + 0.01 → Max ~2.5
+                    # New: Use exponential scaling for smart money
+                    skill_premium = max(0.0, 0.25 - brier)
+                    
+                    # FIX: Weight now scaled to match threshold (100-200 range)
+                    weight = vol * (skill_premium * 1000.0 + 1.0)  # Min 1x vol, Max 1250x vol
+                    
+                    # Accumulate Net Weight
+                    tracker[cid]['net_weight'] += (weight * trade_direction)
+                    
+                    # --- 3. CHECK SPLASH THRESHOLD ---
+                    abs_net_weight = abs(tracker[cid]['net_weight'])
+                    
+                    if abs_net_weight > splash_thresh:
+                        # Log the signal BEFORE reset
+                        debug_signals.append({
+                            'market': cid[:8],
+                            'net_weight': tracker[cid]['net_weight'],
+                            'threshold': splash_thresh
+                        })
                         
-                        # --- 6. POSITION SIZING ---
-                        target_f = 0.0
-                        cost = 0.0
+                        # --- Calculate Edge ---
+                        raw_net = tracker[cid]['net_weight']
+                        net_sentiment = np.tanh(raw_net / 5000.0)
+                        p_model = 0.5 + (net_sentiment * 0.4)
+                        edge = p_model - prev_price
                         
-                        if sizing_mode == 'fixed_pct':
-                            target_f = sizing_val
-                        elif sizing_mode == 'kelly':
-                            target_f = abs(edge) * sizing_val
-                        elif sizing_mode == 'fixed':
-                            cost = sizing_val
-                            target_f = -1  # Sentinel
+                        # FIX: Reset weight AFTER checking, BEFORE trade logic
+                        tracker[cid]['net_weight'] = 0.0
                         
-                        # Cap Kelly at 20%
-                        if target_f > 0:
-                            target_f = min(target_f, 0.20)
-                            cost = cash * target_f
+                        # --- 4. EDGE FILTER ---
+                        edge_thresh = config.get('edge_threshold', 0.05)
+                        if abs(edge) < edge_thresh:
+                            rejection_log['low_edge'] += 1
+                            continue
                         
-                        # --- 7. CASH CHECK & TRADE EXECUTION ---
-                        if cost > 5.0 and cash > cost:
-                            # Slippage Simulation
-                            buffer = 0.01
-                            if side == 1:
-                                safe_entry = min(new_price + buffer, 0.99)
+                        # --- 5. PRICE SAFETY CHECK (FIXED: No continue) ---
+                        is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
+                        is_not_in_position = (cid not in positions)
+                        
+                        # FIX: Use IF block instead of continue
+                        if is_safe_price and is_not_in_position:
+                            side = 1 if edge > 0 else -1
+                            
+                            # --- 6. POSITION SIZING ---
+                            target_f = 0.0
+                            cost = 0.0
+                            
+                            if sizing_mode == 'fixed_pct':
+                                target_f = sizing_val
+                            elif sizing_mode == 'kelly':
+                                target_f = abs(edge) * sizing_val
+                            elif sizing_mode == 'fixed':
+                                cost = sizing_val
+                                target_f = -1  # Sentinel
+                            
+                            # Cap Kelly at 20%
+                            if target_f > 0:
+                                target_f = min(target_f, 0.20)
+                                cost = cash * target_f
+                            
+                            # --- 7. CASH CHECK & TRADE EXECUTION ---
+                            if cost > 5.0 and cash > cost:
+                                # Slippage Simulation
+                                buffer = 0.01
+                                if side == 1:
+                                    safe_entry = min(new_price + buffer, 0.99)
+                                else:
+                                    safe_entry = max(new_price - buffer, 0.01)
+                                
+                                # Calculate Shares
+                                if side == 1:
+                                    shares = cost / safe_entry
+                                else:
+                                    shares = cost / (1.0 - safe_entry)
+                                
+                                # Execute Trade
+                                cash -= cost
+                                positions[cid] = {
+                                    'side': side,
+                                    'size': cost,
+                                    'shares': shares,
+                                    'entry': safe_entry
+                                }
+                                trade_count += 1
+                                volume_traded += cost
+                                
+                                # Diagnostic Log
+                                if trade_count <= 5:
+                                    print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][side==1]} {cid[:8]} | "
+                                          f"Edge: {edge:.3f} | Size: ${cost:.0f} | Entry: {safe_entry:.3f}")
                             else:
-                                safe_entry = max(new_price - buffer, 0.01)
-                            
-                            # Calculate Shares
-                            if side == 1:
-                                shares = cost / safe_entry
-                            else:
-                                shares = cost / (1.0 - safe_entry)
-                            
-                            # Execute Trade
-                            cash -= cost
-                            positions[cid] = {
-                                'side': side,
-                                'size': cost,
-                                'shares': shares,
-                                'entry': safe_entry
-                            }
-                            trade_count += 1
-                            volume_traded += cost
-                            
-                            # Diagnostic Log
-                            if trade_count <= 5:
-                                print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][side==1]} {cid[:8]} | "
-                                      f"Edge: {edge:.3f} | Size: ${cost:.0f} | Entry: {safe_entry:.3f}")
-                        else:
-                            rejection_log['insufficient_cash'] += 1
-                    elif not is_safe_price:
-                        rejection_log['unsafe_price'] += 1
-            
-            # ==================== C. RESOLUTION ====================
-            elif ev_type == 'RESOLUTION':
-                if cid in positions:
+                                rejection_log['insufficient_cash'] += 1
+                        elif not is_safe_price:
+                            rejection_log['unsafe_price'] += 1
+                
+                # ==================== C. RESOLUTION ====================
+                elif ev_type == 'RESOLUTION':
+                    if cid in positions:
+                        pos = positions[cid]
+                        outcome = float(data.get('outcome', 0))
+                        
+                        win = False
+                        if pos['side'] == 1 and outcome == 1.0:
+                            win = True
+                        if pos['side'] == -1 and outcome == 0.0:
+                            win = True
+                        
+                        if win:
+                            cash += pos['shares']
+                        
+                        del positions[cid]
+                
+                # ==================== D. POSITION MANAGEMENT ====================
+                # Only runs if NOT a resolution event
+                if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
-                    outcome = float(data.get('outcome', 0))
+                    curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                     
-                    win = False
-                    if pos['side'] == 1 and outcome == 1.0:
-                        win = True
-                    if pos['side'] == -1 and outcome == 0.0:
-                        win = True
-                    
-                    if win:
-                        cash += pos['shares']
-                    
-                    del positions[cid]
-            
-            # ==================== D. POSITION MANAGEMENT ====================
-            # Only runs if NOT a resolution event
-            if ev_type != 'RESOLUTION' and cid in positions:
-                pos = positions[cid]
-                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                
-                # PnL Calculation
-                if pos['side'] == 1:
-                    pnl_pct = (curr_p - pos['entry']) / pos['entry']
-                else:
-                    pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
-                
-                # Stop Loss Check
-                should_close = False
-                if stop_loss_pct and pnl_pct < -stop_loss_pct:
-                    should_close = True
-                
-                # Smart Exit Check
-                if use_smart_exit:
-                    cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                    if pos['side'] == 1 and cur_net < -splash_thresh/2:
-                        should_close = True
-                    if pos['side'] == -1 and cur_net > splash_thresh/2:
-                        should_close = True
-                
-                # Close Position
-                if should_close:
+                    # PnL Calculation
                     if pos['side'] == 1:
-                        payout = pos['shares'] * curr_p
+                        pnl_pct = (curr_p - pos['entry']) / pos['entry']
                     else:
-                        payout = pos['shares'] * (1.0 - curr_p)
-                    cash += payout
-                    del positions[cid]
-    
-    # --- END OF PERIOD VALUATION ---
-    final_value = cash
-    for cid, pos in positions.items():
-        last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-        if pos['side'] == 1:
-            val = pos['shares'] * last_p
-        else:
-            val = pos['shares'] * (1.0 - last_p)
-        final_value += val
-    
-    # --- DIAGNOSTICS ---
-    print(f"\n📊 PERIOD SUMMARY:")
-    print(f"   Trades Executed: {trade_count}")
-    print(f"   Volume Traded: ${volume_traded:.0f}")
-    print(f"   Final Value: ${final_value:.2f}")
-    print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
-    print(f"\n🚫 REJECTION LOG:")
-    for reason, count in rejection_log.items():
-        if count > 0:
-            print(f"   {reason}: {count}")
-    
-    if debug_signals:
-        print(f"\n🎯 SIGNALS FIRED: {len(debug_signals)}")
-        for sig in debug_signals[:3]:
-            print(f"   Market: {sig['market']} | Net: {sig['net_weight']:.1f} | Thresh: {sig['threshold']:.1f}")
-    
-    return {
-        'final_value': final_value,
-        'total_return': (final_value / 10000.0) - 1.0,
-        'trades': trade_count,
-        'sharpe_ratio': 0.0,
-        'max_drawdown': 0.0
-    }
+                        pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
+                    
+                    # Stop Loss Check
+                    should_close = False
+                    if stop_loss_pct and pnl_pct < -stop_loss_pct:
+                        should_close = True
+                    
+                    # Smart Exit Check
+                    if use_smart_exit:
+                        cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                        if pos['side'] == 1 and cur_net < -splash_thresh/2:
+                            should_close = True
+                        if pos['side'] == -1 and cur_net > splash_thresh/2:
+                            should_close = True
+                    
+                    # Close Position
+                    if should_close:
+                        if pos['side'] == 1:
+                            payout = pos['shares'] * curr_p
+                        else:
+                            payout = pos['shares'] * (1.0 - curr_p)
+                        cash += payout
+                        del positions[cid]
+        
+        # --- END OF PERIOD VALUATION ---
+        final_value = cash
+        for cid, pos in positions.items():
+            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+            if pos['side'] == 1:
+                val = pos['shares'] * last_p
+            else:
+                val = pos['shares'] * (1.0 - last_p)
+            final_value += val
+        
+        # --- DIAGNOSTICS ---
+        print(f"\n📊 PERIOD SUMMARY:")
+        print(f"   Trades Executed: {trade_count}")
+        print(f"   Volume Traded: ${volume_traded:.0f}")
+        print(f"   Final Value: ${final_value:.2f}")
+        print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
+        print(f"\n🚫 REJECTION LOG:")
+        for reason, count in rejection_log.items():
+            if count > 0:
+                print(f"   {reason}: {count}")
+        
+        if debug_signals:
+            print(f"\n🎯 SIGNALS FIRED: {len(debug_signals)}")
+            for sig in debug_signals[:3]:
+                print(f"   Market: {sig['market']} | Net: {sig['net_weight']:.1f} | Thresh: {sig['threshold']:.1f}")
+        
+        return {
+            'final_value': final_value,
+            'total_return': (final_value / 10000.0) - 1.0,
+            'trades': trade_count,
+            'sharpe_ratio': 0.0,
+            'max_drawdown': 0.0
+        }
         
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
