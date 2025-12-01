@@ -1476,7 +1476,15 @@ class FastBacktestEngine:
         # Metrics
         trade_count = 0
         volume_traded = 0.0
-        
+        # --- DIAGNOSTIC BLOCK 1: INPUTS ---
+        print(f"DEBUG: Starting Period. Batches: {len(batches)}")
+        print(f"DEBUG: Splash Threshold: {splash_thresh}")
+        if len(batches) == 0:
+            print("CRITICAL FAILURE: No events to process. Check Train/Test dates.")
+            return {'final_value': cash, 'trades': 0}
+        if splash_thresh > 100:
+            print(f"CRITICAL FAILURE: Threshold is {splash_thresh}. Config passed incorrectly?")
+        # ----------------------------------
         for batch in batches:
             for event in batch:
                 ev_type = event['event_type']
@@ -1501,8 +1509,6 @@ class FastBacktestEngine:
 
                     new_price = data.get('p_market_all', 0.5)
                     prev_price = tracker[cid]['last_price']
-                    
-                    # --- FIX 1: Update Memory Immediately ---
                     tracker[cid]['last_price'] = new_price
                     # ----------------------------------------
 
@@ -1520,7 +1526,13 @@ class FastBacktestEngine:
                     
                     skill_premium = max(0.0, 0.25 - brier)
                     weight = vol * ((skill_premium * 10.0) + 0.01)
-
+                    if debug_prints < 5:
+                        print(f"DEBUG ID: {cid[:6]} | Vol: {vol:.0f} | Wt: {weight:.4f} | Net: {tracker[cid]['net_weight']:.4f}")
+                        if weight == 0:
+                            print("CRITICAL FAILURE: Weight is 0. The +0.01 fix is missing or vol is 0.")
+                        elif abs(tracker[cid]['net_weight']) < 0.1:
+                            print(f"WARNING: Net Weight {tracker[cid]['net_weight']:.4f} is too low to trigger threshold.")
+                        debug_prints += 1
                     tracker[cid]['net_weight'] += (weight * trade_direction)
                     
                     # 3. Check Splash
