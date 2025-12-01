@@ -1543,6 +1543,10 @@ class FastBacktestEngine:
                         edge = p_model - prev_price 
                         
                         if abs(edge) > config.get('edge_threshold', 0.05):
+                            
+                            if new_price < 0.05 or new_price > 0.95:
+                                continue
+                                
                             if cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
@@ -1557,7 +1561,7 @@ class FastBacktestEngine:
                                     cost = cash * target_f
                                 
                                 if cost > 5.0 and cash > cost:
-                                    safe_entry = max(0.001, min(new_price, 0.999))
+                                    safe_entry = max(0.05, min(new_price, 0.95))
                                     if side == 1: shares = cost / safe_entry
                                     else: shares = cost / (1.0 - safe_entry)
 
