@@ -1492,32 +1492,25 @@ class FastBacktestEngine:
 
                 # --- B. PRICE UPDATE ---
                 elif ev_type == 'PRICE_UPDATE':
-               
                     cid = data['contract_id']
-                    if cid not in market_liq:
-                    # Check if we passed history, OR default to 10k
-                        if known_liquidity and cid in known_liquidity:
-                            market_liq[cid] = known_liquidity[cid]
-                        else:
-                            market_liq[cid] = 10000.0 
-                         
+                    
+                    # 1. State Init
+                    if cid not in market_liq: market_liq[cid] = 10000.0
                     if cid not in market_prices: market_prices[cid] = 0.5
-                    # Initialize if missing (e.g. we missed the NEW_CONTRACT event)
-                    if cid not in tracker:
-                        tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
+                    if cid not in tracker: tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
 
-                    # 1. Update Price
                     new_price = data.get('p_market_all', 0.5)
                     prev_price = tracker[cid]['last_price']
-                    tracker[cid]['net_weight'] = 0.0 # Full Reset
+                    
+                    # --- FIX 1: Update Memory Immediately ---
                     tracker[cid]['last_price'] = new_price
-                    # 2. Determine Direction (Trust Token Flow)
+                    # ----------------------------------------
+
+                    # 2. Calc Weight
+                    vol = float(data.get('trade_volume', 0.0))
                     is_sell = data.get('is_sell', False)
                     trade_direction = -1.0 if is_sell else 1.0
-                    
-                    # 3. Calculate Weight
                     w_id = str(data.get('wallet_id'))
-                    vol = float(data.get('trade_volume', 0.0))
                     
                     brier = wallet_scores.get((w_id, 'default_topic'))
                     if brier is None:
@@ -1527,55 +1520,59 @@ class FastBacktestEngine:
                     
                     skill_premium = max(0.0, 0.25 - brier)
                     weight = vol * ((skill_premium * 10.0) + 0.01)
-                    
-                    # 4. Accumulate
+
                     tracker[cid]['net_weight'] += (weight * trade_direction)
-                    if debug_prints < 20 and abs(tracker[cid]['net_weight']) > 0.1:
-                        cur_wt = tracker[cid]['net_weight']
-                        print(f"   [DEBUG] ID:{cid[:6]} | Vol:{vol:.0f} | NetWt:{cur_wt:.2f} vs Thresh:{splash_thresh}")
-                        debug_prints += 1
-                        
-                    # 5. Generate Signal
+                    
+                    # 3. Check Splash
                     if abs(tracker[cid]['net_weight']) > splash_thresh:
+                        
+                        # Calc Edge
                         raw_net = tracker[cid]['net_weight']
                         net_sentiment = np.tanh(raw_net / 50000.0) 
                         p_model = 0.5 + (net_sentiment * 0.4) 
-                        
                         edge = p_model - prev_price 
                         
+                        # --- FIX 2: Reset Weight NOW ---
+                        tracker[cid]['net_weight'] = 0.0
+                        # -------------------------------
+
+                        # 4. Attempt Trade (If Edge is good)
                         if abs(edge) > config.get('edge_threshold', 0.05):
                             
-                            is_valid_price = (new_price >= 0.02 and new_price <= 0.98)
+                            # --- FIX 3: Guardrails via IF, not CONTINUE ---
+                            # This allows the code to flow correctly without breaking the loop
+                            is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
                             
-                            if is_valid_price and cid not in positions:
+                            if is_safe_price and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
                                 # Sizing
+                                sizing_val = config.get('kelly_fraction', 0.25)
+                                if config.get('sizing_mode') == 'fixed': sizing_val = config.get('fixed_size', 10.0)
+                                
                                 target_f = 0.0
-                                if sizing_mode == "fixed_pct": target_f = sizing_val
-                                elif sizing_mode == "kelly": target_f = abs(edge) * sizing_val
-                                elif sizing_mode == "fixed": cost = sizing_val; target_f = -1
+                                if config.get('sizing_mode', 'kelly') == 'fixed_pct': target_f = sizing_val
+                                elif config.get('sizing_mode', 'kelly') == 'kelly': target_f = abs(edge) * sizing_val
+                                elif config.get('sizing_mode', 'kelly') == 'fixed': cost = sizing_val; target_f = -1
 
                                 if target_f > 0:
                                     target_f = min(target_f, 0.20)
                                     cost = cash * target_f
                                 
                                 if cost > 5.0 and cash > cost:
-                                    safe_entry = max(0.05, min(new_price, 0.95))
+                                    # Safe Entry Calculation (Slippage Simulation)
+                                    buffer = 0.01
+                                    if side == 1: safe_entry = min(new_price + buffer, 0.99)
+                                    else: safe_entry = max(new_price - buffer, 0.01)
+
                                     if side == 1: shares = cost / safe_entry
                                     else: shares = cost / (1.0 - safe_entry)
 
                                     cash -= cost
                                     positions[cid] = {
-                                        'side': side, 
-                                        'size': cost, 
-                                        'shares': shares, 
-                                        'entry': safe_entry
+                                        'side': side, 'size': cost, 'shares': shares, 'entry': safe_entry
                                     }
                                     trade_count += 1
-                                    volume_traded += cost
-                        
-                        
 
                 # --- C. RESOLUTION (Moved UP to prioritize payout) ---
                 elif ev_type == 'RESOLUTION':
