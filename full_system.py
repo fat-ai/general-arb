@@ -2377,93 +2377,78 @@ class BacktestEngine:
     
     def _transform_to_events(self, markets, trades):
         import gc
+        import pandas as pd
+        import numpy as np
 
         log.info("Transforming Data (Robust Mode)...")
+        
+        # 1. TIME NORMALIZATION (CRITICAL FIX)
+        # Force all date columns to be Datetime objects. 
+        # This fixes the "TypeError: '<' not supported" crash during sorting.
         markets['created_at'] = pd.to_datetime(markets['created_at'], errors='coerce').dt.tz_localize(None)
         markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         
-
-        # 1. Ensure IDs are standard strings
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
-        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
+        # 2. STRING NORMALIZATION
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip()
+        trades['contract_id'] = trades['contract_id'].astype(str).str.strip()
         
-        # 2. Filter to Common IDs
-        market_ids = set(markets['contract_id'])
-        trade_mkts = set(trades['contract_id'])
-        common_ids = market_ids.intersection(trade_mkts)
-        
-        log.info(f"   Markets: {len(market_ids)}, Trades: {len(trades)}")
-        log.info(f"   Common IDs: {len(common_ids)}")
-        
-        if len(common_ids) == 0:
-            log.error("❌ NO COMMON IDS FOUND. Check ID formats (e.g. 0x prefix).")
+        # 3. FILTER TO COMMON IDs
+        common_ids = set(markets['contract_id']).intersection(set(trades['contract_id']))
+        if not common_ids:
+            log.error("❌ NO COMMON IDS FOUND.")
             return pd.DataFrame(), pd.DataFrame()
             
         markets = markets[markets['contract_id'].isin(common_ids)].copy()
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
         
-        # 3. Build Profiler Data
-        # FIX: Map 'size' to tradeAmount (USDC) to ensure Price = USDC / Tokens works
+        # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'].astype(str), 
             'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
-            'usdc_vol': trades['tradeAmount'].astype('float32'),       # Volume in Dollars
-            'tokens': trades['outcomeTokensAmount'].astype('float32')  # Number of Shares
+            'usdc_vol': trades['tradeAmount'].astype('float32'),
+            'tokens': trades['outcomeTokensAmount'].astype('float32')
         })
         
-        # --- FIX: ROBUST PRICE CALCULATION ---
-        # Formula: Price = USDC / Abs(Shares)
-        # 1. Avoid Division by Zero
+        # Price Calculation
         valid_mask = (prof_data['tokens'] != 0) & (prof_data['usdc_vol'] > 0)
-        
-        # 2. Vectorized Calculation with safety checks
         prof_data['bet_price'] = np.where(
             valid_mask,
             (prof_data['usdc_vol'] / prof_data['tokens'].abs()).clip(0.001, 0.999),
             np.nan
         )
-        
-        # 3. Drop invalid rows (Don't fill with 0, just ignore them)
         prof_data = prof_data.dropna(subset=['bet_price'])
-        
-        # Add metadata
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # 4. Build Event Log
+        # 5. BUILD EVENT LOG
         events_ts, events_type, events_data = [], [], []
 
         # A. NEW_CONTRACT
-       
         for _, row in markets.iterrows():
+            if pd.isna(row['created_at']): continue
             events_ts.append(row['created_at'])
             events_type.append('NEW_CONTRACT')
-            liq_val = row.get('liquidity')
-            safe_liq = float(liq_val) if liq_val is not None else 0.0
-            events_data.append({
-                'contract_id': row['contract_id'], 
-                'p_market_all': 0.5, 
-                'liquidity': safe_liq
-            })
+            # Safe Liquidity Handling
+            liq = row.get('liquidity')
+            safe_liq = float(liq) if liq is not None else 0.0
+            events_data.append({'contract_id': row['contract_id'], 'p_market_all': 0.5, 'liquidity': safe_liq})
             
         # B. RESOLUTION
         for _, row in markets.iterrows():
+            if pd.isna(row['resolution_timestamp']): continue
             events_ts.append(row['resolution_timestamp'])
             events_type.append('RESOLUTION')
             events_data.append({'contract_id': row['contract_id'], 'outcome': float(row['outcome'])})
 
-        # C. PRICE_UPDATE (Using the calculated bet_price)
-        # Sort trades by time first
+        # C. PRICE_UPDATE
+        # Align trades with profiler data index
         trades = trades.sort_values('timestamp')
-        
-        # Vectorized preparation
-        # Note: We must align 'trades' with 'prof_data' since we dropped rows from prof_data
-        # Re-index trades to match the filtered prof_data
         aligned_trades = trades.loc[prof_data.index]
         
+        # Bulk list extraction for speed
         t_ts = aligned_trades['timestamp'].tolist()
         t_cid = aligned_trades['contract_id'].tolist()
         t_uid = aligned_trades['user'].astype(str).tolist()
@@ -2482,8 +2467,9 @@ class BacktestEngine:
                 'is_sell': t_tokens[i] < 0
             })
 
-        # 5. Final Assembly
+        # 6. FINAL SORT
         df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
+        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp']) # Ensure type again
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
