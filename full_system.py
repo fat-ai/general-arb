@@ -1863,7 +1863,7 @@ class BacktestEngine:
         import json
         
         # New cache file
-        cache_file = self.cache_dir / "gamma_markets_strict_tokens.parquet"
+        cache_file = self.cache_dir / "gamma_markets_str_tokens.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1872,7 +1872,7 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching GLOBAL market list...")
+        print(f"Fetching GLOBAL market list (Gamma API)...")
         
         while True:
             try:
@@ -1893,31 +1893,25 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- STRICT DECIMAL TOKEN ID EXTRACTION ---
+        # --- EXTRACT TOKEN ID AS PURE STRING ---
         def extract_token(row):
             try:
                 raw = row.get('clobTokenIds')
                 if not raw: return None
-                
-                # Parse JSON if needed
                 if isinstance(raw, str): 
                     try: tokens = json.loads(raw)
                     except: return None
-                else: 
-                    tokens = raw
+                else: tokens = raw
                 
                 if isinstance(tokens, list) and len(tokens) > 0:
                     val = tokens[0]
-                    # CRITICAL: Force to integer first, then string
-                    # This removes '1.23e+20' formatting
-                    if isinstance(val, float):
-                        return str(int(val))
-                    return str(val).strip()
+                    # FORCE STRING. DO NOT ALLOW SCIENTIFIC NOTATION.
+                    return "{:.0f}".format(val) if isinstance(val, float) else str(val).strip()
                 return None
             except: return None
 
         df['contract_id'] = df.apply(extract_token, axis=1)
-        # ------------------------------------------
+        # ---------------------------------------
 
         # Normalization
         def derive_outcome(row):
@@ -1936,6 +1930,9 @@ class BacktestEngine:
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
+        # Enforce String Type for ID
+        df['contract_id'] = df['contract_id'].astype(str)
+        
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
@@ -2047,8 +2044,9 @@ class BacktestEngine:
             try: os.remove(cache_file)
             except: pass
             
-        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
+        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH (String IDs)...")
         
+        # PROVEN URL
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2059,35 +2057,25 @@ class BacktestEngine:
         ledger_lock = threading.Lock()
         self.first_success = False
         
-        self.debug_printed = False
-        
-        def fetch_and_write_worker(token_id, writer, f_handle):
+        def fetch_and_write_worker(token_id_raw, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # --- FIX: NO FLOATS ALLOWED ---
-            # Treat ID purely as a string.
-            # If it comes in as 12345 (int), str() keeps it perfect.
-            # If it comes in as "12345" (str), str() keeps it perfect.
-            token_str = str(token_id).strip()
+            # --- CRITICAL FIX: STRING INTEGRITY ---
+            token_str = str(token_id_raw).strip()
             
-            # Sanity check: If it contains a decimal point or 'e+', it's already corrupt from upstream.
-            if '.' in token_str or 'e+' in token_str.lower():
-                # Try to salvage if it's a simple string, but generally this shouldn't happen 
-                # with the new Market Fetcher.
-                pass 
-
-            if not self.debug_printed:
-                print(f"DEBUG: Checking Format -> Input: {token_id} | Output: {token_str}")
-                self.debug_printed = True
+            # Safety Check: If scientific notation is detected, SKIP.
+            if 'e+' in token_str.lower():
+                print(f"❌ SKIPPING CORRUPT ID: {token_str}")
+                return False
 
             last_ts = 9999999999
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # Query makerAssetId (Proven to work in Diagnostic with Decimal String)
+                    # Query makerAssetId (Proven in Diagnostic)
                     query = """
                     query($token: String!, $max_ts: BigInt!) {
                       orderFilledEvents(
@@ -2150,7 +2138,8 @@ class BacktestEngine:
                                 writer.writerows(rows)
                                 f_handle.flush()
                                 if not self.first_success:
-                                    print(f"\n✅ SUCCESS: Connected to Market {token_str[:5]}... (Found {len(rows)} trades)")
+                                    # Print first success to confirm flow
+                                    print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
                         if int(min_batch_ts) >= int(last_ts): break
@@ -2165,13 +2154,14 @@ class BacktestEngine:
                     break 
             
             with ledger_lock:
-                with open(ledger_file, "a") as lf: lf.write(f"{token_id}\n")
+                with open(ledger_file, "a") as lf: lf.write(f"{token_str}\n")
             return True
 
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
+            # Use 10 workers (Graph is fast)
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
