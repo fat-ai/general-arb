@@ -1396,7 +1396,11 @@ class FastBacktestEngine:
                     if not group.empty:
                         batch_events = []
                         for ts, row in group.iterrows():
-                            ev = {'event_type': row['event_type'], 'data': row['data']}
+                            data = row['data']
+                            if row['event_type'] == 'NEW_CONTRACT':
+                                if data.get('liquidity', 0) == 0:
+                                    data['liquidity'] = 10000.0
+                            ev = {'event_type': row['event_type'], 'data': data}
                             batch_events.append(ev)
                         batches.append(batch_events)
 
