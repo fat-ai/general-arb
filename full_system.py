@@ -1836,26 +1836,70 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets (Reads gamma_markets_v2_numeric.parquet)
-        markets = self._fetch_gamma_markets(days_back=200)
+        import pandas as pd
+        import glob
+        import os
         
-        # 2. Date Filter
-        cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
-        markets = markets[markets['resolution_timestamp'] >= cutoff_date].copy()
+        print("Loading data from cache...")
         
-        # 3. Fetch Trades
-        active_ids = markets['contract_id'].unique()
-        trades = self._fetch_gamma_trades_parallel(list(active_ids))
-        
-        if trades.empty:
+        # 1. LOAD MARKETS (The latest file)
+        # We need the one with "all_tokens" or "fixed_types"
+        market_files = glob.glob(str(self.cache_dir / "gamma_markets_*.parquet"))
+        if not market_files:
+            print("❌ No market file found.")
             return pd.DataFrame(), pd.DataFrame()
+            
+        latest_market_file = max(market_files, key=os.path.getctime)
+        print(f"   Loading Markets: {os.path.basename(latest_market_file)}")
+        markets = pd.read_parquet(latest_market_file)
         
-        # 4. Filter
+        # 2. LOAD TRADES
+        trades_file = self.cache_dir / "gamma_trades_stream.csv"
+        if not trades_file.exists():
+            print("❌ No trades file found.")
+            return pd.DataFrame(), pd.DataFrame()
+            
+        print(f"   Loading Trades: {os.path.basename(trades_file)}")
+        # Load all cols with correct types
+        trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
+        
+        # Basic Trade Cleaning
+        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
+        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
+        trades['contract_id'] = trades['contract_id'].str.strip()
+        
+        # 3. FIX THE ID MISMATCH (The Critical Step)
+        # Markets have "ID1,ID2". Trades have "ID1".
+        # We must 'explode' the markets dataframe so "ID1,ID2" becomes two rows.
+        print("   Expanding Market IDs...")
+        
+        # Ensure string
+        markets['contract_id'] = markets['contract_id'].astype(str)
+        
+        # Split "123,456" -> ["123", "456"]
+        markets['contract_id'] = markets['contract_id'].str.split(',')
+        
+        # Explode list into rows
+        markets = markets.explode('contract_id')
+        
+        # Clean whitespace
+        markets['contract_id'] = markets['contract_id'].str.strip()
+        
+        # 4. FILTER
+        # Only keep markets that we actually have trades for
         valid_ids = set(trades['contract_id'].unique())
-        markets = markets[markets['contract_id'].isin(valid_ids)]
+        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         
-        print(f"DEBUG: Data Load Complete. {len(markets)} Markets matched with {len(trades)} Trades.")
-        return markets, trades
+        # Filter trades to match valid markets (removes orphans)
+        valid_market_ids = set(market_subset['contract_id'].unique())
+        trades = trades[trades['contract_id'].isin(valid_market_ids)].copy()
+        
+        print(f"✅ Data Load Complete.")
+        print(f"   Original Markets: {len(markets)}")
+        print(f"   Matched Markets:  {len(market_subset)}")
+        print(f"   Total Trades:     {len(trades)}")
+        
+        return market_subset, trades
         
     def _fetch_gamma_markets(self, days_back=200):
         import os
