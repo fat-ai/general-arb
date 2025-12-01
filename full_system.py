@@ -1836,11 +1836,8 @@ class BacktestEngine:
         return best_config
         
     def _load_data(self):
-        # 1. Fetch Markets (Now with Token IDs)
+        # 1. Fetch Markets (Reads gamma_markets_v2_numeric.parquet)
         markets = self._fetch_gamma_markets(days_back=200)
-        if markets.empty: 
-            log.error("No markets found.")
-            return pd.DataFrame(), pd.DataFrame()
         
         # 2. Date Filter
         cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
@@ -1851,10 +1848,9 @@ class BacktestEngine:
         trades = self._fetch_gamma_trades_parallel(list(active_ids))
         
         if trades.empty:
-            log.error("Trades data is empty.")
             return pd.DataFrame(), pd.DataFrame()
         
-        # 4. Filter Markets to match found Trades
+        # 4. Filter
         valid_ids = set(trades['contract_id'].unique())
         markets = markets[markets['contract_id'].isin(valid_ids)]
         
@@ -1866,10 +1862,9 @@ class BacktestEngine:
         import os
         import json
         
-        # Cache file
-        cache_file = self.cache_dir / "gamma_markets_unsorted.parquet"
+        # CHANGED FILENAME: Forces a fresh download of the correct ID type
+        cache_file = self.cache_dir / "gamma_markets_v2_numeric.parquet"
         
-        # 1. Force Clean Start
         if cache_file.exists():
             try: os.remove(cache_file)
             except: pass
@@ -1877,11 +1872,10 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching GLOBAL market list (Default Order)...")
+        print(f"Fetching GLOBAL market list (Gamma API)...")
         
         while True:
             try:
-                # REMOVED: order="volume"
                 params = {
                     "limit": 1000, 
                     "offset": offset, 
@@ -1900,9 +1894,7 @@ class BacktestEngine:
                 
                 offset += 1000
                 if offset % 5000 == 0: print(f" {offset}..", end="", flush=True)
-                
-                # Cap at 50k to avoid fetching 2018 markets
-              
+                if offset > 50000: break
                 
             except Exception as e:
                 log.error(f"Market fetch error: {e}")
@@ -1914,16 +1906,15 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- EXTRACT TOKEN ID (Required for Data API) ---
-        def extract_condition_id(row):
-            # We need the Hex Condition ID (e.g. 0x123...)
-            return row.get('conditionId')
+        # --- FIX: USE STANDARD NUMERIC ID ---
+        # We explicitly grab the 'id' field (e.g. "1005")
+        if 'id' in df.columns:
+            df['contract_id'] = df['id'].astype(str).str.strip().str.replace(".0", "")
+        else:
+            print("❌ Error: 'id' field missing from API.")
+            return pd.DataFrame()
+        # ------------------------------------
 
-        df['contract_id'] = df.apply(extract_condition_id, axis=1)
-        # ------------------------------------------------
-        
-        df = df.dropna(subset=['contract_id'])
-        
         # Normalization
         def derive_outcome(row):
             try:
@@ -1943,7 +1934,6 @@ class BacktestEngine:
         
         df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
-        
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
         if not df.empty: df.to_parquet(cache_file)
@@ -2047,88 +2037,72 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # 1. Clean Start
+        # Force Clean Start
         if ledger_file.exists():
             try: os.remove(ledger_file)
             except: pass
+        if cache_file.exists():
+            try: os.remove(cache_file)
+            except: pass
             
-        # IDs are Token IDs. Clean them.
-        todo_ids = [str(m).strip().replace("'", "").replace('"', "") for m in market_ids]
+        todo_ids = [str(m).strip() for m in market_ids]
         
-        print(f"Stream-fetching {len(todo_ids)} markets via DATA API...")
-        print("Waiting for first data connection...")
+        print(f"Stream-fetching {len(todo_ids)} markets via GAMMA API (Offset Strategy)...")
+        print("Waiting for first valid connection...")
         
-        # 2. Setup CSV Writer
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         
-        write_mode = 'a' if cache_file.exists() else 'w'
-        
+        write_mode = 'w'
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
-        
-        # FEEDBACK FLAGS
         self.first_success = False
         
-        # 3. Define Worker
         def fetch_and_write_worker(market_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            cursor_ts = None 
+            # OFFSET PAGINATION: Guarantees no loops
+            offset = 0
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # USE ACTIVITY API (Supports 'end' timestamp for history)
-                    url = "https://data-api.polymarket.com/activity"
+                    url = "https://gamma-api.polymarket.com/trades"
                     
                     params = {
-                        "market": market_id, # Condition ID (0x...)
-                        "type": "TRADE",
-                        "limit": 500
+                        "market": market_id, 
+                        "limit": 500,         
+                        "offset": offset,     
+                        "order": "timestamp",
+                        "ascending": "false" 
                     }
-                    if cursor_ts:
-                        params["end"] = cursor_ts
                     
                     resp = session.get(url, params=params, timeout=10)
                     
                     if resp.status_code == 200:
                         data = resp.json()
-                        if not data or not isinstance(data, list): break
+                        if not data: break # End of list
                         
                         rows = []
-                        last_ts = None
-                        
                         for row in data:
                             try:
-                                ts_val = row.get('timestamp')
+                                ts_val = row.get('timestamp') or row.get('time')
                                 if not ts_val: continue
                                 
                                 trade_ts = float(ts_val)
-                                last_ts = trade_ts
-                                
-                                if trade_ts < cutoff_ts: raise StopIteration
+                                if trade_ts < cutoff_ts: raise StopIteration 
                                 
                                 ts_str = pd.to_datetime(trade_ts, unit='s').isoformat()
-                                
-                                # Activity API fields are slightly different
-                                size = float(row.get('size') or 0.0)
-                                amount = float(row.get('amount') or 0.0) # Cash Volume
-                                
-                                # Calculate price if missing
                                 price = float(row.get('price') or 0.0)
-                                if price == 0 and size > 0:
-                                    price = amount / size
-                                
-                                side = str(row.get('side', '')).upper()
-                                side_mult = 1 if side == 'BUY' else -1
-                                user = str(row.get('proxyWallet') or row.get('user') or 'unknown')
+                                size = float(row.get('size') or row.get('shares') or row.get('taker_amount') or 0.0)
+                                side_mult = 1 if str(row.get('side', '')).upper() == 'BUY' else -1
+                                user = str(row.get('taker_address') or row.get('taker') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': amount * 1e6,
+                                    'tradeAmount': size * price * 1e6,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
                                     'contract_id': str(market_id),
@@ -2149,35 +2123,34 @@ class BacktestEngine:
                                     self.first_success = True
                         
                         if len(data) < 500: break
+                        offset += 500
                         
-                        # Pagination: Move cursor backwards
-                        if last_ts:
-                            cursor_ts = int(last_ts) - 1
-                        else:
-                            break
-                            
+                        # Safety break to prevent runaways (optional)
+                        if offset > 100000: break 
+                        
+                    elif resp.status_code == 404:
+                        # Market not found in Trades DB. Stop.
+                        break
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
                     else:
                         break 
+                        
                 except StopIteration:
                     break 
                 except Exception:
-                    break
+                    break 
             
             with ledger_lock:
                 with open(ledger_file, "a") as lf: lf.write(f"{market_id}\n")
             return True
 
-        # 4. Run Execution
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            if not cache_file.exists() or cache_file.stat().st_size == 0:
-                writer.writeheader()
+            writer.writeheader()
             
-            # 4 Workers
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in todo_ids
@@ -2197,14 +2170,8 @@ class BacktestEngine:
             df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         except:
             return pd.DataFrame()
-            
-        print(f"De-duping {len(df)} trades...")
         df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
-        
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
-        df['contract_id'] = df['contract_id'].astype(str).str.strip().astype('category')
-        df['user'] = df['user'].astype('category')
-        
         return df
         
     def _fetch_subgraph_trades(self, days_back=200):
