@@ -1403,7 +1403,16 @@ class FastBacktestEngine:
                             ev = {'event_type': row['event_type'], 'data': data}
                             batch_events.append(ev)
                         batches.append(batch_events)
-
+                        
+                past_events = self.event_log[self.event_log.index < test_end]
+                init_events = past_events[past_events['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
+                global_liq = {}
+                for _, row in init_events.iterrows():
+                    l = row['data'].get('liquidity')
+                    # Ensure we capture the 10k fix if it's there
+                    if l is None or l == 0: l = 10000.0
+                    global_liq[row['data']['contract_id']] = l
+                    
                 # RUN SIMULATION
                 # --- FIX: Handle Dictionary Return ---
                 result = self._run_single_period(
@@ -1412,7 +1421,8 @@ class FastBacktestEngine:
                     config, 
                     fw_slope, 
                     fw_intercept, 
-                    start_time=train_end
+                    start_time=train_end,
+                    known_liquidity=global_liq
                 )
                 
                 # Extract values from dict
@@ -1442,7 +1452,7 @@ class FastBacktestEngine:
             'trades': total_trades
         }
 
-    def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
+    def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
         """
         Runs the simulation for a specific fold (Train or Test).
         Final Version: Full Reset, Explicit Shares, Net Sentiment, Safety Clipping.
@@ -1481,6 +1491,17 @@ class FastBacktestEngine:
 
                 # --- B. PRICE UPDATE ---
                 elif ev_type == 'PRICE_UPDATE':
+               
+                    cid = data['contract_id']
+                # --- AMNESIA FIX ---
+                    if cid not in market_liq:
+                    # Check if we passed history, OR default to 10k
+                        if known_liquidity and cid in known_liquidity:
+                            market_liq[cid] = known_liquidity[cid]
+                        else:
+                            market_liq[cid] = 10000.0 
+                            
+                if cid not in market_prices: market_prices[cid] = 0.5
                     # Initialize if missing (e.g. we missed the NEW_CONTRACT event)
                     if cid not in tracker:
                         tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
