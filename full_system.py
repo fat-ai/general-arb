@@ -1862,8 +1862,8 @@ class BacktestEngine:
         import json
         import pandas as pd
         
-        # New cache file
-        cache_file = self.cache_dir / "gamma_markets_verified_str.parquet"
+        # Cache file
+        cache_file = self.cache_dir / "gamma_markets_fixed_types.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1876,7 +1876,6 @@ class BacktestEngine:
         
         while True:
             try:
-                # Gamma API List (Reliable)
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
@@ -1900,7 +1899,6 @@ class BacktestEngine:
                 raw = row.get('clobTokenIds')
                 if not raw: return None
                 
-                # Handle JSON list string
                 if isinstance(raw, str):
                     try: tokens = json.loads(raw)
                     except: return None
@@ -1908,21 +1906,20 @@ class BacktestEngine:
                 
                 if isinstance(tokens, list) and len(tokens) > 0:
                     val = tokens[0]
-                    # IF FLOAT/INT: Convert to full integer string (No "e+" notation)
+                    # Convert to string without scientific notation
                     if isinstance(val, (int, float)):
                         return "{:.0f}".format(val)
-                    # IF STRING: Strip whitespace
                     return str(val).strip()
                 return None
             except: return None
 
         df['contract_id'] = df.apply(extract_token, axis=1)
         
-        # Filter and Typecast
+        # Validation
         df = df.dropna(subset=['contract_id'])
         df['contract_id'] = df['contract_id'].astype(str)
 
-        # Standard Normalization
+        # Normalization
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -2051,8 +2048,8 @@ class BacktestEngine:
             except: pass
             
         print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
+        print("Config: Decimal IDs | MakerAsset Filter | Timestamp: Int")
         
-        # PROVEN ENDPOINT
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2065,24 +2062,23 @@ class BacktestEngine:
         
         def fetch_and_write_worker(token_id_raw, writer, f_handle):
             session = requests.Session()
-            # Standard Retry Policy
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
             token_str = str(token_id_raw).strip()
             
-            # Reject Scientific Notation (The Corrupt Data Check)
+            # Reject Scientific Notation
             if 'e+' in token_str or '.' in token_str:
                 return False
 
-            last_ts = 9999999999
+            last_ts = 2147483647 # Max 32-bit Int (Year 2038) - Safe for 'Int' type
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # EXACT QUERY FROM CONTROL TEST (makerAssetId only)
+                    # FIX: Use 'Int!' instead of 'BigInt!'
                     query = """
-                    query($token: String!, $max_ts: BigInt!) {
+                    query($token: String!, $max_ts: Int!) {
                       orderFilledEvents(
                         first: 1000
                         orderBy: timestamp
@@ -2093,14 +2089,16 @@ class BacktestEngine:
                       }
                     }
                     """
+                    # FIX: Explicit int() cast to prevent Float error
                     variables = {"token": token_str, "max_ts": int(last_ts)}
                     
-                    # 10s Timeout (Control Test took 0.27s, so 10s is plenty safe)
-                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=10)
+                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=30)
                     
                     if resp.status_code == 200:
                         r_json = resp.json()
-                        if 'errors' in r_json: break 
+                        if 'errors' in r_json: 
+                            # If we get a type error, we can't recover for this market
+                            break 
                         
                         data = r_json.get('data', {}).get('orderFilledEvents', [])
                         if not data: break # End of History
@@ -2116,8 +2114,6 @@ class BacktestEngine:
                                 if ts_val < cutoff_ts: continue
                                 
                                 # METRICS
-                                # makerAmountFilled = Asset Size
-                                # takerAmountFilled = USDC Value
                                 size = float(row.get('makerAmountFilled') or 0.0)
                                 usdc = float(row.get('takerAmountFilled') or 0.0)
                                 
@@ -2149,12 +2145,13 @@ class BacktestEngine:
                                     print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
+                        # Pagination Loop Logic
                         if int(min_batch_ts) >= int(last_ts): break
                         last_ts = min_batch_ts
                         if min_batch_ts < cutoff_ts: break
                         
                     else:
-                        time.sleep(1) # Mild backoff on HTTP error
+                        time.sleep(1)
                         continue
 
                 except Exception:
@@ -2168,7 +2165,6 @@ class BacktestEngine:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
-            # 8 Workers is safe for this speed
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
