@@ -1884,7 +1884,7 @@ class BacktestEngine:
             
             # B. Trigger Downloader (With Strict Time Limit)
             # This uses the fetcher you just updated
-            trades = self._fetch_gamma_trades_parallel(target_tokens)
+            trades = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
             
         else:
             print(f"   Loading local trades: {os.path.basename(trades_file)}")
