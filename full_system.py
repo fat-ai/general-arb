@@ -1471,7 +1471,7 @@ class FastBacktestEngine:
         cash = 10000.0
         positions = {} 
         tracker = {}
-        
+        market_liq = {}
         # Metrics
         trade_count = 0
         volume_traded = 0.0
