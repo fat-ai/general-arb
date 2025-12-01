@@ -1472,6 +1472,7 @@ class FastBacktestEngine:
         positions = {} 
         tracker = {}
         market_liq = {}
+        market_prices = {}
         # Metrics
         trade_count = 0
         volume_traded = 0.0
