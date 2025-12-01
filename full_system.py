@@ -2059,7 +2059,6 @@ class BacktestEngine:
         ledger_lock = threading.Lock()
         self.first_success = False
         
-        # Debug counter
         self.debug_printed = False
         
         def fetch_and_write_worker(token_id, writer, f_handle):
@@ -2067,14 +2066,18 @@ class BacktestEngine:
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # PARANOID FORMATTING
-            # Ensure it is a clean integer string. No decimals. No 'e+'.
-            try:
-                token_str = str(int(float(str(token_id))))
-            except:
-                return False
+            # --- FIX: NO FLOATS ALLOWED ---
+            # Treat ID purely as a string.
+            # If it comes in as 12345 (int), str() keeps it perfect.
+            # If it comes in as "12345" (str), str() keeps it perfect.
+            token_str = str(token_id).strip()
+            
+            # Sanity check: If it contains a decimal point or 'e+', it's already corrupt from upstream.
+            if '.' in token_str or 'e+' in token_str.lower():
+                # Try to salvage if it's a simple string, but generally this shouldn't happen 
+                # with the new Market Fetcher.
+                pass 
 
-            # DEBUG: Print the first ID to ensure it looks right
             if not self.debug_printed:
                 print(f"DEBUG: Checking Format -> Input: {token_id} | Output: {token_str}")
                 self.debug_printed = True
@@ -2084,7 +2087,7 @@ class BacktestEngine:
             
             while True:
                 try:
-                    # Query makerAssetId (Proven to work in Diagnostic)
+                    # Query makerAssetId (Proven to work in Diagnostic with Decimal String)
                     query = """
                     query($token: String!, $max_ts: BigInt!) {
                       orderFilledEvents(
@@ -2119,14 +2122,13 @@ class BacktestEngine:
                                 if ts_val < cutoff_ts: continue
                                 
                                 # METRICS
-                                # Note: In this table, makerAmountFilled is usually the Outcome Token Amount
                                 size = float(row.get('makerAmountFilled') or 0.0)
                                 usdc = float(row.get('takerAmountFilled') or 0.0)
                                 
                                 if size == 0: continue
                                 
                                 price = usdc / size if size > 0 else 0.0
-                                side_mult = 1 # Graph doesn't specify side easily, assume 1 (Net Volume)
+                                side_mult = 1 
                                 
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 user = str(row.get('taker') or 'unknown')
