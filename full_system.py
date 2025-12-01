@@ -1742,10 +1742,19 @@ class FastBacktestEngine:
 # --- HELPER: Ray Wrapper (Global) ---
 # ==============================================================================
 def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
+    """
+    FIXED: Now properly unpacks the 'sizing' tuple into the keys expected by the engine.
+    
+    CRITICAL FIX:
+    - Ray Tune passes: config = {'sizing': ('kelly', 0.5), ...}
+    - Engine expects: config = {'sizing_mode': 'kelly', 'kelly_fraction': 0.5, ...}
+    - This wrapper bridges the gap.
+    """
     import traceback
     try:
         def get_ref(obj):
-            if isinstance(obj, ray.ObjectRef): return ray.get(obj)
+            if isinstance(obj, ray.ObjectRef): 
+                return ray.get(obj)
             return obj
 
         event_log = get_ref(event_log_ref)
@@ -1753,9 +1762,36 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         nlp_cache = get_ref(nlp_cache_ref)
         priors = get_ref(priors_ref)
 
+        # ============================================================
+        # === CRITICAL FIX: Unpack Sizing Tuple ===
+        # ============================================================
+        if 'sizing' in config:
+            mode, val = config['sizing']
+            
+            # Map to engine-expected keys
+            config['sizing_mode'] = mode
+            
+            if mode == 'kelly':
+                config['kelly_fraction'] = val
+            elif mode == 'fixed_pct':
+                # Engine uses 'sizing_val' directly for fixed_pct
+                # Since engine does: target_f = sizing_val
+                # We don't need a separate key, just ensure it reads correctly
+                config['fixed_size'] = val  # Store for consistency
+            elif mode == 'fixed':
+                config['fixed_size'] = val
+            
+            # Optional: Remove the tuple to avoid confusion in logs
+            # del config['sizing']
+        # ============================================================
+        
+        # Also unpack stop_loss if it's named differently in search space
+        if 'stop_loss' in config:
+            config['stop_loss_pct'] = config['stop_loss']
+
         engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
         
-        # PATCH 4: Fixed Seed for reproducibility inside the worker
+        # Fixed Seed for reproducibility inside the worker
         import numpy as np
         np.random.seed(config.get('seed', 42))
 
@@ -1765,19 +1801,32 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         dd = results.get('max_drawdown', 1.0)
         
         # Calculate Smart Score inside worker
-        # (Since we removed the local objective_function, we do it here)
         smart_score = ret / (dd + 0.01)
         
         results['smart_score'] = smart_score
+        
+        # Log the actual parameters used (for verification)
+        if results.get('trades', 0) > 0:
+            print(f"✅ Worker Success: Mode={config.get('sizing_mode')}, "
+                  f"Val={config.get('kelly_fraction', config.get('fixed_size')):.3f}, "
+                  f"Trades={results['trades']}, Return={ret:.2%}")
+        else:
+            print(f"⚠️ Worker No Trades: Splash={config.get('splash_threshold')}, "
+                  f"Edge={config.get('edge_threshold')}")
 
-        # Run Walk-Forward Validation
         return results
 
     except Exception as e:
-        print(f"!!!!! WORKER CRASH !!!!! Config: {config}")
+        print(f"!!!!! WORKER CRASH !!!!!")
+        print(f"Config: {config}")
         traceback.print_exc()
-        return {'total_return': -1.0, 'sharpe_ratio': -99.0, 'max_drawdown': 1.0}
-
+        return {
+            'total_return': -1.0, 
+            'sharpe_ratio': -99.0, 
+            'max_drawdown': 1.0,
+            'trades': 0,
+            'smart_score': -99.0
+        }
 
 # ==============================================================================
 # --- ORCHESTRATOR: BacktestEngine (Sensitivity Analysis Config) ---
