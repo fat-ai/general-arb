@@ -1509,7 +1509,8 @@ class FastBacktestEngine:
                     # 1. Update Price
                     new_price = data.get('p_market_all', 0.5)
                     prev_price = tracker[cid]['last_price']
-                    
+                    tracker[cid]['net_weight'] = 0.0 # Full Reset
+                    tracker[cid]['last_price'] = new_price
                     # 2. Determine Direction (Trust Token Flow)
                     is_sell = data.get('is_sell', False)
                     trade_direction = -1.0 if is_sell else 1.0
@@ -1529,7 +1530,7 @@ class FastBacktestEngine:
                     
                     # 4. Accumulate
                     tracker[cid]['net_weight'] += (weight * trade_direction)
-                    if debug_prints < 20 and abs(tracker[cid]['net_weight']) > 1.0:
+                    if debug_prints < 20 and abs(tracker[cid]['net_weight']) > 0.1:
                         cur_wt = tracker[cid]['net_weight']
                         print(f"   [DEBUG] ID:{cid[:6]} | Vol:{vol:.0f} | NetWt:{cur_wt:.2f} vs Thresh:{splash_thresh}")
                         debug_prints += 1
@@ -1544,7 +1545,7 @@ class FastBacktestEngine:
                         
                         if abs(edge) > config.get('edge_threshold', 0.05):
                             
-                            is_valid_price = (new_price >= 0.05 and new_price <= 0.95)
+                            is_valid_price = (new_price >= 0.02 and new_price <= 0.98)
                             
                             if is_valid_price and cid not in positions:
                                 side = 1 if edge > 0 else -1
@@ -1574,9 +1575,7 @@ class FastBacktestEngine:
                                     trade_count += 1
                                     volume_traded += cost
                         
-                        tracker[cid]['net_weight'] = 0.0 # Full Reset
-
-                    tracker[cid]['last_price'] = new_price
+                        
 
                 # --- C. RESOLUTION (Moved UP to prioritize payout) ---
                 elif ev_type == 'RESOLUTION':
