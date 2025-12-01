@@ -1858,12 +1858,12 @@ class BacktestEngine:
         return markets, trades
         
     def _fetch_gamma_markets(self, days_back=200):
-        from datetime import datetime, timedelta
         import os
         import json
+        import pandas as pd
         
         # New cache file
-        cache_file = self.cache_dir / "gamma_markets_str_tokens.parquet"
+        cache_file = self.cache_dir / "gamma_markets_verified_str.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1872,12 +1872,13 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching GLOBAL market list (Gamma API)...")
+        print(f"Fetching GLOBAL market list...")
         
         while True:
             try:
+                # Gamma API List (Reliable)
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
+                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
@@ -1893,27 +1894,35 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- EXTRACT TOKEN ID AS PURE STRING ---
+        # --- EXTRACT TOKEN ID (STRICT STRING) ---
         def extract_token(row):
             try:
                 raw = row.get('clobTokenIds')
                 if not raw: return None
-                if isinstance(raw, str): 
+                
+                # Handle JSON list string
+                if isinstance(raw, str):
                     try: tokens = json.loads(raw)
                     except: return None
                 else: tokens = raw
                 
                 if isinstance(tokens, list) and len(tokens) > 0:
                     val = tokens[0]
-                    # FORCE STRING. DO NOT ALLOW SCIENTIFIC NOTATION.
-                    return "{:.0f}".format(val) if isinstance(val, float) else str(val).strip()
+                    # IF FLOAT/INT: Convert to full integer string (No "e+" notation)
+                    if isinstance(val, (int, float)):
+                        return "{:.0f}".format(val)
+                    # IF STRING: Strip whitespace
+                    return str(val).strip()
                 return None
             except: return None
 
         df['contract_id'] = df.apply(extract_token, axis=1)
-        # ---------------------------------------
+        
+        # Filter and Typecast
+        df = df.dropna(subset=['contract_id'])
+        df['contract_id'] = df['contract_id'].astype(str)
 
-        # Normalization
+        # Standard Normalization
         def derive_outcome(row):
             try:
                 prices = row.get('outcomePrices')
@@ -1929,10 +1938,7 @@ class BacktestEngine:
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        df = df.dropna(subset=['contract_id', 'resolution_timestamp', 'outcome'])
-        # Enforce String Type for ID
-        df['contract_id'] = df['contract_id'].astype(str)
-        
+        df = df.dropna(subset=['resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
@@ -2044,9 +2050,9 @@ class BacktestEngine:
             try: os.remove(cache_file)
             except: pass
             
-        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH (String IDs)...")
+        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
         
-        # PROVEN URL
+        # PROVEN ENDPOINT
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
@@ -2059,15 +2065,14 @@ class BacktestEngine:
         
         def fetch_and_write_worker(token_id_raw, writer, f_handle):
             session = requests.Session()
+            # Standard Retry Policy
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # --- CRITICAL FIX: STRING INTEGRITY ---
             token_str = str(token_id_raw).strip()
             
-            # Safety Check: If scientific notation is detected, SKIP.
-            if 'e+' in token_str.lower():
-                print(f"❌ SKIPPING CORRUPT ID: {token_str}")
+            # Reject Scientific Notation (The Corrupt Data Check)
+            if 'e+' in token_str or '.' in token_str:
                 return False
 
             last_ts = 9999999999
@@ -2075,7 +2080,7 @@ class BacktestEngine:
             
             while True:
                 try:
-                    # Query makerAssetId (Proven in Diagnostic)
+                    # EXACT QUERY FROM CONTROL TEST (makerAssetId only)
                     query = """
                     query($token: String!, $max_ts: BigInt!) {
                       orderFilledEvents(
@@ -2090,7 +2095,8 @@ class BacktestEngine:
                     """
                     variables = {"token": token_str, "max_ts": int(last_ts)}
                     
-                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=15)
+                    # 10s Timeout (Control Test took 0.27s, so 10s is plenty safe)
+                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=10)
                     
                     if resp.status_code == 200:
                         r_json = resp.json()
@@ -2110,6 +2116,8 @@ class BacktestEngine:
                                 if ts_val < cutoff_ts: continue
                                 
                                 # METRICS
+                                # makerAmountFilled = Asset Size
+                                # takerAmountFilled = USDC Value
                                 size = float(row.get('makerAmountFilled') or 0.0)
                                 usdc = float(row.get('takerAmountFilled') or 0.0)
                                 
@@ -2138,7 +2146,6 @@ class BacktestEngine:
                                 writer.writerows(rows)
                                 f_handle.flush()
                                 if not self.first_success:
-                                    # Print first success to confirm flow
                                     print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
@@ -2147,7 +2154,7 @@ class BacktestEngine:
                         if min_batch_ts < cutoff_ts: break
                         
                     else:
-                        time.sleep(1)
+                        time.sleep(1) # Mild backoff on HTTP error
                         continue
 
                 except Exception:
@@ -2161,8 +2168,8 @@ class BacktestEngine:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
-            # Use 10 workers (Graph is fast)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # 8 Workers is safe for this speed
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in market_ids
