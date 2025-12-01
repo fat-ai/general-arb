@@ -1621,6 +1621,9 @@ class FastBacktestEngine:
                                 rejection_log['insufficient_cash'] += 1
                         elif not is_safe_price:
                             rejection_log['unsafe_price'] += 1
+                            # DEBUG: Print the first 5 rejected prices to confirm Decimal Mismatch
+                            if rejection_log['unsafe_price'] <= 5:
+                                print(f"🚫 REJECTED PRICE: {new_price:.6f} (Limit: 0.02-0.98)")
                 
                 # ==================== C. RESOLUTION ====================
                 elif ev_type == 'RESOLUTION':
