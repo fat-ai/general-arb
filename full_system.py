@@ -1453,16 +1453,7 @@ class FastBacktestEngine:
         }
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
-        """
-        FIXED VERSION: Trades now fire correctly with proper weight calculation and thresholds.
-        
-        KEY FIXES:
-        1. Weight calculation scaled to match threshold (1000x multiplier)
-        2. Threshold raised to 50-200 range (realistic for accumulated weight)
-        3. Net weight checked BEFORE reset
-        4. Price safety uses IF blocks (not continue)
-        5. Volume validation added
-        """
+
         import numpy as np
         
         # --- CONFIG EXTRACTION ---
