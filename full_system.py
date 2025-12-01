@@ -1915,19 +1915,11 @@ class BacktestEngine:
         df = pd.DataFrame(all_rows)
         
         # --- EXTRACT TOKEN ID (Required for Data API) ---
-        def extract_token(row):
-            try:
-                raw = row.get('clobTokenIds')
-                if not raw: return None
-                if isinstance(raw, str): tokens = json.loads(raw)
-                else: tokens = raw
-                
-                if isinstance(tokens, list) and len(tokens) > 0:
-                    return str(tokens[0])
-                return None
-            except: return None
+        def extract_condition_id(row):
+            # We need the Hex Condition ID (e.g. 0x123...)
+            return row.get('conditionId')
 
-        df['contract_id'] = df.apply(extract_token, axis=1)
+        df['contract_id'] = df.apply(extract_condition_id, axis=1)
         # ------------------------------------------------
         
         df = df.dropna(subset=['contract_id'])
@@ -2089,15 +2081,16 @@ class BacktestEngine:
             
             while True:
                 try:
-                    # USE DATA API (Verified Working)
-                    url = "https://data-api.polymarket.com/trades"
+                    # USE ACTIVITY API (Supports 'end' timestamp for history)
+                    url = "https://data-api.polymarket.com/activity"
                     
                     params = {
-                        "asset_id": market_id, 
+                        "market": market_id, # Condition ID (0x...)
+                        "type": "TRADE",
                         "limit": 500
                     }
                     if cursor_ts:
-                        params["before"] = cursor_ts
+                        params["end"] = cursor_ts
                     
                     resp = session.get(url, params=params, timeout=10)
                     
@@ -2110,7 +2103,7 @@ class BacktestEngine:
                         
                         for row in data:
                             try:
-                                ts_val = row.get('timestamp') or row.get('time')
+                                ts_val = row.get('timestamp')
                                 if not ts_val: continue
                                 
                                 trade_ts = float(ts_val)
@@ -2119,14 +2112,23 @@ class BacktestEngine:
                                 if trade_ts < cutoff_ts: raise StopIteration
                                 
                                 ts_str = pd.to_datetime(trade_ts, unit='s').isoformat()
+                                
+                                # Activity API fields are slightly different
+                                size = float(row.get('size') or 0.0)
+                                amount = float(row.get('amount') or 0.0) # Cash Volume
+                                
+                                # Calculate price if missing
                                 price = float(row.get('price') or 0.0)
-                                size = float(row.get('size') or row.get('sz') or 0.0)
-                                side_mult = 1 if str(row.get('side', '')).upper() == 'BUY' else -1
-                                user = str(row.get('maker_address') or row.get('taker_address') or 'unknown')
+                                if price == 0 and size > 0:
+                                    price = amount / size
+                                
+                                side = str(row.get('side', '')).upper()
+                                side_mult = 1 if side == 'BUY' else -1
+                                user = str(row.get('proxyWallet') or row.get('user') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': size * price * 1e6,
+                                    'tradeAmount': amount * 1e6,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
                                     'contract_id': str(market_id),
@@ -2142,15 +2144,18 @@ class BacktestEngine:
                             with csv_lock:
                                 writer.writerows(rows)
                                 f_handle.flush()
-                                # IMMEDIATE FEEDBACK
                                 if not self.first_success:
-                                    print(f"\n✅ SUCCESS: Connected! Saving trades for Asset {market_id}...")
+                                    print(f"\n✅ SUCCESS: Connected to Market {market_id}")
                                     self.first_success = True
                         
-                        if len(data) < 100: break
-                        if last_ts: cursor_ts = int(last_ts) - 1
-                        else: break
+                        if len(data) < 500: break
                         
+                        # Pagination: Move cursor backwards
+                        if last_ts:
+                            cursor_ts = int(last_ts) - 1
+                        else:
+                            break
+                            
                     elif resp.status_code == 429:
                         time.sleep(2)
                         continue
@@ -2159,7 +2164,7 @@ class BacktestEngine:
                 except StopIteration:
                     break 
                 except Exception:
-                    break 
+                    break
             
             with ledger_lock:
                 with open(ledger_file, "a") as lf: lf.write(f"{market_id}\n")
