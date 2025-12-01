@@ -2094,10 +2094,10 @@ class BacktestEngine:
                     
                     params = {
                         "asset_id": market_id, 
-                        "limit": 100
+                        "limit": 500
                     }
                     if cursor_ts:
-                        params["max_timestamp"] = cursor_ts
+                        params["before"] = cursor_ts
                     
                     resp = session.get(url, params=params, timeout=10)
                     
