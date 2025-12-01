@@ -2382,9 +2382,7 @@ class BacktestEngine:
 
         log.info("Transforming Data (Robust Mode)...")
         
-        # 1. TIME NORMALIZATION (CRITICAL FIX)
-        # Force all date columns to be Datetime objects. 
-        # This fixes the "TypeError: '<' not supported" crash during sorting.
+        # 1. TIME NORMALIZATION
         markets['created_at'] = pd.to_datetime(markets['created_at'], errors='coerce').dt.tz_localize(None)
         markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
@@ -2410,8 +2408,18 @@ class BacktestEngine:
             'usdc_vol': trades['tradeAmount'].astype('float32'),
             'tokens': trades['outcomeTokensAmount'].astype('float32')
         })
-        outcomes_map = markets[['contract_id', 'outcome']].drop_duplicates()
-        prof_data = prof_data.merge(outcomes_map, left_on='market_id', right_on='contract_id', how='left')
+
+        # --- FIX: MAP OUTCOMES (PRESERVE INDEX) ---
+        # We use .map() instead of .merge() to ensure prof_data keeps the 
+        # exact same index as the 'trades' dataframe.
+        # 1. Create a reference Series: Index=ID, Value=Outcome
+        outcome_map = markets.set_index('contract_id')['outcome']
+        # 2. Drop duplicates to avoid mapping errors
+        outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
+        # 3. Map values safely
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        # ------------------------------------------
+        
         # Price Calculation
         valid_mask = (prof_data['tokens'] != 0) & (prof_data['usdc_vol'] > 0)
         prof_data['bet_price'] = np.where(
@@ -2419,6 +2427,7 @@ class BacktestEngine:
             (prof_data['usdc_vol'] / prof_data['tokens'].abs()).clip(0.001, 0.999),
             np.nan
         )
+        
         prof_data = prof_data.dropna(subset=['bet_price'])
         prof_data['entity_type'] = 'default_topic'
         
@@ -2432,24 +2441,34 @@ class BacktestEngine:
             if pd.isna(row['created_at']): continue
             events_ts.append(row['created_at'])
             events_type.append('NEW_CONTRACT')
-            # Safe Liquidity Handling
+            
             liq = row.get('liquidity')
             safe_liq = float(liq) if liq is not None else 0.0
-            events_data.append({'contract_id': row['contract_id'], 'p_market_all': 0.5, 'liquidity': safe_liq})
+            
+            events_data.append({
+                'contract_id': row['contract_id'], 
+                'p_market_all': 0.5, 
+                'liquidity': safe_liq
+            })
             
         # B. RESOLUTION
         for _, row in markets.iterrows():
             if pd.isna(row['resolution_timestamp']): continue
             events_ts.append(row['resolution_timestamp'])
             events_type.append('RESOLUTION')
-            events_data.append({'contract_id': row['contract_id'], 'outcome': float(row['outcome'])})
+            events_data.append({
+                'contract_id': row['contract_id'], 
+                'outcome': float(row['outcome'])
+            })
 
         # C. PRICE_UPDATE
         # Align trades with profiler data index
         trades = trades.sort_values('timestamp')
+        
+        # KEY STEP: This relies on indices matching.
+        # Since we removed .merge(), prof_data.index is now a valid subset of trades.index.
         aligned_trades = trades.loc[prof_data.index]
         
-        # Bulk list extraction for speed
         t_ts = aligned_trades['timestamp'].tolist()
         t_cid = aligned_trades['contract_id'].tolist()
         t_uid = aligned_trades['user'].astype(str).tolist()
@@ -2470,7 +2489,7 @@ class BacktestEngine:
 
         # 6. FINAL SORT
         df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
-        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp']) # Ensure type again
+        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
         df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
