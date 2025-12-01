@@ -1197,68 +1197,7 @@ class NLPCache:
     def get_entities(self, market_id):
         return self.cache.get(str(market_id), [])
 
-def calibrate_fresh_wallet_model(self, profiler_data):
-        """
-        Calibrates the 'Fresh Wallet' regression model (Volume -> Skill).
-        Includes strict statistical validation to prevent fitting noise.
-        """
-        from scipy.stats import linregress
-        import numpy as np
-        
-        # 1. Safe Default (Null Hypothesis: Random Brier 0.25, No Volume impact)
-        SAFE_SLOPE = 0.0
-        SAFE_INTERCEPT = 0.25
-        
-        # 2. Data Prep
-        # We need trades that have a known outcome
-        if 'outcome' not in profiler_data.columns or profiler_data.empty:
-            return SAFE_SLOPE, SAFE_INTERCEPT
-            
-        valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
-        
-        # 3. Minimum Sample Size Check
-        # Fitting a regression on < 50 trades is statistical malpractice
-        if len(valid) < 50:
-            return SAFE_SLOPE, SAFE_INTERCEPT
 
-        # 4. Calculate Trade-Level Brier Scores
-        # If Long (tokens > 0), Prediction is 1.0. Error = (1 - Outcome)^2
-        # If Short (tokens < 0), Prediction is 0.0. Error = (0 - Outcome)^2
-        valid = valid.copy()
-        valid['prediction'] = np.where(valid['tokens'] > 0, 1.0, 0.0)
-        valid['brier'] = (valid['prediction'] - valid['outcome']) ** 2
-        
-        # Log Transform Volume (Standardize impact)
-        # We use log1p to handle small values gracefully
-        valid['log_vol'] = np.log1p(valid['usdc_vol'])
-
-        try:
-            # 5. Run Regression
-            slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
-            
-            # 6. Statistical Significance Validation (The Fix)
-            # A. p-value > 0.05 means the relationship is likely random chance.
-            # B. slope > 0 means Higher Volume = WORSE Score (Dumb Whales). 
-            #    While possible, we usually don't want to blindly trust 'Contrarian' models 
-            #    on fresh wallets without more evidence. Safe bet is to ignore.
-            if p_val > 0.05 or slope > 0:
-                # Relationship is weak or inverted. Fallback to safe default.
-                return SAFE_SLOPE, SAFE_INTERCEPT
-                
-            # C. R-squared check (Optional but good)
-            # If R^2 is extremely low, the signal is negligible
-            if (r_val ** 2) < 0.01: 
-                return SAFE_SLOPE, SAFE_INTERCEPT
-                
-            # If we pass all checks, return the found relationship
-            # Bound the intercept to be sane (cannot be worse than 1.0 or better than 0.0)
-            intercept = max(0.0, min(intercept, 0.50))
-            
-            return slope, intercept
-            
-        except Exception as e:
-            # On any math error (e.g. singular matrix), return safe default
-            return SAFE_SLOPE, SAFE_INTERCEPT
 
 # --- OPTIMIZATION HELPER: Vectorized Profiler ---
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
@@ -1332,7 +1271,70 @@ class FastBacktestEngine:
                 self.minute_batches.append(list(group))
         else:
             self.minute_batches = []
+            
+    def calibrate_fresh_wallet_model(self, profiler_data):
+        """
+        Calibrates the 'Fresh Wallet' regression model (Volume -> Skill).
+        Includes strict statistical validation to prevent fitting noise.
+        """
+        from scipy.stats import linregress
+        import numpy as np
+        
+        # 1. Safe Default (Null Hypothesis: Random Brier 0.25, No Volume impact)
+        SAFE_SLOPE = 0.0
+        SAFE_INTERCEPT = 0.25
+        
+        # 2. Data Prep
+        # We need trades that have a known outcome
+        if 'outcome' not in profiler_data.columns or profiler_data.empty:
+            return SAFE_SLOPE, SAFE_INTERCEPT
+            
+        valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+        
+        # 3. Minimum Sample Size Check
+        # Fitting a regression on < 50 trades is statistical malpractice
+        if len(valid) < 50:
+            return SAFE_SLOPE, SAFE_INTERCEPT
 
+        # 4. Calculate Trade-Level Brier Scores
+        # If Long (tokens > 0), Prediction is 1.0. Error = (1 - Outcome)^2
+        # If Short (tokens < 0), Prediction is 0.0. Error = (0 - Outcome)^2
+        valid = valid.copy()
+        valid['prediction'] = np.where(valid['tokens'] > 0, 1.0, 0.0)
+        valid['brier'] = (valid['prediction'] - valid['outcome']) ** 2
+        
+        # Log Transform Volume (Standardize impact)
+        # We use log1p to handle small values gracefully
+        valid['log_vol'] = np.log1p(valid['usdc_vol'])
+
+        try:
+            # 5. Run Regression
+            slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
+            
+            # 6. Statistical Significance Validation (The Fix)
+            # A. p-value > 0.05 means the relationship is likely random chance.
+            # B. slope > 0 means Higher Volume = WORSE Score (Dumb Whales). 
+            #    While possible, we usually don't want to blindly trust 'Contrarian' models 
+            #    on fresh wallets without more evidence. Safe bet is to ignore.
+            if p_val > 0.05 or slope > 0:
+                # Relationship is weak or inverted. Fallback to safe default.
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # C. R-squared check (Optional but good)
+            # If R^2 is extremely low, the signal is negligible
+            if (r_val ** 2) < 0.01: 
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # If we pass all checks, return the found relationship
+            # Bound the intercept to be sane (cannot be worse than 1.0 or better than 0.0)
+            intercept = max(0.0, min(intercept, 0.50))
+            
+            return slope, intercept
+            
+        except Exception as e:
+            # On any math error (e.g. singular matrix), return safe default
+            return SAFE_SLOPE, SAFE_INTERCEPT
+            
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
         """
         Rolling Walk-Forward Optimization (Dictionary Compatible).
