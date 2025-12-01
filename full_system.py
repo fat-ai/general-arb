@@ -1458,7 +1458,7 @@ class FastBacktestEngine:
         Final Version: Full Reset, Explicit Shares, Net Sentiment, Safety Clipping.
         """
         import numpy as np
-
+        debug_prints = 0
         # Config extraction
         splash_thresh = config.get('splash_threshold', 10000)
         use_smart_exit = config.get('use_smart_exit', False)
@@ -1494,14 +1494,13 @@ class FastBacktestEngine:
                 elif ev_type == 'PRICE_UPDATE':
                
                     cid = data['contract_id']
-                # --- AMNESIA FIX ---
                     if cid not in market_liq:
                     # Check if we passed history, OR default to 10k
                         if known_liquidity and cid in known_liquidity:
                             market_liq[cid] = known_liquidity[cid]
                         else:
                             market_liq[cid] = 10000.0 
-                            
+                         
                     if cid not in market_prices: market_prices[cid] = 0.5
                     # Initialize if missing (e.g. we missed the NEW_CONTRACT event)
                     if cid not in tracker:
@@ -1530,7 +1529,11 @@ class FastBacktestEngine:
                     
                     # 4. Accumulate
                     tracker[cid]['net_weight'] += (weight * trade_direction)
-                    
+                    if debug_prints < 20 and abs(tracker[cid]['net_weight']) > 1.0:
+                        cur_wt = tracker[cid]['net_weight']
+                        print(f"   [DEBUG] ID:{cid[:6]} | Vol:{vol:.0f} | NetWt:{cur_wt:.2f} vs Thresh:{splash_thresh}")
+                        debug_prints += 1
+                        
                     # 5. Generate Signal
                     if abs(tracker[cid]['net_weight']) > splash_thresh:
                         raw_net = tracker[cid]['net_weight']
