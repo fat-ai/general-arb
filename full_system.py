@@ -2431,11 +2431,18 @@ class BacktestEngine:
         events_ts, events_type, events_data = [], [], []
 
         # A. NEW_CONTRACT
+       
         for _, row in markets.iterrows():
             events_ts.append(row['created_at'])
             events_type.append('NEW_CONTRACT')
-            events_data.append({'contract_id': row['contract_id'], 'p_market_all': 0.5, 'liquidity': float(row.get('liquidity', 0))})
-
+            liq_val = row.get('liquidity')
+            safe_liq = float(liq_val) if liq_val is not None else 0.0
+            events_data.append({
+                'contract_id': row['contract_id'], 
+                'p_market_all': 0.5, 
+                'liquidity': safe_liq
+            })
+            
         # B. RESOLUTION
         for _, row in markets.iterrows():
             events_ts.append(row['resolution_timestamp'])
