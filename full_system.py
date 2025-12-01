@@ -1862,8 +1862,7 @@ class BacktestEngine:
         import json
         import pandas as pd
         
-        # Cache file
-        cache_file = self.cache_dir / "gamma_markets_fixed_types.parquet"
+        cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1876,6 +1875,7 @@ class BacktestEngine:
         
         while True:
             try:
+                # Gamma API
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
@@ -1893,8 +1893,8 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- EXTRACT TOKEN ID (STRICT STRING) ---
-        def extract_token(row):
+        # --- EXTRACT ALL TOKEN IDS ---
+        def extract_all_tokens(row):
             try:
                 raw = row.get('clobTokenIds')
                 if not raw: return None
@@ -1905,17 +1905,21 @@ class BacktestEngine:
                 else: tokens = raw
                 
                 if isinstance(tokens, list) and len(tokens) > 0:
-                    val = tokens[0]
-                    # Convert to string without scientific notation
-                    if isinstance(val, (int, float)):
-                        return "{:.0f}".format(val)
-                    return str(val).strip()
+                    # Clean all IDs
+                    clean_ids = []
+                    for t in tokens:
+                        if isinstance(t, (int, float)):
+                            clean_ids.append("{:.0f}".format(t))
+                        else:
+                            clean_ids.append(str(t).strip())
+                    # Join with comma for storage
+                    return ",".join(clean_ids)
                 return None
             except: return None
 
-        df['contract_id'] = df.apply(extract_token, axis=1)
+        df['contract_id'] = df.apply(extract_all_tokens, axis=1)
         
-        # Validation
+        # Filter
         df = df.dropna(subset=['contract_id'])
         df['contract_id'] = df['contract_id'].astype(str)
 
@@ -2028,7 +2032,7 @@ class BacktestEngine:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, market_ids):
+    def _fetch_gamma_trades_parallel(self, market_ids_raw):
         import concurrent.futures 
         import csv
         import threading
@@ -2040,7 +2044,6 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        # Reset Files
         if ledger_file.exists():
             try: os.remove(ledger_file)
             except: pass
@@ -2048,8 +2051,19 @@ class BacktestEngine:
             try: os.remove(cache_file)
             except: pass
             
-        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
-        print("Config: Dual-Side Query (Maker+Taker) | Correct Scaling | Decimal IDs")
+        # EXPAND: 1 Market Row -> N Token IDs
+        all_tokens = []
+        for mid_str in market_ids_raw:
+            parts = str(mid_str).split(',')
+            for p in parts:
+                if len(p) > 5: # Basic validity check
+                    all_tokens.append(p.strip())
+        
+        # Deduplicate
+        all_tokens = list(set(all_tokens))
+            
+        print(f"Stream-fetching {len(all_tokens)} individual tokens via ORDERBOOK SUBGRAPH...")
+        print("Config: Full History | All Outcomes | 45s Timeout")
         
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
@@ -2061,23 +2075,21 @@ class BacktestEngine:
         ledger_lock = threading.Lock()
         self.first_success = False
         
-        def fetch_and_write_worker(token_id_raw, writer, f_handle):
+        def fetch_and_write_worker(token_str, writer, f_handle):
             session = requests.Session()
-            retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504, 524])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # 1. STRICT STRING ID
-            token_str = str(token_id_raw).strip()
-            if 'e+' in token_str or '.' in token_str:
-                return False
+            # Validation
+            if 'e+' in token_str or '.' in token_str: return False
 
-            last_ts = 2147483647 # Int32 Max
-            cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
+            # NO TIME LIMIT: Go back to the beginning
+            last_ts = 2147483647 
+            cutoff_ts = 0 
             
             while True:
                 try:
-                    # 2. DUAL QUERY (Capture Buys AND Sells)
-                    # We query trades where Token is Maker (Asks) AND where Token is Taker (Bids)
+                    # DUAL QUERY
                     query = """
                     query($token: String!, $max_ts: Int!) {
                       asMaker: orderFilledEvents(
@@ -2100,24 +2112,19 @@ class BacktestEngine:
                     """
                     variables = {"token": token_str, "max_ts": int(last_ts)}
                     
-                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=30)
+                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=45)
                     
                     if resp.status_code == 200:
                         r_json = resp.json()
                         if 'errors' in r_json: break 
                         
-                        # 3. MERGE & PROCESS
                         batch_maker = r_json.get('data', {}).get('asMaker', [])
                         batch_taker = r_json.get('data', {}).get('asTaker', [])
                         
-                        # Tag them so we know which logic to apply
-                        # Maker List: Token = MakerAsset, USDC = TakerAsset
-                        # Taker List: Token = TakerAsset, USDC = MakerAsset
                         tagged_rows = [(r, 'maker') for r in batch_maker] + [(r, 'taker') for r in batch_taker]
+                        if not tagged_rows: break 
                         
-                        if not tagged_rows: break # End of History
-                        
-                        # Sort by timestamp desc to handle pagination correctly
+                        # Sort Newest -> Oldest
                         tagged_rows.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
                         
                         rows = []
@@ -2130,30 +2137,26 @@ class BacktestEngine:
                                 
                                 if ts_val < cutoff_ts: continue
                                 
-                                # 4. DYNAMIC MAPPING
+                                # LOGIC
                                 if source == 'maker':
-                                    # Token is Maker. USDC is Taker.
                                     size = float(row.get('makerAmountFilled') or 0.0)
                                     usdc = float(row.get('takerAmountFilled') or 0.0)
-                                    user = str(row.get('taker') or 'unknown') # Taker is the aggressor (Buyer)
-                                    side_mult = 1 # Buyer took the Ask
+                                    user = str(row.get('taker') or 'unknown')
+                                    side_mult = 1
                                 else:
-                                    # Token is Taker. USDC is Maker.
                                     size = float(row.get('takerAmountFilled') or 0.0)
                                     usdc = float(row.get('makerAmountFilled') or 0.0)
-                                    user = str(row.get('taker') or 'unknown') # Taker is the aggressor (Seller)
-                                    side_mult = -1 # Seller hit the Bid
+                                    user = str(row.get('taker') or 'unknown')
+                                    side_mult = -1
                                 
                                 if size == 0: continue
-                                
                                 price = usdc / size
-                                
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': usdc,  # 5. CORRECT SCALING (No * 1e6)
-                                    'outcomeTokensAmount': size * side_mult * 1e18, # Est. for logic compatibility
+                                    'tradeAmount': usdc, # Correct Raw Value
+                                    'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
                                     'contract_id': token_str,
                                     'price': price,
@@ -2170,9 +2173,17 @@ class BacktestEngine:
                                     print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
-                        # Pagination Update
-                        if int(min_batch_ts) >= int(last_ts): break
-                        last_ts = min_batch_ts
+                        # PAGINATION FIX:
+                        # If the batch ends on the same timestamp we started with, and we haven't filtered logic...
+                        # Graph 'lt' skips the collision. This is acceptable for speed vs precision trade-off.
+                        # But if min_batch_ts didn't move, we are stuck.
+                        if int(min_batch_ts) >= int(last_ts): 
+                            # Force move back 1 second to break infinite loops on high-freq timestamps
+                            # (We accept losing sub-second trades at the boundary to ensure completion)
+                            last_ts = int(min_batch_ts) - 1
+                        else:
+                            last_ts = min_batch_ts
+                            
                         if min_batch_ts < cutoff_ts: break
                         
                     else:
@@ -2190,17 +2201,17 @@ class BacktestEngine:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
-                    for mid in market_ids
+                    for mid in all_tokens
                 ]
                 
                 completed = 0
                 for f_res in concurrent.futures.as_completed(futures):
                     completed += 1
                     if completed % 100 == 0:
-                        print(f" Progress: {completed}/{len(market_ids)} checked...", end="\r")
+                        print(f" Progress: {completed}/{len(all_tokens)} tokens checked...", end="\r")
 
         print("\n✅ Fetch complete.")
         try: df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
