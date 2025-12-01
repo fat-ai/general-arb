@@ -2410,7 +2410,8 @@ class BacktestEngine:
             'usdc_vol': trades['tradeAmount'].astype('float32'),
             'tokens': trades['outcomeTokensAmount'].astype('float32')
         })
-        
+        outcomes_map = markets[['contract_id', 'outcome']].drop_duplicates()
+        prof_data = prof_data.merge(outcomes_map, left_on='market_id', right_on='contract_id', how='left')
         # Price Calculation
         valid_mask = (prof_data['tokens'] != 0) & (prof_data['usdc_vol'] > 0)
         prof_data['bet_price'] = np.where(
