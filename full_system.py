@@ -1884,7 +1884,7 @@ class BacktestEngine:
             
             # B. Trigger Downloader (With Strict Time Limit)
             # This uses the fetcher you just updated
-            trades = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
+            trades = self._fetch_gamma_trades_parallel(target_tokens)
             
         else:
             print(f"   Loading local trades: {os.path.basename(trades_file)}")
@@ -2099,7 +2099,7 @@ class BacktestEngine:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, market_ids_raw):
+    def _fetch_gamma_trades_parallel(self, market_ids_raw, days_back=200):
         import concurrent.futures 
         import csv
         import threading
@@ -2111,48 +2111,40 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
-        if ledger_file.exists():
-            try: os.remove(ledger_file)
-            except: pass
-        if cache_file.exists():
-            try: os.remove(cache_file)
-            except: pass
-            
-        # EXPAND: 1 Market Row -> N Token IDs
+        # Expand Market IDs to Token IDs
         all_tokens = []
         for mid_str in market_ids_raw:
             parts = str(mid_str).split(',')
             for p in parts:
-                if len(p) > 5: # Basic validity check
-                    all_tokens.append(p.strip())
-        
-        # Deduplicate
+                if len(p) > 5: all_tokens.append(p.strip())
         all_tokens = list(set(all_tokens))
             
-        print(f"Stream-fetching {len(all_tokens)} individual tokens via ORDERBOOK SUBGRAPH...")
-        print("Config: Full History | All Outcomes | 45s Timeout")
+        print(f"Stream-fetching {len(all_tokens)} tokens via SUBGRAPH...")
+        print(f"Constraint: STRICT {days_back} DAY HISTORY LIMIT.")
         
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         
-        write_mode = 'w'
+        # Append if file exists, write new if not
+        write_mode = 'a' if cache_file.exists() else 'w'
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
         self.first_success = False
         
+        # CALCULATE THE HARD TIME LIMIT
+        limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+        CUTOFF_TS = limit_date.timestamp()
+        
         def fetch_and_write_worker(token_str, writer, f_handle):
             session = requests.Session()
-            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504, 524])
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # Validation
             if 'e+' in token_str or '.' in token_str: return False
 
-            # NO TIME LIMIT: Go back to the beginning
-            last_ts = 2147483647 
-            cutoff_ts = 0 
+            last_ts = 2147483647 # Int32 Max
             
             while True:
                 try:
@@ -2191,20 +2183,23 @@ class BacktestEngine:
                         tagged_rows = [(r, 'maker') for r in batch_maker] + [(r, 'taker') for r in batch_taker]
                         if not tagged_rows: break 
                         
-                        # Sort Newest -> Oldest
                         tagged_rows.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
                         
                         rows = []
                         min_batch_ts = last_ts
+                        stop_signal = False
                         
                         for row, source in tagged_rows:
+                            ts_val = float(row['timestamp'])
+                            min_batch_ts = min(min_batch_ts, ts_val)
+                            
+                            # --- STRICT DATE CHECK ---
+                            if ts_val < CUTOFF_TS:
+                                stop_signal = True
+                                continue
+                            # -------------------------
+                            
                             try:
-                                ts_val = float(row['timestamp'])
-                                min_batch_ts = min(min_batch_ts, ts_val)
-                                
-                                if ts_val < cutoff_ts: continue
-                                
-                                # LOGIC
                                 if source == 'maker':
                                     size = float(row.get('makerAmountFilled') or 0.0)
                                     usdc = float(row.get('takerAmountFilled') or 0.0)
@@ -2222,7 +2217,7 @@ class BacktestEngine:
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': usdc, # Correct Raw Value
+                                    'tradeAmount': usdc,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
                                     'contract_id': token_str,
@@ -2236,22 +2231,15 @@ class BacktestEngine:
                             with csv_lock:
                                 writer.writerows(rows)
                                 f_handle.flush()
-                                if not self.first_success:
-                                    print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
-                                    self.first_success = True
                         
-                        # PAGINATION FIX:
-                        # If the batch ends on the same timestamp we started with, and we haven't filtered logic...
-                        # Graph 'lt' skips the collision. This is acceptable for speed vs precision trade-off.
-                        # But if min_batch_ts didn't move, we are stuck.
-                        if int(min_batch_ts) >= int(last_ts): 
-                            # Force move back 1 second to break infinite loops on high-freq timestamps
-                            # (We accept losing sub-second trades at the boundary to ensure completion)
-                            last_ts = int(min_batch_ts) - 1
-                        else:
-                            last_ts = min_batch_ts
-                            
-                        if min_batch_ts < cutoff_ts: break
+                        # Stop if we hit the time limit
+                        if stop_signal: break
+                        
+                        if int(min_batch_ts) >= int(last_ts): last_ts = int(min_batch_ts) - 1
+                        else: last_ts = min_batch_ts
+                        
+                        # Stop if we went past cutoff
+                        if min_batch_ts < CUTOFF_TS: break
                         
                     else:
                         time.sleep(2)
@@ -2266,25 +2254,19 @@ class BacktestEngine:
 
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            writer.writeheader()
+            # Only write header if we are starting a NEW file
+            if write_mode == 'w': writer.writeheader()
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [
-                    executor.submit(fetch_and_write_worker, mid, writer, f) 
-                    for mid in all_tokens
-                ]
-                
+                futures = [executor.submit(fetch_and_write_worker, mid, writer, f) for mid in all_tokens]
                 completed = 0
-                for f_res in concurrent.futures.as_completed(futures):
+                for _ in concurrent.futures.as_completed(futures):
                     completed += 1
-                    if completed % 100 == 0:
-                        print(f" Progress: {completed}/{len(all_tokens)} tokens checked...", end="\r")
+                    if completed % 100 == 0: print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
 
         print("\n✅ Fetch complete.")
         try: df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         except: return pd.DataFrame()
-        df = df.drop_duplicates(subset=['contract_id', 'timestamp', 'tradeAmount'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.tz_localize(None)
         return df
         
     def _fetch_subgraph_trades(self, days_back=200):
