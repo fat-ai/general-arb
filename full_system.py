@@ -1840,25 +1840,21 @@ class BacktestEngine:
         import glob
         import os
         
-        print("Initializing Data Engine...")
+        # CONFIGURATION
+        REQ_DAYS = 200  # The objective constraint
+        
+        print(f"Initializing Data Engine (Limit: Last {REQ_DAYS} Days)...")
         
         # 1. ACQUIRE MARKETS
-        # We call the fetcher directly. It handles the "Download vs Load Cache" logic internally.
-        # If cache exists, it loads it. If not, it downloads from Gamma.
-        markets = self._fetch_gamma_markets(days_back=200)
+        # Ensure we have the market list. If not, fetch it (respecting date).
+        markets = self._fetch_gamma_markets(days_back=REQ_DAYS)
         
         if markets.empty:
-            print("❌ Market Fetch Failed. Cannot proceed.")
+            print("❌ Market Fetch Failed.")
             return pd.DataFrame(), pd.DataFrame()
-            
-        print(f"   Markets Ready: {len(markets)}")
 
         # 2. IDENTIFY REQUIRED TOKENS
-        # We need to know exactly what we are supposed to have.
         all_target_tokens = set()
-        
-        # Parse the comma-separated IDs from the market file
-        # (e.g. "123,456" -> adds "123" and "456" to target list)
         for raw_ids in markets['contract_id']:
             parts = str(raw_ids).split(',')
             for p in parts:
@@ -1866,61 +1862,50 @@ class BacktestEngine:
                 if len(p_clean) > 2:
                     all_target_tokens.add(p_clean)
         
-        print(f"   Target Tokens: {len(all_target_tokens)} (Total Outcomes)")
+        print(f"   Target Scope: {len(all_target_tokens)} tokens")
 
-        # 3. CHECK EXISTING TRADES
+        # 3. CHECK LOCAL CACHE
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         downloaded_tokens = set()
         trades = pd.DataFrame()
         
         if trades_file.exists():
-            print(f"   Found existing trades file. checking coverage...")
-            # Load unique IDs only first to check coverage (fast)
+            print(f"   Checking local cache...")
             try:
+                # Quick scan of what we have
                 existing_ids = pd.read_csv(trades_file, usecols=['contract_id'])
-                # Ensure they are strings to match target tokens
                 downloaded_tokens = set(existing_ids['contract_id'].astype(str).str.strip().unique())
-            except Exception as e:
-                print(f"   ⚠️ Could not read existing file ({e}). Treating as empty.")
+            except: pass
         
-        # 4. PERFORM GAP ANALYSIS & DOWNLOAD
-        # Identify exactly which tokens are missing
+        # 4. DOWNLOAD MISSING DATA
         missing_tokens = list(all_target_tokens - downloaded_tokens)
         
         if missing_tokens:
-            print(f"   ⚠️ Missing data for {len(missing_tokens)} tokens.")
-            print(f"   🚀 STARTING SCRATCH DOWNLOADER...")
+            print(f"   ⚠️ Found {len(missing_tokens)} tokens missing from cache.")
+            print(f"   🚀 downloading missing data (Last {REQ_DAYS} Days ONLY)...")
             
-            # This triggers the robust Graph fetcher for the missing batch
-            new_trades = self._fetch_gamma_trades_parallel(missing_tokens)
-            
-            if new_trades.empty and len(missing_tokens) > 0:
-                 print("   ⚠️ Downloader ran but returned no new trades (Markets might be inactive).")
+            # PASS THE REQ_DAYS TO THE FETCHER
+            new_trades = self._fetch_gamma_trades_parallel(missing_tokens, days_back=REQ_DAYS)
         else:
-            print("   ✅ Local cache is complete (100% of tokens present).")
+            print("   ✅ Local cache is complete.")
 
-        # 5. LOAD & ALIGN FINAL DATASET
-        print("   Loading full dataset into memory...")
-        if not trades_file.exists():
-            return pd.DataFrame(), pd.DataFrame()
+        # 5. LOAD & ALIGN
+        print("   Loading dataset...")
+        if not trades_file.exists(): return pd.DataFrame(), pd.DataFrame()
 
-        # Load full CSV with strict types
         trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
         trades['contract_id'] = trades['contract_id'].str.strip()
 
-        # Explode Markets to align with Trades
-        # (Map "ID1,ID2" row to separate rows for ID1 and ID2)
+        # Explode Markets
         markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
         markets = markets.explode('contract_id')
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # Filter for valid matches only
+        # Strict Sync
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
-        
-        # Final strict sync
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
         
         print(f"✅ SYSTEM READY.")
