@@ -1525,7 +1525,7 @@ class FastBacktestEngine:
                         brier = max(0.10, min(pred_brier, 0.35))
                     
                     skill_premium = max(0.0, 0.25 - brier)
-                    weight = vol * (skill_premium * 10.0)
+                    weight = vol * ((skill_premium * 10.0) + 0.01)
                     
                     # 4. Accumulate
                     tracker[cid]['net_weight'] += (weight * trade_direction)
