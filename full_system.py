@@ -1840,9 +1840,10 @@ class BacktestEngine:
         import glob
         import os
         
-        print("Loading data from cache (Offline Mode)...")
+        print("Loading data from cache...")
         
-        # 1. LOAD MARKETS
+        # 1. LOAD MARKETS (The latest file)
+        # We need the one with "all_tokens" or "fixed_types"
         market_files = glob.glob(str(self.cache_dir / "gamma_markets_*.parquet"))
         if not market_files:
             print("❌ No market file found.")
@@ -1859,32 +1860,42 @@ class BacktestEngine:
             return pd.DataFrame(), pd.DataFrame()
             
         print(f"   Loading Trades: {os.path.basename(trades_file)}")
+        # Load all cols with correct types
         trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
         
-        # Types and Cleaning
+        # Basic Trade Cleaning
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
         trades['contract_id'] = trades['contract_id'].str.strip()
-
-        # 3. ALIGN IDs (The only necessary step)
-        # Markets have "ID1,ID2" -> Trades have "ID1"
-        print("   Aligning Market IDs to Trades...")
         
-        # Explode markets so every token has its own row
-        markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
+        # 3. FIX THE ID MISMATCH (The Critical Step)
+        # Markets have "ID1,ID2". Trades have "ID1".
+        # We must 'explode' the markets dataframe so "ID1,ID2" becomes two rows.
+        print("   Expanding Market IDs...")
+        
+        # Ensure string
+        markets['contract_id'] = markets['contract_id'].astype(str)
+        
+        # Split "123,456" -> ["123", "456"]
+        markets['contract_id'] = markets['contract_id'].str.split(',')
+        
+        # Explode list into rows
         markets = markets.explode('contract_id')
+        
+        # Clean whitespace
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # 4. STRICT SYNC
-        # Only keep Markets that match the Trades we HAVE.
-        # We ignore "missing" tokens because they are likely outside our date range.
-        valid_trade_ids = set(trades['contract_id'].unique())
-        market_subset = markets[markets['contract_id'].isin(valid_trade_ids)].copy()
+        # 4. FILTER
+        # Only keep markets that we actually have trades for
+        valid_ids = set(trades['contract_id'].unique())
+        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         
-        # Double check trade alignment
-        trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
+        # Filter trades to match valid markets (removes orphans)
+        valid_market_ids = set(market_subset['contract_id'].unique())
+        trades = trades[trades['contract_id'].isin(valid_market_ids)].copy()
         
         print(f"✅ Data Load Complete.")
+        print(f"   Original Markets: {len(markets)}")
         print(f"   Matched Markets:  {len(market_subset)}")
         print(f"   Total Trades:     {len(trades)}")
         
