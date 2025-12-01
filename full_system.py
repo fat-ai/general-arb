@@ -1902,7 +1902,7 @@ class BacktestEngine:
                 if offset % 5000 == 0: print(f" {offset}..", end="", flush=True)
                 
                 # Cap at 50k to avoid fetching 2018 markets
-                if offset > 50000: break
+              
                 
             except Exception as e:
                 log.error(f"Market fetch error: {e}")
