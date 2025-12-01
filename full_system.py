@@ -1544,10 +1544,9 @@ class FastBacktestEngine:
                         
                         if abs(edge) > config.get('edge_threshold', 0.05):
                             
-                            if new_price < 0.05 or new_price > 0.95:
-                                continue
-                                
-                            if cid not in positions:
+                            is_valid_price = (new_price >= 0.05 and new_price <= 0.95)
+                            
+                            if is_valid_price and cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
                                 # Sizing
