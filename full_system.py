@@ -1197,41 +1197,68 @@ class NLPCache:
     def get_entities(self, market_id):
         return self.cache.get(str(market_id), [])
 
-def calibrate_fresh_wallet_model(profiler_data):
-    """
-    Regresses First-Trade-Size against Brier Score to find the 'Beta'.
-    Returns: (slope, intercept) for the equation: Brier = Intercept + Slope * ln(Volume)
-    """
-    if profiler_data.empty: return 0.0, 0.25
-    
-    # 1. Isolate the VERY FIRST trade for every wallet
-    df = profiler_data.sort_values('timestamp')
-    first_trades = df.groupby('wallet_id').first().reset_index()
-    
-    # 2. Filter for resolved outcomes and non-zero size
-    valid = first_trades[
-        (first_trades['outcome'].isin([0, 1])) & 
-        (first_trades['bet_price'] > 0) & 
-        (first_trades['size'] > 1.0) # Ignore dust
-    ].copy()
-    
-    if len(valid) < 5: return 0.0, 0.25 # Not enough data
-    
-    # 3. Calculate 'Single-Trade Brier'
-    valid['brier'] = (valid['bet_price'] - valid['outcome']) ** 2
-    
-    # 4. Log-Transform Volume (Trade Size * Price)
-    valid['trade_val'] = valid['size'] * valid['bet_price']
-    # Add 1.0 to avoid log(0)
-    valid['log_vol'] = np.log(valid['trade_val'] + 1.0)
-    
-    # 5. Run Regression
-    try:
-        slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
-        if np.isnan(slope) or np.isnan(intercept): return 0.0, 0.25
-        return slope, intercept
-    except:
-        return 0.0, 0.25
+def calibrate_fresh_wallet_model(self, profiler_data):
+        """
+        Calibrates the 'Fresh Wallet' regression model (Volume -> Skill).
+        Includes strict statistical validation to prevent fitting noise.
+        """
+        from scipy.stats import linregress
+        import numpy as np
+        
+        # 1. Safe Default (Null Hypothesis: Random Brier 0.25, No Volume impact)
+        SAFE_SLOPE = 0.0
+        SAFE_INTERCEPT = 0.25
+        
+        # 2. Data Prep
+        # We need trades that have a known outcome
+        if 'outcome' not in profiler_data.columns or profiler_data.empty:
+            return SAFE_SLOPE, SAFE_INTERCEPT
+            
+        valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+        
+        # 3. Minimum Sample Size Check
+        # Fitting a regression on < 50 trades is statistical malpractice
+        if len(valid) < 50:
+            return SAFE_SLOPE, SAFE_INTERCEPT
+
+        # 4. Calculate Trade-Level Brier Scores
+        # If Long (tokens > 0), Prediction is 1.0. Error = (1 - Outcome)^2
+        # If Short (tokens < 0), Prediction is 0.0. Error = (0 - Outcome)^2
+        valid = valid.copy()
+        valid['prediction'] = np.where(valid['tokens'] > 0, 1.0, 0.0)
+        valid['brier'] = (valid['prediction'] - valid['outcome']) ** 2
+        
+        # Log Transform Volume (Standardize impact)
+        # We use log1p to handle small values gracefully
+        valid['log_vol'] = np.log1p(valid['usdc_vol'])
+
+        try:
+            # 5. Run Regression
+            slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
+            
+            # 6. Statistical Significance Validation (The Fix)
+            # A. p-value > 0.05 means the relationship is likely random chance.
+            # B. slope > 0 means Higher Volume = WORSE Score (Dumb Whales). 
+            #    While possible, we usually don't want to blindly trust 'Contrarian' models 
+            #    on fresh wallets without more evidence. Safe bet is to ignore.
+            if p_val > 0.05 or slope > 0:
+                # Relationship is weak or inverted. Fallback to safe default.
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # C. R-squared check (Optional but good)
+            # If R^2 is extremely low, the signal is negligible
+            if (r_val ** 2) < 0.01: 
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # If we pass all checks, return the found relationship
+            # Bound the intercept to be sane (cannot be worse than 1.0 or better than 0.0)
+            intercept = max(0.0, min(intercept, 0.50))
+            
+            return slope, intercept
+            
+        except Exception as e:
+            # On any math error (e.g. singular matrix), return safe default
+            return SAFE_SLOPE, SAFE_INTERCEPT
 
 # --- OPTIMIZATION HELPER: Vectorized Profiler ---
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
@@ -1362,7 +1389,7 @@ class FastBacktestEngine:
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time):
         """
         Runs the simulation for a specific fold (Train or Test).
-        Optimized with fixes for Edge Calculation, Signal Reset, and Calibration.
+        Final Version: Full Reset, Explicit Shares, Net Sentiment, Safety Clipping.
         """
         import numpy as np
 
@@ -1375,24 +1402,15 @@ class FastBacktestEngine:
         if sizing_mode == 'fixed': sizing_val = config.get('fixed_size', 10.0)
         
         # State
-        cash = 10000.0  # Starting portfolio for this period
-        positions = {}  # {contract_id: {'side': 1/-1, 'size': $, 'entry': p}}
-        
-        # Trackers
-        # tracker[cid] = {'buy_weight': float, 'sell_weight': float, 'last_price': float}
+        cash = 10000.0
+        positions = {} 
         tracker = {}
         
         # Metrics
         trade_count = 0
         volume_traded = 0.0
         
-        # Helper: Sigmoid for bounding
-        def sigmoid(x): return 1 / (1 + np.exp(-x))
-
         for batch in batches:
-            # Sort batch by time to ensure causal order
-            # (Assuming batch is a list of events)
-            
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
@@ -1401,185 +1419,147 @@ class FastBacktestEngine:
                 # --- A. NEW CONTRACT ---
                 if ev_type == 'NEW_CONTRACT':
                     tracker[cid] = {
-                        'buy_weight': 0.0, 
-                        'sell_weight': 0.0, 
-                        'last_price': 0.5 # Initialize at 0.5
+                        'net_weight': 0.0, 
+                        'last_price': 0.5 
                     }
 
-                # --- B. PRICE UPDATE (THE CORE LOGIC) ---
+                # --- B. PRICE UPDATE ---
                 elif ev_type == 'PRICE_UPDATE':
+                    cid = data.get('contract_id')
+                    
                     if cid not in tracker:
-                        tracker[cid] = {'buy_weight': 0.0, 'sell_weight': 0.0, 'last_price': 0.5}
+                        tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
+
+                    # 1. Price Impact Logic
+                    new_price = data.get('p_market_all', 0.5)
+                    prev_price = tracker[cid]['last_price']
+                    price_delta = new_price - prev_price
                     
-                    # 1. Get Market Info
-                    # FIX: Use data.get properly and sanitize
-                    raw_price = data.get('p_market_all', 0.5)
-                    if np.isnan(raw_price) or np.isinf(raw_price): continue
+                    # Validate Direction
+                    if abs(price_delta) < 0.000001:
+                        trade_direction = -1.0 if data.get('is_sell') else 1.0
+                    else:
+                        trade_direction = np.sign(price_delta)
                     
-                    current_market_price = max(0.001, min(raw_price, 0.999))
-                    
-                    # 2. Extract Signal Data
+                    # 2. Weight Calculation
                     w_id = str(data.get('wallet_id'))
                     vol = float(data.get('trade_volume', 0.0))
-                    is_sell = data.get('is_sell', False)
                     
-                    # 3. Retrieve or Calibrate Wallet Score
-                    # Lower Brier = Better. Random = 0.25. Perfect = 0.0.
                     brier = wallet_scores.get((w_id, 'default_topic'))
-                    
                     if brier is None:
-                        # FIX: Use Slope AND Intercept for Fresh Wallets
-                        # We log-transform volume because impact usually scales logarithmically
                         log_vol = np.log(max(vol, 1.0))
                         pred_brier = fw_intercept + (fw_slope * log_vol)
-                        # Clamp to reasonable bounds (0.10 is very smart, 0.35 is dumb/random)
                         brier = max(0.10, min(pred_brier, 0.35))
                     
-                    # 4. Convert Brier to "Implied Accuracy" (Bayesian Weight)
-                    # Heuristic: If Brier=0.25 (Random), Accuracy=0.0. If Brier=0 (Perfect), Accuracy=1.0
-                    # Formula: weight = (0.25 - brier) * Volume
-                    # Only give positive weight to traders better than random (Brier < 0.25)
                     skill_premium = max(0.0, 0.25 - brier)
-                    weight = vol * (skill_premium * 10.0) # Scale up for impact
+                    weight = vol * (skill_premium * 10.0)
                     
-                    # 5. Accumulate Sentiment
-                    if is_sell:
-                        tracker[cid]['sell_weight'] += weight
-                    else:
-                        tracker[cid]['buy_weight'] += weight
-                        
-                    total_weight = tracker[cid]['buy_weight'] + tracker[cid]['sell_weight']
+                    # 3. Accumulate
+                    tracker[cid]['net_weight'] += (weight * trade_direction)
                     
-                    # 6. Check Splash Threshold
-                    if total_weight > splash_thresh:
-                        # --- GENERATE SIGNAL ---
-                        
-                        # Calculate Net Bullishness (-1.0 to 1.0)
-                        buy_w = tracker[cid]['buy_weight']
-                        sell_w = tracker[cid]['sell_weight']
-                        net_sentiment = (buy_w - sell_w) / (buy_w + sell_w + 1e-9)
-                        
-                        # Map to Probability (Centered on 0.5)
-                        # If net_sentiment is 1.0 (All Buy), p_model -> 0.9
-                        # If net_sentiment is -1.0 (All Sell), p_model -> 0.1
+                    # 4. Generate Signal
+                    if abs(tracker[cid]['net_weight']) > splash_thresh:
+                        raw_net = tracker[cid]['net_weight']
+                        net_sentiment = np.tanh(raw_net / 50000.0) 
                         p_model = 0.5 + (net_sentiment * 0.4) 
                         
-                        # FIX: Compare p_model to LAST price (Pre-impact) vs Current
-                        # If we think P should be 0.8, and market is 0.6, we buy.
-                        edge = p_model - current_market_price
+                        edge = p_model - prev_price 
                         
-                        # --- EXECUTION LOGIC ---
+                        # --- EXECUTION ---
                         if abs(edge) > config.get('edge_threshold', 0.05):
-                            # Check if we already have a position
                             if cid not in positions:
                                 side = 1 if edge > 0 else -1
                                 
                                 # Sizing
                                 target_f = 0.0
-                                if sizing_mode == "fixed_pct": 
-                                    target_f = sizing_val
-                                elif sizing_mode == "kelly":
-                                    # Simplified Kelly for Binary: f = edge / odds
-                                    # Odds = (1-p)/p. 
-                                    # Safe fallback: f = edge / 1.0 (conservative)
-                                    target_f = abs(edge) * sizing_val
-                                elif sizing_mode == "fixed":
-                                    cost = sizing_val
-                                    target_f = -1 # Flag for fixed cash
+                                if sizing_mode == "fixed_pct": target_f = sizing_val
+                                elif sizing_mode == "kelly": target_f = abs(edge) * sizing_val
+                                elif sizing_mode == "fixed": cost = sizing_val; target_f = -1
 
-                                # Cap size
                                 if target_f > 0:
                                     target_f = min(target_f, 0.20)
                                     cost = cash * target_f
                                 
                                 if cost > 5.0 and cash > cost:
+                                    # SAFETY: Clip entry price
+                                    safe_entry = max(0.001, min(new_price, 0.999))
+                                    
+                                    # EXPLICIT SHARE CALCULATION
+                                    if side == 1:
+                                        shares = cost / safe_entry
+                                    else:
+                                        shares = cost / (1.0 - safe_entry)
+
                                     cash -= cost
                                     positions[cid] = {
                                         'side': side, 
-                                        'size': cost, 
-                                        'entry': current_market_price
+                                        'size': cost,     
+                                        'shares': shares, 
+                                        'entry': safe_entry
                                     }
                                     trade_count += 1
                                     volume_traded += cost
                         
-                        # FIX: Reset Tracker to avoid infinite signaling
-                        # We keep a tiny bit of "momentum" (10%) but mostly reset
-                        tracker[cid]['buy_weight'] *= 0.1
-                        tracker[cid]['sell_weight'] *= 0.1
+                        # FIX: Full Reset to 0 (No path dependency)
+                        tracker[cid]['net_weight'] = 0.0
 
-                    # Update Price Tracking for Next Tick
-                    tracker[cid]['last_price'] = current_market_price
+                    tracker[cid]['last_price'] = new_price
 
-                    # --- C. MANAGE POSITIONS (Stop Loss / Take Profit) ---
-                    if cid in positions:
-                        pos = positions[cid]
-                        should_close = False
+                # --- C. POSITIONS ---
+                elif cid in positions:
+                    pos = positions[cid]
+                    should_close = False
+                    
+                    curr_p = data.get('p_market_all') if ev_type == 'PRICE_UPDATE' else tracker.get(cid, {}).get('last_price', 0.5)
+
+                    # PnL Calculation
+                    if pos['side'] == 1: 
+                        pnl_pct = (curr_p - pos['entry']) / pos['entry']
+                    else: 
+                        pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
+                    
+                    if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
                         
-                        # Calculate PnL %
-                        curr_val = 0
-                        if pos['side'] == 1: # Long Yes
-                            # Profit if Price > Entry
-                            pnl_pct = (current_market_price - pos['entry']) / pos['entry']
-                        else: # Long No (Short Yes)
-                            # Profit if Price < Entry
-                            pnl_pct = (pos['entry'] - current_market_price) / (1.0 - pos['entry'])
+                    if use_smart_exit:
+                        cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                        if pos['side'] == 1 and cur_net < -splash_thresh/2: should_close = True
+                        if pos['side'] == -1 and cur_net > splash_thresh/2: should_close = True
                         
-                        # Stop Loss
-                        if stop_loss_pct and pnl_pct < -stop_loss_pct:
-                            should_close = True
-                            
-                        # Smart Exit (Signal Reversal)
-                        if use_smart_exit:
-                            # Re-calculate sentiment briefly
-                            cur_net = (tracker[cid]['buy_weight'] - tracker[cid]['sell_weight'])
-                            if pos['side'] == 1 and cur_net < 0: should_close = True
-                            if pos['side'] == -1 and cur_net > 0: should_close = True
-                            
-                        if should_close:
-                            # Cash out
-                            payout = pos['size'] * (1.0 + pnl_pct)
-                            cash += payout
-                            del positions[cid]
+                    if should_close:
+                        if pos['side'] == 1:
+                            payout = pos['shares'] * curr_p
+                        else:
+                            payout = pos['shares'] * (1.0 - curr_p)
+                        cash += payout
+                        del positions[cid]
 
                 # --- D. RESOLUTION ---
-                elif ev_type == 'RESOLUTION':
+                if ev_type == 'RESOLUTION':
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(data.get('outcome', 0))
                         
-                        # Binary Payoff
-                        # If Long Yes (1) and Outcome 1 -> Win
-                        # If Short Yes (-1) and Outcome 0 -> Win
                         win = False
                         if pos['side'] == 1 and outcome == 1.0: win = True
                         if pos['side'] == -1 and outcome == 0.0: win = True
                         
                         if win:
-                            # Payout is 1.00 per share.
-                            # Shares = Size / Entry
-                            if pos['side'] == 1:
-                                shares = pos['size'] / pos['entry']
-                            else:
-                                shares = pos['size'] / (1.0 - pos['entry'])
-                            
-                            cash += shares # (Shares * $1.00)
+                            cash += pos['shares']
                         
                         del positions[cid]
         
         # End of Period Valuation
-        # Liquidate remaining positions at current recorded prices
         final_value = cash
         for cid, pos in positions.items():
             last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
             if pos['side'] == 1:
-                val = (pos['size'] / pos['entry']) * last_p
+                val = pos['shares'] * last_p
             else:
-                val = (pos['size'] / (1-pos['entry'])) * (1-last_p)
+                val = pos['shares'] * (1.0 - last_p)
             final_value += val
             
         return final_value, trade_count
-
-    # ... (Methods _aggregate_fold_results and _calculate_metrics remain unchanged) ...
+        
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         total_ret = 1.0
@@ -2269,6 +2249,7 @@ class BacktestEngine:
     
     def _transform_to_events(self, markets, trades):
         import gc
+
         log.info("Transforming Data (Robust Mode)...")
         
         # 1. Ensure IDs are standard strings
@@ -2291,18 +2272,31 @@ class BacktestEngine:
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
         
         # 3. Build Profiler Data
+        # FIX: Map 'size' to tradeAmount (USDC) to ensure Price = USDC / Tokens works
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'].astype(str), 
             'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
-            'size': trades['size'].astype('float32'),
-            'tokens': trades['outcomeTokensAmount'].astype('float32')
+            'usdc_vol': trades['tradeAmount'].astype('float32'),       # Volume in Dollars
+            'tokens': trades['outcomeTokensAmount'].astype('float32')  # Number of Shares
         })
         
-        # Calculate Price safely
-        # Avoid division by zero and infinite values
-        price_series = (prof_data['size'] / prof_data['tokens'])
-        prof_data['bet_price'] = price_series.replace([np.inf, -np.inf], np.nan).fillna(0).abs().clip(0, 1)
+        # --- FIX: ROBUST PRICE CALCULATION ---
+        # Formula: Price = USDC / Abs(Shares)
+        # 1. Avoid Division by Zero
+        valid_mask = (prof_data['tokens'] != 0) & (prof_data['usdc_vol'] > 0)
+        
+        # 2. Vectorized Calculation with safety checks
+        prof_data['bet_price'] = np.where(
+            valid_mask,
+            (prof_data['usdc_vol'] / prof_data['tokens'].abs()).clip(0.001, 0.999),
+            np.nan
+        )
+        
+        # 3. Drop invalid rows (Don't fill with 0, just ignore them)
+        prof_data = prof_data.dropna(subset=['bet_price'])
+        
+        # Add metadata
         prof_data['entity_type'] = 'default_topic'
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
@@ -2322,19 +2316,23 @@ class BacktestEngine:
             events_type.append('RESOLUTION')
             events_data.append({'contract_id': row['contract_id'], 'outcome': float(row['outcome'])})
 
-        # C. PRICE_UPDATE (Explicit Iteration to avoid Zip misalignment)
+        # C. PRICE_UPDATE (Using the calculated bet_price)
         # Sort trades by time first
         trades = trades.sort_values('timestamp')
         
         # Vectorized preparation
-        t_ts = trades['timestamp'].tolist()
-        t_cid = trades['contract_id'].tolist()
-        t_uid = trades['user'].astype(str).tolist()
-        t_vol = trades['tradeAmount'].tolist()
-        t_price = prof_data['bet_price'].tolist() # Aligned because prof_data is built from trades
-        t_tokens = trades['outcomeTokensAmount'].tolist()
+        # Note: We must align 'trades' with 'prof_data' since we dropped rows from prof_data
+        # Re-index trades to match the filtered prof_data
+        aligned_trades = trades.loc[prof_data.index]
         
-        for i in range(len(trades)):
+        t_ts = aligned_trades['timestamp'].tolist()
+        t_cid = aligned_trades['contract_id'].tolist()
+        t_uid = aligned_trades['user'].astype(str).tolist()
+        t_vol = aligned_trades['tradeAmount'].tolist()
+        t_tokens = aligned_trades['outcomeTokensAmount'].tolist()
+        t_price = prof_data['bet_price'].tolist() 
+        
+        for i in range(len(aligned_trades)):
             events_ts.append(t_ts[i])
             events_type.append('PRICE_UPDATE')
             events_data.append({
