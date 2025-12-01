@@ -2040,6 +2040,7 @@ class BacktestEngine:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         ledger_file = self.cache_dir / "gamma_completed.txt"
         
+        # Reset Files
         if ledger_file.exists():
             try: os.remove(ledger_file)
             except: pass
@@ -2048,7 +2049,7 @@ class BacktestEngine:
             except: pass
             
         print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
-        print("Config: Decimal IDs | MakerAsset Filter | Timestamp: Int")
+        print("Config: Dual-Side Query (Maker+Taker) | Correct Scaling | Decimal IDs")
         
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
@@ -2065,21 +2066,21 @@ class BacktestEngine:
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
+            # 1. STRICT STRING ID
             token_str = str(token_id_raw).strip()
-            
-            # Reject Scientific Notation
             if 'e+' in token_str or '.' in token_str:
                 return False
 
-            last_ts = 2147483647 # Max 32-bit Int (Year 2038) - Safe for 'Int' type
+            last_ts = 2147483647 # Int32 Max
             cutoff_ts = (pd.Timestamp.now() - pd.Timedelta(days=205)).timestamp()
             
             while True:
                 try:
-                    # FIX: Use 'Int!' instead of 'BigInt!'
+                    # 2. DUAL QUERY (Capture Buys AND Sells)
+                    # We query trades where Token is Maker (Asks) AND where Token is Taker (Bids)
                     query = """
                     query($token: String!, $max_ts: Int!) {
-                      orderFilledEvents(
+                      asMaker: orderFilledEvents(
                         first: 1000
                         orderBy: timestamp
                         orderDirection: desc
@@ -2087,48 +2088,72 @@ class BacktestEngine:
                       ) {
                         timestamp, makerAmountFilled, takerAmountFilled, maker, taker
                       }
+                      asTaker: orderFilledEvents(
+                        first: 1000
+                        orderBy: timestamp
+                        orderDirection: desc
+                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
+                      ) {
+                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
+                      }
                     }
                     """
-                    # FIX: Explicit int() cast to prevent Float error
                     variables = {"token": token_str, "max_ts": int(last_ts)}
                     
                     resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=30)
                     
                     if resp.status_code == 200:
                         r_json = resp.json()
-                        if 'errors' in r_json: 
-                            # If we get a type error, we can't recover for this market
-                            break 
+                        if 'errors' in r_json: break 
                         
-                        data = r_json.get('data', {}).get('orderFilledEvents', [])
-                        if not data: break # End of History
+                        # 3. MERGE & PROCESS
+                        batch_maker = r_json.get('data', {}).get('asMaker', [])
+                        batch_taker = r_json.get('data', {}).get('asTaker', [])
+                        
+                        # Tag them so we know which logic to apply
+                        # Maker List: Token = MakerAsset, USDC = TakerAsset
+                        # Taker List: Token = TakerAsset, USDC = MakerAsset
+                        tagged_rows = [(r, 'maker') for r in batch_maker] + [(r, 'taker') for r in batch_taker]
+                        
+                        if not tagged_rows: break # End of History
+                        
+                        # Sort by timestamp desc to handle pagination correctly
+                        tagged_rows.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
                         
                         rows = []
                         min_batch_ts = last_ts
                         
-                        for row in data:
+                        for row, source in tagged_rows:
                             try:
                                 ts_val = float(row['timestamp'])
                                 min_batch_ts = min(min_batch_ts, ts_val)
                                 
                                 if ts_val < cutoff_ts: continue
                                 
-                                # METRICS
-                                size = float(row.get('makerAmountFilled') or 0.0)
-                                usdc = float(row.get('takerAmountFilled') or 0.0)
+                                # 4. DYNAMIC MAPPING
+                                if source == 'maker':
+                                    # Token is Maker. USDC is Taker.
+                                    size = float(row.get('makerAmountFilled') or 0.0)
+                                    usdc = float(row.get('takerAmountFilled') or 0.0)
+                                    user = str(row.get('taker') or 'unknown') # Taker is the aggressor (Buyer)
+                                    side_mult = 1 # Buyer took the Ask
+                                else:
+                                    # Token is Taker. USDC is Maker.
+                                    size = float(row.get('takerAmountFilled') or 0.0)
+                                    usdc = float(row.get('makerAmountFilled') or 0.0)
+                                    user = str(row.get('taker') or 'unknown') # Taker is the aggressor (Seller)
+                                    side_mult = -1 # Seller hit the Bid
                                 
                                 if size == 0: continue
                                 
-                                price = usdc / size if size > 0 else 0.0
-                                side_mult = 1 
+                                price = usdc / size
                                 
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
-                                user = str(row.get('taker') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
-                                    'tradeAmount': usdc * 1e6,
-                                    'outcomeTokensAmount': size * side_mult * 1e18,
+                                    'tradeAmount': usdc,  # 5. CORRECT SCALING (No * 1e6)
+                                    'outcomeTokensAmount': size * side_mult * 1e18, # Est. for logic compatibility
                                     'user': user,
                                     'contract_id': token_str,
                                     'price': price,
@@ -2145,13 +2170,13 @@ class BacktestEngine:
                                     print(f"\n✅ SUCCESS: Connected to {token_str[:10]}... (Found {len(rows)} trades)")
                                     self.first_success = True
                         
-                        # Pagination Loop Logic
+                        # Pagination Update
                         if int(min_batch_ts) >= int(last_ts): break
                         last_ts = min_batch_ts
                         if min_batch_ts < cutoff_ts: break
                         
                     else:
-                        time.sleep(1)
+                        time.sleep(2)
                         continue
 
                 except Exception:
@@ -2165,7 +2190,7 @@ class BacktestEngine:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
                     for mid in market_ids
