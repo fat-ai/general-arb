@@ -1795,123 +1795,121 @@ class BacktestEngine:
         except: pass
 
     def run_tuning_job(self):
-    """
-    FIXED: Search space now uses realistic thresholds that match the weight scale.
-    """
-    log.info("--- Starting Full Strategy Optimization (FIXED) ---")
-    
-    df_markets, df_trades = self._load_data()
-    if df_markets.empty or df_trades.empty: 
-        log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
-        return None
-  
-    event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
-    now = pd.Timestamp.now()
-    event_log = event_log[event_log.index <= now]
 
-    if event_log.empty:
-        log.error("⛔ Event log is empty after transformation.")
-        return None
-
-    min_date = event_log.index.min()
-    max_date = event_log.index.max()
-    total_days = (max_date - min_date).days
-
-    log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
-
-    safe_train = max(5, int(total_days * 0.33))
-    safe_test = max(5, int(total_days * 0.60))
-    required_days = safe_train + safe_test + 2
-    
-    if total_days < required_days:
-        log.error(f"⛔ Not enough data: Have {total_days} days, need {required_days} for current split.")
-        return None
+        log.info("--- Starting Full Strategy Optimization (FIXED) ---")
         
-    log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
-
-    import gc
-    del df_markets, df_trades
-    gc.collect()
-
-    log.info("Uploading data to Ray Object Store...")
-    event_log_ref = ray.put(event_log)
-    profiler_ref = ray.put(profiler_data)
-    nlp_cache_ref = ray.put(None)
-    priors_ref = ray.put({})
+        df_markets, df_trades = self._load_data()
+        if df_markets.empty or df_trades.empty: 
+            log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
+            return None
+      
+        event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        now = pd.Timestamp.now()
+        event_log = event_log[event_log.index <= now]
     
-    gc.collect()
+        if event_log.empty:
+            log.error("⛔ Event log is empty after transformation.")
+            return None
     
-    from ray.tune.search.hyperopt import HyperOptSearch
+        min_date = event_log.index.min()
+        max_date = event_log.index.max()
+        total_days = (max_date - min_date).days
     
-    # === FIXED SEARCH SPACE ===
-    search_space = {
-        # --- FIX 1: Raised Threshold Range ---
-        # Old: [2.0] → New: [50, 100, 150, 200]
-        # This matches the new weight calculation scale
-        "splash_threshold": tune.choice([50.0, 100.0, 150.0, 200.0]),
+        log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
+    
+        safe_train = max(5, int(total_days * 0.33))
+        safe_test = max(5, int(total_days * 0.60))
+        required_days = safe_train + safe_test + 2
         
-        # --- FIX 2: Lowered Edge Threshold ---
-        # Old: [0.01] → New: [0.01, 0.03, 0.05]
-        # With better signals, we can afford to be more selective
-        "edge_threshold": tune.choice([0.01, 0.03, 0.05]),
-        
-        # Longer Window for statistical significance
-        "train_days": tune.choice([safe_train]),
-        "test_days": tune.choice([safe_test]),
-        "seed": 42,
-        
-        # 1. Sizing Options (Dynamic vs Static)
-        "sizing": tune.choice([
-            ("kelly", 1.0), ("kelly", 0.5), ("kelly", 0.25),
-            ("fixed_pct", 0.10), ("fixed_pct", 0.075), ("fixed_pct", 0.05), ("fixed_pct", 0.025)
-        ]),
-        
-        # 2. Smart Exit (Toggle)
-        "use_smart_exit": tune.choice([True, False]),
-        
-        # 3. Stop Loss (None = 100%)
-        "stop_loss": tune.choice([None, 0.05, 0.10, 0.15, 0.25, 0.35])
-    }
-
-    searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
+        if total_days < required_days:
+            log.error(f"⛔ Not enough data: Have {total_days} days, need {required_days} for current split.")
+            return None
+            
+        log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
     
-    # Higher sample count to cover combinations
-    analysis = tune.run(
-        tune.with_parameters(
-            ray_backtest_wrapper,
-            event_log_ref=event_log_ref,
-            profiler_ref=profiler_ref,
-            nlp_cache_ref=nlp_cache_ref,
-            priors_ref=priors_ref
-        ),
-        config=search_space,
-        search_alg=searcher,
-        num_samples=30,  # Increased to cover new threshold combinations
-        resources_per_trial={"cpu": 1},
-    )
-
-    best_config = analysis.get_best_config(metric="smart_score", mode="max")
-    best_trial = [t for t in analysis.trials if t.config == best_config][0]
-    metrics = best_trial.last_result
+        import gc
+        del df_markets, df_trades
+        gc.collect()
     
-    mode, val = best_config['sizing']
-    sizing_str = f"Kelly {val}x" if mode == "kelly" else f"Fixed {val*100}%"
+        log.info("Uploading data to Ray Object Store...")
+        event_log_ref = ray.put(event_log)
+        profiler_ref = ray.put(profiler_data)
+        nlp_cache_ref = ray.put(None)
+        priors_ref = ray.put({})
+        
+        gc.collect()
+        
+        from ray.tune.search.hyperopt import HyperOptSearch
+        
+        # === FIXED SEARCH SPACE ===
+        search_space = {
+            # --- FIX 1: Raised Threshold Range ---
+            # Old: [2.0] → New: [50, 100, 150, 200]
+            # This matches the new weight calculation scale
+            "splash_threshold": tune.choice([50.0, 100.0, 150.0, 200.0]),
+            
+            # --- FIX 2: Lowered Edge Threshold ---
+            # Old: [0.01] → New: [0.01, 0.03, 0.05]
+            # With better signals, we can afford to be more selective
+            "edge_threshold": tune.choice([0.01, 0.03, 0.05]),
+            
+            # Longer Window for statistical significance
+            "train_days": tune.choice([safe_train]),
+            "test_days": tune.choice([safe_test]),
+            "seed": 42,
+            
+            # 1. Sizing Options (Dynamic vs Static)
+            "sizing": tune.choice([
+                ("kelly", 1.0), ("kelly", 0.5), ("kelly", 0.25),
+                ("fixed_pct", 0.10), ("fixed_pct", 0.075), ("fixed_pct", 0.05), ("fixed_pct", 0.025)
+            ]),
+            
+            # 2. Smart Exit (Toggle)
+            "use_smart_exit": tune.choice([True, False]),
+            
+            # 3. Stop Loss (None = 100%)
+            "stop_loss": tune.choice([None, 0.05, 0.10, 0.15, 0.25, 0.35])
+        }
     
-    print("\n" + "="*60)
-    print("🏆  GRAND CHAMPION STRATEGY  🏆")
-    print(f"   Splash Threshold: {best_config['splash_threshold']:.1f}")
-    print(f"   Edge Threshold:   {best_config['edge_threshold']:.3f}")
-    print(f"   Sizing:           {sizing_str}")
-    print(f"   Smart Exit:       {best_config['use_smart_exit']}")
-    print(f"   Stop Loss:        {best_config['stop_loss']}")
-    print(f"   Smart Score:      {metrics.get('smart_score', 0.0):.4f}")
-    print(f"   Total Return:     {metrics.get('total_return', 0.0):.2%}")
-    print(f"   Max Drawdown:     {metrics.get('max_drawdown', 0.0):.2%}")
-    print(f"   Sharpe Ratio:     {metrics.get('sharpe_ratio', 0.0):.4f}")
-    print(f"   Trades:           {metrics.get('trades', 0)}")
-    print("="*60 + "\n")
-
-    return best_config
+        searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
+        
+        # Higher sample count to cover combinations
+        analysis = tune.run(
+            tune.with_parameters(
+                ray_backtest_wrapper,
+                event_log_ref=event_log_ref,
+                profiler_ref=profiler_ref,
+                nlp_cache_ref=nlp_cache_ref,
+                priors_ref=priors_ref
+            ),
+            config=search_space,
+            search_alg=searcher,
+            num_samples=30,  # Increased to cover new threshold combinations
+            resources_per_trial={"cpu": 1},
+        )
+    
+        best_config = analysis.get_best_config(metric="smart_score", mode="max")
+        best_trial = [t for t in analysis.trials if t.config == best_config][0]
+        metrics = best_trial.last_result
+        
+        mode, val = best_config['sizing']
+        sizing_str = f"Kelly {val}x" if mode == "kelly" else f"Fixed {val*100}%"
+        
+        print("\n" + "="*60)
+        print("🏆  GRAND CHAMPION STRATEGY  🏆")
+        print(f"   Splash Threshold: {best_config['splash_threshold']:.1f}")
+        print(f"   Edge Threshold:   {best_config['edge_threshold']:.3f}")
+        print(f"   Sizing:           {sizing_str}")
+        print(f"   Smart Exit:       {best_config['use_smart_exit']}")
+        print(f"   Stop Loss:        {best_config['stop_loss']}")
+        print(f"   Smart Score:      {metrics.get('smart_score', 0.0):.4f}")
+        print(f"   Total Return:     {metrics.get('total_return', 0.0):.2%}")
+        print(f"   Max Drawdown:     {metrics.get('max_drawdown', 0.0):.2%}")
+        print(f"   Sharpe Ratio:     {metrics.get('sharpe_ratio', 0.0):.4f}")
+        print(f"   Trades:           {metrics.get('trades', 0)}")
+        print("="*60 + "\n")
+    
+        return best_config
         
     def _load_data(self):
         import pandas as pd
