@@ -1842,8 +1842,7 @@ class BacktestEngine:
         
         print("Loading data from cache...")
         
-        # 1. LOAD MARKETS (The latest file)
-        # We need the one with "all_tokens" or "fixed_types"
+        # 1. LOAD MARKETS
         market_files = glob.glob(str(self.cache_dir / "gamma_markets_*.parquet"))
         if not market_files:
             print("❌ No market file found.")
@@ -1853,49 +1852,81 @@ class BacktestEngine:
         print(f"   Loading Markets: {os.path.basename(latest_market_file)}")
         markets = pd.read_parquet(latest_market_file)
         
+        # --- FIX 1: REMOVE DATE FILTER ---
+        # OLD: cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=205)
+        # OLD: markets = markets[markets['resolution_timestamp'] >= cutoff_date]
+        
+        # NEW: Keep ALL markets to capture 2024 Election volume
+        print(f"   Markets Loaded: {len(markets)} (Full History)")
+        # ---------------------------------
+        
         # 2. LOAD TRADES
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
+        
+        # If trades file doesn't exist yet, pass ALL tokens to the fetcher
         if not trades_file.exists():
-            print("❌ No trades file found.")
-            return pd.DataFrame(), pd.DataFrame()
+            print("   No existing trades. Queueing ALL markets for download...")
+            trades = pd.DataFrame(columns=['contract_id'])
+        else:
+            print(f"   Loading Trades: {os.path.basename(trades_file)}")
+            trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
+            trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
+            trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
+            trades['contract_id'] = trades['contract_id'].str.strip()
+
+        # 3. IDENTIFY MISSING TOKENS
+        # We need to know which tokens we haven't downloaded yet.
+        
+        # A. Get all target tokens from Markets
+        all_target_tokens = []
+        for raw_ids in markets['contract_id']:
+            parts = str(raw_ids).split(',')
+            for p in parts:
+                p_clean = p.strip()
+                if len(p_clean) > 2:
+                    all_target_tokens.append(p_clean)
+        
+        all_target_tokens = set(all_target_tokens)
+        
+        # B. Get downloaded tokens
+        downloaded_tokens = set(trades['contract_id'].unique()) if not trades.empty else set()
+        
+        # C. Find the Gap
+        missing_tokens = list(all_target_tokens - downloaded_tokens)
+        
+        print(f"   Total Tokens:     {len(all_target_tokens)}")
+        print(f"   Downloaded:       {len(downloaded_tokens)}")
+        print(f"   Missing/Queued:   {len(missing_tokens)}")
+        
+        # 4. FETCH MISSING TRADES
+        if missing_tokens:
+            print(f"   🚀 Launching Downloader for {len(missing_tokens)} missing tokens...")
+            # This triggers the _fetch_gamma_trades_parallel function you already have
+            new_trades = self._fetch_gamma_trades_parallel(missing_tokens)
             
-        print(f"   Loading Trades: {os.path.basename(trades_file)}")
-        # Load all cols with correct types
-        trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
+            if not new_trades.empty:
+                # Merge new trades with old trades
+                if not trades.empty:
+                    trades = pd.concat([trades, new_trades], ignore_index=True)
+                else:
+                    trades = new_trades
         
-        # Basic Trade Cleaning
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
-        trades['contract_id'] = trades['contract_id'].str.strip()
-        
-        # 3. FIX THE ID MISMATCH (The Critical Step)
-        # Markets have "ID1,ID2". Trades have "ID1".
-        # We must 'explode' the markets dataframe so "ID1,ID2" becomes two rows.
-        print("   Expanding Market IDs...")
-        
-        # Ensure string
-        markets['contract_id'] = markets['contract_id'].astype(str)
-        
-        # Split "123,456" -> ["123", "456"]
-        markets['contract_id'] = markets['contract_id'].str.split(',')
-        
-        # Explode list into rows
+        # 5. EXPAND MARKET IDs FOR MATCHING
+        # Markets have "ID1,ID2". Trades have "ID1". We explode Markets to match.
+        print("   Aligning Market IDs...")
+        markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
         markets = markets.explode('contract_id')
-        
-        # Clean whitespace
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # 4. FILTER
-        # Only keep markets that we actually have trades for
+        # 6. FINAL FILTER
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         
-        # Filter trades to match valid markets (removes orphans)
-        valid_market_ids = set(market_subset['contract_id'].unique())
-        trades = trades[trades['contract_id'].isin(valid_market_ids)].copy()
+        # Ensure we don't drop trades that just don't have metadata (optional, but good for safety)
+        # For now, we sync them:
+        trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
         
         print(f"✅ Data Load Complete.")
-        print(f"   Original Markets: {len(markets)}")
         print(f"   Matched Markets:  {len(market_subset)}")
         print(f"   Total Trades:     {len(trades)}")
         
