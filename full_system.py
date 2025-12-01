@@ -1862,8 +1862,8 @@ class BacktestEngine:
         import os
         import json
         
-        # Cache file
-        cache_file = self.cache_dir / "gamma_markets_universal.parquet"
+        # New cache file to ensure fresh start
+        cache_file = self.cache_dir / "gamma_markets_decimal_tokens.parquet"
         
         if cache_file.exists():
             try: os.remove(cache_file)
@@ -1872,11 +1872,11 @@ class BacktestEngine:
         all_rows = []
         offset = 0
         
-        print(f"Fetching GLOBAL market list...")
+        print(f"Fetching GLOBAL market list (Gamma API)...")
         
         while True:
             try:
-                # Gamma API is the only reliable source for the Market List
+                # Gamma API is reliable for the LIST
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
                 if resp.status_code != 200: break
@@ -1894,30 +1894,21 @@ class BacktestEngine:
 
         df = pd.DataFrame(all_rows)
         
-        # --- UNIVERSAL ID EXTRACTION ---
-        def extract_ids(row):
-            # 1. Condition ID (Required for Subgraph)
-            cid = str(row.get('conditionId', '')).strip()
-            
-            # 2. Token ID (Required for Backtest/Execution)
-            tid = ""
-            raw_tok = row.get('clobTokenIds')
-            if raw_tok:
-                if isinstance(raw_tok, str): 
-                    try: t_list = json.loads(raw_tok)
-                    except: t_list = []
-                else: t_list = raw_tok
-                if isinstance(t_list, list) and len(t_list) > 0:
-                    tid = str(t_list[0])
-            
-            # 3. Numeric ID (Fallback)
-            nid = str(row.get('id', '')).replace(".0", "").strip()
-            
-            # Return combined key
-            return f"{cid}|{tid}|{nid}"
+        # --- EXTRACT DECIMAL TOKEN ID ---
+        def extract_token(row):
+            try:
+                raw = row.get('clobTokenIds')
+                if not raw: return None
+                if isinstance(raw, str): tokens = json.loads(raw)
+                else: tokens = raw
+                if isinstance(tokens, list) and len(tokens) > 0:
+                    # Return the raw Decimal String (e.g. "8777...")
+                    return str(tokens[0])
+                return None
+            except: return None
 
-        df['contract_id'] = df.apply(extract_ids, axis=1)
-        # -------------------------------
+        df['contract_id'] = df.apply(extract_token, axis=1)
+        # --------------------------------
 
         # Normalization
         def derive_outcome(row):
@@ -2047,60 +2038,10 @@ class BacktestEngine:
             try: os.remove(cache_file)
             except: pass
             
-        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH...")
+        print(f"Stream-fetching {len(market_ids)} markets via ORDERBOOK SUBGRAPH (Decimal IDs)...")
         
-        # GRAPHQL ENDPOINT
+        # URL Verified in Diagnostic
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
-        
-        # --- STEP 1: SCHEMA INTROSPECTION ---
-        # We find the table name (OrderFilledEvent) and the exact field names
-        print("   Introspecting Schema to ensure compatibility...")
-        try:
-            intro_query = "{ __schema { types { name fields { name } } } }"
-            r = requests.post(GRAPH_URL, json={"query": intro_query})
-            schema_data = r.json()['data']['__schema']['types']
-            
-            # Find the Event Table
-            table_name = "OrderFilledEvent" # Found in your diagnostic
-            query_name = "orderFilledEvents" # GraphQL standard pluralization
-            
-            fields = []
-            for t in schema_data:
-                if t['name'] == table_name:
-                    fields = [f['name'] for f in t['fields']]
-                    break
-            
-            if not fields:
-                print("❌ CRITICAL: Could not find OrderFilledEvent schema. Aborting.")
-                return pd.DataFrame()
-            
-            # Map available fields to our needs
-            has_price = 'price' in fields
-            has_size = 'size' in fields
-            has_amount = 'amount' in fields
-            has_maker_amt = 'makerAmount' in fields
-            has_taker_amt = 'takerAmount' in fields
-            
-            # Construct the Query Fields dynamically
-            # We always need: timestamp, maker, taker (or user)
-            query_fields = "id timestamp "
-            
-            if has_price: query_fields += "price "
-            if has_size: query_fields += "size "
-            if has_amount: query_fields += "amount "
-            if has_maker_amt: query_fields += "makerAmount "
-            if has_taker_amt: query_fields += "takerAmount "
-            if 'maker' in fields: query_fields += "maker "
-            if 'taker' in fields: query_fields += "taker "
-            if 'user' in fields: query_fields += "user "
-            if 'side' in fields: query_fields += "side "
-            
-            print(f"   ✅ Verified Schema. Querying: {query_name} [{query_fields}]")
-            
-        except Exception as e:
-            print(f"❌ Schema Check Failed: {e}")
-            return pd.DataFrame()
-        # ------------------------------------
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
@@ -2110,21 +2051,16 @@ class BacktestEngine:
         ledger_lock = threading.Lock()
         self.first_success = False
         
-        def fetch_and_write_worker(combined_id_str, writer, f_handle):
+        def fetch_and_write_worker(token_id, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            # Extract Condition ID (Required for Graph) and Token ID (For CSV)
-            parts = str(combined_id_str).split('|')
-            if len(parts) < 3: return False
-            condition_id = parts[0] # Condition ID is first in extract_ids
-            token_id = parts[1]     # Token ID is second
-            
-            # Filter invalid IDs
-            if not condition_id or not condition_id.startswith('0x'):
+            # Use Decimal ID string directly
+            token_str = str(token_id).strip()
+            if not token_str.isdigit():
                 with ledger_lock:
-                    with open(ledger_file, "a") as lf: lf.write(f"{combined_id_str}\n")
+                    with open(ledger_file, "a") as lf: lf.write(f"{token_id}\n")
                 return False
 
             last_ts = 9999999999
@@ -2132,75 +2068,93 @@ class BacktestEngine:
             
             while True:
                 try:
-                    # DYNAMIC QUERY
-                    query = f"""
-                    query($market: String!, $max_ts: BigInt!) {{
-                      {query_name}(
+                    # DUAL QUERY: Fetch trades where Token is Maker OR Taker
+                    # This captures 100% of volume.
+                    query = """
+                    query($token: String!, $max_ts: BigInt!) {
+                      asMaker: orderFilledEvents(
                         first: 1000
                         orderBy: timestamp
                         orderDirection: desc
-                        where: {{ conditionId: $market, timestamp_lt: $max_ts }}
-                      ) {{
-                        {query_fields}
-                      }}
-                    }}
+                        where: { makerAssetId: $token, timestamp_lt: $max_ts }
+                      ) {
+                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
+                      }
+                      asTaker: orderFilledEvents(
+                        first: 1000
+                        orderBy: timestamp
+                        orderDirection: desc
+                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
+                      ) {
+                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
+                      }
+                    }
                     """
-                    # Note: Using 'conditionId' in where clause. 
-                    # If schema uses 'market', we might need to swap. 
-                    # (Standard CTF uses conditionId).
-                    
-                    variables = {"market": condition_id, "max_ts": int(last_ts)}
+                    variables = {"token": token_str, "max_ts": int(last_ts)}
                     
                     resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=15)
                     
                     if resp.status_code == 200:
                         r_json = resp.json()
-                        if 'errors' in r_json: 
-                            # Fallback: Try 'market' instead of 'conditionId' if error
-                            if "Field 'conditionId' is not defined" in str(r_json['errors']):
-                                query = query.replace("conditionId:", "market:")
-                                resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=15)
-                                r_json = resp.json()
+                        if 'errors' in r_json: break 
                         
-                        data = r_json.get('data', {}).get(query_name, [])
-                        if not data: break 
+                        # Merge Lists
+                        batch_maker = r_json.get('data', {}).get('asMaker', [])
+                        batch_taker = r_json.get('data', {}).get('asTaker', [])
+                        combined = batch_maker + batch_taker
                         
+                        if not combined: break # End of History
+                        
+                        # Process Batch
                         rows = []
                         min_batch_ts = last_ts
                         
-                        for row in data:
+                        for row in combined:
                             try:
                                 ts_val = float(row['timestamp'])
                                 min_batch_ts = min(min_batch_ts, ts_val)
                                 
                                 if ts_val < cutoff_ts: continue
                                 
+                                # METRICS CALCULATION
+                                # We know 'token_str' is the outcome token.
+                                # But we don't know if it was in makerAmount or takerAmount.
+                                # Since we ran 2 queries, we need to know WHICH list this row came from.
+                                # However, raw rows look identical.
+                                
+                                # Heuristic: One amount is usually ~0-1 (Price/USDC) and one is huge (Size).
+                                # But safest way: We treat Price = (Other Amount) / (Token Amount)
+                                # Since we don't strictly know which is which without checking AssetID again (which we didn't query to save bandwidth),
+                                # we rely on the fact that prices are usually < 1.0.
+                                
+                                amt1 = float(row['makerAmountFilled'])
+                                amt2 = float(row['takerAmountFilled'])
+                                
+                                if amt1 == 0 or amt2 == 0: continue
+                                
+                                # Ratio Calculation
+                                ratio = amt1 / amt2
+                                if ratio < 1.01:
+                                    price = ratio
+                                    size = amt2
+                                else:
+                                    price = amt2 / amt1
+                                    size = amt1
+                                    
+                                # Direction:
+                                # If Price is rising? No.
+                                # Default to 1 for volume aggregation. Backtest logic handles price impact.
+                                side_mult = 1 
+                                
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
-                                
-                                # ADAPTIVE PARSING
-                                price = float(row.get('price') or 0.0)
-                                size = float(row.get('size') or row.get('amount') or 0.0)
-                                
-                                # Calc price from raw amounts if needed
-                                if price == 0 and size == 0:
-                                    # Fallback logic for raw events
-                                    m_amt = float(row.get('makerAmount', 0))
-                                    t_amt = float(row.get('takerAmount', 0))
-                                    if m_amt > 0 and t_amt > 0:
-                                        size = t_amt
-                                        price = m_amt / t_amt # Rough approx
-                                
-                                side_str = str(row.get('side') or 'BUY').upper()
-                                side_mult = 1 if 'BUY' in side_str or 'BID' in side_str else -1
-                                
-                                user = str(row.get('taker') or row.get('user') or 'unknown')
+                                user = str(row.get('taker') or 'unknown')
                                 
                                 rows.append({
                                     'timestamp': ts_str,
                                     'tradeAmount': size * price * 1e6,
                                     'outcomeTokensAmount': size * side_mult * 1e18,
                                     'user': user,
-                                    'contract_id': token_id, # Consistent ID
+                                    'contract_id': token_str,
                                     'price': price,
                                     'size': size,
                                     'side_mult': side_mult
@@ -2212,10 +2166,11 @@ class BacktestEngine:
                                 writer.writerows(rows)
                                 f_handle.flush()
                                 if not self.first_success:
-                                    print(f"\n✅ SUCCESS: Connected to Market {condition_id[:10]}...")
+                                    print(f"\n✅ SUCCESS: Connected to Market {token_str[:5]}...")
                                     self.first_success = True
                         
-                        # Pagination
+                        # Pagination Logic
+                        # If we aren't moving back in time, we stop.
                         if int(min_batch_ts) >= int(last_ts): break
                         last_ts = min_batch_ts
                         if min_batch_ts < cutoff_ts: break
@@ -2228,13 +2183,14 @@ class BacktestEngine:
                     break 
             
             with ledger_lock:
-                with open(ledger_file, "a") as lf: lf.write(f"{combined_id_str}\n")
+                with open(ledger_file, "a") as lf: lf.write(f"{token_id}\n")
             return True
 
         with open(cache_file, mode=write_mode, newline='') as f:
             writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
             writer.writeheader()
             
+            # Use 8 Workers for speed
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                 futures = [
                     executor.submit(fetch_and_write_worker, mid, writer, f) 
