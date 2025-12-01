@@ -1840,77 +1840,87 @@ class BacktestEngine:
         import glob
         import os
         
-        # CONFIGURATION
-        REQ_DAYS = 200  # The objective constraint
+        DAYS_BACK = 200 # The strict requirement
+        print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        print(f"Initializing Data Engine (Limit: Last {REQ_DAYS} Days)...")
+        # ---------------------------------------------------------
+        # 1. MARKETS (Get Metadata)
+        # ---------------------------------------------------------
+        market_files = glob.glob(str(self.cache_dir / "gamma_markets_*.parquet"))
         
-        # 1. ACQUIRE MARKETS
-        # Ensure we have the market list. If not, fetch it (respecting date).
-        markets = self._fetch_gamma_markets(days_back=REQ_DAYS)
-        
+        if not market_files:
+            print("   ⚠️ No local markets found. Downloading from scratch...")
+            markets = self._fetch_gamma_markets(days_back=DAYS_BACK)
+        else:
+            latest = max(market_files, key=os.path.getctime)
+            print(f"   Loading local markets: {os.path.basename(latest)}")
+            markets = pd.read_parquet(latest)
+
         if markets.empty:
-            print("❌ Market Fetch Failed.")
+            print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # 2. IDENTIFY REQUIRED TOKENS
-        all_target_tokens = set()
-        for raw_ids in markets['contract_id']:
-            parts = str(raw_ids).split(',')
-            for p in parts:
-                p_clean = p.strip()
-                if len(p_clean) > 2:
-                    all_target_tokens.add(p_clean)
-        
-        print(f"   Target Scope: {len(all_target_tokens)} tokens")
-
-        # 3. CHECK LOCAL CACHE
+        # ---------------------------------------------------------
+        # 2. TRADES (Get History)
+        # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
-        downloaded_tokens = set()
-        trades = pd.DataFrame()
         
-        if trades_file.exists():
-            print(f"   Checking local cache...")
-            try:
-                # Quick scan of what we have
-                existing_ids = pd.read_csv(trades_file, usecols=['contract_id'])
-                downloaded_tokens = set(existing_ids['contract_id'].astype(str).str.strip().unique())
-            except: pass
-        
-        # 4. DOWNLOAD MISSING DATA
-        missing_tokens = list(all_target_tokens - downloaded_tokens)
-        
-        if missing_tokens:
-            print(f"   ⚠️ Found {len(missing_tokens)} tokens missing from cache.")
-            print(f"   🚀 downloading missing data (Last {REQ_DAYS} Days ONLY)...")
+        if not trades_file.exists():
+            print("   ⚠️ No local trades found. Downloading from scratch...")
             
-            # PASS THE REQ_DAYS TO THE FETCHER
-            new_trades = self._fetch_gamma_trades_parallel(missing_tokens, days_back=REQ_DAYS)
+            # A. Extract ALL Token IDs from the markets we just loaded
+            all_tokens = []
+            for raw_ids in markets['contract_id']:
+                # Handle "ID1,ID2" format
+                parts = str(raw_ids).split(',')
+                for p in parts:
+                    clean_p = p.strip()
+                    if len(clean_p) > 2:
+                        all_tokens.append(clean_p)
+            
+            # Remove duplicates
+            target_tokens = list(set(all_tokens))
+            print(f"   Identified {len(target_tokens)} tokens to download.")
+            
+            # B. Trigger Downloader (With Strict Time Limit)
+            # This uses the fetcher you just updated
+            trades = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
+            
         else:
-            print("   ✅ Local cache is complete.")
+            print(f"   Loading local trades: {os.path.basename(trades_file)}")
+            trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
 
-        # 5. LOAD & ALIGN
-        print("   Loading dataset...")
-        if not trades_file.exists(): return pd.DataFrame(), pd.DataFrame()
+        if trades.empty:
+            print("❌ Critical: No trade data available.")
+            return pd.DataFrame(), pd.DataFrame()
 
-        trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
+        # ---------------------------------------------------------
+        # 3. CLEANUP & SYNC
+        # ---------------------------------------------------------
+        print("   Synchronizing data...")
+        
+        # A. Type Conversion
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
         trades['contract_id'] = trades['contract_id'].str.strip()
-
-        # Explode Markets
+        
+        # B. Strict Date Filter (Double Check)
+        cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=DAYS_BACK)
+        trades = trades[trades['timestamp'] >= cutoff_date].copy()
+        
+        # C. Align Market IDs (Explode "ID1,ID2" -> Single Rows)
         markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
         markets = markets.explode('contract_id')
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # Strict Sync
+        # D. Match Dataframes
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-        
+
         print(f"✅ SYSTEM READY.")
-        print(f"   Matched Markets: {len(market_subset)}")
-        print(f"   Total Trades:    {len(trades)}")
+        print(f"   Markets: {len(market_subset)}")
+        print(f"   Trades:  {len(trades)}")
         
         return market_subset, trades
         
