@@ -1673,7 +1673,8 @@ class FastBacktestEngine:
                                 # SMART SIZING LOGIC
                                 # -----------------------------------------------------
                                 impact_coeff = 0.5 
-                                max_allowed_slippage = 0.02  # Max 2% price move allowed
+                                optimal_slippage = abs(edge) * (2.0 / 3.0)
+                                max_allowed_slippage = max(0.005, min(optimal_slippage, 0.15))
                                 
                                 # Invert the Square Root Law to find max size:
                                 # Impact = Coeff * sqrt(Size / Liq)
