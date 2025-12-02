@@ -1431,26 +1431,57 @@ class FastBacktestEngine:
                 # -------------------------------------
                 
                 # Update Globals
-                profit = pnl - 10000.0 
-                total_pnl += profit
+                local_curve = result.get('equity_curve', [pnl])
+                period_growth = [x / 10000.0 for x in local_curve]
+                scaled_curve = [capital * x for x in period_growth]
+                if len(equity_curve) > 0:
+                    equity_curve.extend(scaled_curve[1:])
+                else:
+                    equity_curve.extend(scaled_curve)
+
+                capital = equity_curve[-1]
                 total_trades += trades
-                capital += profit
-                equity_curve.append(capital)
             
             # Slide Window
             current_date += timedelta(days=test_days)
         
-        # Metrics Calculation
-        returns = pd.Series(equity_curve).pct_change().dropna()
+        # --- FIX 2: ROBUST METRICS ---
+        if not equity_curve:
+             return {'total_return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0, 'trades': 0}
+
+        series = pd.Series(equity_curve)
+        
+        # 1. Total Return
+        total_ret = (capital - 10000.0) / 10000.0
+        
+        # 2. Max Drawdown
+        # Tracks the percentage drop from the highest point seen so far
+        running_max = series.cummax()
+        drawdown = (series - running_max) / running_max
+        max_dd = drawdown.min() # This will be negative (e.g., -0.05)
+        
+        # 3. Sharpe Ratio
+        # Calculate returns per step (minute)
+        pct_changes = series.pct_change().dropna()
+        
         sharpe = 0.0
-        if len(returns) > 1 and returns.std() > 0:
-            sharpe = (returns.mean() / returns.std()) * np.sqrt(len(returns))
+        if len(pct_changes) > 1 and pct_changes.std() > 0:
+            mean_ret = pct_changes.mean()
+            std_ret = pct_changes.std()
+            
+            # Annualize: sqrt(Minutes in a Year) -> sqrt(525,600) ≈ 725
+            # This aligns the Sharpe to a standard yearly metric
+            annualization_factor = np.sqrt(252 * 1440) 
+            sharpe = (mean_ret / std_ret) * annualization_factor
         
         return {
-            'total_return': (capital - 10000.0) / 10000.0,
+            'total_return': total_ret,
             'sharpe': sharpe,
-            'trades': total_trades
+            'max_drawdown': abs(max_dd), # Return as positive number (e.g. 0.05)
+            'trades': total_trades,
+            'equity_curve': equity_curve 
         }
+        # -----------------------------
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
 
@@ -1467,6 +1498,7 @@ class FastBacktestEngine:
         
         # --- STATE INIT ---
         cash = 10000.0
+        equity_curve = []
         positions = {}
         tracker = {}
         market_liq = {}
@@ -1475,6 +1507,7 @@ class FastBacktestEngine:
         volume_traded = 0.0
         
         # Diagnostics
+        equity_curve = []
         debug_signals = []
         rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0}
         
@@ -1619,6 +1652,19 @@ class FastBacktestEngine:
                                           f"Edge: {edge:.3f} | Size: ${cost:.0f} | Entry: {safe_entry:.3f}")
                             else:
                                 rejection_log['insufficient_cash'] += 1
+
+                            current_val = cash
+                            for cid, pos in positions.items():
+                                # Use last known price for open positions
+                                last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                                if pos['side'] == 1: 
+                                    val = pos['shares'] * last_p
+                                else: 
+                                    val = pos['shares'] * (1.0 - last_p)
+                                current_val += val
+                            
+                            equity_curve.append(current_val)
+                            
                         elif not is_safe_price:
                             rejection_log['unsafe_price'] += 1
                             # DEBUG: Print the first 5 rejected prices to confirm Decimal Mismatch
@@ -1709,7 +1755,50 @@ class FastBacktestEngine:
             'sharpe_ratio': 0.0,
             'max_drawdown': 0.0
         }
+
+    def plot_performance(equity_curve, trades_count):
+    
+        import matplotlib.pyplot as plt
         
+        # 1. Setup Plot
+        plt.figure(figsize=(12, 6))
+        
+        # 2. Plot the Curve
+        # We use a simple range for X-axis (Time Steps)
+        x_axis = range(len(equity_curve))
+        plt.plot(x_axis, equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
+        
+        # 3. Add Baselines
+        plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Starting Capital')
+        
+        # 4. Styling
+        plt.title(f"C7 Strategy Performance ({trades_count} Trades)", fontsize=14)
+        plt.xlabel("Time (Minutes Active)", fontsize=10)
+        plt.ylabel("Capital ($)", fontsize=10)
+        plt.grid(True, which='both', linestyle='--', alpha=0.3)
+        plt.legend()
+        
+        # 5. Calculate & Annotate Max Drawdown Visual
+        series = np.array(equity_curve)
+        running_max = np.maximum.accumulate(series)
+        drawdown = (series - running_max) / running_max
+        max_dd_idx = np.argmin(drawdown)
+        
+        # Mark the bottom of the drawdown
+        if len(equity_curve) > 0:
+            plt.plot(max_dd_idx, equity_curve[max_dd_idx], 'rv', markersize=10)
+            plt.annotate(f"Max DD: {drawdown[max_dd_idx]:.2%}", 
+                         xy=(max_dd_idx, equity_curve[max_dd_idx]), 
+                         xytext=(max_dd_idx, equity_curve[max_dd_idx]*0.95),
+                         arrowprops=dict(facecolor='black', shrink=0.05))
+    
+        # 6. Save
+        filename = "c7_equity_curve.png"
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"\n📈 CHART GENERATED: Saved to '{filename}'")
+    
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
         total_ret = 1.0
@@ -1960,6 +2049,33 @@ class BacktestEngine:
         print(f"   Sharpe Ratio:     {metrics.get('sharpe_ratio', 0.0):.4f}")
         print(f"   Trades:           {metrics.get('trades', 0)}")
         print("="*60 + "\n")
+
+        print("\n--- Generating Visual Report ---")
+    
+        # 1. Re-run the Best Config to get the full curve
+        # (We need to re-instantiate the engine locally to run it)
+        engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
+        
+        # Use the best config found by Ray
+        final_results = engine.run_walk_forward(best_config)
+        
+        # 2. Extract Curve
+        curve_data = final_results.get('equity_curve', [])
+        trade_count = final_results.get('trades', 0)
+        
+        if curve_data:
+            # 3. Plot
+            plot_performance(curve_data, trade_count)
+            
+            # 4. Optional: Quick Terminal "Sparkline"
+            start = curve_data[0]
+            end = curve_data[-1]
+            peak = max(curve_data)
+            low = min(curve_data)
+            print(f"   Start: ${start:.0f} -> Peak: ${peak:.0f} -> End: ${end:.0f}")
+            print(f"   Lowest Point: ${low:.0f}")
+        else:
+            print("❌ Error: No equity curve data returned to plot.")
     
         return best_config
         
