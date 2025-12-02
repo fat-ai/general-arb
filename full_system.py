@@ -1485,10 +1485,9 @@ class FastBacktestEngine:
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
 
-        import numpy as np
         
         # --- CONFIG EXTRACTION ---
-        splash_thresh = config.get('splash_threshold', 100.0)  # FIX: Raised from 2.0 to 100.0
+        splash_thresh = config.get('splash_threshold', 100.0) 
         use_smart_exit = config.get('use_smart_exit', False)
         stop_loss_pct = config.get('stop_loss_pct', None)
         sizing_mode = config.get('sizing_mode', 'kelly')
@@ -1498,7 +1497,7 @@ class FastBacktestEngine:
         
         # --- STATE INIT ---
         cash = 10000.0
-        equity_curve = []
+        equity_curve = [] # Initialize list here
         positions = {}
         tracker = {}
         market_liq = {}
@@ -1507,7 +1506,6 @@ class FastBacktestEngine:
         volume_traded = 0.0
         
         # Diagnostics
-        equity_curve = []
         debug_signals = []
         rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0}
         
@@ -1558,13 +1556,9 @@ class FastBacktestEngine:
                         pred_brier = fw_intercept + (fw_slope * log_vol)
                         brier = max(0.10, min(pred_brier, 0.35))
                     
-                    # FIX: Skill Premium Calculation (Now Scales to 0-1000+)
-                    # Old: (0.25 - brier) * 10 + 0.01 → Max ~2.5
-                    # New: Use exponential scaling for smart money
+                    # Skill Premium Calculation
                     skill_premium = max(0.0, 0.25 - brier)
-                    
-                    # FIX: Weight now scaled to match threshold (100-200 range)
-                    weight = vol * (skill_premium * 1000.0 + 1.0)  # Min 1x vol, Max 1250x vol
+                    weight = vol * (skill_premium * 1000.0 + 1.0) 
                     
                     # Accumulate Net Weight
                     tracker[cid]['net_weight'] += (weight * trade_direction)
@@ -1573,20 +1567,17 @@ class FastBacktestEngine:
                     abs_net_weight = abs(tracker[cid]['net_weight'])
                     
                     if abs_net_weight > splash_thresh:
-                        # Log the signal BEFORE reset
                         debug_signals.append({
                             'market': cid[:8],
                             'net_weight': tracker[cid]['net_weight'],
                             'threshold': splash_thresh
                         })
                         
-                        # --- Calculate Edge ---
                         raw_net = tracker[cid]['net_weight']
                         net_sentiment = np.tanh(raw_net / 5000.0)
                         p_model = 0.5 + (net_sentiment * 0.4)
                         edge = p_model - prev_price
                         
-                        # FIX: Reset weight AFTER checking, BEFORE trade logic
                         tracker[cid]['net_weight'] = 0.0
                         
                         # --- 4. EDGE FILTER ---
@@ -1595,11 +1586,10 @@ class FastBacktestEngine:
                             rejection_log['low_edge'] += 1
                             continue
                         
-                        # --- 5. PRICE SAFETY CHECK (FIXED: No continue) ---
+                        # --- 5. PRICE SAFETY CHECK ---
                         is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
                         is_not_in_position = (cid not in positions)
                         
-                        # FIX: Use IF block instead of continue
                         if is_safe_price and is_not_in_position:
                             side = 1 if edge > 0 else -1
                             
@@ -1613,29 +1603,25 @@ class FastBacktestEngine:
                                 target_f = abs(edge) * sizing_val
                             elif sizing_mode == 'fixed':
                                 cost = sizing_val
-                                target_f = -1  # Sentinel
+                                target_f = -1 
                             
-                            # Cap Kelly at 20%
                             if target_f > 0:
                                 target_f = min(target_f, 0.20)
                                 cost = cash * target_f
                             
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
                             if cost > 5.0 and cash > cost:
-                                # Slippage Simulation
                                 buffer = 0.01
                                 if side == 1:
                                     safe_entry = min(new_price + buffer, 0.99)
                                 else:
                                     safe_entry = max(new_price - buffer, 0.01)
                                 
-                                # Calculate Shares
                                 if side == 1:
                                     shares = cost / safe_entry
                                 else:
                                     shares = cost / (1.0 - safe_entry)
                                 
-                                # Execute Trade
                                 cash -= cost
                                 positions[cid] = {
                                     'side': side,
@@ -1646,30 +1632,14 @@ class FastBacktestEngine:
                                 trade_count += 1
                                 volume_traded += cost
                                 
-                                # Diagnostic Log
                                 if trade_count <= 5:
                                     print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][side==1]} {cid[:8]} | "
                                           f"Edge: {edge:.3f} | Size: ${cost:.0f} | Entry: {safe_entry:.3f}")
                             else:
                                 rejection_log['insufficient_cash'] += 1
 
-                            current_val = cash
-                            for cid, pos in positions.items():
-                                # Use last known price for open positions
-                                last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                                if pos['side'] == 1: 
-                                    val = pos['shares'] * last_p
-                                else: 
-                                    val = pos['shares'] * (1.0 - last_p)
-                                current_val += val
-                            
-                            equity_curve.append(current_val)
-                            
                         elif not is_safe_price:
                             rejection_log['unsafe_price'] += 1
-                            # DEBUG: Print the first 5 rejected prices to confirm Decimal Mismatch
-                            if rejection_log['unsafe_price'] <= 5:
-                                print(f"🚫 REJECTED PRICE: {new_price:.6f} (Limit: 0.02-0.98)")
                 
                 # ==================== C. RESOLUTION ====================
                 elif ev_type == 'RESOLUTION':
@@ -1685,27 +1655,22 @@ class FastBacktestEngine:
                         
                         if win:
                             cash += pos['shares']
-                        
                         del positions[cid]
                 
                 # ==================== D. POSITION MANAGEMENT ====================
-                # Only runs if NOT a resolution event
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                     
-                    # PnL Calculation
                     if pos['side'] == 1:
                         pnl_pct = (curr_p - pos['entry']) / pos['entry']
                     else:
                         pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
                     
-                    # Stop Loss Check
                     should_close = False
                     if stop_loss_pct and pnl_pct < -stop_loss_pct:
                         should_close = True
                     
-                    # Smart Exit Check
                     if use_smart_exit:
                         cur_net = tracker.get(cid, {}).get('net_weight', 0)
                         if pos['side'] == 1 and cur_net < -splash_thresh/2:
@@ -1713,7 +1678,6 @@ class FastBacktestEngine:
                         if pos['side'] == -1 and cur_net > splash_thresh/2:
                             should_close = True
                     
-                    # Close Position
                     if should_close:
                         if pos['side'] == 1:
                             payout = pos['shares'] * curr_p
@@ -1721,6 +1685,22 @@ class FastBacktestEngine:
                             payout = pos['shares'] * (1.0 - curr_p)
                         cash += payout
                         del positions[cid]
+            
+            # ================================================================
+            # <<<< FIX: MOVE EQUITY CURVE RECORDING HERE (End of Batch Loop)
+            # ================================================================
+            current_val = cash
+            for cid, pos in positions.items():
+                # Mark-to-Market: Value open positions at last known price
+                last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                if pos['side'] == 1: 
+                    val = pos['shares'] * last_p
+                else: 
+                    val = pos['shares'] * (1.0 - last_p)
+                current_val += val
+            
+            equity_curve.append(current_val)
+            # ================================================================
         
         # --- END OF PERIOD VALUATION ---
         final_value = cash
@@ -1743,17 +1723,13 @@ class FastBacktestEngine:
             if count > 0:
                 print(f"   {reason}: {count}")
         
-        if debug_signals:
-            print(f"\n🎯 SIGNALS FIRED: {len(debug_signals)}")
-            for sig in debug_signals[:3]:
-                print(f"   Market: {sig['market']} | Net: {sig['net_weight']:.1f} | Thresh: {sig['threshold']:.1f}")
-        
         return {
             'final_value': final_value,
             'total_return': (final_value / 10000.0) - 1.0,
             'trades': trade_count,
             'sharpe_ratio': 0.0,
-            'max_drawdown': 0.0
+            'max_drawdown': 0.0,
+            'equity_curve': equity_curve # Ensure this is passed back
         }
 
     def plot_performance(equity_curve, trades_count):
