@@ -1445,17 +1445,25 @@ class FastBacktestEngine:
             train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
             
             # Map Outcomes
-            train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
-            
-            # Final Safety Drop (Should be redundant now, but good for sanity)
-            train_profiler = train_profiler.dropna(subset=['outcome'])
-            
-            valid_res = all_resolutions[all_resolutions.index < train_end]
+            # 1. Build Lookups for Outcome AND Resolution Time
             outcome_map = {}
-            for _, row in valid_res.iterrows():
-                outcome_map[row['data']['contract_id']] = float(row['data']['outcome'])
+            res_time_map = {}
             
+            for ts, row in valid_res.iterrows():
+                cid = row['data']['contract_id']
+                outcome_map[cid] = float(row['data']['outcome'])
+                res_time_map[cid] = ts # Capture the exact resolution timestamp
+            
+            # 2. Map Data
             train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
+            train_profiler['res_time'] = train_profiler['market_id'].map(res_time_map)
+            
+            # 3. CRITICAL HYGIENE: Filter out "Post-Mortem" Trades
+            # Ensure we only learn from trades that happened BEFORE the market resolved.
+            # This prevents "Cheater Trades" (trading after the news is public) from corrupting wallet scores.
+            train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
+            
+            # 4. Final Safety Drop (Removes any market that didn't resolve in the window)
             train_profiler = train_profiler.dropna(subset=['outcome'])
             
             # B. Calibrate Models
@@ -1687,6 +1695,7 @@ class FastBacktestEngine:
                                 target_f = min(target_f, 0.20)
                                 cost = cash * target_f
                             
+                    
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
                             if cost > 5.0 and cash > cost:
@@ -1696,73 +1705,62 @@ class FastBacktestEngine:
                                 if pool_liq < 1.0: pool_liq = 10000.0
                                 
                                 # -----------------------------------------------------
-                                # SMART SIZING LOGIC
+                                # FINAL EXECUTION MODEL: CPMM + TOXIC FLOW TAX
                                 # -----------------------------------------------------
-                                # 1. Fixed Costs (The "Toxic Flow" Tax)
-                                # Spread (0.5%) + Latency/MEV (1.0%)
-                                # If you are smart, bots will front-run you. Cost is fixed ~1.5%.
-                                fixed_penalty = 0.015 
                                 
-                                # 2. Variable Impact (CPMM Approx)
-                                # CPMM is nastier than Square Root. We add a linear term.
-                                # Impact = 0.5 * sqrt(Ratio) + 1.0 * Ratio
-                                ratio = actual_cost / pool_liq
-                                variable_impact = (0.5 * np.sqrt(ratio)) + (1.0 * ratio)
+                                # 1. The "Toxic Flow" Tax (Fixed Costs)
+                                # Market Makers widen spreads for smart flow (2%)
+                                # + Latency/Slippage between signal and block inclusion (1%)
+                                # = 3.0% Fixed Penalty on every trade.
+                                fixed_penalty = 0.03 
                                 
-                                # Total Estimated Slippage
+                                # 2. Variable Impact (Exact CPMM Formula)
+                                # In Constant Product AMMs, price moves based on the ratio of deposit.
+                                # Impact = Size / (Liquidity + Size)
+                                # This is less harsh than Sqrt for small trades, but realistic.
+                                
+                                # We need to solve for Max Size given a max allowed impact.
+                                # Let Target_Impact = 0.05 (5%). 
+                                # Max_Size = (Target_Impact * Liq) / (1 - Target_Impact)
+                                
+                                # Dynamic Tolerance: We accept impact up to 2/3rds of our Edge.
+                                # If Edge is 10%, we accept 6.6% total slippage.
+                                target_total_slippage = abs(edge) * (2.0 / 3.0)
+                                
+                                # The variable portion allowed is Total - Fixed
+                                allowed_variable_impact = target_total_slippage - fixed_penalty
+                                
+                                if allowed_variable_impact <= 0:
+                                    # If the fixed tax (3%) eats our entire edge tolerance, SKIP TRADE.
+                                    rejection_log['low_edge_vs_cost'] = rejection_log.get('low_edge_vs_cost', 0) + 1
+                                    continue
+                                
+                                # Calculate Max Size based on CPMM math
+                                # Size = (Impact * Liq) / (1 - Impact)
+                                max_size_cpmm = (allowed_variable_impact * pool_liq) / (1.0 - allowed_variable_impact)
+                                
+                                # Cap our trade size
+                                actual_cost = min(cost, max_size_cpmm)
+                                
+                                # Final Check: Is the trade too small to bother?
+                                if actual_cost < 5.0:
+                                    rejection_log['low_liquidity'] = rejection_log.get('low_liquidity', 0) + 1
+                                    continue
+
+                                # 3. Calculate Final Execution Price
+                                # Recalculate exact variable impact for the final size
+                                variable_impact = actual_cost / (pool_liq + actual_cost)
                                 total_slippage = fixed_penalty + variable_impact
                                 
-                                # 3. Dynamic Limit (Profit Maximization)
-                                # We still use the 2/3rds rule, but we apply it to the NEW harsher reality.
-                                # If the harsher slippage > 2/3rds of edge, we CUT SIZE.
-                                
-                                max_tolerable_slippage = abs(edge) * (2.0 / 3.0)
-                                
-                                # 4. Recursive Sizing Check
-                                # If our calculated slippage is too high, we must shrink the trade
-                                # iteratively until it fits the tolerance.
-                                # (Simple approximation: Scale down by ratio of tolerance/impact)
-                                if total_slippage > max_tolerable_slippage:
-                                    scale_factor = max_tolerable_slippage / total_slippage
-                                    actual_cost = actual_cost * scale_factor
-                                    # Recalculate impact for the smaller size
-                                    ratio = actual_cost / pool_liq
-                                    variable_impact = (0.5 * np.sqrt(ratio)) + (1.0 * ratio)
-                                    total_slippage = fixed_penalty + variable_impact
-                                
-                                # Final Safety Clamp
+                                # Safety Clamp (Max 20% impact allowed ever)
                                 total_slippage = min(total_slippage, 0.20)
-                                
+
                                 # Apply to Price
                                 if side == 1:
                                     safe_entry = min(new_price + total_slippage, 0.99)
                                 else:
                                     safe_entry = max(new_price - total_slippage, 0.01)
-                                # -----------------------------------------------------
                                 
-                                # Invert the Square Root Law to find max size:
-                                # Impact = Coeff * sqrt(Size / Liq)
-                                # Size = Liq * (Impact / Coeff)^2
-                                
-                                max_trade_size = pool_liq * (max_allowed_slippage / impact_coeff) ** 2
-                                
-                                # Cap our trade size to respect liquidity
-                                actual_cost = min(cost, max_trade_size)
-                                
-                                # If the allowed size is too small ($5), skip the trade
-                                if actual_cost < 5.0:
-                                    rejection_log['low_liquidity'] = rejection_log.get('low_liquidity', 0) + 1
-                                    continue
-                                
-                                # Recalculate actual impact for the new size
-                                impact = impact_coeff * np.sqrt(actual_cost / pool_liq)
-                                impact = max(0.005, impact) # Minimum spread always exists
-                                
-                                # Apply Impact
-                                if side == 1:
-                                    safe_entry = min(new_price + impact, 0.99)
-                                else:
-                                    safe_entry = max(new_price - impact, 0.01)
                                 # -----------------------------------------------------
 
                                 if side == 1:
@@ -1770,34 +1768,26 @@ class FastBacktestEngine:
                                 else:
                                     shares = actual_cost / (1.0 - safe_entry)
                                 
-                                # --- FRICTION COST (Fees + Gas) ---
-                                # Standard Taker Fee (0.1%) + Gas Buffer (0.1%) = 0.2%
-                                friction_rate = 0.002 
+                                # --- FRICTION COST (Gas/Fees) ---
+                                friction_rate = 0.002 # 0.2%
                                 friction_cost = actual_cost * friction_rate
-                                
-                                # We pay the cost + the fee
                                 total_deduction = actual_cost + friction_cost
                                 
-                                # Check if we can afford the fee too
                                 if cash < total_deduction:
-                                    # Resize to fit fee
                                     actual_cost = cash / (1 + friction_rate)
                                     friction_cost = actual_cost * friction_rate
                                     total_deduction = cash
 
-                                cash -= total_deduction 
-                                # ----------------------------------
-
+                                cash -= total_deduction
+                                
                                 positions[cid] = {
                                     'side': side,
-                                    'size': actual_cost, # We only invested this much
+                                    'size': actual_cost, 
                                     'shares': shares,
-                                    'entry': safe_entry,
-                                    'fee_paid': friction_cost # Optional: Track for stats
+                                    'entry': safe_entry
                                 }
-                       
                                 trade_count += 1
-                                volume_traded += cost
+                                volume_traded += actual_cost
                                 
                                 if trade_count <= 5:
                                     print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][side==1]} {cid[:8]} | "
@@ -1905,7 +1895,7 @@ class FastBacktestEngine:
             'trades': trade_count,
             'sharpe_ratio': 0.0,
             'max_drawdown': 0.0,
-            'equity_curve': equity_curve # Ensure this is passed back
+            'equity_curve': equity_curve
         }
 
     
