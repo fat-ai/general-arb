@@ -1857,7 +1857,7 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
         if 'stop_loss' in config:
             config['stop_loss_pct'] = config['stop_loss']
 
-        engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
+        engine = FastBacktestEngine(event_log, profiler_data, None, {})
         
         # Fixed Seed for reproducibility inside the worker
         import numpy as np
@@ -2030,7 +2030,7 @@ class BacktestEngine:
     
         # 1. Re-run the Best Config to get the full curve
         # (We need to re-instantiate the engine locally to run it)
-        engine = FastBacktestEngine(event_log, profiler_data, None, priors)
+        engine = FastBacktestEngine(event_log, profiler_data, None, {})
         
         # Use the best config found by Ray
         final_results = engine.run_walk_forward(best_config)
