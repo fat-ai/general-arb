@@ -2613,6 +2613,7 @@ class BacktestEngine:
         
         # 3. FILTER TO COMMON IDs
         common_ids = set(markets['contract_id']).intersection(set(trades['contract_id']))
+        common_ids = sorted(list(common_ids_set))
         if not common_ids:
             log.error("❌ NO COMMON IDS FOUND.")
             return pd.DataFrame(), pd.DataFrame()
