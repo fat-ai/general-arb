@@ -33,6 +33,13 @@ import torch
 from scipy.stats import linregress
 import shutil  
 
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 def force_clear_cache(cache_dir):
     path = Path(cache_dir)
     if path.exists():
@@ -1047,7 +1054,8 @@ class HybridKellySolver:
 
         # Generate the random samples ONCE (Fixed Seed per step for stability)
         # Moving random generation outside the objective function speeds up scipy.minimize drastically
-        Z = np.random.standard_normal((self.k_samples, n))
+        rng = np.random.default_rng(seed=42) # Hardcode the seed
+        Z = rng.standard_normal((self.k_samples, n))
         correlated_Z = Z @ L.T
         U = norm.cdf(correlated_Z)
         I_k = (U < M).astype(float) # Pre-calculate outcomes
@@ -1653,7 +1661,7 @@ class FastBacktestEngine:
                                 cost = cash * target_f
                             
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
-                            if cost > 5.0 and cash > cost:
+                            if cost > 5.0 and round(cash, 2) > round(cost, 2):
                                 buffer = 0.01
                                 if side == 1:
                                     safe_entry = min(new_price + buffer, 0.99)
