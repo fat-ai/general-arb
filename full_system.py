@@ -1244,7 +1244,7 @@ class FastBacktestEngine:
     - Smart Sells vote for p=0.01.
     - This creates a real mathematical edge without needing noise.
     """
-    def __init__(self, event_log, profiler_data, NLPCache, precalc_priors):
+    def __init__(self, event_log, profiler_data, None, precalc_priors):
         self.event_log = event_log
         self.profiler_data = profiler_data
         self.market_lifecycle = {}
@@ -2030,7 +2030,7 @@ class BacktestEngine:
     
         # 1. Re-run the Best Config to get the full curve
         # (We need to re-instantiate the engine locally to run it)
-        engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors)
+        engine = FastBacktestEngine(event_log, profiler_data, None, priors)
         
         # Use the best config found by Ray
         final_results = engine.run_walk_forward(best_config)
