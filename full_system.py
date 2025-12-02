@@ -57,6 +57,49 @@ nlp = spacy.load("en_core_web_trf")
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
+def plot_performance(equity_curve, trades_count):
+    
+        import matplotlib.pyplot as plt
+        
+        # 1. Setup Plot
+        plt.figure(figsize=(12, 6))
+        
+        # 2. Plot the Curve
+        # We use a simple range for X-axis (Time Steps)
+        x_axis = range(len(equity_curve))
+        plt.plot(x_axis, equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
+        
+        # 3. Add Baselines
+        plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Starting Capital')
+        
+        # 4. Styling
+        plt.title(f"C7 Strategy Performance ({trades_count} Trades)", fontsize=14)
+        plt.xlabel("Time (Minutes Active)", fontsize=10)
+        plt.ylabel("Capital ($)", fontsize=10)
+        plt.grid(True, which='both', linestyle='--', alpha=0.3)
+        plt.legend()
+        
+        # 5. Calculate & Annotate Max Drawdown Visual
+        series = np.array(equity_curve)
+        running_max = np.maximum.accumulate(series)
+        drawdown = (series - running_max) / running_max
+        max_dd_idx = np.argmin(drawdown)
+        
+        # Mark the bottom of the drawdown
+        if len(equity_curve) > 0:
+            plt.plot(max_dd_idx, equity_curve[max_dd_idx], 'rv', markersize=10)
+            plt.annotate(f"Max DD: {drawdown[max_dd_idx]:.2%}", 
+                         xy=(max_dd_idx, equity_curve[max_dd_idx]), 
+                         xytext=(max_dd_idx, equity_curve[max_dd_idx]*0.95),
+                         arrowprops=dict(facecolor='black', shrink=0.05))
+    
+        # 6. Save
+        filename = "c7_equity_curve.png"
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"\n📈 CHART GENERATED: Saved to '{filename}'")
+
 def convert_to_beta(mean: float, confidence_interval: tuple[float, float]) -> tuple[float, float]:
     """(Production) Converts a mean and 95% CI to Beta(a, b) parameters."""
     if not (0 <= mean <= 1):
@@ -1732,48 +1775,7 @@ class FastBacktestEngine:
             'equity_curve': equity_curve # Ensure this is passed back
         }
 
-    def plot_performance(equity_curve, trades_count):
     
-        import matplotlib.pyplot as plt
-        
-        # 1. Setup Plot
-        plt.figure(figsize=(12, 6))
-        
-        # 2. Plot the Curve
-        # We use a simple range for X-axis (Time Steps)
-        x_axis = range(len(equity_curve))
-        plt.plot(x_axis, equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
-        
-        # 3. Add Baselines
-        plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Starting Capital')
-        
-        # 4. Styling
-        plt.title(f"C7 Strategy Performance ({trades_count} Trades)", fontsize=14)
-        plt.xlabel("Time (Minutes Active)", fontsize=10)
-        plt.ylabel("Capital ($)", fontsize=10)
-        plt.grid(True, which='both', linestyle='--', alpha=0.3)
-        plt.legend()
-        
-        # 5. Calculate & Annotate Max Drawdown Visual
-        series = np.array(equity_curve)
-        running_max = np.maximum.accumulate(series)
-        drawdown = (series - running_max) / running_max
-        max_dd_idx = np.argmin(drawdown)
-        
-        # Mark the bottom of the drawdown
-        if len(equity_curve) > 0:
-            plt.plot(max_dd_idx, equity_curve[max_dd_idx], 'rv', markersize=10)
-            plt.annotate(f"Max DD: {drawdown[max_dd_idx]:.2%}", 
-                         xy=(max_dd_idx, equity_curve[max_dd_idx]), 
-                         xytext=(max_dd_idx, equity_curve[max_dd_idx]*0.95),
-                         arrowprops=dict(facecolor='black', shrink=0.05))
-    
-        # 6. Save
-        filename = "c7_equity_curve.png"
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        print(f"\n📈 CHART GENERATED: Saved to '{filename}'")
     
     def _aggregate_fold_results(self, results):
         if not results: return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'trades': 0, 'max_drawdown': 0.0}
