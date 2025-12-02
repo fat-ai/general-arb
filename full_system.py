@@ -1662,25 +1662,58 @@ class FastBacktestEngine:
                                 cost = cash * target_f
                             
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
-                            if cost > 5.0 and round(cash, 2) > round(cost, 2):
-                                buffer = 0.01
-                                if side == 1:
-                                    safe_entry = min(new_price + buffer, 0.99)
-                                else:
-                                    safe_entry = max(new_price - buffer, 0.01)
+                            # --- 7. CASH CHECK & TRADE EXECUTION ---
+                            if cost > 5.0 and cash > cost:
                                 
-                                if side == 1:
-                                    shares = cost / safe_entry
-                                else:
-                                    shares = cost / (1.0 - safe_entry)
+                                # Retrieve Liquidity
+                                pool_liq = market_liq.get(cid, 10000.0)
+                                if pool_liq < 1.0: pool_liq = 10000.0
                                 
-                                cash -= cost
+                                # -----------------------------------------------------
+                                # SMART SIZING LOGIC
+                                # -----------------------------------------------------
+                                impact_coeff = 0.5 
+                                max_allowed_slippage = 0.02  # Max 2% price move allowed
+                                
+                                # Invert the Square Root Law to find max size:
+                                # Impact = Coeff * sqrt(Size / Liq)
+                                # Size = Liq * (Impact / Coeff)^2
+                                
+                                max_trade_size = pool_liq * (max_allowed_slippage / impact_coeff) ** 2
+                                
+                                # Cap our trade size to respect liquidity
+                                actual_cost = min(cost, max_trade_size)
+                                
+                                # If the allowed size is too small ($5), skip the trade
+                                if actual_cost < 5.0:
+                                    rejection_log['low_liquidity'] = rejection_log.get('low_liquidity', 0) + 1
+                                    continue
+                                
+                                # Recalculate actual impact for the new size
+                                impact = impact_coeff * np.sqrt(actual_cost / pool_liq)
+                                impact = max(0.005, impact) # Minimum spread always exists
+                                
+                                # Apply Impact
+                                if side == 1:
+                                    safe_entry = min(new_price + impact, 0.99)
+                                else:
+                                    safe_entry = max(new_price - impact, 0.01)
+                                # -----------------------------------------------------
+
+                                if side == 1:
+                                    shares = actual_cost / safe_entry
+                                else:
+                                    shares = actual_cost / (1.0 - safe_entry)
+                                
+                                cash -= actual_cost # Use the resized cost
+                                
                                 positions[cid] = {
                                     'side': side,
-                                    'size': cost,
+                                    'size': actual_cost, # Store the resized cost
                                     'shares': shares,
                                     'entry': safe_entry
                                 }
+                       
                                 trade_count += 1
                                 volume_traded += cost
                                 
