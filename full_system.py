@@ -1415,14 +1415,40 @@ class FastBacktestEngine:
         all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
         
         # --- WALK FORWARD LOOP ---
-        while current_date + timedelta(days=train_days + test_days) <= max_date:
+        embargo_days = 2 # Gap to prevent leakage
+        
+        while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
-            test_end = train_end + timedelta(days=test_days)
             
-            # A. Prepare Training Data
+            # EMBARGO: The test set starts AFTER the gap
+            test_start = train_end + timedelta(days=embargo_days)
+            test_end = test_start + timedelta(days=test_days)
+            
+            # A. Prepare Training Data (Strictly BEFORE train_end)
             train_mask = (self.profiler_data['timestamp'] >= current_date) & \
                          (self.profiler_data['timestamp'] < train_end)
             train_profiler = self.profiler_data[train_mask].copy()
+            
+            # STRICT FILTER: Only consider resolutions that happened BEFORE the training window ends.
+            # This prevents "Time Travel" where we train on an outcome that hasn't happened yet.
+            valid_res = all_resolutions[all_resolutions.index < train_end]
+            
+            # Build Whitelist of Resolved IDs
+            resolved_ids = set()
+            outcome_map = {}
+            for _, row in valid_res.iterrows():
+                cid = row['data']['contract_id']
+                resolved_ids.add(cid)
+                outcome_map[cid] = float(row['data']['outcome'])
+            
+            # EXPLICIT FILTER: Only keep trades for markets that have actually resolved
+            train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
+            
+            # Map Outcomes
+            train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
+            
+            # Final Safety Drop (Should be redundant now, but good for sanity)
+            train_profiler = train_profiler.dropna(subset=['outcome'])
             
             valid_res = all_resolutions[all_resolutions.index < train_end]
             outcome_map = {}
@@ -1438,7 +1464,7 @@ class FastBacktestEngine:
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler)
             
             # C. Run Test Simulation
-            test_slice = self.event_log[(self.event_log.index >= train_end) & 
+            test_slice = self.event_log[(self.event_log.index >= test_start) & 
                                         (self.event_log.index < test_end)]
             
             if not test_slice.empty:
@@ -1672,9 +1698,47 @@ class FastBacktestEngine:
                                 # -----------------------------------------------------
                                 # SMART SIZING LOGIC
                                 # -----------------------------------------------------
-                                impact_coeff = 0.5 
-                                optimal_slippage = abs(edge) * (2.0 / 3.0)
-                                max_allowed_slippage = max(0.005, min(optimal_slippage, 0.15))
+                                # 1. Fixed Costs (The "Toxic Flow" Tax)
+                                # Spread (0.5%) + Latency/MEV (1.0%)
+                                # If you are smart, bots will front-run you. Cost is fixed ~1.5%.
+                                fixed_penalty = 0.015 
+                                
+                                # 2. Variable Impact (CPMM Approx)
+                                # CPMM is nastier than Square Root. We add a linear term.
+                                # Impact = 0.5 * sqrt(Ratio) + 1.0 * Ratio
+                                ratio = actual_cost / pool_liq
+                                variable_impact = (0.5 * np.sqrt(ratio)) + (1.0 * ratio)
+                                
+                                # Total Estimated Slippage
+                                total_slippage = fixed_penalty + variable_impact
+                                
+                                # 3. Dynamic Limit (Profit Maximization)
+                                # We still use the 2/3rds rule, but we apply it to the NEW harsher reality.
+                                # If the harsher slippage > 2/3rds of edge, we CUT SIZE.
+                                
+                                max_tolerable_slippage = abs(edge) * (2.0 / 3.0)
+                                
+                                # 4. Recursive Sizing Check
+                                # If our calculated slippage is too high, we must shrink the trade
+                                # iteratively until it fits the tolerance.
+                                # (Simple approximation: Scale down by ratio of tolerance/impact)
+                                if total_slippage > max_tolerable_slippage:
+                                    scale_factor = max_tolerable_slippage / total_slippage
+                                    actual_cost = actual_cost * scale_factor
+                                    # Recalculate impact for the smaller size
+                                    ratio = actual_cost / pool_liq
+                                    variable_impact = (0.5 * np.sqrt(ratio)) + (1.0 * ratio)
+                                    total_slippage = fixed_penalty + variable_impact
+                                
+                                # Final Safety Clamp
+                                total_slippage = min(total_slippage, 0.20)
+                                
+                                # Apply to Price
+                                if side == 1:
+                                    safe_entry = min(new_price + total_slippage, 0.99)
+                                else:
+                                    safe_entry = max(new_price - total_slippage, 0.01)
+                                # -----------------------------------------------------
                                 
                                 # Invert the Square Root Law to find max size:
                                 # Impact = Coeff * sqrt(Size / Liq)
@@ -1706,13 +1770,30 @@ class FastBacktestEngine:
                                 else:
                                     shares = actual_cost / (1.0 - safe_entry)
                                 
-                                cash -= actual_cost # Use the resized cost
+                                # --- FRICTION COST (Fees + Gas) ---
+                                # Standard Taker Fee (0.1%) + Gas Buffer (0.1%) = 0.2%
+                                friction_rate = 0.002 
+                                friction_cost = actual_cost * friction_rate
                                 
+                                # We pay the cost + the fee
+                                total_deduction = actual_cost + friction_cost
+                                
+                                # Check if we can afford the fee too
+                                if cash < total_deduction:
+                                    # Resize to fit fee
+                                    actual_cost = cash / (1 + friction_rate)
+                                    friction_cost = actual_cost * friction_rate
+                                    total_deduction = cash
+
+                                cash -= total_deduction 
+                                # ----------------------------------
+
                                 positions[cid] = {
                                     'side': side,
-                                    'size': actual_cost, # Store the resized cost
+                                    'size': actual_cost, # We only invested this much
                                     'shares': shares,
-                                    'entry': safe_entry
+                                    'entry': safe_entry,
+                                    'fee_paid': friction_cost # Optional: Track for stats
                                 }
                        
                                 trade_count += 1
@@ -1728,19 +1809,28 @@ class FastBacktestEngine:
                             rejection_log['unsafe_price'] += 1
                 
                 # ==================== C. RESOLUTION ====================
+                # ==================== C. RESOLUTION ====================
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(data.get('outcome', 0))
                         
-                        win = False
-                        if pos['side'] == 1 and outcome == 1.0:
-                            win = True
-                        if pos['side'] == -1 and outcome == 0.0:
-                            win = True
+                        # FIX: Handle Invalid Markets (Outcome 0.5)
+                        if outcome == 0.5:
+                            # REFUND LOGIC: Market was invalid. 
+                            # We get our original investment back (Cost Basis), not the shares.
+                            # Penalty: We lost the opportunity cost of that capital for the duration.
+                            cash += pos['size']
+                            
+                        else:
+                            # Standard Win/Loss Logic
+                            win = False
+                            if pos['side'] == 1 and outcome == 1.0: win = True
+                            if pos['side'] == -1 and outcome == 0.0: win = True
+                            
+                            if win:
+                                cash += pos['shares']
                         
-                        if win:
-                            cash += pos['shares']
                         del positions[cid]
                 
                 # ==================== D. POSITION MANAGEMENT ====================
@@ -2262,9 +2352,9 @@ class BacktestEngine:
                 if isinstance(prices, str): prices = json.loads(prices)
                 if not isinstance(prices, list) or len(prices) != 2: return pd.NA
                 p0, p1 = float(prices[0]), float(prices[1])
-                if p0 > 0.95: return 0 
-                if p1 > 0.95: return 1 
-                return pd.NA
+                if p0 > 0.95: return 0.0
+                if p1 > 0.95: return 1.0
+                return 0.5
             except: return pd.NA
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
