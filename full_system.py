@@ -1244,7 +1244,7 @@ class FastBacktestEngine:
     - Smart Sells vote for p=0.01.
     - This creates a real mathematical edge without needing noise.
     """
-    def __init__(self, event_log, profiler_data, None, precalc_priors):
+    def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
         self.event_log = event_log
         self.profiler_data = profiler_data
         self.market_lifecycle = {}
