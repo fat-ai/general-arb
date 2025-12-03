@@ -2034,7 +2034,7 @@ class BacktestEngine:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         if ray.is_initialized(): ray.shutdown()
-        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
+        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=Truelocal_mode=True, num_cpus=1)
         except: pass
 
     def run_tuning_job(self):
