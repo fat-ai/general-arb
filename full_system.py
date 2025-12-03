@@ -2785,7 +2785,7 @@ class BacktestEngine:
         # 6. FINAL SORT
         df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
-        df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index()
+        df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index(kind='stable')
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
