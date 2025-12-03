@@ -1324,7 +1324,7 @@ class FastBacktestEngine:
         else:
             self.minute_batches = []
             
-    def calibrate_fresh_wallet_model(self, profiler_data):
+    def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None):
         """
         Calibrates the 'Fresh Wallet' regression model (Volume -> Skill).
         Includes strict statistical validation to prevent fitting noise.
@@ -1715,7 +1715,7 @@ class FastBacktestEngine:
                                 # + Latency/Slippage between signal and block inclusion (1%)
                                 # = 3.0% Fixed Penalty on every trade.
                                 fixed_penalty = 0.03 
-                                net_capital = actual_cost * (1.0 - fixed_penalty_rate)
+                                net_capital = cost * (1.0 - fixed_penalty)
                                 variable_impact = net_capital / (pool_liq + net_capital)
                                 variable_impact = min(variable_impact, 0.15)
                                 if side == 1:
@@ -1731,24 +1731,21 @@ class FastBacktestEngine:
                   
                                 # --- FRICTION COST (Gas/Fees) ---
                                 friction_rate = 0.002 # 0.2%
-                                friction_cost = actual_cost * friction_rate
-                                total_deduction = actual_cost + friction_cost
-                                
-                                if cash < total_deduction:
-                                    actual_cost = cash / (1 + friction_rate)
-                                    friction_cost = actual_cost * friction_rate
-                                    total_deduction = cash
-
-                                cash -= total_deduction
-                                
+                                friction_cost = cost * friction_rate
+                                friction_rate = 0.002
+                                investment_amount = cost / (1.0 + friction_rate) # Amount actually going into the trade setup
+                                friction_paid = cost - investment_amount
+                                net_capital = investment_amount * (1.0 - fixed_penalty_rate)
+                               
                                 positions[cid] = {
                                     'side': side,
-                                    'size': actual_cost, 
+                                    'size': cost, 
                                     'shares': shares,
                                     'entry': safe_entry
                                 }
                                 trade_count += 1
-                                volume_traded += actual_cost
+                                volume_traded += cost
+                                cash -= cost
                                 
                                 if trade_count <= 5:
                                     print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][side==1]} {cid[:8]} | "
