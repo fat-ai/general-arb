@@ -2034,7 +2034,7 @@ class BacktestEngine:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         if ray.is_initialized(): ray.shutdown()
-        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True, local_mode=True, num_cpus=1)
+        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
         except: pass
 
     def run_tuning_job(self):
@@ -2079,8 +2079,7 @@ class BacktestEngine:
         profiler_ref = ray.put(profiler_data)
         nlp_cache_ref = ray.put(None)
         priors_ref = ray.put({})
-        del event_log
-        del profiler_data
+
 
         gc.collect()
         
