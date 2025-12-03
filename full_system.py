@@ -1370,9 +1370,30 @@ class FastBacktestEngine:
             # B. slope > 0 means Higher Volume = WORSE Score (Dumb Whales). 
             #    While possible, we usually don't want to blindly trust 'Contrarian' models 
             #    on fresh wallets without more evidence. Safe bet is to ignore.
-            if p_val > 0.05 or slope > 0:
-                # Relationship is weak or inverted. Fallback to safe default.
+            # --- ROBUST FIX: Soften the P-Value Cliff ---
+            # Instead of a hard kill switch at 0.05, we dampen the signal 
+            # as confidence decreases.
+            
+            # 1. Filter completely broken models (Wrong direction)
+            if slope > 0: 
                 return SAFE_SLOPE, SAFE_INTERCEPT
+            
+            # 2. Dampen weak signals instead of ignoring them
+            # If p < 0.05, keep 100% of slope.
+            # If p is 0.10, keep 50% of slope.
+            # If p > 0.20, kill it.
+            if p_val > 0.20:
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            confidence_factor = 1.0
+            
+            if p_val > 0.05:
+                # Linear decay from 0.05 to 0.20
+                # p=0.05 -> factor=1.0. p=0.20 -> factor=0.0
+                confidence_factor = 1.0 - ((p_val - 0.05) / 0.15)
+                
+            slope = slope * confidence_factor
+            intercept = (intercept * confidence_factor) + (SAFE_INTERCEPT * (1.0 - confidence_factor))
                 
             # C. R-squared check (Optional but good)
             # If R^2 is extremely low, the signal is negligible
