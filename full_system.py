@@ -1646,11 +1646,14 @@ class FastBacktestEngine:
                         brier = max(0.10, min(pred_brier, 0.35))
                     
                     # Skill Premium Calculation
-                    skill_premium = max(0.0, 0.25 - brier)
-                    weight = vol * (skill_premium * 1000.0 + 1.0) 
-                    
+                    raw_skill = max(0.0, 0.25 - brier)
+                    skill_factor = np.log1p(raw_skill * 100)
+                    multiplier = 1.0 + min(skill_factor * 5.0, 10.0) 
+                    weight = vol * multiplier
                     # Accumulate Net Weight
                     tracker[cid]['net_weight'] += (weight * trade_direction)
+                
+                    
                     
                     # --- 3. CHECK SPLASH THRESHOLD ---
                     abs_net_weight = abs(tracker[cid]['net_weight'])
