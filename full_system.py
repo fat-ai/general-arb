@@ -2244,11 +2244,21 @@ class BacktestEngine:
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-        trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
+        # 1. Normalize floats to ensure sorting works on consistent precision
+        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0).round(6)
+
+        # 2. SORT FIRST. This forces a physical order regardless of CSV line order.
         trades = trades.sort_values(
             ['timestamp', 'contract_id', 'user', 'tradeAmount'], 
             kind='stable'
+        )
+
+        # 3. DROP DUPLICATES SECOND. Now 'keep=first' always keeps the exact same record.
+        trades = trades.drop_duplicates(
+            subset=['timestamp', 'contract_id', 'user', 'tradeAmount'],
+            keep='first'
         ).reset_index(drop=True)
+        
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
@@ -2789,10 +2799,16 @@ class BacktestEngine:
         # C. PRICE_UPDATE (Robust Logic)
         
         # 1. Ensure the source is strictly sorted and deduped
-        trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
+        # 1. Sort strictly first
         trades = trades.sort_values(
             by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
             kind='stable'
+        )
+        
+        # 2. Dedup second
+        trades = trades.drop_duplicates(
+            subset=['timestamp', 'contract_id', 'user', 'tradeAmount'],
+            keep='first'
         ).reset_index(drop=True)
         
         # 2. Re-create prof_data-like vectors directly from the sorted source
