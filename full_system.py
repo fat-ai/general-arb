@@ -1730,13 +1730,32 @@ class FastBacktestEngine:
                                     shares = net_capital / (1.0 - safe_entry)
                   
                                 # --- FRICTION COST (Gas/Fees) ---
-                                friction_rate = 0.002 # 0.2%
-                                friction_cost = cost * friction_rate
-                                friction_rate = 0.002
-                                investment_amount = cost / (1.0 + friction_rate) # Amount actually going into the trade setup
-                                friction_paid = cost - investment_amount
-                                net_capital = investment_amount * (1.0 - fixed_penalty_rate)
-                               
+                                friction_rate = 0.002  # Gas/Fees
+                                fixed_penalty = 0.03   # Slippage/Tax
+                                
+                                # Back out the friction from the total 'cost' (cash leaving wallet)
+                                investment_principal = cost / (1.0 + friction_rate)
+                                
+                                # Apply Fixed Penalty to the Principal
+                                net_capital = investment_principal * (1.0 - fixed_penalty)
+                                
+                                # 2. Variable Impact (CPMM)
+                                variable_impact = net_capital / (pool_liq + net_capital)
+                                variable_impact = min(variable_impact, 0.15)
+                                
+                                # 3. Calculate Execution Price
+                                if side == 1:
+                                    safe_entry = min(new_price + variable_impact, 0.99)
+                                else:
+                                    safe_entry = max(new_price - variable_impact, 0.01)
+                                
+                                # 4. Position Sizing
+                                if side == 1:
+                                    shares = net_capital / safe_entry
+                                else:
+                                    shares = net_capital / (1.0 - safe_entry)
+                                
+                                # 5. Execution
                                 positions[cid] = {
                                     'side': side,
                                     'size': cost, 
