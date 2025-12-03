@@ -2071,12 +2071,9 @@ class BacktestEngine:
         # === FIXED SEARCH SPACE ===
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
-            "splash_threshold": tune.grid_search([200.0, 300.0, 400.0, 500.0]),
-            "edge_threshold": tune.grid_search([0.05, 0.1, 0.15]),
+            "splash_threshold": tune.grid_search([50.0, 100.0, 250.0, 500.0]),
+            "edge_threshold": tune.grid_search([0.01, 0.025, 0.05]),
             "use_smart_exit": tune.grid_search([True, False]),
-            
-            # FIXED: Constants are passed directly. 
-            # Ray will inject these into 'config' without searching them.
             "sizing": ("fixed_pct", 0.025), 
             "stop_loss": None,
             "train_days": safe_train,
@@ -2246,7 +2243,9 @@ class BacktestEngine:
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
         # 1. Normalize floats to ensure sorting works on consistent precision
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0).round(6)
-
+        trades['contract_id'] = trades['contract_id'].astype(str)
+        trades['user'] = trades['user'].astype(str)
+        
         # 2. SORT FIRST. This forces a physical order regardless of CSV line order.
         trades = trades.sort_values(
             ['timestamp', 'contract_id', 'user', 'tradeAmount'], 
@@ -2837,9 +2836,20 @@ class BacktestEngine:
             })
 
         # 6. FINAL SORT
-        df_ev = pd.DataFrame({'timestamp': events_ts, 'event_type': events_type, 'data': events_data})
+        df_ev = pd.DataFrame({
+            'timestamp': events_ts, 
+            'event_type': events_type, 
+            'data': events_data
+        })
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
-        df_ev = df_ev.dropna(subset=['timestamp']).set_index('timestamp').sort_index(kind='stable')
+        df_ev = df_ev.dropna(subset=['timestamp'])
+        df_ev['cid_temp'] = df_ev['data'].apply(lambda x: x.get('contract_id', ''))
+        df_ev = df_ev.sort_values(
+            by=['timestamp', 'cid_temp', 'event_type'], 
+            kind='stable'
+        )
+        df_ev = df_ev.drop(columns=['cid_temp'])
+        df_ev = df_ev.set_index('timestamp')
         
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
