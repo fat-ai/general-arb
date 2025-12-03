@@ -1342,7 +1342,9 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
             
         valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
-        
+        if known_wallet_ids:
+            # We only want to learn from the "Amateurs/Transients"
+            valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
         # 3. Minimum Sample Size Check
         # Fitting a regression on < 50 trades is statistical malpractice
         if len(valid) < 50:
@@ -1469,7 +1471,8 @@ class FastBacktestEngine:
             # B. Calibrate Models
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
             # Use 'self.' to call method
-            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler)
+            known_experts = set(k[0] for k in fold_wallet_scores.keys())
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts)
             
             # C. Run Test Simulation
             test_slice = self.event_log[(self.event_log.index >= test_start) & 
@@ -1697,7 +1700,6 @@ class FastBacktestEngine:
                             
                     
                             # --- 7. CASH CHECK & TRADE EXECUTION ---
-                            # --- 7. CASH CHECK & TRADE EXECUTION ---
                             if cost > 5.0 and cash > cost:
                                 
                                 # Retrieve Liquidity
@@ -1713,61 +1715,20 @@ class FastBacktestEngine:
                                 # + Latency/Slippage between signal and block inclusion (1%)
                                 # = 3.0% Fixed Penalty on every trade.
                                 fixed_penalty = 0.03 
-                                
-                                # 2. Variable Impact (Exact CPMM Formula)
-                                # In Constant Product AMMs, price moves based on the ratio of deposit.
-                                # Impact = Size / (Liquidity + Size)
-                                # This is less harsh than Sqrt for small trades, but realistic.
-                                
-                                # We need to solve for Max Size given a max allowed impact.
-                                # Let Target_Impact = 0.05 (5%). 
-                                # Max_Size = (Target_Impact * Liq) / (1 - Target_Impact)
-                                
-                                # Dynamic Tolerance: We accept impact up to 2/3rds of our Edge.
-                                # If Edge is 10%, we accept 6.6% total slippage.
-                                target_total_slippage = abs(edge) * (2.0 / 3.0)
-                                
-                                # The variable portion allowed is Total - Fixed
-                                allowed_variable_impact = target_total_slippage - fixed_penalty
-                                
-                                if allowed_variable_impact <= 0:
-                                    # If the fixed tax (3%) eats our entire edge tolerance, SKIP TRADE.
-                                    rejection_log['low_edge_vs_cost'] = rejection_log.get('low_edge_vs_cost', 0) + 1
-                                    continue
-                                
-                                # Calculate Max Size based on CPMM math
-                                # Size = (Impact * Liq) / (1 - Impact)
-                                max_size_cpmm = (allowed_variable_impact * pool_liq) / (1.0 - allowed_variable_impact)
-                                
-                                # Cap our trade size
-                                actual_cost = min(cost, max_size_cpmm)
-                                
-                                # Final Check: Is the trade too small to bother?
-                                if actual_cost < 5.0:
-                                    rejection_log['low_liquidity'] = rejection_log.get('low_liquidity', 0) + 1
-                                    continue
-
-                                # 3. Calculate Final Execution Price
-                                # Recalculate exact variable impact for the final size
-                                variable_impact = actual_cost / (pool_liq + actual_cost)
-                                total_slippage = fixed_penalty + variable_impact
-                                
-                                # Safety Clamp (Max 20% impact allowed ever)
-                                total_slippage = min(total_slippage, 0.20)
-
-                                # Apply to Price
+                                net_capital = actual_cost * (1.0 - fixed_penalty_rate)
+                                variable_impact = net_capital / (pool_liq + net_capital)
+                                variable_impact = min(variable_impact, 0.15)
                                 if side == 1:
-                                    safe_entry = min(new_price + total_slippage, 0.99)
+                                    safe_entry = min(new_price + variable_impact, 0.99)
                                 else:
-                                    safe_entry = max(new_price - total_slippage, 0.01)
+                                    safe_entry = max(new_price - variable_impact, 0.01)
                                 
-                                # -----------------------------------------------------
-
+                                # 4. Position Sizing (Use net capital after fixed costs)
                                 if side == 1:
-                                    shares = actual_cost / safe_entry
+                                    shares = net_capital / safe_entry
                                 else:
-                                    shares = actual_cost / (1.0 - safe_entry)
-                                
+                                    shares = net_capital / (1.0 - safe_entry)
+                  
                                 # --- FRICTION COST (Gas/Fees) ---
                                 friction_rate = 0.002 # 0.2%
                                 friction_cost = actual_cost * friction_rate
@@ -1799,7 +1760,7 @@ class FastBacktestEngine:
                             rejection_log['unsafe_price'] += 1
                 
                 # ==================== C. RESOLUTION ====================
-                # ==================== C. RESOLUTION ====================
+
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
                         pos = positions[cid]
@@ -1807,10 +1768,8 @@ class FastBacktestEngine:
                         
                         # FIX: Handle Invalid Markets (Outcome 0.5)
                         if outcome == 0.5:
-                            # REFUND LOGIC: Market was invalid. 
-                            # We get our original investment back (Cost Basis), not the shares.
-                            # Penalty: We lost the opportunity cost of that capital for the duration.
-                            cash += pos['size']
+                            refund = pos['shares'] * 0.50
+                            cash += refund
                             
                         else:
                             # Standard Win/Loss Logic
@@ -1851,14 +1810,10 @@ class FastBacktestEngine:
                             payout = pos['shares'] * (1.0 - curr_p)
                         cash += payout
                         del positions[cid]
-            
-            # ================================================================
-            # <<<< FIX: MOVE EQUITY CURVE RECORDING HERE (End of Batch Loop)
-            # ================================================================
+                        
             current_val = cash
             for cid in sorted(positions.keys()):
                 pos = positions[cid]
-                # Mark-to-Market: Value open positions at last known price
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                 if pos['side'] == 1: 
                     val = pos['shares'] * last_p
@@ -1867,8 +1822,7 @@ class FastBacktestEngine:
                 current_val += val
             
             equity_curve.append(current_val)
-            # ================================================================
-        
+   
         # --- END OF PERIOD VALUATION ---
         final_value = cash
         for cid, pos in positions.items():
@@ -2087,18 +2041,18 @@ class BacktestEngine:
         
         # === FIXED SEARCH SPACE ===
         search_space = {
-        # Grid Search forces Ray to try ALL of these. No guessing.
-        "splash_threshold": tune.grid_search([50.0, 100.0, 150.0, 200.0]),
-        "edge_threshold": tune.grid_search([0.01, 0.03, 0.05]),
-        "use_smart_exit": tune.grid_search([True, False]),
-        
-        # We lock these variables because we already solved them
-        "sizing": tune.choice([("fixed_pct", 0.025)]), 
-        "stop_loss": tune.choice([None]),
-        
-        "train_days": tune.choice([safe_train]),
-        "test_days": tune.choice([safe_test]),
-        "seed": 42,
+            # Grid Search: Ray will strictly iterate these combinations
+            "splash_threshold": tune.grid_search([50.0, 100.0, 150.0, 200.0]),
+            "edge_threshold": tune.grid_search([0.01, 0.03, 0.05]),
+            "use_smart_exit": tune.grid_search([True, False]),
+            
+            # FIXED: Constants are passed directly. 
+            # Ray will inject these into 'config' without searching them.
+            "sizing": ("fixed_pct", 0.025), 
+            "stop_loss": None,
+            "train_days": safe_train,
+            "test_days": safe_test,
+            "seed": 42,
         }
     
     #    searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
