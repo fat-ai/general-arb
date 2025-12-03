@@ -2081,39 +2081,25 @@ class BacktestEngine:
         
         gc.collect()
         
-        from ray.tune.search.hyperopt import HyperOptSearch
+       # from ray.tune.search.hyperopt import HyperOptSearch
         
         # === FIXED SEARCH SPACE ===
         search_space = {
-            # --- FIX 1: Raised Threshold Range ---
-            # Old: [2.0] → New: [50, 100, 150, 200]
-            # This matches the new weight calculation scale
-            "splash_threshold": tune.choice([50.0, 100.0, 150.0, 200.0]),
-            
-            # --- FIX 2: Lowered Edge Threshold ---
-            # Old: [0.01] → New: [0.01, 0.03, 0.05]
-            # With better signals, we can afford to be more selective
-            "edge_threshold": tune.choice([0.01, 0.03, 0.05]),
-            
-            # Longer Window for statistical significance
-            "train_days": tune.choice([safe_train]),
-            "test_days": tune.choice([safe_test]),
-            "seed": 42,
-            
-            # 1. Sizing Options (Dynamic vs Static)
-            "sizing": tune.choice([
-                ("kelly", 1.0), ("kelly", 0.5), ("kelly", 0.25),
-                ("fixed_pct", 0.10), ("fixed_pct", 0.075), ("fixed_pct", 0.05), ("fixed_pct", 0.025)
-            ]),
-            
-            # 2. Smart Exit (Toggle)
-            "use_smart_exit": tune.choice([True, False]),
-            
-            # 3. Stop Loss (None = 100%)
-            "stop_loss": tune.choice([None, 0.05, 0.10, 0.15, 0.25, 0.35])
+        # Grid Search forces Ray to try ALL of these. No guessing.
+        "splash_threshold": tune.grid_search([50.0, 100.0, 150.0, 200.0]),
+        "edge_threshold": tune.grid_search([0.01, 0.03, 0.05]),
+        "use_smart_exit": tune.grid_search([True, False]),
+        
+        # We lock these variables because we already solved them
+        "sizing": tune.choice([("fixed_pct", 0.025)]), 
+        "stop_loss": tune.choice([None]),
+        
+        "train_days": tune.choice([safe_train]),
+        "test_days": tune.choice([safe_test]),
+        "seed": 42,
         }
     
-        searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
+    #    searcher = HyperOptSearch(metric="smart_score", mode="max", random_state_seed=42)
         
         # Higher sample count to cover combinations
         analysis = tune.run(
@@ -2125,8 +2111,8 @@ class BacktestEngine:
                 priors_ref=priors_ref
             ),
             config=search_space,
-            search_alg=searcher,
-            num_samples=30,  # Increased to cover new threshold combinations
+    #        search_alg=searcher,
+    #        num_samples=30,  # Increased to cover new threshold combinations
             resources_per_trial={"cpu": 1},
         )
     
