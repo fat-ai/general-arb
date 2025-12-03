@@ -2220,7 +2220,8 @@ class BacktestEngine:
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-        trades = trades.sort_values(['timestamp', 'contract_id', 'user']).reset_index(drop=True)
+        trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
+        trades = trades.sort_values(['timestamp', 'contract_id', 'user'], kind='stable').reset_index(drop=True)
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
@@ -2759,7 +2760,8 @@ class BacktestEngine:
             })
 
         # C. PRICE_UPDATE
-        trades = trades.sort_values(['timestamp', 'contract_id', 'user'])
+        trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
+        trades = trades.sort_values(['timestamp', 'contract_id', 'user'], kind='stable').reset_index(drop=True)
         aligned_trades = trades.loc[prof_data.index]
         
         t_ts = aligned_trades['timestamp'].tolist()
