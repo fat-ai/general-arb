@@ -1856,7 +1856,8 @@ class FastBacktestEngine:
             # <<<< FIX: MOVE EQUITY CURVE RECORDING HERE (End of Batch Loop)
             # ================================================================
             current_val = cash
-            for cid, pos in positions.items():
+            for cid in sorted(positions.keys()):
+                pos = positions[cid]
                 # Mark-to-Market: Value open positions at last known price
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                 if pos['side'] == 1: 
@@ -2787,7 +2788,7 @@ class BacktestEngine:
             })
 
         # C. PRICE_UPDATE
-        trades = trades.sort_values('timestamp')
+        trades = trades.sort_values(['timestamp', 'contract_id', 'user'])
         aligned_trades = trades.loc[prof_data.index]
         
         t_ts = aligned_trades['timestamp'].tolist()
