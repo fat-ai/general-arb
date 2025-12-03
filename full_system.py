@@ -1924,6 +1924,7 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
     """
     import traceback
     import random
+    import numpy as np
     try:
         seed = config.get('seed', 42)
         np.random.seed(seed)
