@@ -2220,7 +2220,7 @@ class BacktestEngine:
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-
+        trades = trades.sort_values(['timestamp', 'contract_id', 'user']).reset_index(drop=True)
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
