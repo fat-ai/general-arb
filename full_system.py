@@ -2238,23 +2238,32 @@ class BacktestEngine:
         markets['contract_id'] = markets['contract_id'].str.strip()
         
         # D. Match Dataframes
+        # D. Match Dataframes
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-        # 1. Normalize floats to ensure sorting works on consistent precision
+
+        # --- FIX: Strict Deterministic Loading ---
+        # 1. Normalize numerics to ensure sorting works consistently
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0).round(6)
+        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0).round(6)
+        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0).round(6)
+        
+        # 2. Strict Type Casting for Sort
         trades['contract_id'] = trades['contract_id'].astype(str)
         trades['user'] = trades['user'].astype(str)
-        
-        # 2. SORT FIRST. This forces a physical order regardless of CSV line order.
+
+        # 3. SORT with ALL varying columns. 
+        # Including Price and Tokens ensures A and B (from above) always appear in the same order.
         trades = trades.sort_values(
-            ['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'], 
             kind='stable'
         )
 
-        # 3. DROP DUPLICATES SECOND. Now 'keep=first' always keeps the exact same record.
+        # 4. DEDUPLICATE with ALL varying columns.
+        # This prevents dropping valid concurrent trades that differ only by price/tokens.
         trades = trades.drop_duplicates(
-            subset=['timestamp', 'contract_id', 'user', 'tradeAmount'],
+            subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
         ).reset_index(drop=True)
         
@@ -2800,13 +2809,12 @@ class BacktestEngine:
         # 1. Ensure the source is strictly sorted and deduped
         # 1. Sort strictly first
         trades = trades.sort_values(
-            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            by=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'], 
             kind='stable'
         )
         
-        # 2. Dedup second
         trades = trades.drop_duplicates(
-            subset=['timestamp', 'contract_id', 'user', 'tradeAmount'],
+            subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
         ).reset_index(drop=True)
         
