@@ -2789,7 +2789,7 @@ class BacktestEngine:
         
         # 1. Ensure the source is strictly sorted and deduped
         trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
-        trades_df = trades_df.sort_values(
+        trades = trades.sort_values(
             by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
             kind='stable'
         ).reset_index(drop=True)
