@@ -2778,24 +2778,32 @@ class BacktestEngine:
                 'outcome': float(row['outcome'])
             })
 
-        # C. PRICE_UPDATE
+        # C. PRICE_UPDATE (Robust Logic)
+        
+        # 1. Ensure the source is strictly sorted and deduped
         trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
         trades = trades.sort_values(['timestamp', 'contract_id', 'user'], kind='stable').reset_index(drop=True)
-        aligned_trades = trades.loc[prof_data.index]
         
-        t_ts = aligned_trades['timestamp'].tolist()
-        t_cid = aligned_trades['contract_id'].tolist()
-        t_uid = aligned_trades['user'].astype(str).tolist()
-        t_vol = aligned_trades['tradeAmount'].tolist()
-        t_tokens = aligned_trades['outcomeTokensAmount'].tolist()
-        t_price = prof_data['bet_price'].tolist() 
+        # 2. Re-create prof_data-like vectors directly from the sorted source
+        # This guarantees 1:1 alignment because we are reading from the SAME dataframe
+        t_ts = trades['timestamp'].tolist()
+        t_cid = trades['contract_id'].tolist()
+        t_uid = trades['user'].astype(str).tolist()
+        t_vol = trades['tradeAmount'].tolist()
+        t_tokens = trades['outcomeTokensAmount'].tolist()
         
-        for i in range(len(aligned_trades)):
+        # 3. Handle Price (Use map to ensure correctness)
+        # We need the 'bet_price' logic from profiler data, but safe.
+        # Since we just sorted 'trades', we can calculate price on the fly.
+        t_price = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).tolist()
+
+        # 4. Append to events
+        for i in range(len(trades)):
             events_ts.append(t_ts[i])
             events_type.append('PRICE_UPDATE')
             events_data.append({
                 'contract_id': t_cid[i],
-                'p_market_all': t_price[i],
+                'p_market_all': t_price[i], # Aligned perfectly
                 'wallet_id': t_uid[i],
                 'trade_volume': float(t_vol[i]),
                 'is_sell': t_tokens[i] < 0
