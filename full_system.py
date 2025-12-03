@@ -1923,7 +1923,11 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
     - This wrapper bridges the gap.
     """
     import traceback
+    import random
     try:
+        seed = config.get('seed', 42)
+        np.random.seed(seed)
+        random.seed(seed)
         def get_ref(obj):
             if isinstance(obj, ray.ObjectRef): 
                 return ray.get(obj)
@@ -2240,7 +2244,10 @@ class BacktestEngine:
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
         trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
-        trades = trades.sort_values(['timestamp', 'contract_id', 'user'], kind='stable').reset_index(drop=True)
+        trades = trades.sort_values(
+            ['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            kind='stable'
+        ).reset_index(drop=True)
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
@@ -2782,7 +2789,10 @@ class BacktestEngine:
         
         # 1. Ensure the source is strictly sorted and deduped
         trades = trades.drop_duplicates(subset=['timestamp', 'contract_id', 'user', 'tradeAmount'])
-        trades = trades.sort_values(['timestamp', 'contract_id', 'user'], kind='stable').reset_index(drop=True)
+        trades_df = trades_df.sort_values(
+            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            kind='stable'
+        ).reset_index(drop=True)
         
         # 2. Re-create prof_data-like vectors directly from the sorted source
         # This guarantees 1:1 alignment because we are reading from the SAME dataframe
