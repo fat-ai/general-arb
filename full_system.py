@@ -1565,7 +1565,7 @@ class FastBacktestEngine:
         
         return {
             'total_return': total_ret,
-            'sharpe': sharpe,
+            'sharpe_ratio': sharpe,
             'max_drawdown': abs(max_dd), # Return as positive number (e.g. 0.05)
             'trades': total_trades,
             'equity_curve': equity_curve 
@@ -2114,11 +2114,22 @@ class BacktestEngine:
 
         print("\n--- Generating Visual Report ---")
     
-        # 1. Re-run the Best Config to get the full curve
-        # (We need to re-instantiate the engine locally to run it)
+        # 1. FIX: Manually unpack the 'sizing' tuple for the local engine
+        # (This replicates the logic inside ray_backtest_wrapper)
+        if 'sizing' in best_config:
+            mode, val = best_config['sizing']
+            best_config['sizing_mode'] = mode
+            if mode == 'kelly':
+                best_config['kelly_fraction'] = val
+            elif mode == 'fixed_pct':
+                best_config['fixed_size'] = val
+            elif mode == 'fixed':
+                best_config['fixed_size'] = val
+
+        # 2. Re-instantiate the engine locally
         engine = FastBacktestEngine(event_log, profiler_data, None, {})
         
-        # Use the best config found by Ray
+        # 3. Run with the CORRECTED config
         final_results = engine.run_walk_forward(best_config)
         
         # 2. Extract Curve
