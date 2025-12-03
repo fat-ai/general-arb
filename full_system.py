@@ -2079,7 +2079,9 @@ class BacktestEngine:
         profiler_ref = ray.put(profiler_data)
         nlp_cache_ref = ray.put(None)
         priors_ref = ray.put({})
-        
+        del event_log
+        del profiler_data
+
         gc.collect()
         
        # from ray.tune.search.hyperopt import HyperOptSearch
