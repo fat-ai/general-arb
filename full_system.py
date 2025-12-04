@@ -2183,7 +2183,8 @@ class BacktestEngine:
         if markets.empty:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
-
+            
+        markets = markets.drop_duplicates(subset=['contract_id']).copy()
         # ---------------------------------------------------------
         # 2. TRADES (Get History)
         # ---------------------------------------------------------
@@ -2237,7 +2238,6 @@ class BacktestEngine:
         markets = markets.explode('contract_id')
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # D. Match Dataframes
         # D. Match Dataframes
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
@@ -2755,8 +2755,9 @@ class BacktestEngine:
             'timestamp': trades['timestamp'],
             'usdc_vol': trades['tradeAmount'].astype('float32'),
             'tokens': trades['outcomeTokensAmount'].astype('float32'),
-            # FIX: Load the REAL price from CSV. No calculation needed.
-            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float32')
+            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float32'),
+            'outcome': 0.0,
+            'bet_price': 0.0
         })
 
         # MAP OUTCOMES
