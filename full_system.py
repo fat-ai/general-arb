@@ -2099,7 +2099,25 @@ class BacktestEngine:
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
-        best_trial = [t for t in analysis.trials if t.config == best_config][0]
+        print("Sorting results deterministically...")
+        all_trials = analysis.trials
+        # Define a robust sort key:
+        # 1. Smart Score (Desc)
+        # 2. Total Return (Desc)
+        # 3. Trades (Desc)
+        # 4. Splash Threshold (Asc - prefer lower threshold if scores are tied)
+        def sort_key(t):
+            metrics = t.last_result or {}
+            return (
+                metrics.get('smart_score', -99.0),
+                metrics.get('total_return', -99.0),
+                metrics.get('trades', 0),
+                -t.config.get('splash_threshold', 0) # Negative for Ascending
+            )
+        sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
+        best_trial = sorted_trials[0]
+        best_config = best_trial.config
+      
         metrics = best_trial.last_result
         
         mode, val = best_config['sizing']
@@ -2753,9 +2771,9 @@ class BacktestEngine:
             'wallet_id': trades['user'].astype(str), 
             'market_id': trades['contract_id'],
             'timestamp': trades['timestamp'],
-            'usdc_vol': trades['tradeAmount'].astype('float32'),
-            'tokens': trades['outcomeTokensAmount'].astype('float32'),
-            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float32'),
+            'usdc_vol': trades['tradeAmount'].astype('float64'),
+            'tokens': trades['outcomeTokensAmount'].astype('float64'),
+            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float64'),
             'outcome': 0.0,
             'bet_price': 0.0
         })
@@ -2852,7 +2870,7 @@ class BacktestEngine:
         })
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
         df_ev = df_ev.dropna(subset=['timestamp'])
-        df_ev['cid_temp'] = df_ev['data'].apply(lambda x: x.get('contract_id', ''))
+        df_ev['cid_temp'] = df_ev['data'].apply(lambda x: str(x.get('contract_id', '')))
         df_ev = df_ev.sort_values(
             by=['timestamp', 'cid_temp', 'event_type'], 
             kind='stable'
