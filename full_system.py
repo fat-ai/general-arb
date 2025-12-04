@@ -847,12 +847,19 @@ class HistoricalProfiler:
             resolved['tokens'] = pd.to_numeric(resolved['tokens'], errors='coerce').fillna(0.0)
             resolved['outcome'] = pd.to_numeric(resolved['outcome'], errors='coerce').fillna(0.0)
             
-            # PnL Formula: Value Received - Cost Basis
-            # Value = Token Count * Outcome (e.g., 100 shares * 1.0 = $100)
-            # Cost = Size (USDC invested)
+
+            # Aggregate PnL per wallet
+            signed_cost = resolved['size'].where(resolved['tokens'] >= 0, -resolved['size'])
+        
             resolved['payout_value'] = resolved['tokens'] * resolved['outcome']
-            resolved['realized_pnl'] = resolved['payout_value'] - resolved['size']
+            resolved['realized_pnl'] = resolved['payout_value'] - signed_cost
             
+            # Debug: Print the top winner to confirm it works
+            top_winner = resolved.sort_values('realized_pnl', ascending=False).head(1)
+            if not top_winner.empty:
+                log.info(f"DEBUG: Top Trade PnL: ${top_winner.iloc[0]['realized_pnl']:.2f} "
+                         f"(Wallet: {top_winner.iloc[0]['wallet_id']})")
+    
             # Aggregate PnL per wallet
             wallet_stats = resolved.groupby('wallet_id')['realized_pnl'].sum()
             
@@ -2350,23 +2357,35 @@ class BacktestEngine:
 
         # Normalization
         def derive_outcome(row):
-            # 1. Trust explicit outcome if present
+            # 1. Trust explicit outcome first (Gold Standard)
             if pd.notna(row.get('outcome')): 
                 return float(row['outcome'])
 
+            # 2. TIME GATE: Check if the market has actually ended
             try:
-                # 2. Check Prices
+                end_date_str = row.get('endDate') # Raw API field
+                if end_date_str:
+                    # Convert to timestamp
+                    end_ts = pd.to_datetime(end_date_str).tz_localize(None)
+                    # Add a 24-hour "Dispute Buffer" to be safe? 
+                    # For now, we'll just check if it's in the past relative to "Now"
+                    if end_ts > pd.Timestamp.now():
+                        return 0.5 # Future market = Active. Do not resolve.
+            except:
+                # If date parsing fails, default to safety (Active)
+                return 0.5
+
+            # 3. PRICE CHECK (Only runs if Time Gate is passed)
+            try:
                 prices = row.get('outcomePrices')
                 if isinstance(prices, str): prices = json.loads(prices)
                 if not isinstance(prices, list) or len(prices) != 2: return 0.5
                 
                 p0, p1 = float(prices[0]), float(prices[1])
                 
-                # 3. STRICT RESOLUTION CHECK
-                # Only accept resolution if the chain has settled to exactly 0 or 1.
-                # Floating point tolerance is tiny (1e-6), ignoring 0.99 vs 1.0 distinction.
-                if p1 >= 0.9999: return 1.0
-                if p0 >= 0.9999: return 0.0
+                # Strict 99% threshold, but ONLY for markets past their end date
+                if p1 >= 0.99: return 1.0
+                if p0 >= 0.99: return 0.0
                 
                 return 0.5
             except: 
@@ -2783,6 +2802,7 @@ class BacktestEngine:
             'usdc_vol': trades['tradeAmount'].astype('float64'),
             'tokens': trades['outcomeTokensAmount'].astype('float64'),
             'price': pd.to_numeric(trades['price'], errors='coerce').astype('float64'),
+            'size': trades['tradeAmount'].astype('float64'),
             'outcome': 0.0,
             'bet_price': 0.0
         })
