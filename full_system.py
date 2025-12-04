@@ -1365,33 +1365,45 @@ class FastBacktestEngine:
             # 5. Run Regression
             slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
             
-            # 6. Statistical Significance Validation (The Fix)
-            # A. p-value > 0.05 means the relationship is likely random chance.
-            # B. slope > 0 means Higher Volume = WORSE Score (Dumb Whales). 
-            #    While possible, we usually don't want to blindly trust 'Contrarian' models 
-            #    on fresh wallets without more evidence. Safe bet is to ignore.
-            # --- ROBUST FIX: Soften the P-Value Cliff ---
-            # Instead of a hard kill switch at 0.05, we dampen the signal 
-            # as confidence decreases.
+            # --- FIX: BAYESIAN DAMPENING & ECONOMIC SIGNIFICANCE ---
             
-            # 1. Filter completely broken models (Wrong direction)
-            if p_val > 0.05 or slope > 0:
+            # 1. Directional Check:
+            # We only care if volume IMPROVES skill (lowers Brier).
+            # If slope is positive (Volume = Higher Brier), it's a "Dumb Whale".
+            # We ignore Dumb Whale signals to be safe.
+            if slope >= 0:
+                return SAFE_SLOPE, SAFE_INTERCEPT
 
+            # 2. Economic Significance (Effect Size):
+            # If the slope is microscopic (e.g. -0.0001), it's noise even if p < 0.05.
+            # We require a minimum improvement per unit of log volume.
+            MIN_EFFECT_SIZE = -0.002 
+            if slope > MIN_EFFECT_SIZE:
                 return SAFE_SLOPE, SAFE_INTERCEPT
-                
-            # C. R-squared check (Optional but good)
-            # If R^2 is extremely low, the signal is negligible
-            if (r_val ** 2) < 0.01: 
-                return SAFE_SLOPE, SAFE_INTERCEPT
-                
-            # If we pass all checks, return the found relationship
-            # Bound the intercept to be sane (cannot be worse than 1.0 or better than 0.0)
-            intercept = max(0.0, min(intercept, 0.50))
+
+            # 3. Bayesian Dampening (The "Dimmer Switch"):
+            # Instead of a hard cliff at 0.05, we linearly decay confidence 
+            # from p=0.0 (Full Trust) to p=0.20 (Zero Trust).
+            SIGNIFICANCE_LIMIT = 0.20
             
-            return slope, intercept
+            if p_val >= SIGNIFICANCE_LIMIT:
+                return SAFE_SLOPE, SAFE_INTERCEPT
+            
+            # Calculate Confidence Factor (0.0 to 1.0)
+            confidence = 1.0 - (p_val / SIGNIFICANCE_LIMIT)
+            
+            # Dampen the slope based on confidence
+            # If p=0.01, we keep ~95% of the slope.
+            # If p=0.19, we keep ~5% of the slope.
+            final_slope = slope * confidence
+            
+            # 4. Intercept Bounding (Safety)
+            # Ensure the baseline amateur is not "Perfect" (0.0) or "Terrible" (0.5)
+            final_intercept = np.clip(intercept, 0.15, 0.35)
+            
+            return final_slope, final_intercept
             
         except Exception as e:
-            # On any math error (e.g. singular matrix), return safe default
             return SAFE_SLOPE, SAFE_INTERCEPT
             
     def run_walk_forward(self, config: Dict) -> Dict[str, float]:
@@ -1607,9 +1619,24 @@ class FastBacktestEngine:
         # [FIXED: TWO-PASS LOGIC WITH DEDUPLICATION]
         for batch_idx, batch in enumerate(batches):
             
-            # --- PHASE 1: COLLECT SIGNALS & PROCESS EXITS ---
-            candidates = []
+            # 1. Strict Sort within the Batch
+            # Ensure we process events in time order. 
+            # If timestamps are identical, process RESOLUTION before PRICE_UPDATE.
+            # We assume 'timestamp' is in the event, or we rely on the list order if pre-sorted.
+            # Ideally, the event log passed here should already be sorted, but this is a safety.
+            def sort_key(e):
+                # Primary: Timestamp (if available, otherwise 0 implies preserve order)
+                ts = e['data'].get('timestamp', pd.Timestamp.min)
+                
+                # Secondary: Event Priority (Resolution First = 0, Price Update = 1)
+                # This only affects ties at the exact same timestamp.
+                prio = 0 if e['event_type'] == 'RESOLUTION' else 1
+                
+                return (ts, prio)
             
+            # Note: If batch is already sorted by time, this is fast.
+            batch.sort(key=sort_key)
+
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
@@ -1617,12 +1644,9 @@ class FastBacktestEngine:
 
                 # ==================== A. NEW CONTRACT ====================
                 if ev_type == 'NEW_CONTRACT':
-                    tracker[cid] = {
-                        'net_weight': 0.0,
-                        'last_price': 0.5
-                    }
+                    tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
 
-                # ==================== B. RESOLUTION (Free up Cash First) ====================
+                # ==================== B. RESOLUTION (Strictly Sequential) ====================
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
                         pos = positions[cid]
@@ -1641,111 +1665,120 @@ class FastBacktestEngine:
                         
                         del positions[cid]
 
-                # ==================== C. PRICE UPDATE (Generate Signals) ====================
+                # ==================== C. PRICE UPDATE & EXECUTION (Strictly Sequential) ====================
                 elif ev_type == 'PRICE_UPDATE':
-                    # --- 1. STATE INIT ---
+                    # 1. Update State
                     if cid not in market_liq:
                         market_liq[cid] = known_liquidity.get(cid, 10000.0) if known_liquidity else 10000.0
-                    if cid not in market_prices:
-                        market_prices[cid] = 0.5
-                    if cid not in tracker:
-                        tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
                     
                     new_price = data.get('p_market_all', 0.5)
+                    # Initialize tracker if missing
+                    if cid not in tracker: tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
+                    
                     prev_price = tracker[cid]['last_price']
                     tracker[cid]['last_price'] = new_price
                     
-                    # --- 2. CALCULATE WEIGHT ---
+                    # 2. Process Signal
                     vol = float(data.get('trade_volume', 0.0))
                     
+                    # Logic Check: Valid Volume?
                     if vol >= 1.0:
                         is_sell = data.get('is_sell', False)
                         trade_direction = -1.0 if is_sell else 1.0
                         w_id = str(data.get('wallet_id'))
                         
-                        # Get Brier Score
+                        # --- Brier Score Lookup ---
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
                             log_vol = np.log(max(vol, 1.0))
                             pred_brier = fw_intercept + (fw_slope * log_vol)
                             brier = max(0.10, min(pred_brier, 0.35))
                         
-                        # Skill Premium
+                        # --- Weight Calculation ---
                         raw_skill = max(0.0, 0.25 - brier)
                         skill_factor = np.log1p(raw_skill * 100)
                         multiplier = 1.0 + min(skill_factor * 5.0, 10.0) 
                         weight = vol * multiplier
                         tracker[cid]['net_weight'] += (weight * trade_direction)
 
-                        # --- 3. CHECK SPLASH THRESHOLD ---
-                        abs_net_weight = abs(tracker[cid]['net_weight'])
-                        
-                        if abs_net_weight > splash_thresh:
-                            # Reset pressure
+                        # --- Threshold Check ---
+                        if abs(tracker[cid]['net_weight']) > splash_thresh:
+                            
+                            # Signal Generated
                             raw_net = tracker[cid]['net_weight']
-                            tracker[cid]['net_weight'] = 0.0
+                            tracker[cid]['net_weight'] = 0.0 # Reset Accumulator
                             
                             net_sentiment = np.tanh(raw_net / 5000.0)
                             p_model = 0.5 + (net_sentiment * 0.4)
                             edge = p_model - prev_price
                             
-                            # --- 4. EDGE FILTER ---
                             edge_thresh = config.get('edge_threshold', 0.05)
                             is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
                             
-                            # CRITICAL: Do NOT check 'cid not in positions' here. 
-                            # We check it in Phase 2 to handle concurrent updates cleanly.
-                            
+                            # --- EXECUTION DECISION (GREEDY / REALISTIC) ---
                             if abs(edge) >= edge_thresh and is_safe_price:
-                                side = 1 if edge > 0 else -1
                                 
-                                # --- 6. POSITION SIZING ---
-                                target_f = 0.0
-                                cost = 0.0
-                                
-                                if sizing_mode == 'fixed_pct':
-                                    target_f = sizing_val
-                                elif sizing_mode == 'kelly':
-                                    target_f = abs(edge) * sizing_val
-                                elif sizing_mode == 'fixed':
-                                    cost = sizing_val
-                                    target_f = -1 
-                                
-                                if target_f > 0:
-                                    target_f = min(target_f, 0.20)
-                                    cost = cash * target_f 
-                                
-                                if cost > 5.0:
-                                    pool_liq = market_liq.get(cid, 10000.0)
-                                    if pool_liq < 1.0: pool_liq = 10000.0
+                                # Do we already hold this?
+                                if cid not in positions:
                                     
-                                    friction_rate = 0.002
-                                    fixed_penalty = 0.03
-                                    investment_principal = cost / (1.0 + friction_rate)
-                                    net_capital = investment_principal * (1.0 - fixed_penalty)
-                                    variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
+                                    # Sizing
+                                    target_f = 0.0
+                                    cost = 0.0
                                     
-                                    if side == 1:
-                                        safe_entry = min(new_price + variable_impact, 0.99)
-                                        shares = net_capital / safe_entry
+                                    if sizing_mode == 'fixed_pct':
+                                        target_f = sizing_val
+                                    elif sizing_mode == 'kelly':
+                                        target_f = abs(edge) * sizing_val
+                                    elif sizing_mode == 'fixed':
+                                        cost = sizing_val
+                                        target_f = -1 
+                                    
+                                    if target_f > 0:
+                                        target_f = min(target_f, 0.20)
+                                        cost = cash * target_f
+                                    
+                                    # --- CASH CHECK (THE MOMENT OF TRUTH) ---
+                                    # We check cash NOW. If we don't have it, we miss the trade.
+                                    # This is painful but historically accurate.
+                                    if cost > 5.0 and cash > cost:
+                                        
+                                        # Execute
+                                        side = 1 if edge > 0 else -1
+                                        pool_liq = market_liq.get(cid, 10000.0)
+                                        
+                                        friction_rate = 0.002
+                                        fixed_penalty = 0.03
+                                        
+                                        investment_principal = cost / (1.0 + friction_rate)
+                                        net_capital = investment_principal * (1.0 - fixed_penalty)
+                                        variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
+                                        
+                                        if side == 1:
+                                            safe_entry = min(new_price + variable_impact, 0.99)
+                                            shares = net_capital / safe_entry
+                                        else:
+                                            safe_entry = max(new_price - variable_impact, 0.01)
+                                            shares = net_capital / (1.0 - safe_entry)
+
+                                        positions[cid] = {
+                                            'side': side,
+                                            'size': cost,
+                                            'shares': shares,
+                                            'entry': safe_entry
+                                        }
+                                        trade_count += 1
+                                        volume_traded += cost
+                                        cash -= cost # Deduct immediately
+                                        
                                     else:
-                                        safe_entry = max(new_price - variable_impact, 0.01)
-                                        shares = net_capital / (1.0 - safe_entry)
+                                        rejection_log['insufficient_cash'] += 1
 
-                                    candidates.append({
-                                        'cid': cid,
-                                        'edge': abs(edge),
-                                        'cost': cost,
-                                        'side': side,
-                                        'shares': shares,
-                                        'entry': safe_entry
-                                    })
-
-                # ==================== D. POSITION MANAGEMENT ====================
+                # ==================== D. POSITION MANAGEMENT (Stop Losses) ====================
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                     
+                    # PnL Calculation
                     if pos['side'] == 1:
                         pnl_pct = (curr_p - pos['entry']) / pos['entry']
                     else:
@@ -1757,67 +1790,23 @@ class FastBacktestEngine:
                     
                     if use_smart_exit:
                         cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                        if pos['side'] == 1 and cur_net < -splash_thresh/2:
-                            should_close = True
-                        if pos['side'] == -1 and cur_net > splash_thresh/2:
-                            should_close = True
+                        if pos['side'] == 1 and cur_net < -splash_thresh/2: should_close = True
+                        if pos['side'] == -1 and cur_net > splash_thresh/2: should_close = True
                     
                     if should_close:
-                        if pos['side'] == 1:
-                            payout = pos['shares'] * curr_p
-                        else:
-                            payout = pos['shares'] * (1.0 - curr_p)
+                        if pos['side'] == 1: payout = pos['shares'] * curr_p
+                        else: payout = pos['shares'] * (1.0 - curr_p)
                         cash += payout
                         del positions[cid]
-
-            # --- PHASE 2: PRIORITIZED EXECUTION (WITH DEDUPLICATION) ---
-            candidates.sort(key=lambda x: x['edge'], reverse=True)
             
-            # [FIX] Track what we bought THIS batch to prevent double-spending
-            bought_this_batch = set()
-            
-            for trade in candidates:
-                cid = trade['cid']
-                
-                # [FIX] CRITICAL SAFETY CHECKS
-                # 1. Do not buy if we already bought it in this batch (Duplicate Signal)
-                if cid in bought_this_batch:
-                    continue
-                # 2. Do not buy if we already hold a position (Concurrent Position)
-                if cid in positions:
-                    continue
-                
-                # Re-check cash
-                if cash > trade['cost']:
-                    positions[cid] = {
-                        'side': trade['side'],
-                        'size': trade['cost'],
-                        'shares': trade['shares'],
-                        'entry': trade['entry']
-                    }
-                    trade_count += 1
-                    volume_traded += trade['cost']
-                    cash -= trade['cost']
-                    
-                    bought_this_batch.add(cid) # Mark as bought
-                    
-                    if trade_count <= 5:
-                        print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][trade['side']==1]} {cid[:8]} | "
-                              f"Edge: {trade['edge']:.3f} | Size: ${trade['cost']:.0f}")
-                else:
-                    rejection_log['insufficient_cash'] += 1
-
-            # --- PHASE 3: VALUATION ---
+            # --- VALUATION (End of Minute) ---
             current_val = cash
             for cid in sorted(positions.keys()):
                 pos = positions[cid]
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                if pos['side'] == 1: 
-                    val = pos['shares'] * last_p
-                else: 
-                    val = pos['shares'] * (1.0 - last_p)
+                if pos['side'] == 1: val = pos['shares'] * last_p
+                else: val = pos['shares'] * (1.0 - last_p)
                 current_val += val
-            
             equity_curve.append(current_val)
    
         # --- END OF PERIOD VALUATION ---
