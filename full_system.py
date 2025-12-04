@@ -1283,6 +1283,7 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     """
     Vectorized Brier score calculation (100x faster than groupby.apply).
     """
+    print(f"DEBUG: Brier Calc received {len(profiler_data)} rows. Columns: {list(profiler_data.columns)}")
     if profiler_data.empty:
         return {}
 
