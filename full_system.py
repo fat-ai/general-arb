@@ -1301,10 +1301,10 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     filtered['brier'] = (filtered['bet_price'] - filtered['outcome']) ** 2
     
     # Group and mean
-    # ... (existing calculation logic) ...
-    
-    # Group and mean
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
+    
+    # --- FIXED SYNTAX BELOW (Added closing quote) ---
+    print(f"SCORES: {str(scores)}")
     
     # --- [PATCH: DEBUG PRINTS] ---
     # Sort by Score (Ascending). 
