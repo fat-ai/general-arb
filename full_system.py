@@ -2825,8 +2825,8 @@ class BacktestEngine:
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         
         # 2. STRING NORMALIZATION
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip()
-        trades['contract_id'] = trades['contract_id'].astype(str).str.strip()
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
+        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
         
         # 3. FILTER TO COMMON IDs
         common_ids_set = set(markets['contract_id']).intersection(set(trades['contract_id']))
