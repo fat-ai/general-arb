@@ -837,6 +837,25 @@ class HistoricalProfiler:
         # --- 1. Identify Smart Wallets (PnL Based) ---
         # Filter for Resolved trades only to calculate PnL
         resolved = df_trades.dropna(subset=['outcome']).copy()
+
+        if 'size' not in resolved.columns:
+            if 'usdc_vol' in resolved.columns:
+                resolved['size'] = resolved['usdc_vol']
+            else:
+                log.error("⛔ CRITICAL: 'size' column missing in Profiler.")
+                return set(), {}
+
+        resolved['size'] = pd.to_numeric(resolved['size'], errors='coerce').fillna(0.0)
+        resolved['tokens'] = pd.to_numeric(resolved['tokens'], errors='coerce').fillna(0.0)
+        resolved['outcome'] = pd.to_numeric(resolved['outcome'], errors='coerce').fillna(0.0)
+
+        signed_cost = resolved['size'].where(resolved['tokens'] >= 0, -resolved['size'])
+        
+        resolved['payout_value'] = resolved['tokens'] * resolved['outcome']
+        resolved['realized_pnl'] = resolved['payout_value'] - signed_cost
+
+        pnl_stats = resolved['realized_pnl'].describe()
+        log.info(f"🔎 PnL DISTRIBUTION:\n{pnl_stats}")
         
         if resolved.empty:
             log.warning("No resolved trades found for profiling.")
@@ -2813,9 +2832,19 @@ class BacktestEngine:
 
         # MAP OUTCOMES
         outcome_map = markets.set_index('contract_id')['outcome']
+        outcome_map.index = outcome_map.index.astype(str).str.strip().str.lower()
         outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
+        
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         prof_data = prof_data[prof_data['outcome'].isin([0.0, 1.0])].copy()
+        matched_count = prof_data['outcome'].notna().sum()
+        total_count = len(prof_data)
+        log.info(f"🔎 OUTCOME JOIN REPORT: {matched_count} / {total_count} trades matched a market.")
+        
+        if matched_count == 0:
+            log.warning("⛔ CRITICAL: 0 trades matched. Checking ID samples:")
+            log.warning(f"   Trade ID Sample: {prof_data['market_id'].iloc[0]}")
+            log.warning(f"   Market ID Sample: {outcome_map.index[0]}")
 
         prof_data['bet_price'] = pd.to_numeric(prof_data['price'], errors='coerce')
         prof_data = prof_data.dropna(subset=['bet_price'])
