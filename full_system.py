@@ -2133,8 +2133,8 @@ class BacktestEngine:
         # === FIXED SEARCH SPACE ===
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
-            "splash_threshold": tune.grid_search([50.0, 100.0, 250.0, 500.0]),
-            "edge_threshold": tune.grid_search([0.01, 0.025, 0.05]),
+            "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0, 3000.0]),
+            "edge_threshold": tune.grid_search([0.06, 0.7, 0.08]),
             "use_smart_exit": tune.grid_search([True, False]),
             "sizing": ("fixed_pct", 0.025), 
             "stop_loss": None,
