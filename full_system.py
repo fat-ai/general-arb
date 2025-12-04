@@ -1551,6 +1551,7 @@ class FastBacktestEngine:
                         batch_events = []
                         for ts, row in group.iterrows():
                             data = row['data']
+                            data['timestamp'] = ts
                             if row['event_type'] == 'NEW_CONTRACT':
                                 if data.get('liquidity', 0) == 0:
                                     data['liquidity'] = 10000.0
@@ -1774,11 +1775,34 @@ class FastBacktestEngine:
                             net_sentiment = np.tanh(raw_net / 5000.0)
                             p_model = 0.5 + (net_sentiment * 0.49)
                             edge = p_model - prev_price
+                            market_info = self.market_lifecycle.get(cid)
+                            current_ts = data.get('timestamp')
                             
+                            # Check A: Do we have the 'End Date' metadata?
+                            if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
+                                rejection_log['missing_metadata'] = rejection_log.get('missing_metadata', 0) + 1
+                                continue # SKIP: Cannot quantify time risk.
+                                
+                            # Check B: Do we have the 'Current Time' from the event stream?
+                            if not current_ts:
+                                rejection_log['missing_timestamp'] = rejection_log.get('missing_timestamp', 0) + 1
+                                continue # SKIP: Malformed event data.
+    
+                            # 3. Calculate Duration
+                            end_ts = market_info['end']
+                            delta = end_ts - current_ts
+                            days_remaining = delta.total_seconds() / 86400.0
+                            
+                            # Check C: Is the market already expired? (Data lag protection)
+                            if days_remaining <= 0:
+                                rejection_log['market_expired'] = rejection_log.get('market_expired', 0) + 1
+                                continue # SKIP: Trading on a dead market.
+    
+                            # 4. Standard Execution (Clean Edge Check)
+                            # We have verified the trade is valid and active. Now we check the edge.
                             edge_thresh = config.get('edge_threshold', 0.05)
                             is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
-                            
-                            # --- EXECUTION DECISION (GREEDY / REALISTIC) ---
+    
                             if abs(edge) >= edge_thresh and is_safe_price:
                                 
                                 # Do we already hold this?
