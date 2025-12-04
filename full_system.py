@@ -2350,14 +2350,27 @@ class BacktestEngine:
 
         # Normalization
         def derive_outcome(row):
-            # 1. Trust the 'outcome' field if Gamma provides it (unlikely for open markets, but good practice)
+            # 1. Trust explicit outcome if present
             if pd.notna(row.get('outcome')): 
                 return float(row['outcome'])
+
+            try:
+                # 2. Check Prices
+                prices = row.get('outcomePrices')
+                if isinstance(prices, str): prices = json.loads(prices)
+                if not isinstance(prices, list) or len(prices) != 2: return 0.5
                 
-            # 2. DO NOT USE PRICE. ONLY USE RESOLUTION STATUS.
-            # If the market is not explicitly resolved in the metadata, it is ACTIVE (0.5).
-            # We remove the p0 > 0.95 check entirely.
-            return 0.5
+                p0, p1 = float(prices[0]), float(prices[1])
+                
+                # 3. STRICT RESOLUTION CHECK
+                # Only accept resolution if the chain has settled to exactly 0 or 1.
+                # Floating point tolerance is tiny (1e-6), ignoring 0.99 vs 1.0 distinction.
+                if p1 >= 0.9999: return 1.0
+                if p0 >= 0.9999: return 0.0
+                
+                return 0.5
+            except: 
+                return 0.5
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
