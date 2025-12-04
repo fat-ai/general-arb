@@ -1488,7 +1488,7 @@ class FastBacktestEngine:
             # B. Calibrate Models
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
             # Use 'self.' to call method
-            known_experts = set(k[0] for k in fold_wallet_scores.keys())
+            known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts)
             
             # C. Run Test Simulation
@@ -1902,10 +1902,15 @@ def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, pri
     import traceback
     import random
     import numpy as np
+    import torch
     try:
         seed = config.get('seed', 42)
         np.random.seed(seed)
         random.seed(seed)
+        torch.manual_seed(seed)  # <--- Critical for PyTorch/Spacy consistency
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            
         def get_ref(obj):
             if isinstance(obj, ray.ObjectRef): 
                 return ray.get(obj)
