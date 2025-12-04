@@ -1724,7 +1724,7 @@ class FastBacktestEngine:
                             tracker[cid]['net_weight'] = 0.0 # Reset Accumulator
                             
                             net_sentiment = np.tanh(raw_net / 5000.0)
-                            p_model = 0.5 + (net_sentiment * 0.4)
+                            p_model = 0.5 + (net_sentiment * 0.49)
                             edge = p_model - prev_price
                             
                             edge_thresh = config.get('edge_threshold', 0.05)
@@ -1759,7 +1759,15 @@ class FastBacktestEngine:
                                         
                                         # Execute
                                         side = 1 if edge > 0 else -1
-                                        pool_liq = market_liq.get(cid, 10000.0)
+                                        pool_liq = market_liq.get(cid, 0.0) 
+
+                                        # 2. First Principles Check
+                                        if pool_liq <= 1.0: # Effectively zero
+                                            # Log rejection
+                                            rejection_log['no_liquidity'] = rejection_log.get('no_liquidity', 0) + 1
+                                            continue # SKIP THE TRADE. Do not execute.
+                                        
+                                        # 3. Only calculate slippage if liquidity exists
                                         
                                         friction_rate = 0.002
                                         fixed_penalty = 0.03
@@ -2170,15 +2178,14 @@ class BacktestEngine:
         # ---------------------------------------------------------
         # 1. MARKETS (Get Metadata)
         # ---------------------------------------------------------
-        market_files = glob.glob(str(self.cache_dir / "gamma_markets_*.parquet"))
-        
-        if not market_files:
-            print("   ⚠️ No local markets found. Downloading from scratch...")
-            markets = self._fetch_gamma_markets(days_back=DAYS_BACK)
+        market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
+
+        if market_file_path.exists():
+            print(f"🔒 LOCKED LOAD: Using local market file: {market_file_path.name}")
+            markets = pd.read_parquet(market_file_path)
         else:
-            latest = max(market_files, key=os.path.getctime)
-            print(f"   Loading local markets: {os.path.basename(latest)}")
-            markets = pd.read_parquet(latest)
+            print(f"⚠️ File not found at {market_file_path}. Downloading from scratch...")
+            markets = self._fetch_gamma_markets(days_back=DAYS_BACK)
 
         if markets.empty:
             print("❌ Critical: No market data available.")
@@ -2341,15 +2348,14 @@ class BacktestEngine:
 
         # Normalization
         def derive_outcome(row):
-            try:
-                prices = row.get('outcomePrices')
-                if isinstance(prices, str): prices = json.loads(prices)
-                if not isinstance(prices, list) or len(prices) != 2: return pd.NA
-                p0, p1 = float(prices[0]), float(prices[1])
-                if p0 > 0.95: return 0.0
-                if p1 > 0.95: return 1.0
-                return 0.5
-            except: return pd.NA
+            # 1. Trust the 'outcome' field if Gamma provides it (unlikely for open markets, but good practice)
+            if pd.notna(row.get('outcome')): 
+                return float(row['outcome'])
+                
+            # 2. DO NOT USE PRICE. ONLY USE RESOLUTION STATUS.
+            # If the market is not explicitly resolved in the metadata, it is ACTIVE (0.5).
+            # We remove the p0 > 0.95 check entirely.
+            return 0.5
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
@@ -2764,12 +2770,11 @@ class BacktestEngine:
         outcome_map = markets.set_index('contract_id')['outcome']
         outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
-        
-        # FIX: Assign Price Directly
-        # We fill NaNs with 0.5 only if absolutely necessary
-        prof_data['bet_price'] = prof_data['price'].fillna(0.5)
-        
-        # Filter invalid prices (guard against data errors)
+        prof_data = prof_data[prof_data['outcome'].isin([0.0, 1.0])].copy()
+
+        prof_data['bet_price'] = pd.to_numeric(prof_data['price'], errors='coerce')
+        prof_data = prof_data.dropna(subset=['bet_price'])
+
         prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] <= 1.0)]
         
         prof_data['entity_type'] = 'default_topic'
