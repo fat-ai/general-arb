@@ -2982,38 +2982,38 @@ class BacktestEngine:
             kind='stable'
         )
         df_ev = df_ev.drop(columns=['cid_temp'])
-        df_ev = df_ev.set_index('timestamp')
+        
+        if 'timestamp' not in df_ev.columns and df_ev.index.name == 'timestamp':
+            df_ev = df_ev.reset_index()
+            
         if not prof_data.empty:
             first_trade_ts = prof_data['timestamp'].min()
             start_cutoff = first_trade_ts - pd.Timedelta(days=1)
             
-            # 1. Identify events that are too old
+            # Identify events that are too old
             mask_old = df_ev['timestamp'] < start_cutoff
             
-            # 2. Split into Old and New
+            # Split into Old and New
             df_old = df_ev[mask_old].copy()
             df_new = df_ev[~mask_old].copy()
             
-            # 3. Rescue 'NEW_CONTRACT' events from the past
-            # We move their timestamp to 'start_cutoff' so they get processed
-            # in the very first batch of the simulation.
+            # Rescue 'NEW_CONTRACT' events from the past
             rescued_contracts = df_old[df_old['event_type'] == 'NEW_CONTRACT'].copy()
             rescued_contracts['timestamp'] = start_cutoff
             
-            # 4. Recombine: Rescued Old Markets + All Recent Events
+            # Recombine: Rescued Old Markets + All Recent Events
             df_ev = pd.concat([rescued_contracts, df_new])
             
-            # 5. Sort to ensure the Rescued events come first
+            # Sort to ensure the Rescued events come first
             df_ev = df_ev.sort_values(by=['timestamp', 'event_type'], ascending=[True, True])
             
             log.info(f"⏱️ SMART SYNC: Teleported {len(rescued_contracts)} old markets to {start_cutoff}. "
                      f"Dropped {len(df_old) - len(rescued_contracts)} irrelevant old events.")
-    
-            log.info(f"⏱️ TIME SYNC: Clipped Event Log start from {df_ev.index.min()} "
-                     f"to {start_cutoff} (Matched Trade History). "
-                     f"Skipped {original_len - len(df_ev)} empty rows.")
-            
-        df_ev = df_ev.set_index('timestamp')    
+        
+        # 3. Final Indexing (Must happen LAST)
+        df_ev = df_ev.set_index('timestamp')
+        # ------------------------------
+        
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
         
