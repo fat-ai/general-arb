@@ -1311,14 +1311,14 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     # Remember: Brier Score 0.0 = Perfect Prediction. Brier Score 1.0 = Dead Wrong.
     if not scores.empty:
         # Get top 5 most accurate wallets
-        top_performers = scores.sort_values(ascending=True).head(5)
+        top_performers = scores.sort_values(ascending=True).head(10)
         
         # Get bottom 5 (worst traders)
-        worst_performers = scores.sort_values(ascending=False).head(5)
+        worst_performers = scores.sort_values(ascending=False).head(10)
         
         log.info(f"\n🔎 BRIER ENGINE REPORT: Scored {len(scores)} unique wallets.")
-        log.info(f"   🏆 Top 5 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
-        log.info(f"   📉 Top 5 'Worst' Wallets (Score > 0.5):\n{worst_performers.to_string()}\n")
+        log.info(f"   🏆 Top 10 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
+        log.info(f"   📉 Top 10 'Worst' Wallets (Score > 0.5):\n{worst_performers.to_string()}\n")
     else:
         log.warning("⚠️ BRIER ENGINE: No scores calculated! (Check Input Data)")
     # -----------------------------
