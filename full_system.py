@@ -1672,6 +1672,21 @@ class FastBacktestEngine:
                         market_liq[cid] = known_liquidity.get(cid, 10000.0) if known_liquidity else 10000.0
                     
                     new_price = data.get('p_market_all', 0.5)
+                    if cid in tracker:
+                        prev_p = tracker[cid]['last_price']
+                        price_delta = abs(new_price - prev_p)
+                        trade_vol = float(data.get('trade_volume', 0.0))
+                        
+                        # Only update if the move is significant enough to be a valid signal (avoid div by zero)
+                        if price_delta > 0.005 and trade_vol > 10.0:
+                            # CPMM Approximation: Impact = Vol / Liquidity  =>  Liquidity = Vol / Impact
+                            # We use a dampening factor (0.5) to be conservative
+                            implied_liq = (trade_vol / price_delta) * 0.5
+                            
+                            # Smooth the liquidity estimate (Exponential Moving Average)
+                            # This prevents one crazy trade from ruining the estimation
+                            current_liq = market_liq[cid]
+                            market_liq[cid] = (current_liq * 0.9) + (implied_liq * 0.1)
                     # Initialize tracker if missing
                     if cid not in tracker: tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
                     
