@@ -1355,8 +1355,14 @@ class FastBacktestEngine:
                 data = row['data']
                 cid = data.get('contract_id')
                 if cid:
+                    scheduled_end = data.get('end_date')
+                    if not scheduled_end or pd.isna(scheduled_end):
+                        scheduled_end = pd.Timestamp.max
+                        
                     self.market_lifecycle[cid] = {
-                        'start': ts, 'end': pd.Timestamp.max, 'liquidity': data.get('liquidity', 10000.0)
+                        'start': ts, 
+                        'end': scheduled_end, 
+                        'liquidity': data.get('liquidity', 10000.0)
                     }
             
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
@@ -2912,11 +2918,14 @@ class BacktestEngine:
             liq = row.get('liquidity')
             # GHOST MARKET FIX: Default to 10k
             safe_liq = float(liq) if liq is not None and float(liq) > 0 else 10000.0
-            
+            res_ts = row.get('resolution_timestamp')
+            if pd.isna(res_ts): res_ts = None
+                
             events_data.append({
                 'contract_id': row['contract_id'], 
                 'p_market_all': 0.5, 
-                'liquidity': safe_liq
+                'liquidity': safe_liq,
+                'end_date': res_ts
             })
             
         # B. RESOLUTION
