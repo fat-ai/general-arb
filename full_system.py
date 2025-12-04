@@ -885,6 +885,8 @@ class HistoricalProfiler:
                 log.warning(f"Volume profiling failed: {e}")
                 market_baselines = {}
 
+        print(f"Top 20 Smart Wallets: {list(profitable_wallets.head(20).index)}")
+
         return smart_wallet_ids, market_baselines
 
 class LiveFeedHandler:
