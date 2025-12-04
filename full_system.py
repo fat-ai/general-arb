@@ -1301,7 +1301,27 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     filtered['brier'] = (filtered['bet_price'] - filtered['outcome']) ** 2
     
     # Group and mean
+    # ... (existing calculation logic) ...
+    
+    # Group and mean
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
+    
+    # --- [PATCH: DEBUG PRINTS] ---
+    # Sort by Score (Ascending). 
+    # Remember: Brier Score 0.0 = Perfect Prediction. Brier Score 1.0 = Dead Wrong.
+    if not scores.empty:
+        # Get top 5 most accurate wallets
+        top_performers = scores.sort_values(ascending=True).head(5)
+        
+        # Get bottom 5 (worst traders)
+        worst_performers = scores.sort_values(ascending=False).head(5)
+        
+        log.info(f"\n🔎 BRIER ENGINE REPORT: Scored {len(scores)} unique wallets.")
+        log.info(f"   🏆 Top 5 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
+        log.info(f"   📉 Top 5 'Worst' Wallets (Score > 0.5):\n{worst_performers.to_string()}\n")
+    else:
+        log.warning("⚠️ BRIER ENGINE: No scores calculated! (Check Input Data)")
+    # -----------------------------
     
     return scores.to_dict()
 
