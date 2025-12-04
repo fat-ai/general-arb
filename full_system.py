@@ -2959,7 +2959,18 @@ class BacktestEngine:
         )
         df_ev = df_ev.drop(columns=['cid_temp'])
         df_ev = df_ev.set_index('timestamp')
-        
+        if not prof_data.empty:
+            first_trade_ts = prof_data['timestamp'].min()
+            
+            # Start 1 day before the first trade to capture setup events
+            start_cutoff = first_trade_ts - pd.Timedelta(days=1)
+            
+            original_len = len(df_ev)
+            df_ev = df_ev[df_ev.index >= start_cutoff].copy()
+            
+            log.info(f"⏱️ TIME SYNC: Clipped Event Log start from {df_ev.index.min()} "
+                     f"to {start_cutoff} (Matched Trade History). "
+                     f"Skipped {original_len - len(df_ev)} empty rows.")
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
         
