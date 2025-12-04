@@ -1316,11 +1316,11 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
         # Get bottom 5 (worst traders)
         worst_performers = scores.sort_values(ascending=False).head(10)
         
-        log.info(f"\n🔎 BRIER ENGINE REPORT: Scored {len(scores)} unique wallets.")
-        log.info(f"   🏆 Top 10 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
-        log.info(f"   📉 Top 10 'Worst' Wallets (Score > 0.5):\n{worst_performers.to_string()}\n")
+        print(f"\n🔎 BRIER ENGINE REPORT: Scored {len(scores)} unique wallets.")
+        print(f"   🏆 Top 10 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
+        print(f"   📉 Top 10 'Worst' Wallets (Score > 0.5):\n{worst_performers.to_string()}\n")
     else:
-        log.warning("⚠️ BRIER ENGINE: No scores calculated! (Check Input Data)")
+        print("⚠️ BRIER ENGINE: No scores calculated! (Check Input Data)")
     # -----------------------------
     
     return scores.to_dict()
