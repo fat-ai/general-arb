@@ -2716,7 +2716,13 @@ class BacktestEngine:
                 sample_market = trades.iloc[0]['market']
                 print(f"   Sample market field: {sample_market}")
         
-        markets = self._fetch_gamma_markets()
+        markets_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        if markets_path.exists():
+            markets = pd.read_parquet(markets_path)
+        else:
+            print("No markets found to diagnose.")
+            return
+            
         print(f"\n📦 MARKETS:")
         print(f"   Total records: {len(markets)}")
         if not markets.empty:
