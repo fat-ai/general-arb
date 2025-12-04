@@ -1604,11 +1604,10 @@ class FastBacktestEngine:
         rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0}
         
         # --- BATCH PROCESSING ---
+        # [FIXED: TWO-PASS LOGIC WITH DEDUPLICATION]
         for batch_idx, batch in enumerate(batches):
             
             # --- PHASE 1: COLLECT SIGNALS & PROCESS EXITS ---
-            # We assume all events in this batch happen "simultaneously" within the minute.
-            # We process Exits FIRST to free up cash, and collect Entries to rank them.
             candidates = []
             
             for event in batch:
@@ -1629,18 +1628,16 @@ class FastBacktestEngine:
                         pos = positions[cid]
                         outcome = float(data.get('outcome', 0))
                         
-                        # FIX: Handle Invalid Markets (Outcome 0.5)
                         if outcome == 0.5:
                             refund = pos['shares'] * 0.50
                             cash += refund
                         else:
-                            # Standard Win/Loss Logic
                             win = False
                             if pos['side'] == 1 and outcome == 1.0: win = True
                             if pos['side'] == -1 and outcome == 0.0: win = True
                             
                             if win:
-                                cash += pos['shares'] # Payout is 1.00 per share
+                                cash += pos['shares']
                         
                         del positions[cid]
 
@@ -1661,10 +1658,7 @@ class FastBacktestEngine:
                     # --- 2. CALCULATE WEIGHT ---
                     vol = float(data.get('trade_volume', 0.0))
                     
-                    if vol < 1.0:
-                        rejection_log['low_volume'] += 1
-                        # We continue here, but we still allow Position Management to run below
-                    else:
+                    if vol >= 1.0:
                         is_sell = data.get('is_sell', False)
                         trade_direction = -1.0 if is_sell else 1.0
                         w_id = str(data.get('wallet_id'))
@@ -1687,12 +1681,9 @@ class FastBacktestEngine:
                         abs_net_weight = abs(tracker[cid]['net_weight'])
                         
                         if abs_net_weight > splash_thresh:
-                            # Note: We do NOT reset net_weight yet. 
-                            # We reset it only if we actually execute, or we can reset here.
-                            # Standard logic: Reset on trigger.
-                            
+                            # Reset pressure
                             raw_net = tracker[cid]['net_weight']
-                            tracker[cid]['net_weight'] = 0.0 # Reset "pressure"
+                            tracker[cid]['net_weight'] = 0.0
                             
                             net_sentiment = np.tanh(raw_net / 5000.0)
                             p_model = 0.5 + (net_sentiment * 0.4)
@@ -1700,16 +1691,12 @@ class FastBacktestEngine:
                             
                             # --- 4. EDGE FILTER ---
                             edge_thresh = config.get('edge_threshold', 0.05)
-                            
                             is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
-                            is_not_in_position = (cid not in positions)
                             
-                            if abs(edge) < edge_thresh:
-                                rejection_log['low_edge'] += 1
-                            elif not is_safe_price:
-                                rejection_log['unsafe_price'] += 1
-                            elif is_not_in_position:
-                                # CANDIDATE FOUND!
+                            # CRITICAL: Do NOT check 'cid not in positions' here. 
+                            # We check it in Phase 2 to handle concurrent updates cleanly.
+                            
+                            if abs(edge) >= edge_thresh and is_safe_price:
                                 side = 1 if edge > 0 else -1
                                 
                                 # --- 6. POSITION SIZING ---
@@ -1726,10 +1713,9 @@ class FastBacktestEngine:
                                 
                                 if target_f > 0:
                                     target_f = min(target_f, 0.20)
-                                    cost = cash * target_f # Note: Uses 'current' cash, will be re-checked in Pass 2
+                                    cost = cash * target_f 
                                 
                                 if cost > 5.0:
-                                    # Prepare Execution Data
                                     pool_liq = market_liq.get(cid, 10000.0)
                                     if pool_liq < 1.0: pool_liq = 10000.0
                                     
@@ -1746,17 +1732,16 @@ class FastBacktestEngine:
                                         safe_entry = max(new_price - variable_impact, 0.01)
                                         shares = net_capital / (1.0 - safe_entry)
 
-                                    # STORE CANDIDATE (Do not execute yet)
                                     candidates.append({
                                         'cid': cid,
-                                        'edge': abs(edge), # Priority Key
+                                        'edge': abs(edge),
                                         'cost': cost,
                                         'side': side,
                                         'shares': shares,
                                         'entry': safe_entry
                                     })
 
-                # ==================== D. POSITION MANAGEMENT (Exits Free Cash) ====================
+                # ==================== D. POSITION MANAGEMENT ====================
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
@@ -1782,18 +1767,29 @@ class FastBacktestEngine:
                             payout = pos['shares'] * curr_p
                         else:
                             payout = pos['shares'] * (1.0 - curr_p)
-                        cash += payout # Cash freed immediately for Pass 2
+                        cash += payout
                         del positions[cid]
 
-            # --- PHASE 2: PRIORITIZED EXECUTION ---
-            # Sort candidates by EDGE strength (Highest Edge gets first dibs on cash)
+            # --- PHASE 2: PRIORITIZED EXECUTION (WITH DEDUPLICATION) ---
             candidates.sort(key=lambda x: x['edge'], reverse=True)
             
+            # [FIX] Track what we bought THIS batch to prevent double-spending
+            bought_this_batch = set()
+            
             for trade in candidates:
-                # Re-check cash (as it might have changed due to exits or other buys)
+                cid = trade['cid']
+                
+                # [FIX] CRITICAL SAFETY CHECKS
+                # 1. Do not buy if we already bought it in this batch (Duplicate Signal)
+                if cid in bought_this_batch:
+                    continue
+                # 2. Do not buy if we already hold a position (Concurrent Position)
+                if cid in positions:
+                    continue
+                
+                # Re-check cash
                 if cash > trade['cost']:
-                    # Execute
-                    positions[trade['cid']] = {
+                    positions[cid] = {
                         'side': trade['side'],
                         'size': trade['cost'],
                         'shares': trade['shares'],
@@ -1803,15 +1799,17 @@ class FastBacktestEngine:
                     volume_traded += trade['cost']
                     cash -= trade['cost']
                     
+                    bought_this_batch.add(cid) # Mark as bought
+                    
                     if trade_count <= 5:
-                        print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][trade['side']==1]} {trade['cid'][:8]} | "
-                              f"Edge: {trade['edge']:.3f} | Size: ${trade['cost']:.0f} | Entry: {trade['entry']:.3f}")
+                        print(f"✅ TRADE #{trade_count}: {['SELL','BUY'][trade['side']==1]} {cid[:8]} | "
+                              f"Edge: {trade['edge']:.3f} | Size: ${trade['cost']:.0f}")
                 else:
                     rejection_log['insufficient_cash'] += 1
 
             # --- PHASE 3: VALUATION ---
             current_val = cash
-            for cid in sorted(positions.keys()): # Sorted for deterministic math
+            for cid in sorted(positions.keys()):
                 pos = positions[cid]
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                 if pos['side'] == 1: 
