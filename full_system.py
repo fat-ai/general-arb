@@ -847,7 +847,6 @@ class HistoricalProfiler:
             resolved['tokens'] = pd.to_numeric(resolved['tokens'], errors='coerce').fillna(0.0)
             resolved['outcome'] = pd.to_numeric(resolved['outcome'], errors='coerce').fillna(0.0)
             
-
             # Aggregate PnL per wallet
             signed_cost = resolved['size'].where(resolved['tokens'] >= 0, -resolved['size'])
         
@@ -862,7 +861,7 @@ class HistoricalProfiler:
     
             # Aggregate PnL per wallet
             wallet_stats = resolved.groupby('wallet_id')['realized_pnl'].sum()
-            
+ 
             # Filter: Only wallets that actually made money
             profitable_wallets = wallet_stats[wallet_stats > 0].sort_values(ascending=False)
             
@@ -2365,23 +2364,28 @@ class BacktestEngine:
             try:
                 end_date_str = row.get('endDate') # Raw API field
                 if end_date_str:
-                    # Convert to timestamp
-                    end_ts = pd.to_datetime(end_date_str).tz_localize(None)
-                    # Add a 24-hour "Dispute Buffer" to be safe? 
-                    # For now, we'll just check if it's in the past relative to "Now"
-                    if end_ts > pd.Timestamp.now():
-                        return 0.5 # Future market = Active. Do not resolve.
+                    # Force UTC for the market end date
+                    end_ts = pd.to_datetime(end_date_str).tz_convert('UTC')
+                    
+                    # Compare against UTC "Now"
+                    if end_ts > pd.Timestamp.now(tz='UTC'):
+                        return 0.5
             except:
                 # If date parsing fails, default to safety (Active)
                 return 0.5
 
             # 3. PRICE CHECK (Only runs if Time Gate is passed)
             try:
-                prices = row.get('outcomePrices')
-                if isinstance(prices, str): prices = json.loads(prices)
-                if not isinstance(prices, list) or len(prices) != 2: return 0.5
+                if isinstance(prices, str): 
+                    prices = json.loads(prices)
                 
-                p0, p1 = float(prices[0]), float(prices[1])
+                # Safety: Ensure it's a list
+                if not isinstance(prices, list) or len(prices) != 2: 
+                    return 0.5
+                
+                # Safety: Convert elements to float (handles strings inside list)
+                p0 = float(prices[0])
+                p1 = float(prices[1])
                 
                 # Strict 99% threshold, but ONLY for markets past their end date
                 if p1 >= 0.99: return 1.0
