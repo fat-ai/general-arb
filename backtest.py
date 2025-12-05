@@ -535,6 +535,7 @@ class BacktestEngine:
         # Execute Tuning
         analysis = tune.run(
             tune.with_parameters(
+                ray_backtest_wrapper,
                 event_log=event_log_ref,      # maps to 'event_log' arg
                 profiler_data=profiler_ref,   # maps to 'profiler_data' arg
                 nlp_cache=nlp_cache_ref,      # maps to 'nlp_cache' arg
