@@ -2404,12 +2404,14 @@ class BacktestEngine:
         
         while True:
             try:
+                print(f"Offset:{offset}")
                 # Gamma API
                 params = {"limit": 1000, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
+                print(f"Rows Retreived:{len(rows)}")
                 if not rows: break
                 all_rows.extend(rows)
                 
