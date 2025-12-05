@@ -1891,8 +1891,19 @@ class FastBacktestEngine:
                     
                     if use_smart_exit:
                         cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                        if pos['side'] == 1 and cur_net < -splash_thresh/2: should_close = True
-                        if pos['side'] == -1 and cur_net > splash_thresh/2: should_close = True
+                        
+                        # [PATCH] Configurable Smart Exit Ratio
+                        # Default to 0.5 (original behavior) if not in config
+                        exit_ratio = config.get('smart_exit_ratio', 0.5)
+                        exit_trigger_val = splash_thresh * exit_ratio
+                        
+                        # LONG EXIT: Sentiment flips negative beyond threshold
+                        if pos['side'] == 1 and cur_net < -exit_trigger_val: 
+                            should_close = True
+                            
+                        # SHORT EXIT: Sentiment flips positive beyond threshold
+                        if pos['side'] == -1 and cur_net > exit_trigger_val: 
+                            should_close = True
                     
                     if should_close:
                         if pos['side'] == 1: payout = pos['shares'] * curr_p
@@ -2142,6 +2153,7 @@ class BacktestEngine:
             "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0, 3000.0]),
             "edge_threshold": tune.grid_search([0.06, 0.7, 0.08]),
             "use_smart_exit": tune.grid_search([True, False]),
+            "smart_exit_ratio": tune.grid_search([0.5, 0.7, 0.9]),
             "sizing": ("fixed_pct", 0.025), 
             "stop_loss": None,
             "train_days": safe_train,
@@ -2197,6 +2209,7 @@ class BacktestEngine:
         print(f"   Edge Threshold:   {best_config['edge_threshold']:.3f}")
         print(f"   Sizing:           {sizing_str}")
         print(f"   Smart Exit:       {best_config['use_smart_exit']}")
+        print(f"   Exit Ratio:       {best_config.get('smart_exit_ratio', 0.5):.2f}x")
         print(f"   Stop Loss:        {best_config['stop_loss']}")
         print(f"   Smart Score:      {metrics.get('smart_score', 0.0):.4f}")
         print(f"   Total Return:     {metrics.get('total_return', 0.0):.2%}")
