@@ -1491,10 +1491,6 @@ class BacktestEngine:
       
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     try:
-        # 1. REMOVED ray.get() calls. 
-        # Ray Tune automatically dereferences objects passed via with_parameters
-        
-        # 2. Updated signature to match the 4 arguments you pass in run_tuning_job
         
         np.random.seed(config.get('seed', 42))
         
