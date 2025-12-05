@@ -575,8 +575,8 @@ class BacktestEngine:
                 ray_backtest_wrapper,
                 event_log=event_log_ref,      # maps to 'event_log' arg
                 profiler_data=profiler_ref,   # maps to 'profiler_data' arg
-                nlp_cache=nlp_cache_ref,      # maps to 'nlp_cache' arg
-                priors=priors_ref             # maps to 'priors' arg
+        #        nlp_cache=nlp_cache_ref,      # maps to 'nlp_cache' arg
+        #        priors=priors_ref             # maps to 'priors' arg
 
             ),
             config=search_space,
