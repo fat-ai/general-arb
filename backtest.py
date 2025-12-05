@@ -43,7 +43,8 @@ def plot_performance(equity_curve, trades_count):
     """Generates a performance chart. Safe for headless servers."""
     try:
         import matplotlib
-        # Force non-interactive backend to prevent "no display name" errors
+        import matplotlib.pyplot as plt
+
         matplotlib.use('Agg') 
         import matplotlib.pyplot as plt
         
@@ -100,13 +101,26 @@ def fast_kelly_objective(F, M, Q, I_k):
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
     if profiler_data.empty: return {}
     valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
+    
+    # Filter for sufficient volume
     counts = valid.groupby(['wallet_id', 'entity_type']).size()
     sufficient = counts[counts >= min_trades].index
     valid.set_index(['wallet_id', 'entity_type'], inplace=True)
     filtered = valid.loc[valid.index.intersection(sufficient)].reset_index()
-    filtered['brier'] = (filtered['bet_price'] - filtered['outcome']) ** 2
+    
+    # === FIXED BRIER CALCULATION ===
+    # 1. Determine Prediction: 1.0 if Long (tokens > 0), 0.0 if Short (tokens < 0)
+    # This uses the 'tokens' column which correctly inherits the sign from the trade data
+    filtered['prediction'] = np.where(filtered['tokens'] > 0, 1.0, 0.0)
+    
+    # 2. Calculate Score: Distance between Prediction and Outcome
+    # (Prediction - Outcome)^2
+    filtered['brier'] = (filtered['prediction'] - filtered['outcome']) ** 2
+    
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
     scores = scores.reset_index()
+    
+    # Sort: Lower Brier score is better
     scores = scores.sort_values(by=['brier', 'wallet_id'], ascending=[True, True], kind='stable')
     return scores.to_dict()
 
@@ -156,6 +170,10 @@ class FastBacktestEngine:
         valid['log_vol'] = np.log1p(valid['usdc_vol'])
         try:
             slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
+            
+            if not np.isfinite(slope) or not np.isfinite(intercept):
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
             if slope >= 0: return SAFE_SLOPE, SAFE_INTERCEPT
             if slope > -0.002: return SAFE_SLOPE, SAFE_INTERCEPT
             if p_val >= 0.20: return SAFE_SLOPE, SAFE_INTERCEPT
@@ -400,7 +418,7 @@ class FastBacktestEngine:
                         del positions[cid]
 
             if candidates:
-                # === CRITICAL FIX: COMMA ADDED TO LAMBDA ===
+                
                 ranked_candidates = sorted(
                     candidates.values(), 
                     key=lambda x: (abs(x['daily_edge']), x['cid']), 
@@ -453,8 +471,10 @@ class BacktestEngine:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         if ray.is_initialized(): ray.shutdown()
-        try: ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
-        except: pass
+        try:
+            ray.init(logging_level=logging.ERROR, ignore_reinit_error=True, include_dashboard=False)
+        except Exception as e:
+            log.warning(f"Ray init warning (continuing): {e}")
 
     def run_tuning_job(self):
 
