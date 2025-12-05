@@ -2438,7 +2438,7 @@ class BacktestEngine:
                     clean_ids = []
                     for t in tokens:
                         if isinstance(t, (int, float)):
-                            clean_ids.append("{:.0f}".format(t))
+                            clean_ids.append(str(t))
                         else:
                             clean_ids.append(str(t).strip())
                     # Join with comma for storage
