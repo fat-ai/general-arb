@@ -1915,6 +1915,7 @@ class FastBacktestEngine:
                                             shares = net_capital / (1.0 - safe_entry)
 
                                         candidates[cid] = {
+                                            'cid': cid,
                                             'side': side,
                                             'size': cost,
                                             'daily_edge': daily_edge,
