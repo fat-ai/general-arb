@@ -2192,7 +2192,8 @@ class BacktestEngine:
                 metrics.get('smart_score', -99.0),
                 metrics.get('total_return', -99.0),
                 metrics.get('trades', 0),
-                -t.config.get('splash_threshold', 0) # Negative for Ascending
+                -t.config.get('splash_threshold', 0), # Negative for Ascending
+                t.trial_id
             )
         sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
         best_trial = sorted_trials[0]
@@ -2316,6 +2317,20 @@ class BacktestEngine:
         if trades.empty:
             print("❌ Critical: No trade data available.")
             return pd.DataFrame(), pd.DataFrame()
+
+        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
+        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
+        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0)
+        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0)
+        trades = trades.sort_values(
+            by=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
+            ascending=[True, True, True, True, True, True],
+            kind='stable' # Stable sort preserves order of equal elements (less random)
+        )
+        trades = trades.drop_duplicates(
+            subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
+            keep='first'
+        )
 
         # ---------------------------------------------------------
         # 3. CLEANUP & SYNC
