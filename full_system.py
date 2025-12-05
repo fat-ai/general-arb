@@ -2406,7 +2406,7 @@ class BacktestEngine:
             try:
                 print(f"Offset:{offset}")
                 # Gamma API
-                params = {"limit": 1000, "offset": offset, "closed": "true"}
+                params = {"limit": 500, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
                 
