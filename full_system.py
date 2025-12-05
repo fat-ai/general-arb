@@ -1303,6 +1303,19 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     
     # Group and mean
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
+
+    # 1. Convert to DataFrame to sort by Multiple Columns
+    scores = scores.reset_index()
+    
+    # 2. Sort by Brier Score (Ascending) THEN Wallet ID (Ascending)
+    # This ensures that wallets with the EXACT SAME score are always consistently ordered.
+    scores = scores.sort_values(
+        by=['brier', 'wallet_id'], 
+        ascending=[True, True],
+        kind='stable'
+    )
+
+    
     
     # --- FIXED SYNTAX BELOW (Added closing quote) ---
     print(f"SCORES: {str(scores)}")
