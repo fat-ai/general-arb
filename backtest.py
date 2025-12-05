@@ -535,12 +535,11 @@ class BacktestEngine:
         # Execute Tuning
         analysis = tune.run(
             tune.with_parameters(
-                ray_backtest_wrapper,
-                event_log_ref=event_log_ref,
-                profiler_ref=profiler_ref,
-                # CRITICAL: Pass these to match wrapper signature
-                nlp_cache_ref=nlp_cache_ref,
-                priors_ref=priors_ref
+                event_log=event_log_ref,      # maps to 'event_log' arg
+                profiler_data=profiler_ref,   # maps to 'profiler_data' arg
+                nlp_cache=nlp_cache_ref,      # maps to 'nlp_cache' arg
+                priors=priors_ref             # maps to 'priors' arg
+
             ),
             config=search_space,
             resources_per_trial={"cpu": 1},
@@ -1444,65 +1443,42 @@ class BacktestEngine:
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
         return df_ev, prof_data
       
-def ray_backtest_wrapper(config, event_log_ref, profiler_ref, nlp_cache_ref, priors_ref):
-    """
-    Production wrapper: Accepts ALL refs passed by tune.with_parameters
-    and properly resolves them using ray.get().
-    """
-    import traceback
-    import numpy as np
-    
+def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     try:
-        # 1. Set Seed
+        # 1. REMOVED ray.get() calls. 
+        # Ray Tune automatically dereferences objects passed via with_parameters
+        
+        # 2. Updated signature to match the 4 arguments you pass in run_tuning_job
+        
         np.random.seed(config.get('seed', 42))
         
-        # 2. Resolve Object Refs
-        # We accept nlp_cache_ref and priors_ref to match the signature, 
-        # even if unused in this simplified backtester.
-        event_log = ray.get(event_log_ref)
-        profiler_data = ray.get(profiler_ref)
-        # nlp_cache = ray.get(nlp_cache_ref) # (Optional: Enable if adding NLP logic)
-        # priors = ray.get(priors_ref)       # (Optional: Enable if adding Priors logic)
-        
-        # 3. Unpack Sizing Tuple (Critical for Search Space)
+        # Logic remains the same, just using the variables directly
         if 'sizing' in config:
             mode, val = config['sizing']
             config['sizing_mode'] = mode
-            if mode == 'kelly': 
-                config['kelly_fraction'] = val
-            elif mode == 'fixed_pct': 
-                config['fixed_size'] = val
-            elif mode == 'fixed': 
-                config['fixed_size'] = val
+            if mode == 'kelly': config['kelly_fraction'] = val
+            elif mode == 'fixed_pct': config['fixed_size'] = val
+            elif mode == 'fixed': config['fixed_size'] = val
 
-        # 4. Initialize Engine
-        # We pass None/{} for the unused components to keep the engine happy
-        engine = FastBacktestEngine(event_log, profiler_data, None, {})
-        
-        # 5. Run Walk-Forward
+        # 3. Pass the resolved objects directly
+        engine = FastBacktestEngine(event_log, profiler_data, nlp_cache, priors if priors else {})
         results = engine.run_walk_forward(config)
         
-        # 6. Calculate Composite Score
         ret = results.get('total_return', 0.0)
         dd = results.get('max_drawdown', 1.0)
         
-        # Smart Score: Rewards return, heavily penalizes drawdown
-        smart_score = ret / (dd + 0.01) 
+        # Safety check for zero drawdown to avoid division by zero
+        if dd == 0: dd = 0.0001
+            
+        smart_score = ret / (dd + 0.01)
         results['smart_score'] = smart_score
-        
         return results
-
+        
     except Exception as e:
-        print(f"!!!!! WORKER CRASH !!!!! Config: {config}")
+        print("Crash:", e)
         traceback.print_exc()
-        # Return a "failure" dict so Ray doesn't kill the whole job
-        return {
-            'total_return': -1.0, 
-            'sharpe_ratio': -99.0, 
-            'max_drawdown': 1.0,
-            'trades': 0,
-            'smart_score': -99.0
-        }
+        return {'smart_score': -99.0}
+
 
 if __name__ == "__main__":
     try:
