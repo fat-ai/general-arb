@@ -401,7 +401,7 @@ class FastBacktestEngine:
                                                     # FIX: Removed double counting of friction (0.97)
                                                     net_capital = (cost / 1.002)
                                                     variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
-                                                    
+                                                    SPREAD_PENALTY = config.get('spread_penalty', 0.01)
                                                     # Final Entry Price
                                                     if side == 1:
                                                         safe_entry = min(estimated_marginal + variable_impact + SPREAD_PENALTY, 0.99)
