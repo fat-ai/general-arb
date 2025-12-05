@@ -1325,10 +1325,10 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     # Remember: Brier Score 0.0 = Perfect Prediction. Brier Score 1.0 = Dead Wrong.
     if not scores.empty:
         # Get top 5 most accurate wallets
-        top_performers = scores.sort_values(ascending=True).head(10)
+        top_performers = scores.sort_values(by='brier', ascending=True).head(10)
         
         # Get bottom 5 (worst traders)
-        worst_performers = scores.sort_values(ascending=False).head(10)
+        worst_performers = scores.sort_values(by='brier', ascending=False).head(10)
         
         print(f"\n🔎 BRIER ENGINE REPORT: Scored {len(scores)} unique wallets.")
         print(f"   🏆 Top 10 'Smartest' Wallets (Score ~ 0.0):\n{top_performers.to_string()}")
@@ -2163,9 +2163,10 @@ class BacktestEngine:
         # === FIXED SEARCH SPACE ===
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
-            "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0, 3000.0]),
-            "edge_threshold": tune.grid_search([0.06, 0.7, 0.08]),
-            "use_smart_exit": tune.grid_search([True, False]),
+            "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0]),
+            "edge_threshold": tune.grid_search([0.06, 0.07, 0.08]),
+         #   "use_smart_exit": tune.grid_search([True, False]),
+            "use_smart_exit": True,
             "smart_exit_ratio": tune.grid_search([0.5, 0.7, 0.9]),
             "sizing": ("fixed_pct", 0.025), 
             "stop_loss": None,
