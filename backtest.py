@@ -372,14 +372,34 @@ class FastBacktestEngine:
                                                 pool_liq = market_liq.get(cid, 0.0) 
                                                 if pool_liq > 1.0:
                                                     net_capital = (cost / 1.002) * 0.97
-                                                    variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
+                                                    
+                                                    # === PATCH 4: REALISTIC SLIPPAGE ===
+                                                    
+                                                    # 1. REMOVE THE CAP (Let slippage explode if size is too big)
+                                                    # Old: min(..., 0.15)
+                                                    raw_impact = net_capital / (pool_liq + net_capital)
+                                                    
+                                                    # 2. ADD SPREAD PENALTY
+                                                    # Assume a base spread of 1% (optimistic) to 3% (conservative)
+                                                    spread_penalty = 0.02 # 2 cents
+                                                    
                                                     if side == 1:
-                                                        safe_entry = min(new_price + variable_impact, 0.99)
+                                                        # Buying YES: Price goes UP
+                                                        # Impact + Spread
+                                                        exec_price = new_price + raw_impact + (spread_penalty / 2)
+                                                        safe_entry = min(exec_price, 0.99)
                                                         shares = net_capital / safe_entry
                                                     else:
-                                                        safe_entry = max(new_price - variable_impact, 0.01)
+                                                        # Selling YES (Buying NO): Price goes DOWN
+                                                        exec_price = new_price - raw_impact - (spread_penalty / 2)
+                                                        safe_entry = max(exec_price, 0.01)
                                                         shares = net_capital / (1.0 - safe_entry)
+                                                    # ===================================
+                                                    
+                                                    pool_liq = market_liq.get(cid, 0.0)
 
+                                                    if pool_liq < 1000.0:
+                                                        continue
                                                     # === CRITICAL FIX: ALL KEYS PRESENT ===
                                                     candidates[cid] = {
                                                         'cid': cid,
@@ -1355,7 +1375,7 @@ class BacktestEngine:
             
             liq = row.get('liquidity')
             # GHOST MARKET FIX: Default to 10k
-            safe_liq = float(liq) if liq is not None and float(liq) > 0 else 10000.0
+            safe_liq = float(liq) if liq is not None and float(liq) > 0 else 1.0
             res_ts = row.get('resolution_timestamp')
             if pd.isna(res_ts): res_ts = None
                 
