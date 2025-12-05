@@ -879,7 +879,7 @@ class HistoricalProfiler:
             signed_cost = resolved['size'].where(resolved['tokens'] >= 0, -resolved['size'])
         
             resolved['payout_value'] = resolved['tokens'] * resolved['outcome']
-            resolved['realized_pnl'] = resolved['payout_value'] - signed_cost
+           
             
             # Debug: Print the top winner to confirm it works
             top_winner = resolved.sort_values('realized_pnl', ascending=False).head(1)
@@ -888,8 +888,17 @@ class HistoricalProfiler:
                          f"(Wallet: {top_winner.iloc[0]['wallet_id']})")
     
             # Aggregate PnL per wallet
-            wallet_stats = resolved.groupby('wallet_id')['realized_pnl'].sum()
- 
+            wallet_stats = resolved.groupby('wallet_id').agg({
+                'realized_pnl': ['sum', 'std', 'count']
+            })
+            wallet_stats.columns = ['pnl_sum', 'pnl_std', 'trade_count']
+            wallet_stats['quality_score'] = wallet_stats['pnl_sum'] / (wallet_stats['pnl_std'] + 1e-9)
+
+            smart_wallets_df = wallet_stats[
+                (wallet_stats['trade_count'] >= 5) & 
+                (wallet_stats['pnl_sum'] > 50.0) &
+                (wallet_stats['quality_score'] > 0.25)
+            ]
             # Filter: Only wallets that actually made money
             profitable_wallets = wallet_stats[wallet_stats > 0].sort_values(ascending=False)
             
@@ -901,7 +910,7 @@ class HistoricalProfiler:
                 count = len(profitable_wallets)
                 top_n = max(5, int(count * 0.20))
                 
-                smart_wallet_ids = set(profitable_wallets.head(top_n).index)
+                smart_wallet_ids = set(smart_wallets_df.sort_values('quality_score', ascending=False).index)
                 log.info(f"Identified {len(smart_wallet_ids)} Smart Wallets (Top {top_n} Profitable).")
 
         # --- 2. Calculate Volume Baselines (Hourly Average) ---
@@ -1530,8 +1539,11 @@ class FastBacktestEngine:
             test_end = test_start + timedelta(days=test_days)
             
             # A. Prepare Training Data (Strictly BEFORE train_end)
-            train_mask = (self.profiler_data['timestamp'] >= current_date) & \
-                         (self.profiler_data['timestamp'] < train_end)
+            train_mask = (
+                (self.profiler_data['timestamp'] >= current_date) & 
+                (self.profiler_data['timestamp'] < train_end) & 
+                (self.profiler_data['market_created'] < train_end) # <--- ADD THIS CHECK
+            )
             train_profiler = self.profiler_data[train_mask].copy()
             
             # STRICT FILTER: Only consider resolutions that happened BEFORE the training window ends.
@@ -1710,7 +1722,7 @@ class FastBacktestEngine:
         # --- BATCH PROCESSING ---
         # [FIXED: TWO-PASS LOGIC WITH DEDUPLICATION]
         for batch_idx, batch in enumerate(batches):
-            
+            candidates = {}
             # 1. Strict Sort within the Batch
             # Ensure we process events in time order. 
             # If timestamps are identical, process RESOLUTION before PRICE_UPDATE.
@@ -1845,9 +1857,10 @@ class FastBacktestEngine:
                             # We have verified the trade is valid and active. Now we check the edge.
                             edge_thresh = config.get('edge_threshold', 0.05)
                             is_safe_price = (new_price >= 0.02 and new_price <= 0.98)
-    
+                            
                             if abs(edge) >= edge_thresh and is_safe_price:
-                                
+                                safe_duration = max(1.0, days_remaining)
+                                 daily_edge = edge / safe_duration
                                 # Do we already hold this?
                                 if cid not in positions:
                                     
@@ -1898,9 +1911,10 @@ class FastBacktestEngine:
                                             safe_entry = max(new_price - variable_impact, 0.01)
                                             shares = net_capital / (1.0 - safe_entry)
 
-                                        positions[cid] = {
+                                        candidates[cid] = {
                                             'side': side,
                                             'size': cost,
+                                            'daily_edge': daily_edge,
                                             'shares': shares,
                                             'entry_signal': tracker[cid]['net_weight'],
                                             'entry': safe_entry
@@ -1963,7 +1977,91 @@ class FastBacktestEngine:
                         
                         cash += net_payout
                         del positions[cid]
+
+            # RANK & EXECUTE PHASE
+            # This runs once per minute, after all events and exits are processed.
             
+            if candidates:
+                # 1. Rank by Absolute Daily Edge (Highest Velocity First)
+                ranked_candidates = sorted(
+                    candidates.values(), 
+                    key=lambda x: abs(x['daily_edge']), 
+                    reverse=True
+                )
+                
+                for trade in ranked_candidates:
+                    cid = trade['cid']
+                    
+                    # Skip if we already hold a position (don't double down in same direction)
+                    # (Refinement: You could allow adding to position, but let's keep it simple)
+                    if cid in positions: continue
+                    
+                    # 2. Sizing Calculation
+                    target_f = 0.0
+                    cost = 0.0
+                    
+                    if sizing_mode == 'fixed_pct':
+                        target_f = sizing_val
+                    elif sizing_mode == 'kelly':
+                        # Use Daily Edge for sizing aggressiveness? 
+                        # Or Total Edge? Standard Kelly uses Total Edge / Odds.
+                        # Let's use Daily Edge to penalize slow trades as discussed.
+                        target_f = abs(trade['daily_edge']) * sizing_val
+                    elif sizing_mode == 'fixed':
+                        cost = sizing_val
+                        target_f = -1 
+                    
+                    if target_f > 0:
+                        target_f = min(target_f, 0.20) # Hard cap 20%
+                        cost = cash * target_f
+                    
+                    # 3. Cash Check (The Moment of Truth)
+                    if cost > 5.0 and cash > cost:
+                        
+                        pool_liq = trade['liq']
+                        if pool_liq <= 1.0: 
+                            rejection_log['no_liquidity'] = rejection_log.get('no_liquidity', 0) + 1
+                            continue
+
+                        # 4. Execution with Spread & Slippage
+                        friction_rate = 0.002
+                        fixed_penalty = 0.03
+                        spread_bps = 0.005 # 50bps Bid-Ask Spread
+                        half_spread = spread_bps / 2.0
+                        
+                        investment_principal = cost / (1.0 + friction_rate)
+                        net_capital = investment_principal * (1.0 - fixed_penalty)
+                        variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
+                        
+                        side = 1 if trade['total_edge'] > 0 else -1
+                        price = trade['price']
+                        
+                        if side == 1:
+                            # Buy at Ask
+                            safe_entry = min(price + half_spread + variable_impact, 0.99)
+                            shares = net_capital / safe_entry
+                        else:
+                            # Sell at Bid
+                            safe_entry = max(price - half_spread - variable_impact, 0.01)
+                            shares = net_capital / (1.0 - safe_entry)
+                        
+                        # 5. Commit Trade
+                        positions[cid] = {
+                            'side': side,
+                            'size': cost,
+                            'shares': shares,
+                            'entry': safe_entry,
+                            'entry_signal': trade['entry_signal']
+                        }
+                        
+                        trade_count += 1
+                        volume_traded += cost
+                        cash -= cost
+                        
+                    else:
+                        if cost > 5.0:
+                            rejection_log['insufficient_cash'] = rejection_log.get('insufficient_cash', 0) + 1
+                            
             # --- VALUATION (End of Minute) ---
             current_val = cash
             for cid in sorted(positions.keys()):
@@ -2974,6 +3072,21 @@ class BacktestEngine:
         outcome_map = markets.set_index('contract_id')['outcome']
         outcome_map.index = outcome_map.index.astype(str).str.strip().str.lower()
         outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
+        res_map = markets.set_index('contract_id')['resolution_timestamp']
+        created_map = markets.set_index('contract_id')['created_at']
+        
+
+        # 1. Map Data
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        prof_data['res_time'] = prof_data['market_id'].map(res_map)
+        prof_data['market_created'] = prof_data['market_id'].map(created_map)
+        
+        # 2. Filter Valid Outcomes
+        prof_data = prof_data[prof_data['outcome'].isin([0.0, 1.0])].copy()
+        
+        # 3. CRITICAL: Filter "Post-Mortem" Trades
+        # Drop trades that happened AFTER the market resolved
+        prof_data = prof_data[prof_data['timestamp'] < prof_data['res_time']]
         
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         matched_mask = prof_data['outcome'].isin([0.0, 1.0])
