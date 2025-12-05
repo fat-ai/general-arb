@@ -2915,15 +2915,29 @@ class BacktestEngine:
         outcome_map = outcome_map[~outcome_map.index.duplicated(keep='first')]
         
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
-        prof_data = prof_data[prof_data['outcome'].isin([0.0, 1.0])].copy()
-        matched_count = prof_data['outcome'].notna().sum()
+        matched_mask = prof_data['outcome'].isin([0.0, 1.0])
+        matched_count = matched_mask.sum()
         total_count = len(prof_data)
+        
         log.info(f"🔎 OUTCOME JOIN REPORT: {matched_count} / {total_count} trades matched a market.")
         
+        # 2. Check for 0 matches using the UNFILTERED data
         if matched_count == 0:
             log.warning("⛔ CRITICAL: 0 trades matched. Checking ID samples:")
-            log.warning(f"   Trade ID Sample: {prof_data['market_id'].iloc[0]}")
-            log.warning(f"   Market ID Sample: {outcome_map.index[0]}")
+            
+            # Safe access: Check if data exists before calling iloc[0]
+            if not prof_data.empty:
+                log.warning(f"   Trade ID Sample: {prof_data['market_id'].iloc[0]}")
+            else:
+                log.warning("   (No trades available to sample)")
+
+            if not outcome_map.empty:
+                log.warning(f"   Market ID Sample: {outcome_map.index[0]}")
+            else:
+                log.warning("   (Outcome map is empty)")
+
+        # 3. NOW apply the filter to keep only valid rows
+        prof_data = prof_data[matched_mask].copy()
 
         prof_data['bet_price'] = pd.to_numeric(prof_data['price'], errors='coerce')
         prof_data = prof_data.dropna(subset=['bet_price'])
