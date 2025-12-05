@@ -2292,7 +2292,7 @@ class BacktestEngine:
         import glob
         import os
         
-        DAYS_BACK = 200 # The strict requirement
+        DAYS_BACK = 200
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
         # ---------------------------------------------------------
@@ -2311,13 +2311,20 @@ class BacktestEngine:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
+        # Keep only essential columns to prevent type issues
+        safe_cols = ['contract_id', 'outcome', 'resolution_timestamp', 'created_at', 'liquidity', 'question', 'volume']
+        actual_cols = [c for c in safe_cols if c in markets.columns]
+        markets = markets[actual_cols].copy()
+
+        # Deterministic Sort for Markets
+        markets['contract_id'] = markets['contract_id'].astype(str)
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
             ascending=[True, True],
             kind='stable'
         )
-            
-        markets = markets.drop_duplicates(subset=['contract_id']).copy()
+        markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
+
         # ---------------------------------------------------------
         # 2. TRADES (Get History)
         # ---------------------------------------------------------
@@ -2325,25 +2332,15 @@ class BacktestEngine:
         
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
-            
-            # A. Extract ALL Token IDs from the markets we just loaded
             all_tokens = []
             for raw_ids in markets['contract_id']:
-                # Handle "ID1,ID2" format
                 parts = str(raw_ids).split(',')
                 for p in parts:
                     clean_p = p.strip()
                     if len(clean_p) > 2:
                         all_tokens.append(clean_p)
-            
-            # Remove duplicates
             target_tokens = list(set(all_tokens))
-            print(f"   Identified {len(target_tokens)} tokens to download.")
-            
-            # B. Trigger Downloader (With Strict Time Limit)
-            # This uses the fetcher you just updated
             trades = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
-            
         else:
             print(f"   Loading local trades: {os.path.basename(trades_file)}")
             trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
@@ -2352,67 +2349,53 @@ class BacktestEngine:
             print("❌ Critical: No trade data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
-        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0)
-        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0)
-        trades = trades.sort_values(
-            by=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
-            ascending=[True, True, True, True, True, True],
-            kind='stable' # Stable sort preserves order of equal elements (less random)
-        )
-        trades = trades.drop_duplicates(
-            subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
-            keep='first'
-        )
-
         # ---------------------------------------------------------
-        # 3. CLEANUP & SYNC
+        # 3. CLEANUP & SYNC (Strict Determinism Fix)
         # ---------------------------------------------------------
         print("   Synchronizing data...")
         
         # A. Type Conversion
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0)
         trades['contract_id'] = trades['contract_id'].str.strip()
+        trades['user'] = trades['user'].astype(str).str.strip()
         
-        # B. Strict Date Filter (Double Check)
+        # Fill NaNs to ensure sorting works (NaNs are notoriously unstable in sorts)
+        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0.0)
+        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0.0)
+        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
+        trades['size'] = pd.to_numeric(trades['size'], errors='coerce').fillna(0.0)
+        trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
+
+        # B. Filter Date
         cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=DAYS_BACK)
         trades = trades[trades['timestamp'] >= cutoff_date].copy()
         
-        # C. Align Market IDs (Explode "ID1,ID2" -> Single Rows)
+        # C. Align Market IDs
         markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
         markets = markets.explode('contract_id')
         markets['contract_id'] = markets['contract_id'].str.strip()
         
-        # D. Match Dataframes
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
 
-        # --- FIX: Strict Deterministic Loading ---
-        # 1. Normalize numerics to ensure sorting works consistently
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0).round(6)
-        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0).round(6)
-        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0).round(6)
+        # --- FIX: INCLUDE ALL COLUMNS IN SORT & DEDUPLICATION ---
+        # We sort by EVERY column to ensure a strict Total Ordering.
+        sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         
-        # 2. Strict Type Casting for Sort
-        trades['contract_id'] = trades['contract_id'].astype(str)
-        trades['user'] = trades['user'].astype(str)
-
-        # 3. SORT with ALL varying columns. 
-        # Including Price and Tokens ensures A and B (from above) always appear in the same order.
+        # Ensure all sort columns exist
+        present_sort_cols = [c for c in sort_cols if c in trades.columns]
+        
         trades = trades.sort_values(
-            ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'], 
+            by=present_sort_cols, 
             kind='stable'
         )
 
-        # 4. DEDUPLICATE with ALL varying columns.
-        # This prevents dropping valid concurrent trades that differ only by price/tokens.
         trades = trades.drop_duplicates(
-            subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
+            subset=present_sort_cols,
             keep='first'
         ).reset_index(drop=True)
+        # --------------------------------------------------------
         
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
