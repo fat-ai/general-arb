@@ -2117,6 +2117,7 @@ class BacktestEngine:
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
         
         df_markets, df_trades = self._load_data()
+        
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
             return None
@@ -2126,8 +2127,8 @@ class BacktestEngine:
             'created_at', 'liquidity', 'question', 'volume'
         ]
         # Only keep columns that actually exist in the data
-        actual_cols = [c for c in safe_cols if c in markets.columns]
-        markets = markets[actual_cols].copy()
+        actual_cols = [c for c in safe_cols if c in df_markets.columns]
+        markets = df_markets[actual_cols].copy()
         markets['contract_id'] = markets['contract_id'].astype(str)
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
