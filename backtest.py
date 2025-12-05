@@ -271,24 +271,28 @@ class FastBacktestEngine:
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
 
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
+        # --- CONFIG ---
         splash_thresh = config.get('splash_threshold', 100.0) 
-        use_smart_exit = config.get('use_smart_exit', False)
-        stop_loss_pct = config.get('stop_loss_pct', None)
         sizing_mode = config.get('sizing_mode', 'kelly')
         sizing_val = config.get('kelly_fraction', 0.25)
         if sizing_mode == 'fixed': sizing_val = config.get('fixed_size', 10.0)
         elif sizing_mode == 'fixed_pct': sizing_val = config.get('fixed_size', 0.025)
         
+        edge_thresh = config.get('edge_threshold', 0.05)
+        SPREAD_PENALTY = config.get('spread_penalty', 0.01)
+        use_smart_exit = config.get('use_smart_exit', False)
+        smart_exit_ratio = config.get('smart_exit_ratio', 0.5)
+        stop_loss_pct = config.get('stop_loss_pct', None)
+
         cash = 10000.0
         equity_curve = []
         positions = {}
         tracker = {}
         market_liq = {}
         trade_count = 0
-        volume_traded = 0.0
         
         for batch in batches:
-            candidates = {}
+            # STRICT SERIAL EXECUTION: Sort by timestamp
             batch.sort(key=lambda e: (e['data'].get('timestamp', pd.Timestamp.min), 0 if e['event_type'] == 'RESOLUTION' else 1))
 
             for event in batch:
@@ -310,39 +314,29 @@ class FastBacktestEngine:
                         del positions[cid]
 
                 elif ev_type == 'PRICE_UPDATE':
-                    # FIX: Default liq 1.0
-                    if cid not in market_liq: market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
+                    # 1. State Update
+                    if cid not in market_liq: 
+                        market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
                     
-                    # NOTE: 'p_market_all' in our data is the AVERAGE execution price of the trade
-                    # FIX: Ensure this variable is defined locally
+                    # NOTE: 'p_market_all' is the average execution price
                     avg_exec_price = data.get('p_market_all', 0.5)
                     
-                    if cid in tracker:
-                        prev_p = tracker[cid]['last_price']
-                        price_delta = abs(avg_exec_price - prev_p)
-                        trade_vol = float(data.get('trade_volume', 0.0))
-                        
-                        # Dynamic Liquidity Update
-                        if price_delta > 0.005 and trade_vol > 10.0:
-                            implied_liq = (trade_vol / price_delta) * 0.5
-                            market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
-                            
-                    # FIX: INITIALIZATION BUG
-                    # If this is the FIRST time we see this contract in this period,
-                    # we must initialize 'last_price' to the CURRENT price, not 0.5.
+                    # FIX: Correct Initialization (Use Current Price, not 0.5)
                     if cid not in tracker: 
                         tracker[cid] = {'net_weight': 0.0, 'last_price': avg_exec_price}
                     
-                    # Store previous price before updating
-                    prev_tracker_price = tracker[cid]['last_price']
+                    prev_p = tracker[cid]['last_price']
                     tracker[cid]['last_price'] = avg_exec_price
                     
                     vol = float(data.get('trade_volume', 0.0))
                     
-                    # --- SIGNAL GENERATION ---
+                    # Dynamic Liquidity Update
+                    if abs(avg_exec_price - prev_p) > 0.005 and vol > 10.0:
+                        implied_liq = (vol / abs(avg_exec_price - prev_p)) * 0.5
+                        market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
+
+                    # 2. Signal Generation
                     if vol >= 1.0:
-                        is_sell = data.get('is_sell', False)
-                        trade_direction = -1.0 if is_sell else 1.0
                         w_id = str(data.get('wallet_id'))
                         brier = wallet_scores.get((w_id, 'default_topic'))
                         if brier is None:
@@ -352,29 +346,31 @@ class FastBacktestEngine:
                         raw_skill = max(0.0, 0.25 - brier)
                         skill_factor = np.log1p(raw_skill * 100)
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
+                        
+                        trade_direction = -1.0 if data.get('is_sell') else 1.0
                         tracker[cid]['net_weight'] += (weight * trade_direction)
 
-                        # --- IMMEDIATE EXECUTION CHECK ---
-                        # If the accumulated signal crosses threshold, we trade NOW.
-                        # We do NOT wait for the end of the batch.
-                        
+                        # 3. Execution Logic
                         if abs(tracker[cid]['net_weight']) > splash_thresh:
                             raw_net = tracker[cid]['net_weight']
-                            # Reset weight (Splash & Reset)
-                            tracker[cid]['net_weight'] = 0.0 
+                            tracker[cid]['net_weight'] = 0.0 # Reset
                             
-                            p_model = 0.5 + (np.tanh(raw_net / 5000.0) * 0.49)
+                            # Model Response (Tuned divisor: 2000.0)
+                            p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
                             edge = p_model - avg_exec_price
+                            
+                            # Lifecycle / Time Check
                             market_info = self.market_lifecycle.get(cid)
                             current_ts = data.get('timestamp')
                             
                             if market_info and current_ts and 'end' in market_info:
                                 days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
+                                
                                 if days_remaining > 0:
-                                    edge_thresh = config.get('edge_threshold', 0.05)
+                                    # Edge Threshold Check
                                     if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
                                         if cid not in positions:
-                                            # Sizing
+                                            # Sizing Logic
                                             target_f = 0.0
                                             cost = 0.0
                                             if sizing_mode == 'fixed_pct': target_f = sizing_val
@@ -386,23 +382,19 @@ class FastBacktestEngine:
                                                 cost = cash * target_f
                                             
                                             if cost > 5.0 and cash > cost:
-                                                side = 1 if edge > 0 else -1
-                                                pool_liq = market_liq.get(cid, 0.0) 
+                                                pool_liq = market_liq.get(cid, 0.0)
                                                 
-                                                # LIQUIDITY GUARDRAIL
-                                                if pool_liq > 100.0:
+                                                # Liquidity Gate (Relaxed to 50.0)
+                                                if pool_liq > 50.0:
+                                                    side = 1 if edge > 0 else -1
                                                     
-                                                    # --- PRICE REALITY ADJUSTMENT ---
-                                                    # FIX: Removed the volatile 'price_move' estimator.
-                                                    # We now assume we fill at the average execution price + spread.
+                                                    # FIX: Standard Execution Model (No Wick Estimation)
                                                     estimated_marginal = avg_exec_price
-
-                                                    # Impact Calculation
-                                                    # FIX: Removed double counting of friction (0.97)
-                                                    net_capital = (cost / 1.002)
+                                                    
+                                                    # Impact (No 0.97 penalty)
+                                                    net_capital = (cost / 1.002) 
                                                     variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
-                                                    SPREAD_PENALTY = config.get('spread_penalty', 0.01)
-                                                    # Final Entry Price
+                                                    
                                                     if side == 1:
                                                         safe_entry = min(estimated_marginal + variable_impact + SPREAD_PENALTY, 0.99)
                                                         shares = net_capital / safe_entry
@@ -410,18 +402,21 @@ class FastBacktestEngine:
                                                         safe_entry = max(estimated_marginal - variable_impact - SPREAD_PENALTY, 0.01)
                                                         shares = net_capital / (1.0 - safe_entry)
 
-                                                    # EXECUTE
                                                     positions[cid] = {
-                                                        'side': side,
-                                                        'size': cost,
-                                                        'shares': shares,
-                                                        'entry': safe_entry,
+                                                        'side': side, 
+                                                        'size': cost, 
+                                                        'shares': shares, 
+                                                        'entry': safe_entry, 
                                                         'entry_signal': raw_net
                                                     }
-                
+                                                    cash -= cost
+                                                    trade_count += 1
+
+                # Stop Loss / Smart Exit (Check every event)
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                    
                     if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
                     else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
                     
@@ -429,43 +424,24 @@ class FastBacktestEngine:
                     if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
                     if use_smart_exit:
                         cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                        if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * config.get('smart_exit_ratio', 0.5)): should_close = True
-                        if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * config.get('smart_exit_ratio', 0.5)): should_close = True
+                        if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
+                        if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
                     
                     if should_close:
-                        friction = 0.998
-                        if pos['side'] == 1: net_payout = pos['shares'] * curr_p * friction
-                        else: net_payout = pos['shares'] * (1.0 - curr_p) * friction
+                        friction = 0.998 # No 0.97 penalty
+                        exit_price = curr_p
+                        
+                        if pos['side'] == 1: 
+                            exit_price = max(curr_p - SPREAD_PENALTY, 0.01)
+                            net_payout = pos['shares'] * exit_price * friction
+                        else: 
+                            exit_price = min(curr_p + SPREAD_PENALTY, 0.99)
+                            net_payout = pos['shares'] * (1.0 - exit_price) * friction
+                            
                         cash += net_payout
                         del positions[cid]
 
-            if candidates:
-                
-                ranked_candidates = sorted(
-                    candidates.values(), 
-                    key=lambda x: (abs(x['daily_edge']), x['cid']), 
-                    reverse=True
-                )
-                
-                for trade in ranked_candidates:
-                    cid = trade['cid']
-                    if cid in positions: continue
-                    cost = trade['size']
-                    if cost > 5.0 and cash > cost:
-                         # Execution Logic duplicated for rank-based phase
-                         # (Simplified here as candidate already calculated cost/shares)
-                         # In strict logic, we re-check liquidty/cost
-                         positions[cid] = {
-                             'side': trade['side'],
-                             'size': cost,
-                             'shares': trade['shares'],
-                             'entry': trade['entry'],
-                             'entry_signal': trade['entry_signal']
-                         }
-                         cash -= cost            # The ONLY deduction
-                         trade_count += 1        # Increment stats here
-                         volume_traded += cost
-
+            # Mark to Market (End of Minute)
             current_val = cash
             for cid, pos in positions.items():
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
