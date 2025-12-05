@@ -310,21 +310,36 @@ class FastBacktestEngine:
                         del positions[cid]
 
                 elif ev_type == 'PRICE_UPDATE':
-                    if cid not in market_liq: market_liq[cid] = known_liquidity.get(cid, 10000.0) if known_liquidity else 10000.0
-                    new_price = data.get('p_market_all', 0.5)
+                    # FIX: Default liq 1.0
+                    if cid not in market_liq: market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
+                    
+                    # NOTE: 'p_market_all' in our data is the AVERAGE execution price of the trade
+                    # FIX: Ensure this variable is defined locally
+                    avg_exec_price = data.get('p_market_all', 0.5)
+                    
                     if cid in tracker:
                         prev_p = tracker[cid]['last_price']
-                        price_delta = abs(new_price - prev_p)
+                        price_delta = abs(avg_exec_price - prev_p)
                         trade_vol = float(data.get('trade_volume', 0.0))
+                        
+                        # Dynamic Liquidity Update
                         if price_delta > 0.005 and trade_vol > 10.0:
                             implied_liq = (trade_vol / price_delta) * 0.5
                             market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
-                    if cid not in tracker: tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
+                            
+                    # FIX: INITIALIZATION BUG
+                    # If this is the FIRST time we see this contract in this period,
+                    # we must initialize 'last_price' to the CURRENT price, not 0.5.
+                    if cid not in tracker: 
+                        tracker[cid] = {'net_weight': 0.0, 'last_price': avg_exec_price}
                     
-                    prev_price = tracker[cid]['last_price']
-                    tracker[cid]['last_price'] = new_price
+                    # Store previous price before updating
+                    prev_tracker_price = tracker[cid]['last_price']
+                    tracker[cid]['last_price'] = avg_exec_price
+                    
                     vol = float(data.get('trade_volume', 0.0))
                     
+                    # --- SIGNAL GENERATION ---
                     if vol >= 1.0:
                         is_sell = data.get('is_sell', False)
                         trade_direction = -1.0 if is_sell else 1.0
@@ -339,11 +354,17 @@ class FastBacktestEngine:
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
                         tracker[cid]['net_weight'] += (weight * trade_direction)
 
+                        # --- IMMEDIATE EXECUTION CHECK ---
+                        # If the accumulated signal crosses threshold, we trade NOW.
+                        # We do NOT wait for the end of the batch.
+                        
                         if abs(tracker[cid]['net_weight']) > splash_thresh:
                             raw_net = tracker[cid]['net_weight']
+                            # Reset weight (Splash & Reset)
                             tracker[cid]['net_weight'] = 0.0 
+                            
                             p_model = 0.5 + (np.tanh(raw_net / 5000.0) * 0.49)
-                            edge = p_model - prev_price
+                            edge = p_model - avg_exec_price
                             market_info = self.market_lifecycle.get(cid)
                             current_ts = data.get('timestamp')
                             
@@ -351,9 +372,9 @@ class FastBacktestEngine:
                                 days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
                                 if days_remaining > 0:
                                     edge_thresh = config.get('edge_threshold', 0.05)
-                                    if abs(edge) >= edge_thresh and (0.02 <= new_price <= 0.98):
-                                        daily_edge = edge / max(1.0, days_remaining)
+                                    if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
                                         if cid not in positions:
+                                            # Sizing
                                             target_f = 0.0
                                             cost = 0.0
                                             if sizing_mode == 'fixed_pct': target_f = sizing_val
@@ -367,51 +388,37 @@ class FastBacktestEngine:
                                             if cost > 5.0 and cash > cost:
                                                 side = 1 if edge > 0 else -1
                                                 pool_liq = market_liq.get(cid, 0.0) 
-                                                if pool_liq > 1.0:
+                                                
+                                                # LIQUIDITY GUARDRAIL
+                                                if pool_liq > 100.0:
+                                                    
+                                                    # --- PRICE REALITY ADJUSTMENT ---
+                                                    # FIX: Removed the volatile 'price_move' estimator.
+                                                    # We now assume we fill at the average execution price + spread.
+                                                    estimated_marginal = avg_exec_price
+
+                                                    # Impact Calculation
+                                                    # FIX: Removed double counting of friction (0.97)
                                                     net_capital = (cost / 1.002)
+                                                    variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
                                                     
-                                                    # === PATCH 4: REALISTIC SLIPPAGE ===
-                                                    
-                                                    # 1. REMOVE THE CAP (Let slippage explode if size is too big)
-                                                    # Old: min(..., 0.15)
-                                                    raw_impact = net_capital / (pool_liq + net_capital)
-                                                    
-                                                    # 2. ADD SPREAD PENALTY
-                                                    # Assume a base spread of 1% (optimistic) to 3% (conservative)
-                                                    spread_penalty = 0.02 # 2 cents
-                                                    
+                                                    # Final Entry Price
                                                     if side == 1:
-                                                        # Buying YES: Price goes UP
-                                                        # Impact + Spread
-                                                        exec_price = new_price + raw_impact + (spread_penalty / 2)
-                                                        safe_entry = min(exec_price, 0.99)
+                                                        safe_entry = min(estimated_marginal + variable_impact + SPREAD_PENALTY, 0.99)
                                                         shares = net_capital / safe_entry
                                                     else:
-                                                        # Selling YES (Buying NO): Price goes DOWN
-                                                        exec_price = new_price - raw_impact - (spread_penalty / 2)
-                                                        safe_entry = max(exec_price, 0.01)
+                                                        safe_entry = max(estimated_marginal - variable_impact - SPREAD_PENALTY, 0.01)
                                                         shares = net_capital / (1.0 - safe_entry)
-                                                    # ===================================
-                                                    
-                                                    pool_liq = market_liq.get(cid, 0.0)
 
-                                                    if pool_liq < 1000.0:
-                                                        continue
-                                                    # === CRITICAL FIX: ALL KEYS PRESENT ===
-                                                    candidates[cid] = {
-                                                        'cid': cid,
-                                                        'liq': pool_liq,
-                                                        'total_edge': edge,
-                                                        'price': new_price,
+                                                    # EXECUTE
+                                                    positions[cid] = {
                                                         'side': side,
                                                         'size': cost,
-                                                        'daily_edge': daily_edge,
                                                         'shares': shares,
-                                                        'entry_signal': raw_net,
-                                                        'entry': safe_entry
+                                                        'entry': safe_entry,
+                                                        'entry_signal': raw_net
                                                     }
-                                      
-
+                
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
@@ -1552,3 +1559,4 @@ if __name__ == "__main__":
         if ray.is_initialized():
             print("Shutting down Ray...")
             ray.shutdown()
+
