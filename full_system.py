@@ -34,6 +34,9 @@ import torch
 from scipy.stats import linregress
 import shutil  
 
+torch.use_deterministic_algorithms(True)
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 SEED = 42
 np.random.seed(SEED)
 random.seed(SEED)
@@ -628,7 +631,7 @@ class GraphManager:
         for c in self.mock_db['contracts'].values():
             if c.get('status') == 'MONITORED':
                 for eid in c.get('entity_ids', []): clusters.add(eid)
-        return list(clusters)
+        return sorted(list(clusters))
             
     def _mock_get_cluster_contracts(self, entity_id):
         res = []
@@ -1985,7 +1988,7 @@ class FastBacktestEngine:
                 # 1. Rank by Absolute Daily Edge (Highest Velocity First)
                 ranked_candidates = sorted(
                     candidates.values(), 
-                    key=lambda x: abs(x['daily_edge']), 
+                    key=lambda x: (abs(x['daily_edge']), x['cid']) # Tuple sort
                     reverse=True
                 )
                 
