@@ -2120,7 +2120,21 @@ class BacktestEngine:
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
             return None
-      
+
+        safe_cols = [
+            'contract_id', 'outcome', 'resolution_timestamp', 
+            'created_at', 'liquidity', 'question', 'volume'
+        ]
+        # Only keep columns that actually exist in the data
+        actual_cols = [c for c in safe_cols if c in markets.columns]
+        markets = markets[actual_cols].copy()
+        markets['contract_id'] = markets['contract_id'].astype(str)
+        markets = markets.sort_values(
+            by=['contract_id', 'resolution_timestamp'], 
+            ascending=[True, True],
+            kind='stable'
+        )
+        markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         now = pd.Timestamp.now()
         event_log = event_log[event_log.index <= now]
