@@ -1988,7 +1988,7 @@ class FastBacktestEngine:
                 # 1. Rank by Absolute Daily Edge (Highest Velocity First)
                 ranked_candidates = sorted(
                     candidates.values(), 
-                    key=lambda x: (abs(x['daily_edge']), x['cid']) # Tuple sort
+                    key=lambda x: (abs(x['daily_edge']), x['cid']), # Tuple sort
                     reverse=True
                 )
                 
