@@ -118,10 +118,7 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     filtered['brier'] = (filtered['prediction'] - filtered['outcome']) ** 2
     
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
-    scores = scores.reset_index()
-    
-    # Sort: Lower Brier score is better
-    scores = scores.sort_values(by=['brier', 'wallet_id'], ascending=[True, True], kind='stable')
+
     return scores.to_dict()
 
 class FastBacktestEngine:
@@ -1404,7 +1401,15 @@ class BacktestEngine:
             by=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'], 
             kind='stable'
         )
+        # We must ensure we don't process trades after the market resolves
+        res_map = markets.set_index('contract_id')['resolution_timestamp']
+        trades['res_time'] = trades['contract_id'].map(res_map)
         
+        # Filter: Keep trades where timestamp < resolution_time
+        # (Handle NaT if resolution is unknown by keeping the trade)
+        trades = trades[
+            (trades['timestamp'] < trades['res_time']) | (trades['res_time'].isna())
+        ].copy()
         trades = trades.drop_duplicates(
             subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
