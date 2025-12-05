@@ -1860,7 +1860,7 @@ class FastBacktestEngine:
                             
                             if abs(edge) >= edge_thresh and is_safe_price:
                                 safe_duration = max(1.0, days_remaining)
-                                 daily_edge = edge / safe_duration
+                                daily_edge = edge / safe_duration
                                 # Do we already hold this?
                                 if cid not in positions:
                                     
