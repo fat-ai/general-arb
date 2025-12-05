@@ -368,7 +368,7 @@ class FastBacktestEngine:
                                                 side = 1 if edge > 0 else -1
                                                 pool_liq = market_liq.get(cid, 0.0) 
                                                 if pool_liq > 1.0:
-                                                    net_capital = (cost / 1.002) * 0.97
+                                                    net_capital = (cost / 1.002)
                                                     
                                                     # === PATCH 4: REALISTIC SLIPPAGE ===
                                                     
@@ -426,7 +426,7 @@ class FastBacktestEngine:
                         if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * config.get('smart_exit_ratio', 0.5)): should_close = True
                     
                     if should_close:
-                        friction = 0.998 * 0.97
+                        friction = 0.998
                         if pos['side'] == 1: net_payout = pos['shares'] * curr_p * friction
                         else: net_payout = pos['shares'] * (1.0 - curr_p) * friction
                         cash += net_payout
