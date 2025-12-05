@@ -2413,8 +2413,8 @@ class BacktestEngine:
                 if not rows: break
                 all_rows.extend(rows)
                 
-                offset += 1000
-                if offset > 50000: break
+                offset += len(rows)
+           
             except Exception: break
         
         print(f" Done. Fetched {len(all_rows)} markets.")
@@ -2474,6 +2474,7 @@ class BacktestEngine:
 
             # 3. PRICE CHECK (Only runs if Time Gate is passed)
             try:
+                prices = row.get('outcomePrices')
                 if isinstance(prices, str): 
                     prices = json.loads(prices)
                 
