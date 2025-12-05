@@ -1916,6 +1916,9 @@ class FastBacktestEngine:
 
                                         candidates[cid] = {
                                             'cid': cid,
+                                            'liq': pool_liq,        
+                                            'total_edge': edge,     
+                                            'price': new_price,
                                             'side': side,
                                             'size': cost,
                                             'daily_edge': daily_edge,
