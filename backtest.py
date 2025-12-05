@@ -410,9 +410,7 @@ class FastBacktestEngine:
                                                         'entry_signal': raw_net,
                                                         'entry': safe_entry
                                                     }
-                                                    trade_count += 1
-                                                    volume_traded += cost
-                                                    cash -= cost
+                                      
 
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
@@ -457,7 +455,9 @@ class FastBacktestEngine:
                              'entry': trade['entry'],
                              'entry_signal': trade['entry_signal']
                          }
-                         cash -= cost
+                         cash -= cost            # The ONLY deduction
+                         trade_count += 1        # Increment stats here
+                         volume_traded += cost
 
             current_val = cash
             for cid, pos in positions.items():
