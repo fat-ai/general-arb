@@ -2282,6 +2282,12 @@ class BacktestEngine:
         if markets.empty:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
+
+        markets = markets.sort_values(
+            by=['contract_id', 'resolution_timestamp'], 
+            ascending=[True, True],
+            kind='stable'
+        )
             
         markets = markets.drop_duplicates(subset=['contract_id']).copy()
         # ---------------------------------------------------------
