@@ -595,9 +595,12 @@ class GraphManager:
         entity_id = self.mock_db['aliases'].get(alias_text)
         if entity_id:
             return {'entity_id': entity_id, 'name': self.mock_db['entities'][entity_id]['canonical_name'], 'confidence': 1.0}
-        # Fallback: Create a dynamic entity for any new alias found in backtest
-        # This prevents "No entities found" errors for valid markets
-        fake_id = f"E_{hash(alias_text)}"
+            
+        import hashlib
+        stable_hash = hashlib.md5(alias_text.encode('utf-8')).hexdigest()[:12]
+        fake_id = f"E_{stable_hash}"
+        # ---------------------------------
+
         self.mock_db['entities'][fake_id] = {'canonical_name': alias_text, 'type': 'default_topic', 'contract_count': 0}
         self.mock_db['aliases'][alias_text] = fake_id
         return {'entity_id': fake_id, 'name': alias_text, 'confidence': 1.0}
@@ -838,6 +841,11 @@ class HistoricalProfiler:
         # Filter for Resolved trades only to calculate PnL
         resolved = df_trades.dropna(subset=['outcome']).copy()
 
+        for col in ['size', 'tokens', 'outcome']:
+            resolved[col] = pd.to_numeric(resolved[col], errors='coerce').fillna(0.0)
+
+        
+
         if 'size' not in resolved.columns:
             if 'usdc_vol' in resolved.columns:
                 resolved['size'] = resolved['usdc_vol']
@@ -851,8 +859,9 @@ class HistoricalProfiler:
 
         signed_cost = resolved['size'].where(resolved['tokens'] >= 0, -resolved['size'])
         
+        resolved['entry_cashflow'] = np.where(resolved['tokens'] >= 0, -resolved['size'], resolved['size'])
         resolved['payout_value'] = resolved['tokens'] * resolved['outcome']
-        resolved['realized_pnl'] = resolved['payout_value'] - signed_cost
+        resolved['realized_pnl'] = resolved['entry_cashflow'] + resolved['payout_value']
 
         pnl_stats = resolved['realized_pnl'].describe()
         log.info(f"🔎 PnL DISTRIBUTION:\n{pnl_stats}")
@@ -1391,7 +1400,7 @@ class FastBacktestEngine:
         else:
             self.minute_batches = []
             
-    def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None):
+    def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
         """
         Calibrates the 'Fresh Wallet' regression model (Volume -> Skill).
         Includes strict statistical validation to prevent fitting noise.
@@ -1409,6 +1418,16 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
             
         valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+
+        if cutoff_date:
+            # Only use trades where the MARKET RESOLVED before the cutoff.
+            # (Requires 'res_time' column which is added in run_walk_forward)
+            if 'res_time' in valid.columns:
+                valid = valid[valid['res_time'] < cutoff_date]
+            else:
+                # Fallback: Filter by trade time if resolution time missing (conservative)
+                valid = valid[valid['timestamp'] < cutoff_date]
+                
         if known_wallet_ids:
             # We only want to learn from the "Amateurs/Transients"
             valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
@@ -1556,7 +1575,12 @@ class FastBacktestEngine:
             fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
             # Use 'self.' to call method
             known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
-            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts)
+       
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(
+                train_profiler, 
+                known_wallet_ids=known_experts, 
+                cutoff_date=train_end
+            )
             
             # C. Run Test Simulation
             test_slice = self.event_log[(self.event_log.index >= test_start) & 
@@ -1878,6 +1902,7 @@ class FastBacktestEngine:
                                             'side': side,
                                             'size': cost,
                                             'shares': shares,
+                                            'entry_signal': tracker[cid]['net_weight'],
                                             'entry': safe_entry
                                         }
                                         trade_count += 1
@@ -1887,7 +1912,7 @@ class FastBacktestEngine:
                                     else:
                                         rejection_log['insufficient_cash'] += 1
 
-                # ==================== D. POSITION MANAGEMENT (Stop Losses) ====================
+                # ==================== D. POSITION MANAGEMENT ====================
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
                     curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
@@ -1899,29 +1924,44 @@ class FastBacktestEngine:
                         pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
                     
                     should_close = False
+                    
+                    # 1. Stop Loss
                     if stop_loss_pct and pnl_pct < -stop_loss_pct:
                         should_close = True
                     
+                    # 2. Smart Exit (Delta Logic)
                     if use_smart_exit:
                         cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                        entry_signal = pos.get('entry_signal', 0) # Default to 0 if missing
                         
-                        # [PATCH] Configurable Smart Exit Ratio
-                        # Default to 0.5 (original behavior) if not in config
+                        # Calculate Delta: How much has sentiment changed since we bought?
+                        signal_delta = cur_net - entry_signal
+                        
                         exit_ratio = config.get('smart_exit_ratio', 0.5)
                         exit_trigger_val = splash_thresh * exit_ratio
                         
-                        # LONG EXIT: Sentiment flips negative beyond threshold
-                        if pos['side'] == 1 and cur_net < -exit_trigger_val: 
+                        # EXIT LONG: If sentiment drops significantly relative to entry
+                        if pos['side'] == 1 and signal_delta < -exit_trigger_val: 
                             should_close = True
                             
-                        # SHORT EXIT: Sentiment flips positive beyond threshold
-                        if pos['side'] == -1 and cur_net > exit_trigger_val: 
+                        # EXIT SHORT: If sentiment rises significantly relative to entry
+                        if pos['side'] == -1 and signal_delta > exit_trigger_val: 
                             should_close = True
                     
                     if should_close:
-                        if pos['side'] == 1: payout = pos['shares'] * curr_p
-                        else: payout = pos['shares'] * (1.0 - curr_p)
-                        cash += payout
+                        # --- FIX: Apply Friction on Exit ---
+                        friction_rate = 0.002
+                        fixed_penalty = 0.03
+                        
+                        if pos['side'] == 1: 
+                            gross_payout = pos['shares'] * curr_p
+                        else: 
+                            gross_payout = pos['shares'] * (1.0 - curr_p)
+                            
+                        # Apply costs
+                        net_payout = gross_payout * (1.0 - friction_rate) * (1.0 - fixed_penalty)
+                        
+                        cash += net_payout
                         del positions[cid]
             
             # --- VALUATION (End of Minute) ---
