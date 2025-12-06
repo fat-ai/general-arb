@@ -283,6 +283,7 @@ class FastBacktestEngine:
         use_smart_exit = config.get('use_smart_exit', False)
         smart_exit_ratio = config.get('smart_exit_ratio', 0.5)
         stop_loss_pct = config.get('stop_loss_pct', None)
+        EVENT_PRIORITY = {'NEW_CONTRACT': 0, 'RESOLUTION': 1, 'PRICE_UPDATE': 2}
 
         cash = 10000.0
         equity_curve = []
