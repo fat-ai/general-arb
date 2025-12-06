@@ -407,7 +407,7 @@ class FastBacktestEngine:
                                                         'size': cost, 
                                                         'shares': shares, 
                                                         'entry': safe_entry, 
-                                                        'entry_signal': raw_net
+                                                        'entry_signal': 0
                                                     }
                                                     cash -= cost
                                                     trade_count += 1
