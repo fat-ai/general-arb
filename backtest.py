@@ -293,7 +293,11 @@ class FastBacktestEngine:
         
         for batch in batches:
             # STRICT SERIAL EXECUTION: Sort by timestamp
-            batch.sort(key=lambda e: (e['data'].get('timestamp', pd.Timestamp.min), 0 if e['event_type'] == 'RESOLUTION' else 1))
+            batch.sort(key=lambda e: (
+                e['data'].get('timestamp', pd.Timestamp.min),
+                EVENT_PRIORITY.get(e['event_type'], 99),
+                e['data'].get('contract_id', '')
+            ))
 
             for event in batch:
                 ev_type = event['event_type']
@@ -388,10 +392,8 @@ class FastBacktestEngine:
                                                 if pool_liq > 50.0:
                                                     side = 1 if edge > 0 else -1
                                                     
-                                                    # FIX: Standard Execution Model (No Wick Estimation)
                                                     estimated_marginal = avg_exec_price
                                                     
-                                                    # Impact (No 0.97 penalty)
                                                     net_capital = (cost / 1.002) 
                                                     variable_impact = min(net_capital / (pool_liq + net_capital), 0.15)
                                                     
@@ -1173,12 +1175,20 @@ class BacktestEngine:
         all_rows = []
         
         print(f"Fetching Trades from NOW ({time_cursor}) back to {cutoff_time}...", end="")
-        
+        retry_count = 0
+        MAX_RETRIES = 5
         while True:
             try:
                 resp = self.session.post(url, json={'query': query_template.format(time_cursor=time_cursor)}, timeout=30)
-                if resp.status_code != 200: break
+                if resp.status_code != 200:
+                    log.error(f"API Error {resp.status_code}: {resp.text[:100]}")
+                    retry_count += 1
+                    if retry_count > MAX_RETRIES:
+                        raise ValueError(f"❌ FATAL: Subgraph API failed after {MAX_RETRIES} attempts. Stopping to prevent partial data.")
+                    time.sleep(2 * retry_count)
+                    continue
                     
+                retry_count = 0    
                 data = resp.json().get('data', {}).get('fpmmTransactions', [])
                 if not data: break
                 
