@@ -295,7 +295,7 @@ class FastBacktestEngine:
         for batch in batches:
             # STRICT SERIAL EXECUTION: Sort by timestamp
             batch.sort(key=lambda e: (
-                e['data'].get('timestamp', pd.Timestamp.min),
+                e['data']['timestamp'],
                 EVENT_PRIORITY.get(e['event_type'], 99),
                 e['data'].get('contract_id', '')
             ))
@@ -337,8 +337,14 @@ class FastBacktestEngine:
                     
                     # Dynamic Liquidity Update
                     if abs(avg_exec_price - prev_p) > 0.005 and vol > 10.0:
-                        implied_liq = (vol / abs(avg_exec_price - prev_p)) * 0.5
-                        market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
+                        raw_implied = (vol / abs(avg_exec_price - prev_p)) * 0.5
+                        safe_implied = np.clip(
+                            raw_implied, 
+                            market_liq[cid] * 0.5, 
+                            market_liq[cid] * 2.0
+                        )
+    
+                    market_liq[cid] = (market_liq[cid] * 0.9) + (safe_implied * 0.1)
 
                     # 2. Signal Generation
                     if vol >= 1.0:
