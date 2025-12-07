@@ -344,7 +344,7 @@ class FastBacktestEngine:
                             market_liq[cid] * 2.0
                         )
     
-                    market_liq[cid] = (market_liq[cid] * 0.9) + (safe_implied * 0.1)
+                        market_liq[cid] = (market_liq[cid] * 0.9) + (safe_implied * 0.1)
 
                     # 2. Signal Generation
                     if vol >= 1.0:
