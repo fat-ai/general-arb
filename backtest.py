@@ -272,9 +272,91 @@ class FastBacktestEngine:
         if len(pct_changes) > 1 and pct_changes.std() > 0:
             sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 1440)
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
-
+        
+    def _try_capital_recycling(self, new_cid, new_edge, required_cash, current_cash, 
+                               positions, tracker, market_liq, config):
+            """
+            Robust Capital Recycling:
+            Scans portfolio for 'dead money' (low marginal EV) to fund a high-EV new trade.
+            Returns: Amount of cash raised, list of (cid, shares_to_sell) tuples.
+            """
+            SPREAD_PENALTY = config.get('spread_penalty', 0.01)
+            recycling_buffer = 0.02 # 2% extra hurdle to prevent noise churning
+            
+            raised_cash = 0.0
+            sell_orders = []
+            
+            # 1. Calculate Marginal Yield for all existing positions
+            candidates = []
+            for cid, pos in positions.items():
+                # Get up-to-the-minute price
+                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                pool_liq = market_liq.get(cid, 10.0)
+                
+                # Calculate Current Edge (decayed)
+                # Re-evaluate model signal. If we don't have a fresh signal, 
+                # assume the market price is efficiently closing the gap.
+                # CONSERVATIVE: Assume current edge is half of remaining distance to resolution
+                if pos['side'] == 1: # LONG
+                    remaining_dist = (1.0 - curr_p)
+                    # If price > 0.98, edge is basically 0. Dead money.
+                    current_edge = remaining_dist * 0.2 if curr_p < 0.95 else 0.0 
+                    marginal_yield = current_edge / max(curr_p, 0.01)
+                else: # SHORT
+                    remaining_dist = curr_p
+                    current_edge = remaining_dist * 0.2 if curr_p > 0.05 else 0.0
+                    marginal_yield = current_edge / max(1.0 - curr_p, 0.01)
+    
+                # Estimate Exit Friction (Slippage + Spread)
+                # We assume a standard "slice" size to estimate slippage
+                est_exit_cost = (pos['size'] * 0.005) + SPREAD_PENALTY
+                
+                candidates.append({
+                    'cid': cid,
+                    'yield': marginal_yield,
+                    'friction': est_exit_cost,
+                    'curr_p': curr_p,
+                    'value': pos['shares'] * curr_p if pos['side']==1 else pos['shares'] * (1.0 - curr_p)
+                })
+                
+            # 2. Sort by LOWEST Yield (The "Deadest" Money)
+            candidates.sort(key=lambda x: x['yield'])
+            
+            # 3. Calculate New Trade Yield
+            # (Simplified: New Edge / Price roughly approx to just New Edge for comparison)
+            new_trade_yield = new_edge 
+            
+            # 4. The Waterfall
+            needed = required_cash - current_cash
+            
+            for cand in candidates:
+                if raised_cash >= needed: break
+                
+                # THE ROBUST CHECK:
+                # Gain from switching > Friction + Buffer
+                yield_gain = new_trade_yield - cand['yield']
+                
+                # Convert friction to strict percentage hurdle approx
+                friction_pct = cand['friction'] # approx 1-2%
+                
+                if yield_gain > (friction_pct + recycling_buffer):
+                    # We sell this position
+                    exit_val = cand['value']
+                    
+                    # Apply simulated exit haircut (slippage/spread)
+                    realized_cash = exit_val * (1.0 - SPREAD_PENALTY) 
+                    
+                    raised_cash += realized_cash
+                    sell_orders.append(cand['cid'])
+                    # print(f"♻️ RECYCLE: Selling {cand['cid']} (Yield {cand['yield']:.2%}) for New Trade (Yield {new_trade_yield:.2%})")
+                else:
+                    # If the worst position isn't worth selling, none are. Stop.
+                    break
+                    
+            return raised_cash, sell_orders
+                                   
     def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
-        # --- CONFIG ---
+
         splash_thresh = config.get('splash_threshold', 100.0) 
         sizing_mode = config.get('sizing_mode', 'kelly')
         sizing_val = config.get('kelly_fraction', 0.25)
@@ -389,6 +471,33 @@ class FastBacktestEngine:
                                             if target_f > 0:
                                                 target_f = min(target_f, 0.20)
                                                 cost = cash * target_f
+
+                                            if cost > 5.0:
+                                        # If we can't afford the trade, OR if we want to optimize, check recycling
+                                        # But typically we only recycle if cash is tight constraints
+                                                if cash < cost:
+                                                    raised, to_sell = self._try_capital_recycling(
+                                                        cid, abs(edge), cost, cash, 
+                                                        positions, tracker, market_liq, config
+                                                    )
+                                                    
+                                                    # Execute the Sells
+                                                    if raised > 0:
+                                                        for sell_cid in to_sell:
+                                                            # Copy-paste your "Smart Exit" logic here to execute the sell
+                                                            s_pos = positions[sell_cid]
+                                                            s_curr = tracker.get(sell_cid, {}).get('last_price', s_pos['entry'])
+                                                            
+                                                            # Simple Market Sell Logic
+                                                            if s_pos['side'] == 1:
+                                                                s_exit = max(s_curr - SPREAD_PENALTY, 0.01)
+                                                                pay = s_pos['shares'] * s_exit * 0.998
+                                                            else:
+                                                                s_exit = min(s_curr + SPREAD_PENALTY, 0.99)
+                                                                pay = s_pos['shares'] * (1.0 - s_exit) * 0.998
+                                                            
+                                                            cash += pay
+                                                            del positions[sell_cid]
                                             
                                             if cost > 5.0 and cash > cost:
                                                 pool_liq = market_liq.get(cid, 0.0)
@@ -468,7 +577,9 @@ class FastBacktestEngine:
             'trades': trade_count,
             'equity_curve': equity_curve
         }
-
+        
+        
+                                   
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
