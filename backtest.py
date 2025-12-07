@@ -338,13 +338,8 @@ class FastBacktestEngine:
                     # Dynamic Liquidity Update
                     if abs(avg_exec_price - prev_p) > 0.005 and vol > 10.0:
                         raw_implied = (vol / abs(avg_exec_price - prev_p)) * 0.5
-                        safe_implied = np.clip(
-                            raw_implied, 
-                            market_liq[cid] * 0.5, 
-                            market_liq[cid] * 2.0
-                        )
-    
-                        market_liq[cid] = (market_liq[cid] * 0.9) + (safe_implied * 0.1)
+                        implied_liq = (vol / abs(avg_exec_price - prev_p)) * 0.5
+                        market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
 
                     # 2. Signal Generation
                     if vol >= 1.0:
