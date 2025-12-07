@@ -39,6 +39,9 @@ def force_clear_cache(cache_dir):
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
+FIXED_START_DATE = pd.Timestamp("2025-05-30")
+FIXED_END_DATE   = pd.Timestamp("2025-11-30")
+
 def plot_performance(equity_curve, trades_count):
     """Generates a performance chart. Safe for headless servers."""
     try:
@@ -505,8 +508,11 @@ class BacktestEngine:
         )
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
-        now = pd.Timestamp.now()
-        event_log = event_log[event_log.index <= now]
+        event_log = event_log[event_log.index <= FIXED_END_DATE]
+        event_log = event_log[
+            (event_log.index >= FIXED_START_DATE) | 
+            (event_log['event_type'] == 'NEW_CONTRACT')
+        ]
     
         if event_log.empty:
             log.error("⛔ Event log is empty after transformation.")
@@ -732,8 +738,10 @@ class BacktestEngine:
         trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
 
         # B. Filter Date
-        cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=DAYS_BACK)
-        trades = trades[trades['timestamp'] >= cutoff_date].copy()
+        trades = trades[
+            (trades['timestamp'] >= FIXED_START_DATE) & 
+            (trades['timestamp'] <= FIXED_END_DATE)
+        ].copy()
         
         # C. Align Market IDs
         markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
