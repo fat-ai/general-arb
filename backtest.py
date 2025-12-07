@@ -295,7 +295,7 @@ class FastBacktestEngine:
         for batch in batches:
             # STRICT SERIAL EXECUTION: Sort by timestamp
             batch.sort(key=lambda e: (
-                e['data']['timestamp'],
+                e['data'].get('timestamp', pd.Timestamp.min),
                 EVENT_PRIORITY.get(e['event_type'], 99),
                 e['data'].get('contract_id', '')
             ))
