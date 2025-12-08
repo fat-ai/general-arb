@@ -289,7 +289,7 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
 
 # 4. ORCHESTRATOR
 def execute_hybrid_waterfall(
-    cid, condition_id, side, cost, current_ts, 
+    cid, condition_id, outcome_tag, side, cost, current_ts, 
     cid_indices, t_times, t_sides, t_vols, t_prices
 ):
     """
@@ -327,7 +327,7 @@ def execute_hybrid_waterfall(
             
             # FIX: Use condition_id (Market ID), fallback to cid if missing (though unlikely to work)
             lookup_id = condition_id if condition_id else cid
-            book_levels = fetch_resting_liquidity(lookup_id, exact_block, side_str)
+            book_levels = fetch_resting_liquidity(lookup_id, exact_block, side_str, outcome_tag)
             
             t2_filled = 0.0
             t2_shares = 0.0
@@ -651,29 +651,85 @@ class FastBacktestEngine:
                                             # --- Inside Trade Execution Logic (Triggered by signal/event) ---
 
                                             elif sizing_mode == 'kelly':
-                                                # 1. Retrieve the optimal weight for this specific asset
-                                                # Default to 0.0 if the asset is new/unknown to the optimizer
-                                                optimal_target = target_weights_map.get(asset_id, 0.0)
-                                                
-                                                # 2. Get Current Allocation (You must implement get_current_weight)
-                                                current_weight = get_current_weight(asset_id, portfolio_value)
-                                                
-                                                # 3. Buffer Logic (Trade Filter)
-                                                # Only trade if the difference is significant enough to justify fees
-                                                weight_diff = optimal_target - current_weight
-                                                
-                                                if abs(weight_diff) > REBALANCE_BUFFER:
-                                                    # 4. Set the Target Size
-                                                    # If we are below target, we buy. If above, we sell (or reduce).
-                                                    # target_f is the *desired final size*, not just the trade size.
-                                                    target_f = optimal_target
-                                                    
-                                                    print(f"Rebalancing {asset_id}: {current_weight:.2%} -> {target_f:.2%}")
-                                                else:
-                                                    # Noise filter: Hold current position
-                                                    target_f = current_weight
-                                                    # explicitly skip trade generation if your logic supports it
+                                            # 1. Update Target Weights if interval passed
+                                            # We use a simplified approach: Re-optimize if we have active signals
                                             
+                                            # Construct Inputs for Optimizer
+                                            active_cids = list(positions.keys())
+                                            if cid not in active_cids: active_cids.append(cid)
+                                            
+                                            # Estimate Expected Returns (Mu)
+                                            # We use the 'edge' calculated earlier, annualized roughly
+                                            mus = []
+                                            valid_cids = []
+                                            
+                                            for c in active_cids:
+                                                # Re-calculate edge for existing positions to be fair
+                                                m_info = self.market_lifecycle.get(c)
+                                                if not m_info: continue
+                                                
+                                                # Get current price
+                                                curr_p = tracker.get(c, {}).get('last_price', 0.5)
+                                                # Get current model signal (re-calc net_weight signal)
+                                                curr_net = tracker.get(c, {}).get('net_weight', 0)
+                                                curr_prob = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
+                                                
+                                                # Invert logic for "No" tokens if necessary
+                                                if m_info.get('outcome_tag') == 'No':
+                                                     # If Model says 80% chance of Event, No token is worth 0.20
+                                                     # If No token Price is 0.40, Edge is 0.20 - 0.40 = -0.20 (Don't Buy/Short)
+                                                     # This simple logic assumes p_model predicts the "Event"
+                                                     c_edge = (1.0 - curr_prob) - curr_p
+                                                else:
+                                                     c_edge = curr_prob - curr_p
+                                                     
+                                                # Simple annualization scaling
+                                                days = max(0.1, (m_info['end'] - current_ts).total_seconds() / 86400.0)
+                                                annualized_return = c_edge / (days / 365.0)
+                                                
+                                                mus.append(annualized_return)
+                                                valid_cids.append(c)
+                                        
+                                            if valid_cids:
+                                                # Create Covariance Matrix (Simplified: Diagonal matrix with assumed variance)
+                                                # Real impl would use self.returns_df covariance
+                                                n_assets = len(valid_cids)
+                                                # Placeholder covariance: Uncorrelated, 0.5 volatility
+                                                cov_matrix = pd.DataFrame(np.eye(n_assets) * 0.25, index=valid_cids, columns=valid_cids)
+                                                mu_series = pd.Series(mus, index=valid_cids)
+                                                
+                                                try:
+                                                    # Instantiate and Optimize
+                                                    optimizer = KellyOptimizer(pd.DataFrame()) # Pass empty hist data if using explicit mu/cov
+                                                    weights = optimizer.optimize_with_explicit_views(
+                                                        mu_series, cov_matrix, fraction=sizing_val, max_leverage=1.0
+                                                    )
+                                                    
+                                                    target_f = weights.get(cid, 0.0)
+                                                    
+                                                    # Get current allocation
+                                                    current_equity = cash + sum(
+                                                        p['shares'] * tracker.get(c, {}).get('last_price', p['entry']) 
+                                                        for c, p in positions.items()
+                                                    )
+                                                    current_pos_val = 0.0
+                                                    if cid in positions:
+                                                        current_pos_val = positions[cid]['shares'] * avg_exec_price
+                                                    
+                                                    current_w = current_pos_val / current_equity
+                                                    
+                                                    # Buffer check
+                                                    if target_f > (current_w + 0.01):
+                                                        want_exposure = target_f * current_equity
+                                                        cost = want_exposure - current_pos_val
+                                                    else:
+                                                        cost = 0.0
+                                                        
+                                                except Exception as e:
+                                                    print(f"Kelly Opt Failed: {e}")
+                                                    target_f = 0.0
+                                                    cost = 0.0
+                                                 
                                             if target_f > 0:
                                                 target_f = min(target_f, 0.20)
                                                 cost = cash * target_f
