@@ -26,6 +26,13 @@ import gzip
 from requests.adapters import HTTPAdapter, Retry
 import hashlib
 from filelock import FileLock
+from risk_engine import KellyOptimizer
+
+# Store optimal weights here so we don't re-optimize every tick
+target_weights_map = {} 
+last_optimization_time = 0
+OPTIMIZATION_INTERVAL = 3600  # Re-optimize every 1 hour (in seconds)
+REBALANCE_BUFFER = 0.05       # 5% buffer: Don't trade if weight change is < 5%
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -638,8 +645,34 @@ class FastBacktestEngine:
                                             target_f = 0.0
                                             cost = 0.0
                                             if sizing_mode == 'fixed_pct': target_f = sizing_val
-                                            elif sizing_mode == 'kelly': target_f = abs(edge) * sizing_val
+                                            
                                             elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
+
+                                            # --- Inside Trade Execution Logic (Triggered by signal/event) ---
+
+                                            elif sizing_mode == 'kelly':
+                                                # 1. Retrieve the optimal weight for this specific asset
+                                                # Default to 0.0 if the asset is new/unknown to the optimizer
+                                                optimal_target = target_weights_map.get(asset_id, 0.0)
+                                                
+                                                # 2. Get Current Allocation (You must implement get_current_weight)
+                                                current_weight = get_current_weight(asset_id, portfolio_value)
+                                                
+                                                # 3. Buffer Logic (Trade Filter)
+                                                # Only trade if the difference is significant enough to justify fees
+                                                weight_diff = optimal_target - current_weight
+                                                
+                                                if abs(weight_diff) > REBALANCE_BUFFER:
+                                                    # 4. Set the Target Size
+                                                    # If we are below target, we buy. If above, we sell (or reduce).
+                                                    # target_f is the *desired final size*, not just the trade size.
+                                                    target_f = optimal_target
+                                                    
+                                                    print(f"Rebalancing {asset_id}: {current_weight:.2%} -> {target_f:.2%}")
+                                                else:
+                                                    # Noise filter: Hold current position
+                                                    target_f = current_weight
+                                                    # explicitly skip trade generation if your logic supports it
                                             
                                             if target_f > 0:
                                                 target_f = min(target_f, 0.20)
