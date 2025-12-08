@@ -208,15 +208,18 @@ def fetch_block_by_timestamp(timestamp_sec: int):
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
 @persistent_disk_cache
-def fetch_resting_liquidity(market_id: str, block_number: int, side: str):
+def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcome_tag: str = "Yes"):
     """
     Fetches historical Order Book from The Graph.
+    NOW SUPPORTS "NO" TOKENS explicitly.
     """
     order_dir = "asc" if side == "Buy" else "desc"
+    
+    # FIX: Replaced hardcoded "Yes" with variable $outcome
     query = """
-    query ($market: String!, $block: Int!) {
+    query ($market: String!, $block: Int!, $outcome: String!) {
       market(id: $market, block: {number: $block}) {
-        priceLevels(where: {outcome: "Yes"}, orderBy: price, orderDirection: %s, first: 50) {
+        priceLevels(where: {outcome: $outcome}, orderBy: price, orderDirection: %s, first: 50) {
           price
           volume
         }
@@ -224,7 +227,11 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str):
     }
     """ % order_dir
     
-    variables = {"market": market_id, "block": int(block_number)}
+    variables = {
+        "market": market_id, 
+        "block": int(block_number),
+        "outcome": outcome_tag  # Pass "Yes" or "No"
+    }
     
     try:
         resp = requests.post(ORDERBOOK_SUBGRAPH_URL, json={'query': query, 'variables': variables}, timeout=4)
@@ -274,36 +281,49 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
     return (filled_cash / total_shares), filled_cash
 
 # 4. ORCHESTRATOR
-def execute_hybrid_waterfall(cid, side, cost, current_ts, cid_indices, t_times, t_sides, t_vols, t_prices):
+def execute_hybrid_waterfall(
+    cid, condition_id, side, cost, current_ts, 
+    cid_indices, t_times, t_sides, t_vols, t_prices
+):
     """
     Symmetric execution: Tier 1 (Logs) -> Tier 2 (Subgraph)
+    
+    CRITICAL UPDATE:
+    - Uses 'cid' (Token ID) for Tier 1 (Matching specific token trades).
+    - Uses 'condition_id' (Market ID) for Tier 2 (Fetching Order Book).
     """
-    # Tier 1
+    # Tier 1: Trade Logs (Uses Token ID)
     t1_avg, t1_filled_cash = 0.0, 0.0
     if cid in cid_indices and len(t_times) > 0:
         c_idxs = cid_indices[cid]
         curr_ts_sec = current_ts.timestamp()
+        
         subset_times = t_times[c_idxs]
         start_pos = np.searchsorted(subset_times, curr_ts_sec)
         
         if start_pos < len(c_idxs):
             real_start_idx = c_idxs[start_pos]
             t1_avg, t1_filled_cash = match_trade_future(
-                side, cost, real_start_idx, t_times, t_sides, t_vols, t_prices
+                target_side=side, target_cash=cost, start_idx=real_start_idx,
+                times=t_times, sides=t_sides, vols=t_vols, prices=t_prices
             )
             
     final_filled_cash = t1_filled_cash
     final_shares = (t1_filled_cash / t1_avg) if (t1_filled_cash > 0 and t1_avg > 0) else 0.0
     remainder = cost - t1_filled_cash
     
-    # Tier 2
+    # Tier 2: Subgraph Snapshot (Uses Condition ID)
     if remainder > 10.0:
         exact_block = fetch_block_by_timestamp(current_ts.timestamp())
         if exact_block:
             side_str = "Buy" if side == 1 else "Sell"
-            book_levels = fetch_resting_liquidity(cid, exact_block, side_str)
-            t2_filled, t2_shares = 0.0, 0.0
             
+            # FIX: Use condition_id (Market ID), fallback to cid if missing (though unlikely to work)
+            lookup_id = condition_id if condition_id else cid
+            book_levels = fetch_resting_liquidity(lookup_id, exact_block, side_str)
+            
+            t2_filled = 0.0
+            t2_shares = 0.0
             for level in book_levels:
                 lvl_price = float(level['price'])
                 lvl_vol = float(level['volume'])
@@ -337,7 +357,7 @@ class FastBacktestEngine:
                     scheduled_end = data.get('end_date')
                     if not scheduled_end or pd.isna(scheduled_end):
                         scheduled_end = pd.Timestamp.max
-                    self.market_lifecycle[cid] = {'start': ts, 'end': scheduled_end, 'liquidity': data.get('liquidity', 10000.0)}
+                    self.market_lifecycle[cid] = {'start': ts, 'end': scheduled_end, 'liquidity': data.get('liquidity', 10000.0),'condition_id': data.get('condition_id'), 'outcome_tag': data.get('token_outcome_label', 'Yes')}
             
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
             for ts, row in resolutions.iterrows():
@@ -629,8 +649,12 @@ class FastBacktestEngine:
                                         if cost > 5.0 and cash > cost:
                                             side = 1 if edge > 0 else -1
                                             
+                                            cond_id = market_info.get('condition_id')
+                                            
+                                            out_tag = market_info.get('outcome_tag', 'Yes')
+                                            
                                             avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                                cid, side, cost, data.get('timestamp'),
+                                                cid, cond_id, out_tag, side, cost, current_ts,
                                                 cid_indices, t_times, t_sides, t_vols, t_prices
                                             )
 
@@ -676,9 +700,12 @@ class FastBacktestEngine:
                     if should_close:
                         exit_side = -1 if pos['side'] == 1 else 1
                         target_exit_cash = pos['shares'] * curr_p 
+                        market_info = self.market_lifecycle.get(cid)
+                        cond_id = market_info.get('condition_id') if market_info else None
+                        out_tag = market_info.get('outcome_tag', 'Yes') if market_info else 'Yes'
                         
                         avg_p, filled_cash, _ = execute_hybrid_waterfall(
-                            cid, exit_side, target_exit_cash, data.get('timestamp'),
+                            cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
                             cid_indices, t_times, t_sides, t_vols, t_prices
                         )
                         
@@ -745,6 +772,14 @@ class BacktestEngine:
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
         
         df_markets, df_trades = self._load_data()
+ 
+        float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
+        for c in float_cols:
+            df_trades[c] = pd.to_numeric(df_trades[c], downcast='float')
+        
+        # Use categorical for repeated strings
+        df_trades['contract_id'] = df_trades['contract_id'].astype('category')
+        df_trades['user'] = df_trades['user'].astype('category')
         
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
@@ -754,7 +789,7 @@ class BacktestEngine:
             'contract_id', 'outcome', 'resolution_timestamp', 
             'created_at', 'liquidity', 'question', 'volume'
         ]
-        # Only keep columns that actually exist in the data
+
         actual_cols = [c for c in safe_cols if c in df_markets.columns]
         markets = df_markets[actual_cols].copy()
         markets['contract_id'] = markets['contract_id'].astype(str)
@@ -764,6 +799,7 @@ class BacktestEngine:
             kind='stable'
         )
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
+        
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         event_log = event_log[event_log.index <= FIXED_END_DATE]
         event_log = event_log[
@@ -938,12 +974,13 @@ class BacktestEngine:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # Keep only essential columns to prevent type issues
-        safe_cols = ['contract_id', 'outcome', 'resolution_timestamp', 'created_at', 'liquidity', 'question', 'volume']
+        safe_cols = [
+            'contract_id', 'outcome', 'resolution_timestamp', 'created_at', 
+            'liquidity', 'question', 'volume', 'conditionId'
+        ]
         actual_cols = [c for c in safe_cols if c in markets.columns]
         markets = markets[actual_cols].copy()
 
-        # Deterministic Sort for Markets
         markets['contract_id'] = markets['contract_id'].astype(str)
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
@@ -951,29 +988,24 @@ class BacktestEngine:
             kind='stable'
         )
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
+        
         # ---------------------------------------------------------
-        # 2. ORDER BOOK (Get History)
+        # 2. ORDER BOOK
         # ---------------------------------------------------------
         df_stats = self._fetch_orderbook_stats()
         if not df_stats.empty:
-            # Merge stats into markets
-            # Ensure types match for merge
             markets['contract_id'] = markets['contract_id'].astype(str)
             df_stats['contract_id'] = df_stats['contract_id'].astype(str)
-            
             markets = markets.merge(df_stats, on='contract_id', how='left')
-            
-            # Fill missing stats with 0 (Ghost Markets)
             markets['total_volume'] = markets['total_volume'].fillna(0.0)
             markets['total_trades'] = markets['total_trades'].fillna(0)
-            
             print(f"Merged stats. High Vol Markets (>10k): {len(markets[markets['total_volume'] > 10000])}")
         else:
             markets['total_volume'] = 0.0
             markets['total_trades'] = 0
 
         # ---------------------------------------------------------
-        # 3. TRADES (Get History)
+        # 3. TRADES
         # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         
@@ -997,54 +1029,58 @@ class BacktestEngine:
             return pd.DataFrame(), pd.DataFrame()
 
         # ---------------------------------------------------------
-        # 3. CLEANUP & SYNC (Strict Determinism Fix)
+        # 4. CLEANUP & SYNC
         # ---------------------------------------------------------
         print("   Synchronizing data...")
         
-        # A. Type Conversion
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         trades['contract_id'] = trades['contract_id'].str.strip()
         trades['user'] = trades['user'].astype(str).str.strip()
         
-        # Fill NaNs to ensure sorting works (NaNs are notoriously unstable in sorts)
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0.0)
         trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0.0)
         trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
         trades['size'] = pd.to_numeric(trades['size'], errors='coerce').fillna(0.0)
         trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
 
-        # B. Filter Date
         trades = trades[
             (trades['timestamp'] >= FIXED_START_DATE) & 
             (trades['timestamp'] <= FIXED_END_DATE)
         ].copy()
         
-        # C. Align Market IDs
-        markets['contract_id'] = markets['contract_id'].astype(str).str.split(',')
-        markets = markets.explode('contract_id')
-        markets['contract_id'] = markets['contract_id'].str.strip()
+        rename_map = {
+            'question': 'question', 'endDate': 'resolution_timestamp', 
+            'createdAt': 'created_at', 'volume': 'volume',
+            'conditionId': 'condition_id'
+        }
+        markets = markets.rename(columns={k:v for k,v in rename_map.items() if k in markets.columns})
+
+        markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
+        markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
+        
+        markets = markets.explode(['contract_id_list', 'token_index'])
+        markets['contract_id'] = markets['contract_id_list'].str.strip()
+        markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
+        
+        def calculate_token_outcome(row):
+            m_out = row['outcome']
+            t_idx = row['token_index']
+            if m_out == 0.5: return 0.5
+            return 1.0 if m_out == t_idx else 0.0
+
+        markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
+        markets = markets.drop(columns=['contract_id_list', 'token_index'])
+        # -------------------------------
         
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
 
-        # --- FIX: INCLUDE ALL COLUMNS IN SORT & DEDUPLICATION ---
-        # We sort by EVERY column to ensure a strict Total Ordering.
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
-        
-        # Ensure all sort columns exist
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
-        trades = trades.sort_values(
-            by=present_sort_cols, 
-            kind='stable'
-        )
-
-        trades = trades.drop_duplicates(
-            subset=present_sort_cols,
-            keep='first'
-        ).reset_index(drop=True)
-        # --------------------------------------------------------
+        trades = trades.sort_values(by=present_sort_cols, kind='stable')
+        trades = trades.drop_duplicates(subset=present_sort_cols, keep='first').reset_index(drop=True)
         
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
@@ -1726,7 +1762,9 @@ class BacktestEngine:
                 'contract_id': row['contract_id'], 
                 'p_market_all': 0.5, 
                 'liquidity': safe_liq,
-                'end_date': res_ts
+                'end_date': res_ts,
+                'condition_id': row.get('condition_id'),
+                'token_outcome_label': row.get('token_outcome_label', 'Yes')
             })
             
         # B. RESOLUTION
