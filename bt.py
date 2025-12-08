@@ -620,7 +620,24 @@ class FastBacktestEngine:
                             
                             # Model Response (Tuned divisor: 2000.0)
                             p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
-                            edge = p_model - avg_exec_price
+                            market_info = self.market_lifecycle.get(cid)
+                            current_ts = data.get('timestamp')
+                            
+                            if not market_info or not current_ts: continue
+
+                            # Normalize everything to "Yes" probability for decision making
+                            outcome_tag = market_info.get('outcome_tag', 'Yes')
+                            
+                            calc_price = avg_exec_price
+                            calc_model = p_model
+                            
+                            if outcome_tag == 'No':
+                                # If token is "No", Price=0.20 means Yes_Prob=0.80
+                                # If Model=0.30 (on No token), it means Model_Yes_Prob=0.70
+                                calc_price = 1.0 - avg_exec_price
+                                calc_model = 1.0 - p_model
+                                
+                            edge = calc_model - calc_price
                             
                             # Lifecycle / Time Check
                             market_info = self.market_lifecycle.get(cid)
@@ -648,87 +665,70 @@ class FastBacktestEngine:
                                             
                                             elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
 
-                                            # --- Inside Trade Execution Logic (Triggered by signal/event) ---
-
                                             elif sizing_mode == 'kelly':
-                                            # 1. Update Target Weights if interval passed
-                                            # We use a simplified approach: Re-optimize if we have active signals
-                                            
-                                            # Construct Inputs for Optimizer
-                                            active_cids = list(positions.keys())
-                                            if cid not in active_cids: active_cids.append(cid)
-                                            
-                                            # Estimate Expected Returns (Mu)
-                                            # We use the 'edge' calculated earlier, annualized roughly
-                                            mus = []
-                                            valid_cids = []
-                                            
-                                            for c in active_cids:
-                                                # Re-calculate edge for existing positions to be fair
-                                                m_info = self.market_lifecycle.get(c)
-                                                if not m_info: continue
-                                                
-                                                # Get current price
-                                                curr_p = tracker.get(c, {}).get('last_price', 0.5)
-                                                # Get current model signal (re-calc net_weight signal)
-                                                curr_net = tracker.get(c, {}).get('net_weight', 0)
-                                                curr_prob = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
-                                                
-                                                # Invert logic for "No" tokens if necessary
-                                                if m_info.get('outcome_tag') == 'No':
-                                                     # If Model says 80% chance of Event, No token is worth 0.20
-                                                     # If No token Price is 0.40, Edge is 0.20 - 0.40 = -0.20 (Don't Buy/Short)
-                                                     # This simple logic assumes p_model predicts the "Event"
-                                                     c_edge = (1.0 - curr_prob) - curr_p
-                                                else:
-                                                     c_edge = curr_prob - curr_p
-                                                     
-                                                # Simple annualization scaling
-                                                days = max(0.1, (m_info['end'] - current_ts).total_seconds() / 86400.0)
-                                                annualized_return = c_edge / (days / 365.0)
-                                                
-                                                mus.append(annualized_return)
-                                                valid_cids.append(c)
-                                        
-                                            if valid_cids:
-                                                # Create Covariance Matrix (Simplified: Diagonal matrix with assumed variance)
-                                                # Real impl would use self.returns_df covariance
-                                                n_assets = len(valid_cids)
-                                                # Placeholder covariance: Uncorrelated, 0.5 volatility
-                                                cov_matrix = pd.DataFrame(np.eye(n_assets) * 0.25, index=valid_cids, columns=valid_cids)
-                                                mu_series = pd.Series(mus, index=valid_cids)
-                                                
-                                                try:
-                                                    # Instantiate and Optimize
-                                                    optimizer = KellyOptimizer(pd.DataFrame()) # Pass empty hist data if using explicit mu/cov
-                                                    weights = optimizer.optimize_with_explicit_views(
-                                                        mu_series, cov_matrix, fraction=sizing_val, max_leverage=1.0
-                                                    )
+                                                # Check if optimization is needed
+                                                now_sec = time.time()
+                                                if now_sec - last_optimization_time > OPTIMIZATION_INTERVAL:
                                                     
-                                                    target_f = weights.get(cid, 0.0)
+                                                    # 1. Build Expectations (Mu)
+                                                    # We gather all active potential markets (current cid + existing positions)
+                                                    active_set = list(positions.keys())
+                                                    if cid not in active_set: active_set.append(cid)
                                                     
-                                                    # Get current allocation
-                                                    current_equity = cash + sum(
-                                                        p['shares'] * tracker.get(c, {}).get('last_price', p['entry']) 
-                                                        for c, p in positions.items()
-                                                    )
-                                                    current_pos_val = 0.0
-                                                    if cid in positions:
-                                                        current_pos_val = positions[cid]['shares'] * avg_exec_price
+                                                    mus = []
+                                                    valid_cids = []
                                                     
-                                                    current_w = current_pos_val / current_equity
-                                                    
-                                                    # Buffer check
-                                                    if target_f > (current_w + 0.01):
-                                                        want_exposure = target_f * current_equity
-                                                        cost = want_exposure - current_pos_val
-                                                    else:
-                                                        cost = 0.0
+                                                    for c_id in active_set:
+                                                        m_inf = self.market_lifecycle.get(c_id)
+                                                        if not m_inf: continue
                                                         
-                                                except Exception as e:
-                                                    print(f"Kelly Opt Failed: {e}")
-                                                    target_f = 0.0
-                                                    cost = 0.0
+                                                        # Get latest price/signal
+                                                        curr_p = tracker.get(c_id, {}).get('last_price', 0.5)
+                                                        curr_net = tracker.get(c_id, {}).get('net_weight', 0)
+                                                        curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
+                                                        
+                                                        # Invert if needed
+                                                        if m_inf.get('outcome_tag') == 'No':
+                                                            curr_p = 1.0 - curr_p
+                                                            curr_mod = 1.0 - curr_mod
+                                                        
+                                                        c_edge = curr_mod - curr_p
+                                                        
+                                                        # Annualize Edge
+                                                        rem_days = max(0.1, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
+                                                        ann_ret = c_edge / (rem_days / 365.0)
+                                                        
+                                                        mus.append(ann_ret)
+                                                        valid_cids.append(c_id)
+                                                    
+                                                    if valid_cids:
+                                                        # 2. Build Covariance (Diagonal/Simplified for speed)
+                                                        n = len(valid_cids)
+                                                        # Placeholder: 50% Volatility
+                                                        cov = pd.DataFrame(np.eye(n) * 0.25, index=valid_cids, columns=valid_cids)
+                                                        mu_series = pd.Series(mus, index=valid_cids)
+                                                        
+                                                        # 3. Optimize
+                                                        try:
+                                                            # Empty DF passed as we use explicit views
+                                                            optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                            weights = optimizer.optimize_with_explicit_views(
+                                                                mu_series, cov, fraction=sizing_val, max_leverage=1.0
+                                                            )
+                                                            target_weights_map = weights.to_dict()
+                                                            last_optimization_time = now_sec
+                                                        except:
+                                                            target_weights_map = {}
+                                                
+                                                # 4. Read Target
+                                                ideal_weight = target_weights_map.get(cid, 0.0)
+                                                
+                                                # Current Weight calc
+                                                pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
+                                                
+                                                if ideal_weight > 0.01:
+                                                    target_f = ideal_weight
+                                                    cost = pf_val * target_f
                                                  
                                             if target_f > 0:
                                                 target_f = min(target_f, 0.20)
@@ -1294,7 +1294,29 @@ class BacktestEngine:
         df = df.dropna(subset=['resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
+        # 1. Split contract_id into list
+        df['contract_id_list'] = df['contract_id'].str.split(',')
         
+        # 2. Explode to create one row per token
+        df = df.explode('contract_id_list')
+        df['contract_id'] = df['contract_id_list'].str.strip()
+        
+        # 3. Assign Label based on order (Assumes [No, Yes] standard from API)
+        # We group by the original index to determine position (0=No, 1=Yes)
+        df['token_index'] = df.groupby(level=0).cumcount()
+        df['token_outcome_label'] = np.where(df['token_index'] == 0, "No", "Yes")
+        
+        # 4. Invert Outcome: If Market resolved Yes (1.0), "No" token pays 0.0
+        # If Market resolved No (0.0), "No" token pays 1.0
+        # If Market is Active (0.5), it stays 0.5
+        df['outcome'] = np.where(
+            df['token_outcome_label'] == 'Yes', 
+            df['outcome'], 
+            np.where(df['outcome'] == 0.5, 0.5, 1.0 - df['outcome'])
+        )
+
+        # Cleanup
+        df = df.drop(columns=['contract_id_list', 'token_index'])
         if not df.empty: df.to_parquet(cache_file)
         return df
         
