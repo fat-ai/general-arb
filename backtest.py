@@ -295,6 +295,9 @@ class FastBacktestEngine:
         tracker = {}
         market_liq = {}
         trade_count = 0
+        volume_traded = 0.0
+
+        rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0, 'unsafe_price': 0}
         
         for batch in batches:
             # STRICT SERIAL EXECUTION: Sort by timestamp
@@ -372,6 +375,14 @@ class FastBacktestEngine:
                             # Lifecycle / Time Check
                             market_info = self.market_lifecycle.get(cid)
                             current_ts = data.get('timestamp')
+
+                            if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
+                                rejection_log['missing_metadata'] = rejection_log.get('missing_metadata', 0) + 1
+                                continue 
+
+                            if not current_ts:
+                                rejection_log['missing_timestamp'] = rejection_log.get('missing_timestamp', 0) + 1
+                                continue 
                             
                             if market_info and current_ts and 'end' in market_info:
                                 days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
@@ -419,7 +430,20 @@ class FastBacktestEngine:
                                                     }
                                                     cash -= cost
                                                     trade_count += 1
-
+                                                    volume_traded += cost
+                                            else:
+                                                if cash <= cost:
+                                                    rejection_log['insufficient_cash'] += 1
+                                                elif cost <= 5:
+                                                    rejection_log['low_volume'] += 1
+                                    else:
+                                        if abs(edge) >= edge_thresh:
+                                          rejection_log['low_edge'] += 1
+                                        if not (0.02 <= avg_exec_price <= 0.98):
+                                          rejection_log['unsafe_price'] += 1
+                                else:
+                                    rejection_log['market_expired'] += 1
+                                    
                 # Stop Loss / Smart Exit (Check every event)
                 if ev_type != 'RESOLUTION' and cid in positions:
                     pos = positions[cid]
@@ -462,6 +486,17 @@ class FastBacktestEngine:
             last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
             val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
             final_value += val
+
+         # --- DIAGNOSTICS ---
+        print(f"\n📊 PERIOD SUMMARY:")
+        print(f"   Trades Executed: {trade_count}")
+        print(f"   Volume Traded: ${volume_traded:.0f}")
+        print(f"   Final Value: ${final_value:.2f}")
+        print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
+        print(f"\n🚫 REJECTION LOG:")
+        for reason, count in rejection_log.items():
+            if count > 0:
+                print(f"   {reason}: {count}")
         
         return {
             'final_value': final_value,
