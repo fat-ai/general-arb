@@ -39,8 +39,8 @@ def force_clear_cache(cache_dir):
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
 
-FIXED_START_DATE = pd.Timestamp("2025-05-30")
-FIXED_END_DATE   = pd.Timestamp("2025-11-30")
+FIXED_START_DATE = pd.Timestamp("2023-12-07")
+FIXED_END_DATE   = pd.Timestamp("2025-12-07")
 today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days
 
