@@ -41,6 +41,7 @@ def force_clear_cache(cache_dir):
 
 FIXED_START_DATE = pd.Timestamp("2025-05-30")
 FIXED_END_DATE   = pd.Timestamp("2025-11-30")
+DAYS_BACK = 200
 
 def plot_performance(equity_curve, trades_count):
     """Generates a performance chart. Safe for headless servers."""
@@ -701,7 +702,6 @@ class BacktestEngine:
         import glob
         import os
         
-        DAYS_BACK = 200
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
         # ---------------------------------------------------------
