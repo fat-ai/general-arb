@@ -42,7 +42,7 @@ def force_clear_cache(cache_dir):
 FIXED_START_DATE = pd.Timestamp("2023-12-07")
 FIXED_END_DATE   = pd.Timestamp("2025-12-07")
 today = pd.Timestamp.now().normalize()
-DAYS_BACK = (today - FIXED_START_DATE).days
+DAYS_BACK = (today - FIXED_START_DATE).days + 10
 
 def plot_performance(equity_curve, trades_count):
     """Generates a performance chart. Safe for headless servers."""
@@ -734,9 +734,29 @@ class BacktestEngine:
             kind='stable'
         )
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
+        # ---------------------------------------------------------
+        # 2. ORDER BOOK (Get History)
+        # ---------------------------------------------------------
+        df_stats = self._fetch_orderbook_stats()
+        if not df_stats.empty:
+            # Merge stats into markets
+            # Ensure types match for merge
+            markets['contract_id'] = markets['contract_id'].astype(str)
+            df_stats['contract_id'] = df_stats['contract_id'].astype(str)
+            
+            markets = markets.merge(df_stats, on='contract_id', how='left')
+            
+            # Fill missing stats with 0 (Ghost Markets)
+            markets['total_volume'] = markets['total_volume'].fillna(0.0)
+            markets['total_trades'] = markets['total_trades'].fillna(0)
+            
+            print(f"Merged stats. High Vol Markets (>10k): {len(markets[markets['total_volume'] > 10000])}")
+        else:
+            markets['total_volume'] = 0.0
+            markets['total_trades'] = 0
 
         # ---------------------------------------------------------
-        # 2. TRADES (Get History)
+        # 3. TRADES (Get History)
         # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         
@@ -1273,6 +1293,73 @@ class BacktestEngine:
             df = df[df['ts_int'] >= cutoff_time]
             
             with open(cache_file, 'wb') as f: pickle.dump(df, f)
+            
+        return df
+
+    def _fetch_orderbook_stats(self):
+        """
+        Fetches aggregate stats (Volume, Trade Count) for all Token IDs from the Subgraph.
+        Used to classify markets as 'Ghost', 'Thin', or 'Liquid'.
+        """
+        import requests
+        import pandas as pd
+        import time
+        
+        cache_file = self.cache_dir / "orderbook_stats.parquet"
+        if cache_file.exists():
+            print(f"   Loading cached orderbook stats...")
+            return pd.read_parquet(cache_file)
+            
+        print("   Fetching Orderbook Stats from Subgraph...")
+        
+        URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+        all_stats = []
+        last_id = ""
+        
+        while True:
+            query = """
+            query($last_id: String!) {
+              orderbooks(
+                first: 1000
+                orderBy: id
+                orderDirection: asc
+                where: { id_gt: $last_id }
+              ) {
+                id
+                scaledCollateralVolume
+                tradesQuantity
+              }
+            }
+            """
+            
+            try:
+                resp = requests.post(URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=30)
+                if resp.status_code != 200:
+                    print(f"   ⚠️ Stats fetch failed: {resp.status_code}")
+                    break
+                    
+                data = resp.json().get('data', {}).get('orderbooks', [])
+                if not data: break
+                
+                for row in data:
+                    all_stats.append({
+                        'contract_id': row['id'],
+                        'total_volume': float(row.get('scaledCollateralVolume', 0) or 0),
+                        'total_trades': int(row.get('tradesQuantity', 0) or 0)
+                    })
+                
+                last_id = data[-1]['id']
+                print(f"   Fetched {len(all_stats)} stats...", end='\r')
+                
+            except Exception as e:
+                print(f"   ⚠️ Stats fetch error: {e}")
+                break
+        
+        print(f"\n   ✅ Loaded stats for {len(all_stats)} tokens.")
+        df = pd.DataFrame(all_stats)
+        
+        if not df.empty:
+            df.to_parquet(cache_file)
             
         return df
         
