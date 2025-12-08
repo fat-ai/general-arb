@@ -25,6 +25,7 @@ import multiprocessing
 import gzip
 from requests.adapters import HTTPAdapter, Retry
 import hashlib
+from filelock import FileLock
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,6 +33,7 @@ log = logging.getLogger(__name__)
 
 SEED = 42
 np.random.seed(SEED)
+
 DISK_CACHE_DIR = Path("polymarket_cache/subgraph_ops")
 DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -130,27 +132,45 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     return scores.to_dict()
 
 def persistent_disk_cache(func):
+    """
+    Decorator that caches function results to disk using pickle.
+    Thread-safe and Process-safe using FileLock.
+    """
     def wrapper(*args, **kwargs):
-        # Create a unique key from function name + args
+        # Generate unique key based on arguments
         key_str = f"{func.__name__}:{args}:{kwargs}"
         key_hash = hashlib.md5(key_str.encode('utf-8', errors='ignore')).hexdigest()
-        cache_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
+        
+        # Files
+        file_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
+        lock_path = DISK_CACHE_DIR / f"{key_hash}.lock"
 
-        if cache_path.exists():
+        # 3. Critical Section: Acquire Lock BEFORE checking/writing
+        # This prevents 10 workers from all fetching the same data simultaneously
+        # and prevents 'half-written' corrupted files.
+        with FileLock(lock_path):
+            
+            # A. Check Disk (Double-check inside lock)
+            if file_path.exists():
+                try:
+                    with open(file_path, 'rb') as f:
+                        return pickle.load(f)
+                except Exception:
+                    # Corrupt? Re-fetch safely.
+                    pass
+
+            # B. Fetch Data (Only 1 worker does this)
+            result = func(*args, **kwargs)
+
+            # C. Save to Disk
             try:
-                with open(cache_path, 'rb') as f:
-                    return pickle.load(f)
+                with open(file_path, 'wb') as f:
+                    pickle.dump(result, f)
             except Exception:
-                pass # Ignore corrupt cache
-
-        result = func(*args, **kwargs)
-
-        try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(result, f)
-        except Exception:
-            pass
-        return result
+                pass
+            
+            return result
+            
     return wrapper
 
 # --- 1. PRECISE BLOCK LOOKUP (The Accuracy Fix) ---
