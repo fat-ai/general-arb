@@ -41,7 +41,8 @@ def force_clear_cache(cache_dir):
 
 FIXED_START_DATE = pd.Timestamp("2025-05-30")
 FIXED_END_DATE   = pd.Timestamp("2025-11-30")
-DAYS_BACK = 200
+today = pd.Timestamp.now().normalize()
+DAYS_BACK = (today - FIXED_START_DATE).days
 
 def plot_performance(equity_curve, trades_count):
     """Generates a performance chart. Safe for headless servers."""
