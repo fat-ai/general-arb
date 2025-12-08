@@ -297,7 +297,7 @@ class FastBacktestEngine:
         trade_count = 0
         volume_traded = 0.0
 
-        rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0, 'unsafe_price': 0}
+        rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0}
         
         for batch in batches:
             # STRICT SERIAL EXECUTION: Sort by timestamp
