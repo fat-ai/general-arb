@@ -24,7 +24,6 @@ import threading
 import multiprocessing
 import gzip
 from requests.adapters import HTTPAdapter, Retry
-import requests
 import hashlib
 
 # Configuration
