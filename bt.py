@@ -133,103 +133,90 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 
 def persistent_disk_cache(func):
     """
-    Decorator that caches function results to disk using pickle.
-    Thread-safe and Process-safe using FileLock.
+    Thread-safe and Process-safe disk cache using FileLock.
+    Ensures multiple Ray workers don't corrupt the cache.
     """
     def wrapper(*args, **kwargs):
-        # Generate unique key based on arguments
         key_str = f"{func.__name__}:{args}:{kwargs}"
         key_hash = hashlib.md5(key_str.encode('utf-8', errors='ignore')).hexdigest()
         
-        # Files
         file_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
         lock_path = DISK_CACHE_DIR / f"{key_hash}.lock"
 
-        # 3. Critical Section: Acquire Lock BEFORE checking/writing
-        # This prevents 10 workers from all fetching the same data simultaneously
-        # and prevents 'half-written' corrupted files.
-        with FileLock(lock_path):
-            
-            # A. Check Disk (Double-check inside lock)
+        # Critical Section: Lock before check/write
+        with FileLock(str(lock_path)):
             if file_path.exists():
                 try:
                     with open(file_path, 'rb') as f:
                         return pickle.load(f)
                 except Exception:
-                    # Corrupt? Re-fetch safely.
-                    pass
+                    pass # Ignore corrupt, re-fetch
 
-            # B. Fetch Data (Only 1 worker does this)
             result = func(*args, **kwargs)
 
-            # C. Save to Disk
             try:
                 with open(file_path, 'wb') as f:
                     pickle.dump(result, f)
             except Exception:
                 pass
-            
             return result
-            
     return wrapper
 
-# --- 1. PRECISE BLOCK LOOKUP (The Accuracy Fix) ---
-# We use a dedicated subgraph that indexes Polygon blocks.
-# This maps '2024-01-01 12:00:00' -> 'Block 51842000' exactly.
-BLOCKS_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/matthewlilley/polygon-blocks"
+# 1. ROBUST BLOCK LOOKUP (Layer 0 + Layer 1)
+LLAMA_BLOCK_URL = "https://coins.llama.fi/block/polygon/{}"
+BLOCK_ENDPOINTS = [
+    "https://api.thegraph.com/subgraphs/name/ianlapham/polygon-blocks",
+    "https://api.thegraph.com/subgraphs/name/matthewlilley/polygon-blocks",
+    "https://api.thegraph.com/subgraphs/name/idsen/polygon-blocks"
+]
 
 @persistent_disk_cache
 def fetch_block_by_timestamp(timestamp_sec: int):
     """
-    Finds the exact Polygon block number that was active at a given timestamp.
+    Finds the exact Polygon block number for a timestamp.
+    Tries DefiLlama first (Reliable), then falls back to Graph subgraphs.
     """
-    query = """
-    query ($ts: BigInt!) {
-      blocks(
-        first: 1
-        orderBy: timestamp
-        orderDirection: desc
-        where: { timestamp_lte: $ts }
-      ) {
-        number
-      }
-    }
-    """
+    # Strategy A: DefiLlama (Fastest & Most Reliable)
+    try:
+        url = LLAMA_BLOCK_URL.format(int(timestamp_sec))
+        resp = requests.get(url, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            if 'height' in data:
+                return int(data['height'])
+    except:
+        pass 
+        
+    # Strategy B: Subgraph Fallbacks
+    query = "query ($ts: BigInt!) { blocks(first: 1, orderBy: timestamp, orderDirection: desc, where: { timestamp_lte: $ts }) { number } }"
     variables = {"ts": int(timestamp_sec)}
     
-    try:
-        resp = requests.post(BLOCKS_SUBGRAPH_URL, json={'query': query, 'variables': variables}, timeout=2.0)
-        data = resp.json()
-        if 'errors' in data: return None
-        blocks = data.get('data', {}).get('blocks', [])
-        if blocks:
-            return int(blocks[0]['number'])
-    except Exception:
-        return None
-    
+    for url in BLOCK_ENDPOINTS:
+        try:
+            resp = requests.post(url, json={'query': query, 'variables': variables}, timeout=3)
+            if resp.status_code != 200: continue
+            data = resp.json()
+            if 'errors' in data: continue
+            blocks = data.get('data', {}).get('blocks', [])
+            if blocks:
+                return int(blocks[0]['number'])
+        except:
+            continue
     return None
 
-# --- 2. TIER 2: ORDER BOOK SNAPSHOT ---
+# 2. ORDER BOOK SNAPSHOT
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
 @persistent_disk_cache
 def fetch_resting_liquidity(market_id: str, block_number: int, side: str):
     """
-    Fetches the actual Order Book from history at a specific block.
+    Fetches historical Order Book from The Graph.
     """
-    # Buying (Long) -> Match Asks (Ascending)
-    # Selling (Short) -> Match Bids (Descending)
     order_dir = "asc" if side == "Buy" else "desc"
-    
     query = """
     query ($market: String!, $block: Int!) {
       market(id: $market, block: {number: $block}) {
-        priceLevels(
-          where: {outcome: "Yes"} 
-          orderBy: price
-          orderDirection: %s
-          first: 50
-        ) {
+        priceLevels(where: {outcome: "Yes"}, orderBy: price, orderDirection: %s, first: 50) {
           price
           volume
         }
@@ -240,25 +227,19 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str):
     variables = {"market": market_id, "block": int(block_number)}
     
     try:
-        resp = requests.post(ORDERBOOK_SUBGRAPH_URL, json={'query': query, 'variables': variables}, timeout=2.0)
+        resp = requests.post(ORDERBOOK_SUBGRAPH_URL, json={'query': query, 'variables': variables}, timeout=4)
         data = resp.json()
         if 'errors' in data: return []
         market_data = data.get('data', {}).get('market')
         if not market_data: return []
         return market_data.get('priceLevels', [])
-    except Exception:
-        return []
+    except: return []
 
-# --- 3. TIER 1: TRADE LOG MATCHING (Numba Optimized) ---
+# 3. TIER 1: TRADE LOG MATCHING
 @njit
-def match_trade_future(
-    target_side: int, target_cash: float, start_idx: int, 
-    times: np.ndarray, sides: np.ndarray, vols: np.ndarray, prices: np.ndarray, 
-    max_window: float = 300.0
-):
+def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, prices, max_window=300.0):
     """
     Scans future trades to see what liquidity was ACTUALLY taken.
-    Returns: (avg_price, filled_cash)
     """
     filled_cash = 0.0
     total_shares = 0.0
@@ -273,11 +254,9 @@ def match_trade_future(
     while current_idx < n:
         if (times[current_idx] - start_time) > max_window:
             break
-            
         if sides[current_idx] == target_side:
             trade_vol = vols[current_idx]
             trade_px = prices[current_idx]
-            
             remaining = target_cash - filled_cash
             take_vol = min(trade_vol, remaining)
             
@@ -292,73 +271,55 @@ def match_trade_future(
         
     if total_shares == 0:
         return 0.0, 0.0
-        
     return (filled_cash / total_shares), filled_cash
 
-# --- 4. ORCHESTRATOR (The Hybrid Engine) ---
-def execute_hybrid_waterfall(
-    cid, side, cost, current_ts, 
-    cid_indices, t_times, t_sides, t_vols, t_prices
-):
+# 4. ORCHESTRATOR
+def execute_hybrid_waterfall(cid, side, cost, current_ts, cid_indices, t_times, t_sides, t_vols, t_prices):
     """
-    Orchestrates the execution:
-    1. Try to fill using Trade Logs (Tier 1).
-    2. If Deficit > $10, find EXACT block and fetch Order Book (Tier 2).
+    Symmetric execution: Tier 1 (Logs) -> Tier 2 (Subgraph)
     """
-    # Tier 1: Logs
+    # Tier 1
     t1_avg, t1_filled_cash = 0.0, 0.0
     if cid in cid_indices and len(t_times) > 0:
         c_idxs = cid_indices[cid]
         curr_ts_sec = current_ts.timestamp()
-        
-        # Fast Binary Search
         subset_times = t_times[c_idxs]
         start_pos = np.searchsorted(subset_times, curr_ts_sec)
         
         if start_pos < len(c_idxs):
             real_start_idx = c_idxs[start_pos]
             t1_avg, t1_filled_cash = match_trade_future(
-                target_side=side, target_cash=cost, start_idx=real_start_idx,
-                times=t_times, sides=t_sides, vols=t_vols, prices=t_prices
+                side, cost, real_start_idx, t_times, t_sides, t_vols, t_prices
             )
-    
+            
     final_filled_cash = t1_filled_cash
     final_shares = (t1_filled_cash / t1_avg) if (t1_filled_cash > 0 and t1_avg > 0) else 0.0
-    
     remainder = cost - t1_filled_cash
     
-    # Tier 2: Subgraph Snapshot (Only if needed)
+    # Tier 2
     if remainder > 10.0:
-        # ACCURACY FIX: Fetch EXACT block number
         exact_block = fetch_block_by_timestamp(current_ts.timestamp())
-        
         if exact_block:
             side_str = "Buy" if side == 1 else "Sell"
             book_levels = fetch_resting_liquidity(cid, exact_block, side_str)
-            
-            t2_filled = 0.0
-            t2_shares = 0.0
+            t2_filled, t2_shares = 0.0, 0.0
             
             for level in book_levels:
                 lvl_price = float(level['price'])
-                lvl_vol_tokens = float(level['volume'])
-                lvl_cap_cash = lvl_vol_tokens * lvl_price
+                lvl_vol = float(level['volume'])
+                lvl_cap_cash = lvl_vol * lvl_price
                 
                 take_cash = min(remainder - t2_filled, lvl_cap_cash)
                 if take_cash > 0:
                     t2_filled += take_cash
                     t2_shares += (take_cash / lvl_price)
-                
-                if t2_filled >= remainder * 0.99: 
-                    break
+                if t2_filled >= remainder * 0.99: break
             
             final_filled_cash += t2_filled
             final_shares += t2_shares
 
     if final_shares > 0:
-        final_avg_price = final_filled_cash / final_shares
-        return final_avg_price, final_filled_cash, final_shares
-    
+        return (final_filled_cash / final_shares), final_filled_cash, final_shares
     return 0.0, 0.0, 0.0
 
 class FastBacktestEngine:
