@@ -28,13 +28,6 @@ import hashlib
 from filelock import FileLock
 from risk_engine import KellyOptimizer
 
-ABSOLUTE_PATH = os.path.abspath(".") # Get current folder path
-RAY_STORE_DIR = os.path.join(ABSOLUTE_PATH, "ray_temp_data")
-os.makedirs(RAY_STORE_DIR, exist_ok=True)
-
-# Force Ray to assume this directory for everything (Sockets, Logs, Spilling)
-os.environ["RAY_TMPDIR"] = RAY_STORE_DIR
-
 # Store optimal weights here so we don't re-optimize every tick
 target_weights_map = {} 
 last_optimization_time = 0
@@ -882,38 +875,35 @@ class BacktestEngine:
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
-        self.ray_temp_dir = Path(os.getcwd()) / "ray_temp_data"
-        self.ray_temp_dir.mkdir(parents=True, exist_ok=True)
-        if ray.is_initialized(): ray.shutdown()
-        self.ray_temp_dir = Path(os.getcwd()) / "ray_temp_data"
-        self.ray_temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Define a specific folder for heavy "spilled" objects
-        spill_dir = self.ray_temp_dir / "spill"
-        spill_dir.mkdir(parents=True, exist_ok=True)
 
+        self.spill_dir = Path(os.getcwd()) / "ray_spill_data"
+        self.spill_dir.mkdir(parents=True, exist_ok=True)
+        
         if ray.is_initialized(): ray.shutdown()
         
         try:
             ray.init(
-                # 1. Point temp dir (redundant with Env Var, but good for safety)
-                _temp_dir=str(self.ray_temp_dir),
+                # DO NOT set _temp_dir. Let it default to /tmp to fix the "Path Length" error.
                 
-                # 2. EXPLICITLY configure the spiller to use the large disk
-                object_spilling_config=json.dumps({
-                    "type": "filesystem",
-                    "params": {
-                        "directory_path": str(spill_dir)
-                    }
-                }),
+                # Fix "Unknown keyword argument": Pass config inside _system_config
+                _system_config={
+                    "object_spilling_config": json.dumps({
+                        "type": "filesystem",
+                        "params": {
+                            "directory_path": str(self.spill_dir)
+                        }
+                    })
+                },
                 
                 logging_level=logging.ERROR, 
                 ignore_reinit_error=True, 
                 include_dashboard=False
             )
+            print(f"✅ Ray initialized. Heavy data will spill to: {self.spill_dir}")
             
         except Exception as e:
             log.warning(f"Ray init warning: {e}")
+            
         if ray.is_initialized(): ray.shutdown()
             
         try:
