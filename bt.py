@@ -596,7 +596,8 @@ class FastBacktestEngine:
                     
                     prev_p = tracker[cid]['last_price']
                     tracker[cid]['last_price'] = avg_exec_price
-
+                    tracker[cid]['history'].append((avg_exec_price))
+                    
                     if len(tracker[cid]['history']) > 60:
                         tracker[cid]['history'].pop(0)
                     
