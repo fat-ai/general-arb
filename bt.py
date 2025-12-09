@@ -878,7 +878,6 @@ class BacktestEngine:
         self.spill_dir = Path(os.getcwd()) / "ray_spill_data"
         self.spill_dir.mkdir(parents=True, exist_ok=True)
         
-        # Ensure clean slate
         if ray.is_initialized(): ray.shutdown()
         
         try:
@@ -907,8 +906,6 @@ class BacktestEngine:
             # Fallback if the custom config fails
             if not ray.is_initialized():
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
-            
-        if ray.is_initialized(): ray.shutdown()
 
     def run_tuning_job(self):
 
