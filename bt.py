@@ -1987,10 +1987,6 @@ class BacktestEngine:
         # Since we just sorted 'trades', we can calculate price on the fly.
         t_price = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).tolist()
 
-        del trades
-        gc.collect() 
-        log.info("   🗑️ Garbage Collection: Freed DataFrame memory.")
-
         # 4. Append to events
         for i in range(len(trades)):
             events_ts.append(t_ts[i])
