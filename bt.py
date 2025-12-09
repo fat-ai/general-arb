@@ -711,11 +711,15 @@ class FastBacktestEngine:
                                                             curr_p = 1.0 - curr_p
                                                             curr_mod = 1.0 - curr_mod
                                                         
-                                                        c_edge = curr_mod - curr_p
-                                                        
-                                                        # Annualize Edge
-                                                        rem_days = max(0.1, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
-                                                        ann_ret = c_edge / (rem_days / 365.0)
+                                                        safe_price = max(curr_p, 0.001) # Avoid div/0
+                                                        expected_roi = (curr_mod / safe_price) - 1.0
+                                                        rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
+                                                        time_factor = min(time_factor, 52.0) # Cap at weekly compounding equivalent
+                                                    
+                                                        if expected_roi <= -1.0:
+                                                            ann_ret = -1.0
+                                                        else:
+                                                            ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0
                                                         
                                                         mus.append(ann_ret)
                                                         valid_cids.append(c_id)
