@@ -875,6 +875,18 @@ class BacktestEngine:
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
+        self.ray_temp_dir = Path(os.getcwd()) / "ray_temp_data"
+        self.ray_temp_dir.mkdir(parents=True, exist_ok=True)
+        if ray.is_initialized(): ray.shutdown()
+        try:
+            ray.init(
+                _temp_dir=str(self.ray_temp_dir), # Point to local large drive
+                logging_level=logging.ERROR, 
+                ignore_reinit_error=True, 
+                include_dashboard=False
+            )
+        except Exception as e:
+            log.warning(f"Ray init warning (continuing): {e}")
         if ray.is_initialized(): ray.shutdown()
         try:
             ray.init(logging_level=logging.ERROR, ignore_reinit_error=True, include_dashboard=False)
