@@ -864,9 +864,7 @@ class FastBacktestEngine:
             'trades': trade_count,
             'equity_curve': equity_curve
         }
-        
-        
-                                   
+                                       
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
@@ -876,16 +874,19 @@ class BacktestEngine:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
 
+        # --- FIX: Define Spill Directory ---
         self.spill_dir = Path(os.getcwd()) / "ray_spill_data"
         self.spill_dir.mkdir(parents=True, exist_ok=True)
         
+        # Ensure clean slate
         if ray.is_initialized(): ray.shutdown()
         
         try:
+            # --- ONE AND ONLY INITIALIZATION ---
             ray.init(
-                # DO NOT set _temp_dir. Let it default to /tmp to fix the "Path Length" error.
+                # 1. Do NOT set _temp_dir (keeps sockets in /tmp to fix "path length" error)
                 
-                # Fix "Unknown keyword argument": Pass config inside _system_config
+                # 2. Configure Object Spilling (fixes "disk full" error)
                 _system_config={
                     "object_spilling_config": json.dumps({
                         "type": "filesystem",
@@ -903,13 +904,11 @@ class BacktestEngine:
             
         except Exception as e:
             log.warning(f"Ray init warning: {e}")
+            # Fallback if the custom config fails
+            if not ray.is_initialized():
+                ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
             
         if ray.is_initialized(): ray.shutdown()
-            
-        try:
-            ray.init(logging_level=logging.ERROR, ignore_reinit_error=True, include_dashboard=False)
-        except Exception as e:
-            log.warning(f"Ray init warning (continuing): {e}")
 
     def run_tuning_job(self):
 
