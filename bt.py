@@ -914,6 +914,7 @@ class BacktestEngine:
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        
         log.info("📉 Optimizing DataFrame memory footprint...")
         if 'wallet_id' in profiler_data.columns:
             profiler_data['wallet_id'] = profiler_data['wallet_id'].astype('category')
@@ -926,7 +927,6 @@ class BacktestEngine:
         if 'event_type' in event_log.columns:
             event_log['event_type'] = event_log['event_type'].astype('category')
 
-        event_log = event_log[event_log.index
         event_log = event_log[event_log.index <= FIXED_END_DATE]
         event_log = event_log[
             (event_log.index >= FIXED_START_DATE) | 
