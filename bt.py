@@ -563,7 +563,11 @@ class FastBacktestEngine:
                 cid = data.get('contract_id')
 
                 if ev_type == 'NEW_CONTRACT':
-                    tracker[cid] = {'net_weight': 0.0, 'last_price': 0.5}
+                    tracker[cid] = {
+                        'net_weight': 0.0, 
+                        'last_price': 0.5,
+                        'history': [0.5] * 60  # Seed with neutral data to allow startup
+                    }
 
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
@@ -580,15 +584,21 @@ class FastBacktestEngine:
                     if cid not in market_liq: 
                         market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
                     
-                    # NOTE: 'p_market_all' is the average execution price
                     avg_exec_price = data.get('p_market_all', 0.5)
                     
                     # FIX: Correct Initialization (Use Current Price, not 0.5)
                     if cid not in tracker: 
-                        tracker[cid] = {'net_weight': 0.0, 'last_price': avg_exec_price}
+                        tracker[cid] = {
+                            'net_weight': 0.0, 
+                            'last_price': avg_exec_price,
+                            'history': [avg_exec_price] * 60
+                        }
                     
                     prev_p = tracker[cid]['last_price']
                     tracker[cid]['last_price'] = avg_exec_price
+
+                    if len(tracker[cid]['history']) > 60:
+                        tracker[cid]['history'].pop(0)
                     
                     vol = float(data.get('trade_volume', 0.0))
                     
@@ -681,7 +691,16 @@ class FastBacktestEngine:
                                                     for c_id in active_set:
                                                         m_inf = self.market_lifecycle.get(c_id)
                                                         if not m_inf: continue
+
+                                                        track_data = tracker.get(c_id, {})
+                                                        raw_hist = track_data.get('history', [0.5]*60)
+                                                        if m_inf.get('outcome_tag') == 'No':
+                                                            hist_data = [1.0 - p for p in raw_hist]
+                                                        else:
+                                                            hist_data = raw_hist
                                                         
+                                                        # Ensure sufficient length for correlation
+                                                        if len(hist_data) < 10: continue
                                                         # Get latest price/signal
                                                         curr_p = tracker.get(c_id, {}).get('last_price', 0.5)
                                                         curr_net = tracker.get(c_id, {}).get('net_weight', 0)
@@ -700,24 +719,25 @@ class FastBacktestEngine:
                                                         
                                                         mus.append(ann_ret)
                                                         valid_cids.append(c_id)
+                                                        price_series[c_id] = hist_data[-60:] # aligned length
                                                     
                                                     if valid_cids:
-                                                        # 2. Build Covariance (Diagonal/Simplified for speed)
-                                                        n = len(valid_cids)
-                                                        # Placeholder: 50% Volatility
-                                                        cov = pd.DataFrame(np.eye(n) * 0.25, index=valid_cids, columns=valid_cids)
+                                                        df_prices = pd.DataFrame(price_series)
+                                                        df_rets = df_prices.pct_change().fillna(0) + 1e-9
+                                                        cov = df_rets.cov()
+                                                        prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
+                                                        cov = (cov * 0.8) + (prior * 0.2)
                                                         mu_series = pd.Series(mus, index=valid_cids)
-                                                        
                                                         # 3. Optimize
                                                         try:
-                                                            # Empty DF passed as we use explicit views
                                                             optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
                                                             weights = optimizer.optimize_with_explicit_views(
                                                                 mu_series, cov, fraction=sizing_val, max_leverage=1.0
                                                             )
                                                             target_weights_map = weights.to_dict()
                                                             last_optimization_time = now_sec
-                                                        except:
+                                                        except Exception as e:
+                                                            print(f"Kelly Optimization Failed: {e}")
                                                             target_weights_map = {}
                                                 
                                                 # 4. Read Target
