@@ -28,6 +28,13 @@ import hashlib
 from filelock import FileLock
 from risk_engine import KellyOptimizer
 
+ABSOLUTE_PATH = os.path.abspath(".") # Get current folder path
+RAY_STORE_DIR = os.path.join(ABSOLUTE_PATH, "ray_temp_data")
+os.makedirs(RAY_STORE_DIR, exist_ok=True)
+
+# Force Ray to assume this directory for everything (Sockets, Logs, Spilling)
+os.environ["RAY_TMPDIR"] = RAY_STORE_DIR
+
 # Store optimal weights here so we don't re-optimize every tick
 target_weights_map = {} 
 last_optimization_time = 0
@@ -878,16 +885,37 @@ class BacktestEngine:
         self.ray_temp_dir = Path(os.getcwd()) / "ray_temp_data"
         self.ray_temp_dir.mkdir(parents=True, exist_ok=True)
         if ray.is_initialized(): ray.shutdown()
+        self.ray_temp_dir = Path(os.getcwd()) / "ray_temp_data"
+        self.ray_temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Define a specific folder for heavy "spilled" objects
+        spill_dir = self.ray_temp_dir / "spill"
+        spill_dir.mkdir(parents=True, exist_ok=True)
+
+        if ray.is_initialized(): ray.shutdown()
+        
         try:
             ray.init(
-                _temp_dir=str(self.ray_temp_dir), # Point to local large drive
+                # 1. Point temp dir (redundant with Env Var, but good for safety)
+                _temp_dir=str(self.ray_temp_dir),
+                
+                # 2. EXPLICITLY configure the spiller to use the large disk
+                object_spilling_config=json.dumps({
+                    "type": "filesystem",
+                    "params": {
+                        "directory_path": str(spill_dir)
+                    }
+                }),
+                
                 logging_level=logging.ERROR, 
                 ignore_reinit_error=True, 
                 include_dashboard=False
             )
+            
         except Exception as e:
-            log.warning(f"Ray init warning (continuing): {e}")
+            log.warning(f"Ray init warning: {e}")
         if ray.is_initialized(): ray.shutdown()
+            
         try:
             ray.init(logging_level=logging.ERROR, ignore_reinit_error=True, include_dashboard=False)
         except Exception as e:
