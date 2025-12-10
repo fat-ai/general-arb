@@ -574,6 +574,8 @@ class FastBacktestEngine:
                     tracker[cid] = {
                         'net_weight': 0.0, 
                         'last_price': 0.5,
+                        'last_update_ts': current_ts,
+                        'last_trigger_ts': None,
                         'history': [0.5] * 60  # Seed with neutral data to allow startup
                     }
 
@@ -600,7 +602,6 @@ class FastBacktestEngine:
                     
                     avg_exec_price = data.get('p_market_all', 0.5)
                     
-                    # FIX: Correct Initialization (Use Current Price, not 0.5)
                     if cid not in tracker: 
                         tracker[cid] = {
                             'net_weight': 0.0, 
@@ -636,12 +637,69 @@ class FastBacktestEngine:
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
                         
                         trade_direction = -1.0 if data.get('is_sell') else 1.0
-                        tracker[cid]['net_weight'] += (weight * trade_direction)
+                        # [STEP A] Apply Time-Based Decay
+            # Calculate seconds since last update for this specific contract
+            last_ts = tracker[cid].get('last_update_ts', current_ts)
+            elapsed_seconds = (current_ts - last_ts).total_seconds()
 
-                        # 3. Execution Logic
-                        if abs(tracker[cid]['net_weight']) > splash_thresh:
-                            raw_net = tracker[cid]['net_weight']
-                            tracker[cid]['net_weight'] = 0.0 # Reset
+            # Apply decay based on Minutes Elapsed
+            # Formula: Weight_New = Weight_Old * (Decay_Factor ^ Minutes_Elapsed)
+            decay_exponent = elapsed_seconds / 60.0
+            time_decay_multiplier = config['decay_factor'] ** decay_exponent
+
+            tracker[cid]['net_weight'] *= time_decay_multiplier
+            tracker[cid]['last_update_ts'] = current_ts  # Update timestamp immediately
+
+            # [STEP B] Accumulate & Sanitize
+            # 1. Add new signal
+            tracker[cid]['net_weight'] += (weight * trade_direction)
+
+            # 2. NaN/Infinity Check (Critical Safety)
+            if not np.isfinite(tracker[cid]['net_weight']):
+                # Log warning if logger is available, otherwise just reset
+                # log.warning(f"NaN/Inf detected in {cid} weight. Resetting to 0.0.")
+                tracker[cid]['net_weight'] = 0.0
+
+            # 3. Safety Clipping (Bounds Check)
+            # Prevent weight from exceeding Cap * Threshold
+            cap = config['splash_thresh'] * config['max_weight_cap']
+            tracker[cid]['net_weight'] = np.clip(tracker[cid]['net_weight'], -cap, cap)
+
+            # [STEP C] Trigger Logic with Throttling
+            raw_net = tracker[cid]['net_weight']
+            abs_net = abs(raw_net)
+
+            if abs_net > config['splash_thresh']:
+                
+                # THROTTLE CHECK: Have we fired in this minute?
+                current_minute = current_ts.floor('1min')
+                last_trigger = tracker[cid].get('last_trigger_ts')
+
+                if last_trigger != current_minute:
+                    
+                    # RISK CHECK: Check Position Limits
+                    # Only allow trigger if we don't already have a position in this contract
+                    if cid not in positions:
+                        
+                        # --- EXECUTION BLOCK ---
+                        
+                        # 1. Dynamic Lambda Calculation
+                        # Higher overflow = Higher confidence = Higher Lambda
+                        overflow_ratio = raw_net / config['splash_thresh']
+                        p_model = 0.5 + (np.tanh(overflow_ratio) * 0.49)
+                        
+                        # 2. Execute
+                        execute_hybrid_waterfall(cid, p_model, current_price, current_ts)
+                        
+                        # 3. Update Throttle
+                        tracker[cid]['last_trigger_ts'] = current_minute
+
+                        # 4. Soft Reset (Preserve Momentum)
+                        # Subtract threshold but keep the "overflow"
+                        if raw_net > 0:
+                            tracker[cid]['net_weight'] -= config['splash_thresh']
+                        else:
+                            tracker[cid]['net_weight'] += config['splash_thresh']
                             
                             # Model Response (Tuned divisor: 2000.0)
                             p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
@@ -1016,6 +1074,8 @@ class BacktestEngine:
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
             "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0]),
+            "decay_factor": 0.95, 
+            "max_weight_cap": 10.0,
             "edge_threshold": tune.grid_search([0.06, 0.07, 0.08]),
             "use_smart_exit": True,
             "smart_exit_ratio": tune.grid_search([0.5, 0.7, 0.9]),
@@ -2068,6 +2128,14 @@ class BacktestEngine:
         return df_ev, prof_data
       
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
+    
+    decay = config.get('decay_factor', 0.95)
+    if not (0.80 <= decay < 1.0):
+        raise ValueError(f"CRITICAL: Invalid decay_factor {decay}. Must be [0.80, 0.99].")
+
+    # 2. Threshold Safety
+    if config.get('splash_thresh', 0) <= 0:
+        raise ValueError("CRITICAL: splash_thresh must be positive.")
     try:
         
         np.random.seed(config.get('seed', 42))
