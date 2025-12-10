@@ -647,6 +647,11 @@ class FastBacktestEngine:
                         # [STEP A] Apply Time-Based Decay
             # Calculate seconds since last update for this specific contract
                         last_ts = tracker[cid].get('last_update_ts', current_ts)
+                        # --- DEBUG PRINTS ---
+                        print(f"DEBUG: CID={cid}")
+                        print(f"DEBUG: Current={current_ts}, Last={last_ts}")
+                        print(f"DEBUG: Keys in tracker={list(tracker[cid].keys())}")
+                        # --------------------
                         elapsed_seconds = (current_ts - last_ts).total_seconds()
             
                         # Apply decay based on Minutes Elapsed
