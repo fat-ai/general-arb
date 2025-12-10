@@ -791,7 +791,7 @@ class FastBacktestEngine:
                                                         'size': filled_cash,
                                                         'shares': shares, 
                                                         'entry': avg_p, 
-                                                        'entry_signal': 0
+                                                        'entry_signal': raw_net
                                                     }
                                                     cash -= filled_cash
                                                     trade_count += 1
