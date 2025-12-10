@@ -596,6 +596,8 @@ class FastBacktestEngine:
                         if payout > pos['size']: wins += 1
                         elif payout < pos['size']: losses += 1
 
+                        del positions[cid]
+
                 elif ev_type == 'PRICE_UPDATE':
                     if current_ts is None:
                         continue
@@ -901,7 +903,8 @@ class FastBacktestEngine:
             'trades': trade_count,
             'wins': wins,  
             'losses': losses,  
-            'equity_curve': equity_curve
+            'equity_curve': equity_curve,
+            'tracker_state': tracker
         }
                                        
 class BacktestEngine:
