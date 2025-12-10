@@ -597,6 +597,8 @@ class FastBacktestEngine:
                         elif payout < pos['size']: losses += 1
 
                 elif ev_type == 'PRICE_UPDATE':
+                    if current_ts is None:
+                        continue
                     # 1. State Update
                     if cid not in market_liq: 
                         market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
