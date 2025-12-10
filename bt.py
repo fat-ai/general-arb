@@ -716,10 +716,63 @@ class FastBacktestEngine:
                                     # Check if optimization is needed
                                     now_sec = time.time()
                                     if now_sec - last_optimization_time > OPTIMIZATION_INTERVAL:
-                                        # (Kelly Optimization Logic - simplified for runtime safety)
-                                        # In production, paste full Kelly block here if needed.
-                                        # For now, we use the cached map or safe fallback.
-                                        pass 
+                                        # 1. Build Expectations
+                                        active_set = list(positions.keys())
+                                        if cid not in active_set: active_set.append(cid)
+                                        
+                                        mus, valid_cids, price_series = [], [], {}
+                                        
+                                        for c_id in active_set:
+                                            m_inf = self.market_lifecycle.get(c_id)
+                                            if not m_inf: continue
+                                            
+                                            # Get History
+                                            track_data = tracker.get(c_id, {})
+                                            raw_hist = track_data.get('history', [0.5]*60)
+                                            hist_data = [1.0 - p for p in raw_hist] if m_inf.get('outcome_tag') == 'No' else raw_hist
+                                            
+                                            if len(hist_data) < 10: continue
+                                            
+                                            # Current metrics
+                                            curr_p = track_data.get('last_price', 0.5)
+                                            curr_net = track_data.get('net_weight', 0)
+                                            curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
+                                            
+                                            if m_inf.get('outcome_tag') == 'No':
+                                                curr_p = 1.0 - curr_p
+                                                curr_mod = 1.0 - curr_mod
+                                            
+                                            # ROI Calc
+                                            safe_price = max(curr_p, 0.001)
+                                            expected_roi = (curr_mod / safe_price) - 1.0
+                                            
+                                            # Annualize
+                                            rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
+                                            time_factor = min(365.0 / (rem_days + 1.0), 52.0)
+                                            ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0 if expected_roi > -1.0 else -1.0
+                                            
+                                            mus.append(ann_ret)
+                                            valid_cids.append(c_id)
+                                            price_series[c_id] = hist_data[-60:]
+
+                                        # 2. Optimize
+                                        if valid_cids:
+                                            try:
+                                                df_prices = pd.DataFrame(price_series)
+                                                df_rets = df_prices.pct_change().fillna(0) + 1e-9
+                                                cov = df_rets.cov()
+                                                # Shrinkage
+                                                prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
+                                                cov = (cov * 0.8) + (prior * 0.2)
+                                                
+                                                optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                weights = optimizer.optimize_with_explicit_views(
+                                                    pd.Series(mus, index=valid_cids), cov, fraction=sizing_val, max_leverage=1.0
+                                                )
+                                                target_weights_map = weights.to_dict()
+                                                last_optimization_time = now_sec
+                                            except Exception:
+                                                target_weights_map = {}
                                     
                                     # Read Target
                                     ideal_weight = target_weights_map.get(cid, 0.0)
