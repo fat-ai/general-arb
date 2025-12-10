@@ -660,7 +660,7 @@ class FastBacktestEngine:
                         raw_net = tracker[cid]['net_weight']
                         abs_net = abs(raw_net)
             
-                        if abs_net > config['splash_thresh']:
+                        if abs_net > config['splash_threshold']:
                             
                             # THROTTLE CHECK: Have we fired in this minute?
                             current_minute = current_ts.floor('1min')
@@ -810,9 +810,9 @@ class FastBacktestEngine:
             
                                                     # C. Soft Reset (Preserve Momentum)
                                                     if raw_net > 0:
-                                                        tracker[cid]['net_weight'] -= config['splash_thresh']
+                                                        tracker[cid]['net_weight'] -= config['splash_threshold']
                                                     else:
-                                                        tracker[cid]['net_weight'] += config['splash_thresh']
+                                                        tracker[cid]['net_weight'] += config['splash_threshold']
             
                                                 else:
                                                     rejection_log['low_volume'] += 1
@@ -2100,8 +2100,8 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         raise ValueError(f"CRITICAL: Invalid decay_factor {decay}. Must be [0.80, 0.99].")
 
     # 2. Threshold Safety
-    if config.get('splash_thresh', 0) <= 0:
-        raise ValueError("CRITICAL: splash_thresh must be positive.")
+    if config.get('splash_threshold', 0) <= 0:
+        raise ValueError("CRITICAL: splash_threshold must be positive.")
     try:
         
         np.random.seed(config.get('seed', 42))
