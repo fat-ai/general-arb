@@ -539,7 +539,7 @@ class FastBacktestEngine:
                 if e['event_type'] == 'PRICE_UPDATE':
                     if e['data'].get('timestamp') is not None:
                         trade_events.append(e['data'])
-                    trade_events.append(e['data'])
+                 
         
         if trade_events:
             t_times = np.array([d.get('timestamp').timestamp() for d in trade_events], dtype=np.float64)
