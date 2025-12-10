@@ -604,6 +604,9 @@ class FastBacktestEngine:
                         continue
                     # 1. State Update
                     if cid not in market_liq: 
+                        init_liq = known_liquidity.get(cid, 0.0)
+                        if init_liq < 5000.0 and vol < 1000.0:
+                            continue
                         market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
                     
                     avg_exec_price = data.get('p_market_all', 0.5)
