@@ -417,6 +417,8 @@ class FastBacktestEngine:
         current_date = min_date
         total_pnl = 0.0
         total_trades = 0
+        total_wins = 0  
+        total_losses = 0
         capital = 10000.0
         equity_curve = [capital]
         all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
@@ -483,6 +485,8 @@ class FastBacktestEngine:
                 else: equity_curve.extend(scaled_curve)
                 capital = equity_curve[-1]
                 total_trades += result['trades']
+                total_wins += result.get('wins', 0)
+                total_losses += result.get('losses', 0)
             
             current_date += timedelta(days=test_days)
             
@@ -496,6 +500,8 @@ class FastBacktestEngine:
         sharpe = 0.0
         if len(pct_changes) > 1 and pct_changes.std() > 0:
             sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 1440)
+
+        wl_ratio = total_wins / total_losses if total_losses > 0 else 0.0
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
         
                                    
@@ -521,6 +527,8 @@ class FastBacktestEngine:
         market_liq = {}
         trade_count = 0
         volume_traded = 0.0
+        wins = 0
+        losses = 0
 
         rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0}
 
@@ -573,11 +581,17 @@ class FastBacktestEngine:
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(data.get('outcome', 0))
-                        if outcome == 0.5: cash += pos['shares'] * 0.50
+                        payout = 0.0
+                        if outcome == 0.5: 
+                            payout = pos['shares'] * 0.50
                         else:
-                            win = (pos['side'] == 1 and outcome == 1.0) or (pos['side'] == -1 and outcome == 0.0)
-                            if win: cash += pos['shares']
-                        del positions[cid]
+                            is_win = (pos['side'] == 1 and outcome == 1.0) or (pos['side'] == -1 and outcome == 0.0)
+                            if is_win: payout = pos['shares']
+                        
+                        cash += payout
+                        
+                        if payout > pos['size']: wins += 1
+                        elif payout < pos['size']: losses += 1
 
                 elif ev_type == 'PRICE_UPDATE':
                     # 1. State Update
@@ -831,6 +845,8 @@ class FastBacktestEngine:
                             else: filled_cash = pos['shares'] * (1.0 - penalty_price)
 
                         cash += filled_cash
+                        if filled_cash > pos['size']: wins += 1
+                        elif filled_cash < pos['size']: losses += 1
                         del positions[cid]
                       
             # Mark to Market (End of Minute)
@@ -862,6 +878,8 @@ class FastBacktestEngine:
             'final_value': final_value,
             'total_return': (final_value / 10000.0) - 1.0,
             'trades': trade_count,
+            'wins': wins,  
+            'losses': losses,  
             'equity_curve': equity_curve
         }
                                        
@@ -1061,6 +1079,7 @@ class BacktestEngine:
         print(f"   Total Return:     {metrics.get('total_return', 0.0):.2%}")
         print(f"   Max Drawdown:     {metrics.get('max_drawdown', 0.0):.2%}")
         print(f"   Sharpe Ratio:     {metrics.get('sharpe_ratio', 0.0):.4f}")
+        print(f"   Win/Loss Ratio:   {metrics.get('win_loss_ratio', 0.0):.2f} ({metrics.get('wins',0)}W / {metrics.get('losses',0)}L)")
         print(f"   Trades:           {metrics.get('trades', 0)}")
         print("="*60 + "\n")
 
