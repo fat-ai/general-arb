@@ -537,6 +537,8 @@ class FastBacktestEngine:
         for b in batches:
             for e in b:
                 if e['event_type'] == 'PRICE_UPDATE':
+                    if e['data'].get('timestamp') is not None:
+                        trade_events.append(e['data'])
                     trade_events.append(e['data'])
         
         if trade_events:
