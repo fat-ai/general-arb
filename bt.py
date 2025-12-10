@@ -898,7 +898,7 @@ class FastBacktestEngine:
         for reason, count in rejection_log.items():
             if count > 0:
                 print(f"   {reason}: {count}")
-        
+        self.tracker = tracker
         return {
             'final_value': final_value,
             'total_return': (final_value / 10000.0) - 1.0,
