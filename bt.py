@@ -600,8 +600,11 @@ class FastBacktestEngine:
                         del positions[cid]
 
                 elif ev_type == 'PRICE_UPDATE':
+                   
                     if current_ts is None:
                         continue
+
+                    vol = float(data.get('trade_volume', 0.0))
                     # 1. State Update
                     if cid not in market_liq: 
                         init_liq = known_liquidity.get(cid, 0.0)
@@ -626,7 +629,7 @@ class FastBacktestEngine:
                     if len(tracker[cid]['history']) > 60:
                         tracker[cid]['history'].pop(0)
                     
-                    vol = float(data.get('trade_volume', 0.0))
+                    
                     last_ts = tracker[cid].get('last_update_ts', current_ts)
                     elapsed_seconds = (current_ts - last_ts).total_seconds()
                     decay_exponent = elapsed_seconds / 60.0
@@ -724,13 +727,15 @@ class FastBacktestEngine:
                                                         if len(hist_data) < 10: continue
                                                         
                                                         # Current metrics
+                                                        # Current metrics (Use as-is)
                                                         curr_p = track_data.get('last_price', 0.5)
                                                         curr_net = track_data.get('net_weight', 0)
+                                                        
+                                                        # Model prob of THIS token winning
+                                                        # (Assuming positive net_weight = bullish on THIS token)
                                                         curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
                                                         
-                                                        if m_inf.get('outcome_tag') == 'No':
-                                                            curr_p = 1.0 - curr_p
-                                                            curr_mod = 1.0 - curr_mod
+                                                  
                                                         
                                                         # ROI Calc
                                                         safe_price = max(curr_p, 0.001)
