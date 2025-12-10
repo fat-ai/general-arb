@@ -533,14 +533,14 @@ class FastBacktestEngine:
         rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0}
 
         # --- PRE-CALCULATION START ---
-        trade_events = []
-        for b in batches:
-            for e in b:
-                if e['event_type'] == 'PRICE_UPDATE':
-                    if e['data'].get('timestamp') is not None:
-                        trade_events.append(e['data'])
-                 
+        trade_events = [
+            e['data'] for b in batches for e in b 
+            if e['event_type'] == 'PRICE_UPDATE' and e['data'].get('timestamp') is not None
+        ]
         
+        if trade_events:
+            t_times = np.array([d['timestamp'].timestamp() for d in trade_events], dtype=np.float64)
+            
         if trade_events:
             t_times = np.array([d.get('timestamp').timestamp() for d in trade_events], dtype=np.float64)
             t_sides = np.array([(-1 if d.get('is_sell') else 1) for d in trade_events], dtype=np.int8)
