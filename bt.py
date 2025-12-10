@@ -613,6 +613,7 @@ class FastBacktestEngine:
                         tracker[cid] = {
                             'net_weight': 0.0, 
                             'last_price': avg_exec_price,
+                            'last_update_ts': current_ts,
                             'history': [avg_exec_price] * 60
                         }
                     
