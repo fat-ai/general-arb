@@ -859,12 +859,12 @@ class FastBacktestEngine:
                                     del positions[cid]
                                   
                         # Mark to Market (End of Minute)
-                        current_val = cash
-                        for cid, pos in positions.items():
-                            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                            val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-                            current_val += val
-                        equity_curve.append(current_val)
+                    current_val = cash
+                    for cid, pos in positions.items():
+                        last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                        val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
+                        current_val += val
+                    equity_curve.append(current_val)
 
         final_value = cash
         for cid, pos in positions.items():
