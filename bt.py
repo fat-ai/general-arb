@@ -646,268 +646,268 @@ class FastBacktestEngine:
                         trade_direction = -1.0 if data.get('is_sell') else 1.0
                         # [STEP A] Apply Time-Based Decay
             # Calculate seconds since last update for this specific contract
-            last_ts = tracker[cid].get('last_update_ts', current_ts)
-            elapsed_seconds = (current_ts - last_ts).total_seconds()
-
-            # Apply decay based on Minutes Elapsed
-            # Formula: Weight_New = Weight_Old * (Decay_Factor ^ Minutes_Elapsed)
-            decay_exponent = elapsed_seconds / 60.0
-            time_decay_multiplier = config['decay_factor'] ** decay_exponent
-
-            tracker[cid]['net_weight'] *= time_decay_multiplier
-            tracker[cid]['last_update_ts'] = current_ts  # Update timestamp immediately
-
-            # [STEP B] Accumulate & Sanitize
-            # 1. Add new signal
-            tracker[cid]['net_weight'] += (weight * trade_direction)
-
-            # 2. NaN/Infinity Check (Critical Safety)
-            if not np.isfinite(tracker[cid]['net_weight']):
-                # Log warning if logger is available, otherwise just reset
-                # log.warning(f"NaN/Inf detected in {cid} weight. Resetting to 0.0.")
-                tracker[cid]['net_weight'] = 0.0
-
-            # 3. Safety Clipping (Bounds Check)
-            # Prevent weight from exceeding Cap * Threshold
-            cap = config['splash_thresh'] * config['max_weight_cap']
-            tracker[cid]['net_weight'] = np.clip(tracker[cid]['net_weight'], -cap, cap)
-
-            # [STEP C] Trigger Logic with Throttling
-            raw_net = tracker[cid]['net_weight']
-            abs_net = abs(raw_net)
-
-            if abs_net > config['splash_thresh']:
-                
-                # THROTTLE CHECK: Have we fired in this minute?
-                current_minute = current_ts.floor('1min')
-                last_trigger = tracker[cid].get('last_trigger_ts')
-
-                if last_trigger != current_minute:
-                    
-                    # RISK CHECK: Check Position Limits
-                    if cid not in positions:
-                        
-                        # --- 1. PREPARE DATA ---
-                        market_info = self.market_lifecycle.get(cid)
-                        if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
-                            rejection_log['missing_metadata'] = rejection_log.get('missing_metadata', 0) + 1
-                            continue 
-
-                        days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
-                        
-                        # --- 2. CALCULATE EDGE ---
-                        if days_remaining > 0:
-                            # Model Probability
-                            p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
+                        last_ts = tracker[cid].get('last_update_ts', current_ts)
+                        elapsed_seconds = (current_ts - last_ts).total_seconds()
+            
+                        # Apply decay based on Minutes Elapsed
+                        # Formula: Weight_New = Weight_Old * (Decay_Factor ^ Minutes_Elapsed)
+                        decay_exponent = elapsed_seconds / 60.0
+                        time_decay_multiplier = config['decay_factor'] ** decay_exponent
+            
+                        tracker[cid]['net_weight'] *= time_decay_multiplier
+                        tracker[cid]['last_update_ts'] = current_ts  # Update timestamp immediately
+            
+                        # [STEP B] Accumulate & Sanitize
+                        # 1. Add new signal
+                        tracker[cid]['net_weight'] += (weight * trade_direction)
+            
+                        # 2. NaN/Infinity Check (Critical Safety)
+                        if not np.isfinite(tracker[cid]['net_weight']):
+                            # Log warning if logger is available, otherwise just reset
+                            # log.warning(f"NaN/Inf detected in {cid} weight. Resetting to 0.0.")
+                            tracker[cid]['net_weight'] = 0.0
+            
+                        # 3. Safety Clipping (Bounds Check)
+                        # Prevent weight from exceeding Cap * Threshold
+                        cap = config['splash_thresh'] * config['max_weight_cap']
+                        tracker[cid]['net_weight'] = np.clip(tracker[cid]['net_weight'], -cap, cap)
+            
+                        # [STEP C] Trigger Logic with Throttling
+                        raw_net = tracker[cid]['net_weight']
+                        abs_net = abs(raw_net)
+            
+                        if abs_net > config['splash_thresh']:
                             
-                            outcome_tag = market_info.get('outcome_tag', 'Yes')
-                            calc_price = avg_exec_price
-                            calc_model = p_model
-                            
-                            if outcome_tag == 'No':
-                                calc_price = 1.0 - avg_exec_price
-                                calc_model = 1.0 - p_model
+                            # THROTTLE CHECK: Have we fired in this minute?
+                            current_minute = current_ts.floor('1min')
+                            last_trigger = tracker[cid].get('last_trigger_ts')
+            
+                            if last_trigger != current_minute:
                                 
-                            edge = calc_model - calc_price
-
-                            # Edge & Safety Checks
-                            if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
-                                
-                                # --- 3. DETERMINE SIZING (COST) ---
-                                target_f = 0.0
-                                cost = 0.0
-                                if sizing_mode == 'fixed_pct': target_f = sizing_val
-                                elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
-                                elif sizing_mode == 'kelly':
-                                    # Check if optimization is needed
-                                    now_sec = time.time()
-                                    if now_sec - last_optimization_time > OPTIMIZATION_INTERVAL:
-                                        # 1. Build Expectations
-                                        active_set = list(positions.keys())
-                                        if cid not in active_set: active_set.append(cid)
+                                # RISK CHECK: Check Position Limits
+                                if cid not in positions:
+                                    
+                                    # --- 1. PREPARE DATA ---
+                                    market_info = self.market_lifecycle.get(cid)
+                                    if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
+                                        rejection_log['missing_metadata'] = rejection_log.get('missing_metadata', 0) + 1
+                                        continue 
+            
+                                    days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
+                                    
+                                    # --- 2. CALCULATE EDGE ---
+                                    if days_remaining > 0:
+                                        # Model Probability
+                                        p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
                                         
-                                        mus, valid_cids, price_series = [], [], {}
+                                        outcome_tag = market_info.get('outcome_tag', 'Yes')
+                                        calc_price = avg_exec_price
+                                        calc_model = p_model
                                         
-                                        for c_id in active_set:
-                                            m_inf = self.market_lifecycle.get(c_id)
-                                            if not m_inf: continue
+                                        if outcome_tag == 'No':
+                                            calc_price = 1.0 - avg_exec_price
+                                            calc_model = 1.0 - p_model
                                             
-                                            # Get History
-                                            track_data = tracker.get(c_id, {})
-                                            raw_hist = track_data.get('history', [0.5]*60)
-                                            hist_data = [1.0 - p for p in raw_hist] if m_inf.get('outcome_tag') == 'No' else raw_hist
+                                        edge = calc_model - calc_price
+            
+                                        # Edge & Safety Checks
+                                        if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
                                             
-                                            if len(hist_data) < 10: continue
-                                            
-                                            # Current metrics
-                                            curr_p = track_data.get('last_price', 0.5)
-                                            curr_net = track_data.get('net_weight', 0)
-                                            curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
-                                            
-                                            if m_inf.get('outcome_tag') == 'No':
-                                                curr_p = 1.0 - curr_p
-                                                curr_mod = 1.0 - curr_mod
-                                            
-                                            # ROI Calc
-                                            safe_price = max(curr_p, 0.001)
-                                            expected_roi = (curr_mod / safe_price) - 1.0
-                                            
-                                            # Annualize
-                                            rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
-                                            time_factor = min(365.0 / (rem_days + 1.0), 52.0)
-                                            ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0 if expected_roi > -1.0 else -1.0
-                                            
-                                            mus.append(ann_ret)
-                                            valid_cids.append(c_id)
-                                            price_series[c_id] = hist_data[-60:]
-
-                                        # 2. Optimize
-                                        if valid_cids:
-                                            try:
-                                                df_prices = pd.DataFrame(price_series)
-                                                df_rets = df_prices.pct_change().fillna(0) + 1e-9
-                                                cov = df_rets.cov()
-                                                # Shrinkage
-                                                prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
-                                                cov = (cov * 0.8) + (prior * 0.2)
+                                            # --- 3. DETERMINE SIZING (COST) ---
+                                            target_f = 0.0
+                                            cost = 0.0
+                                            if sizing_mode == 'fixed_pct': target_f = sizing_val
+                                            elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
+                                            elif sizing_mode == 'kelly':
+                                                # Check if optimization is needed
+                                                now_sec = time.time()
+                                                if now_sec - last_optimization_time > OPTIMIZATION_INTERVAL:
+                                                    # 1. Build Expectations
+                                                    active_set = list(positions.keys())
+                                                    if cid not in active_set: active_set.append(cid)
+                                                    
+                                                    mus, valid_cids, price_series = [], [], {}
+                                                    
+                                                    for c_id in active_set:
+                                                        m_inf = self.market_lifecycle.get(c_id)
+                                                        if not m_inf: continue
+                                                        
+                                                        # Get History
+                                                        track_data = tracker.get(c_id, {})
+                                                        raw_hist = track_data.get('history', [0.5]*60)
+                                                        hist_data = [1.0 - p for p in raw_hist] if m_inf.get('outcome_tag') == 'No' else raw_hist
+                                                        
+                                                        if len(hist_data) < 10: continue
+                                                        
+                                                        # Current metrics
+                                                        curr_p = track_data.get('last_price', 0.5)
+                                                        curr_net = track_data.get('net_weight', 0)
+                                                        curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
+                                                        
+                                                        if m_inf.get('outcome_tag') == 'No':
+                                                            curr_p = 1.0 - curr_p
+                                                            curr_mod = 1.0 - curr_mod
+                                                        
+                                                        # ROI Calc
+                                                        safe_price = max(curr_p, 0.001)
+                                                        expected_roi = (curr_mod / safe_price) - 1.0
+                                                        
+                                                        # Annualize
+                                                        rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
+                                                        time_factor = min(365.0 / (rem_days + 1.0), 52.0)
+                                                        ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0 if expected_roi > -1.0 else -1.0
+                                                        
+                                                        mus.append(ann_ret)
+                                                        valid_cids.append(c_id)
+                                                        price_series[c_id] = hist_data[-60:]
+            
+                                                    # 2. Optimize
+                                                    if valid_cids:
+                                                        try:
+                                                            df_prices = pd.DataFrame(price_series)
+                                                            df_rets = df_prices.pct_change().fillna(0) + 1e-9
+                                                            cov = df_rets.cov()
+                                                            # Shrinkage
+                                                            prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
+                                                            cov = (cov * 0.8) + (prior * 0.2)
+                                                            
+                                                            optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                            weights = optimizer.optimize_with_explicit_views(
+                                                                pd.Series(mus, index=valid_cids), cov, fraction=sizing_val, max_leverage=1.0
+                                                            )
+                                                            target_weights_map = weights.to_dict()
+                                                            last_optimization_time = now_sec
+                                                        except Exception:
+                                                            target_weights_map = {}
                                                 
-                                                optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
-                                                weights = optimizer.optimize_with_explicit_views(
-                                                    pd.Series(mus, index=valid_cids), cov, fraction=sizing_val, max_leverage=1.0
+                                                # Read Target
+                                                ideal_weight = target_weights_map.get(cid, 0.0)
+                                                pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
+                                                
+                                                if ideal_weight > 0.01:
+                                                    target_f = ideal_weight
+                                                    cost = pf_val * target_f
+                                            
+                                            if target_f > 0:
+                                                target_f = min(target_f, 0.20)
+                                                cost = cash * target_f
+                                            
+                                            # --- 4. EXECUTE TRADE ---
+                                            if cost > 5.0 and cash > cost:
+                                                side = 1 if edge > 0 else -1
+                                                cond_id = market_info.get('condition_id')
+                                                out_tag = market_info.get('outcome_tag', 'Yes')
+                                                
+                                                avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                                    cid, cond_id, out_tag, side, cost, current_ts,
+                                                    cid_indices, t_times, t_sides, t_vols, t_prices
                                                 )
-                                                target_weights_map = weights.to_dict()
-                                                last_optimization_time = now_sec
-                                            except Exception:
-                                                target_weights_map = {}
-                                    
-                                    # Read Target
-                                    ideal_weight = target_weights_map.get(cid, 0.0)
-                                    pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
-                                    
-                                    if ideal_weight > 0.01:
-                                        target_f = ideal_weight
-                                        cost = pf_val * target_f
+            
+                                                if filled_cash > 0:
+                                                    # A. Record Position
+                                                    positions[cid] = {
+                                                        'side': side, 
+                                                        'size': filled_cash,
+                                                        'shares': shares, 
+                                                        'entry': avg_p, 
+                                                        'entry_signal': 0
+                                                    }
+                                                    cash -= filled_cash
+                                                    trade_count += 1
+                                                    volume_traded += filled_cash
+                                                    
+                                                    # B. Update Throttle
+                                                    tracker[cid]['last_trigger_ts'] = current_minute
+            
+                                                    # C. Soft Reset (Preserve Momentum)
+                                                    if raw_net > 0:
+                                                        tracker[cid]['net_weight'] -= config['splash_thresh']
+                                                    else:
+                                                        tracker[cid]['net_weight'] += config['splash_thresh']
+            
+                                                else:
+                                                    rejection_log['low_volume'] += 1
+                                            elif cash <= cost:
+                                                rejection_log['insufficient_cash'] += 1
+                                        else:
+                                            if abs(edge) < edge_thresh: rejection_log['low_edge'] += 1
+                                            else: rejection_log['unsafe_price'] += 1
+                                    else:
+                                        rejection_log['market_expired'] += 1
+                                                
+                            # Stop Loss / Smart Exit (Check every event)
+                            if ev_type != 'RESOLUTION' and cid in positions:
+                                pos = positions[cid]
+                                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                                 
-                                if target_f > 0:
-                                    target_f = min(target_f, 0.20)
-                                    cost = cash * target_f
+                                if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
+                                else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
                                 
-                                # --- 4. EXECUTE TRADE ---
-                                if cost > 5.0 and cash > cost:
-                                    side = 1 if edge > 0 else -1
-                                    cond_id = market_info.get('condition_id')
-                                    out_tag = market_info.get('outcome_tag', 'Yes')
+                                should_close = False
+                                if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
+                                if use_smart_exit:
+                                    cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                                    if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
+                                    if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
+                                
+                                if should_close:
+                                    exit_side = -1 if pos['side'] == 1 else 1
+                                    target_exit_cash = pos['shares'] * curr_p 
+                                    market_info = self.market_lifecycle.get(cid)
+                                    cond_id = market_info.get('condition_id') if market_info else None
+                                    out_tag = market_info.get('outcome_tag', 'Yes') if market_info else 'Yes'
                                     
-                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                        cid, cond_id, out_tag, side, cost, current_ts,
+                                    avg_p, filled_cash, _ = execute_hybrid_waterfall(
+                                        cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
                                         cid_indices, t_times, t_sides, t_vols, t_prices
                                     )
-
-                                    if filled_cash > 0:
-                                        # A. Record Position
-                                        positions[cid] = {
-                                            'side': side, 
-                                            'size': filled_cash,
-                                            'shares': shares, 
-                                            'entry': avg_p, 
-                                            'entry_signal': 0
-                                        }
-                                        cash -= filled_cash
-                                        trade_count += 1
-                                        volume_traded += filled_cash
-                                        
-                                        # B. Update Throttle
-                                        tracker[cid]['last_trigger_ts'] = current_minute
-
-                                        # C. Soft Reset (Preserve Momentum)
-                                        if raw_net > 0:
-                                            tracker[cid]['net_weight'] -= config['splash_thresh']
-                                        else:
-                                            tracker[cid]['net_weight'] += config['splash_thresh']
-
-                                    else:
-                                        rejection_log['low_volume'] += 1
-                                elif cash <= cost:
-                                    rejection_log['insufficient_cash'] += 1
-                            else:
-                                if abs(edge) < edge_thresh: rejection_log['low_edge'] += 1
-                                else: rejection_log['unsafe_price'] += 1
-                        else:
-                            rejection_log['market_expired'] += 1
                                     
-                # Stop Loss / Smart Exit (Check every event)
-                if ev_type != 'RESOLUTION' and cid in positions:
-                    pos = positions[cid]
-                    curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                    
-                    if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
-                    else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
-                    
-                    should_close = False
-                    if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
-                    if use_smart_exit:
-                        cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                        if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
-                        if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
-                    
-                    if should_close:
-                        exit_side = -1 if pos['side'] == 1 else 1
-                        target_exit_cash = pos['shares'] * curr_p 
-                        market_info = self.market_lifecycle.get(cid)
-                        cond_id = market_info.get('condition_id') if market_info else None
-                        out_tag = market_info.get('outcome_tag', 'Yes') if market_info else 'Yes'
-                        
-                        avg_p, filled_cash, _ = execute_hybrid_waterfall(
-                            cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
-                            cid_indices, t_times, t_sides, t_vols, t_prices
-                        )
-                        
-                        # Fallback for total market failure
-                        if filled_cash == 0:
-                            penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
-                            penalty_price = max(0.01, min(penalty_price, 0.99))
-                            if pos['side'] == 1: filled_cash = pos['shares'] * penalty_price
-                            else: filled_cash = pos['shares'] * (1.0 - penalty_price)
-
-                        cash += filled_cash
-                        if filled_cash > pos['size']: wins += 1
-                        elif filled_cash < pos['size']: losses += 1
-                        del positions[cid]
-                      
-            # Mark to Market (End of Minute)
-            current_val = cash
-            for cid, pos in positions.items():
-                last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-                current_val += val
-            equity_curve.append(current_val)
-   
-        final_value = cash
-        for cid, pos in positions.items():
-            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-            val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-            final_value += val
-
-         # --- DIAGNOSTICS ---
-        print(f"\n📊 PERIOD SUMMARY:")
-        print(f"   Trades Executed: {trade_count}")
-        print(f"   Volume Traded: ${volume_traded:.0f}")
-        print(f"   Final Value: ${final_value:.2f}")
-        print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
-        print(f"\n🚫 REJECTION LOG:")
-        for reason, count in rejection_log.items():
-            if count > 0:
-                print(f"   {reason}: {count}")
-        self.tracker = tracker
-        return {
-            'final_value': final_value,
-            'total_return': (final_value / 10000.0) - 1.0,
-            'trades': trade_count,
-            'wins': wins,  
-            'losses': losses,  
-            'equity_curve': equity_curve,
-            'tracker_state': tracker
-        }
+                                    # Fallback for total market failure
+                                    if filled_cash == 0:
+                                        penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
+                                        penalty_price = max(0.01, min(penalty_price, 0.99))
+                                        if pos['side'] == 1: filled_cash = pos['shares'] * penalty_price
+                                        else: filled_cash = pos['shares'] * (1.0 - penalty_price)
+            
+                                    cash += filled_cash
+                                    if filled_cash > pos['size']: wins += 1
+                                    elif filled_cash < pos['size']: losses += 1
+                                    del positions[cid]
+                                  
+                        # Mark to Market (End of Minute)
+                        current_val = cash
+                        for cid, pos in positions.items():
+                            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                            val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
+                            current_val += val
+                        equity_curve.append(current_val)
+               
+                    final_value = cash
+                    for cid, pos in positions.items():
+                        last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                        val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
+                        final_value += val
+            
+                     # --- DIAGNOSTICS ---
+                    print(f"\n📊 PERIOD SUMMARY:")
+                    print(f"   Trades Executed: {trade_count}")
+                    print(f"   Volume Traded: ${volume_traded:.0f}")
+                    print(f"   Final Value: ${final_value:.2f}")
+                    print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
+                    print(f"\n🚫 REJECTION LOG:")
+                    for reason, count in rejection_log.items():
+                        if count > 0:
+                            print(f"   {reason}: {count}")
+                    self.tracker = tracker
+                    return {
+                        'final_value': final_value,
+                        'total_return': (final_value / 10000.0) - 1.0,
+                        'trades': trade_count,
+                        'wins': wins,  
+                        'losses': losses,  
+                        'equity_curve': equity_curve,
+                        'tracker_state': tracker
+                    }
                                        
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
