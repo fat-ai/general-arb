@@ -867,34 +867,33 @@ class FastBacktestEngine:
                         equity_curve.append(current_val)
 
         final_value = cash
-                    for cid, pos in positions.items():
-                        last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                        val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-                        final_value += val
+        for cid, pos in positions.items():
+            last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+            val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
+            final_value += val
             
+        self.tracker = tracker 
                      # --- DIAGNOSTICS ---
-                    print(f"\n📊 PERIOD SUMMARY:")
-                    print(f"   Trades Executed: {trade_count}")
-                    print(f"   Volume Traded: ${volume_traded:.0f}")
-                    print(f"   Final Value: ${final_value:.2f}")
-                    print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
-                    print(f"\n🚫 REJECTION LOG:")
-                    for reason, count in rejection_log.items():
-                        if count > 0:
-                            print(f"   {reason}: {count}")
-                    self.tracker = tracker
-                    return {
-                        'final_value': final_value,
-                        'total_return': (final_value / 10000.0) - 1.0,
-                        'trades': trade_count,
-                        'wins': wins,  
-                        'losses': losses,  
-                        'equity_curve': equity_curve,
-                        'tracker_state': tracker
-                    }
-                
-                    
-                                       
+        print(f"\n📊 PERIOD SUMMARY:")
+        print(f"   Trades Executed: {trade_count}")
+        print(f"   Volume Traded: ${volume_traded:.0f}")
+        print(f"   Final Value: ${final_value:.2f}")
+        print(f"   Return: {((final_value/10000.0)-1.0)*100:.2f}%")
+        print(f"\n🚫 REJECTION LOG:")
+        for reason, count in rejection_log.items():
+            if count > 0:
+                print(f"   {reason}: {count}")
+
+        return {
+            'final_value': final_value,
+            'total_return': (final_value / 10000.0) - 1.0,
+            'trades': trade_count,
+            'wins': wins,  
+            'losses': losses,  
+            'equity_curve': equity_curve,
+            'tracker_state': tracker
+         }
+                                                                   
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
         self.historical_data_path = historical_data_path
