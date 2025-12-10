@@ -624,6 +624,12 @@ class FastBacktestEngine:
                         tracker[cid]['history'].pop(0)
                     
                     vol = float(data.get('trade_volume', 0.0))
+                    last_ts = tracker[cid].get('last_update_ts', current_ts)
+                    elapsed_seconds = (current_ts - last_ts).total_seconds()
+                    decay_exponent = elapsed_seconds / 60.0
+                    time_decay_multiplier = config['decay_factor'] ** decay_exponent
+                    tracker[cid]['net_weight'] *= time_decay_multiplier
+                    tracker[cid]['last_update_ts'] = current_ts
                     
                     # Dynamic Liquidity Update
                     if abs(avg_exec_price - prev_p) > 0.005 and vol > 10.0:
@@ -644,40 +650,7 @@ class FastBacktestEngine:
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
                         
                         trade_direction = -1.0 if data.get('is_sell') else 1.0
-                        # [STEP A] Apply Time-Based Decay
-            # Calculate seconds since last update for this specific contract
-                        last_ts = tracker[cid].get('last_update_ts', current_ts)
-                        # --- DEBUG PRINTS ---
-                        print(f"DEBUG: CID={cid}")
-                        print(f"DEBUG: Current={current_ts}, Last={last_ts}")
-                        print(f"DEBUG: Keys in tracker={list(tracker[cid].keys())}")
-                        # --------------------
-                        elapsed_seconds = (current_ts - last_ts).total_seconds()
-            
-                        # Apply decay based on Minutes Elapsed
-                        # Formula: Weight_New = Weight_Old * (Decay_Factor ^ Minutes_Elapsed)
-                        decay_exponent = elapsed_seconds / 60.0
-                        time_decay_multiplier = config['decay_factor'] ** decay_exponent
-            
-                        tracker[cid]['net_weight'] *= time_decay_multiplier
-                        tracker[cid]['last_update_ts'] = current_ts  # Update timestamp immediately
-            
-                        # [STEP B] Accumulate & Sanitize
-                        # 1. Add new signal
-                        tracker[cid]['net_weight'] += (weight * trade_direction)
-            
-                        # 2. NaN/Infinity Check (Critical Safety)
-                        if not np.isfinite(tracker[cid]['net_weight']):
-                            # Log warning if logger is available, otherwise just reset
-                            # log.warning(f"NaN/Inf detected in {cid} weight. Resetting to 0.0.")
-                            tracker[cid]['net_weight'] = 0.0
-            
-                        # 3. Safety Clipping (Bounds Check)
-                        # Prevent weight from exceeding Cap * Threshold
-                        cap = config['splash_thresh'] * config['max_weight_cap']
-                        tracker[cid]['net_weight'] = np.clip(tracker[cid]['net_weight'], -cap, cap)
-            
-                        # [STEP C] Trigger Logic with Throttling
+        
                         raw_net = tracker[cid]['net_weight']
                         abs_net = abs(raw_net)
             
