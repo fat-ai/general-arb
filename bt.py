@@ -656,7 +656,7 @@ class FastBacktestEngine:
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
                         
                         trade_direction = -1.0 if data.get('is_sell') else 1.0
-        
+                        tracker[cid]['net_weight'] += (weight * trade_direction)
                         raw_net = tracker[cid]['net_weight']
                         abs_net = abs(raw_net)
             
@@ -864,12 +864,12 @@ class FastBacktestEngine:
                                     del positions[cid]
                                   
                         # Mark to Market (End of Minute)
-                    current_val = cash
-                    for cid, pos in positions.items():
-                        last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                        val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-                        current_val += val
-                    equity_curve.append(current_val)
+            current_val = cash
+            for cid, pos in positions.items():
+                last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
+                current_val += val
+            equity_curve.append(current_val)
 
         final_value = cash
         for cid, pos in positions.items():
