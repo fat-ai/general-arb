@@ -718,6 +718,9 @@ class FastBacktestEngine:
                                                         raw_hist = track_data.get('history', [0.5]*60)
                                                         hist_data = [1.0 - p for p in raw_hist] if m_inf.get('outcome_tag') == 'No' else raw_hist
                                                         
+                                                        if np.std(hist_data) < 0.0001:
+                                                          continue
+                                                            
                                                         if len(hist_data) < 10: continue
                                                         
                                                         # Current metrics
@@ -862,8 +865,8 @@ class FastBacktestEngine:
                             val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
                             current_val += val
                         equity_curve.append(current_val)
-               
-                    final_value = cash
+
+        final_value = cash
                     for cid, pos in positions.items():
                         last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
                         val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
@@ -889,6 +892,8 @@ class FastBacktestEngine:
                         'equity_curve': equity_curve,
                         'tracker_state': tracker
                     }
+                
+                    
                                        
 class BacktestEngine:
     def __init__(self, historical_data_path: str):
@@ -1629,7 +1634,7 @@ class BacktestEngine:
                         if rows:
                             with csv_lock:
                                 writer.writerows(rows)
-                                f_handle.flush()
+                              
                         
                         # Stop if we hit the time limit
                         if stop_signal: break
@@ -2016,16 +2021,24 @@ class BacktestEngine:
         t_price = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).tolist()
 
         # 4. Append to events
-        for i in range(len(trades)):
-            events_ts.append(t_ts[i])
-            events_type.append('PRICE_UPDATE')
-            events_data.append({
-                'contract_id': t_cid[i],
-                'p_market_all': t_price[i], # Aligned perfectly
-                'wallet_id': t_uid[i],
-                'trade_volume': float(t_vol[i]),
-                'is_sell': t_tokens[i] < 0
-            })
+        # 4. Append to events (Vectorized)
+        # Extend the timestamp list directly
+        events_ts.extend(t_ts)
+        
+        # Create the type list in one shot
+        events_type.extend(['PRICE_UPDATE'] * len(t_ts))
+        
+        # Use list comprehension for data dicts (Faster than loop append)
+        events_data.extend([
+            {
+                'contract_id': c,
+                'p_market_all': p,
+                'wallet_id': u,
+                'trade_volume': float(v),
+                'is_sell': tok < 0
+            }
+            for c, p, u, v, tok in zip(t_cid, t_price, t_uid, t_vol, t_tokens)
+        ])
 
         # 6. FINAL SORT
         df_ev = pd.DataFrame({
