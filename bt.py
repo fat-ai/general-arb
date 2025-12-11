@@ -1055,8 +1055,8 @@ class BacktestEngine:
 
             ),
             config=search_space,
-            resources_per_trial={"cpu": 7},
-            max_concurrent_trials=2,
+            resources_per_trial={"cpu": 15},
+            max_concurrent_trials=1,
             object_store_memory=10 * 1024 * 1024 * 1024,
             logging_level=logging.ERROR, 
             ignore_reinit_error=True, 
