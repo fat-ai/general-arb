@@ -1880,9 +1880,11 @@ class BacktestEngine:
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
         
         # 2. STRING NORMALIZATION
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
-        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower()
-        
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower().astype('category')
+        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower().astype('category')
+        if 'user' in trades.columns:
+            trades['user'] = trades['user'].astype(str).astype('category')
+            
         # 3. FILTER TO COMMON IDs
         common_ids_set = set(markets['contract_id']).intersection(set(trades['contract_id']))
         common_ids = sorted(list(common_ids_set))
@@ -2011,6 +2013,7 @@ class BacktestEngine:
         trades = trades[
             (trades['timestamp'] < trades['res_time']) | (trades['res_time'].isna())
         ].copy()
+        
         trades = trades.drop_duplicates(
             subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
@@ -2028,8 +2031,9 @@ class BacktestEngine:
         # We need the 'bet_price' logic from profiler data, but safe.
         # Since we just sorted 'trades', we can calculate price on the fly.
         t_price = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).tolist()
-
-        # 4. Append to events
+        
+        del trades
+        gc.collect()
         # 4. Append to events (Vectorized)
         # Extend the timestamp list directly
         events_ts.extend(t_ts)
@@ -2055,6 +2059,10 @@ class BacktestEngine:
             'event_type': events_type, 
             'data': events_data
         })
+        
+        del events_ts, events_type, events_data
+        gc.collect()
+        
         df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
         df_ev = df_ev.dropna(subset=['timestamp'])
         df_ev['cid_temp'] = df_ev['data'].apply(lambda x: str(x.get('contract_id', '')))
