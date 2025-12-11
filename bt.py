@@ -1054,7 +1054,6 @@ class BacktestEngine:
             ),
             config=search_space,
             resources_per_trial={"cpu": 4},
-            ignore_reinit_error=True, 
             include_dashboard=False,
             verbose=1 # Reduce log spam
         )
