@@ -928,7 +928,7 @@ class BacktestEngine:
                         }
                     })
                 },
-                
+                object_store_memory=100 * 1024 * 1024 * 1024,
                 logging_level=logging.ERROR, 
                 ignore_reinit_error=True, 
                 include_dashboard=False
@@ -1055,8 +1055,7 @@ class BacktestEngine:
 
             ),
             config=search_space,
-            resources_per_trial={"cpu": 15},
-            max_concurrent_trials=1,
+            resources_per_trial={"cpu": 4},
             object_store_memory=10 * 1024 * 1024 * 1024,
             logging_level=logging.ERROR, 
             ignore_reinit_error=True, 
