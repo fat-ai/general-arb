@@ -1055,7 +1055,11 @@ class BacktestEngine:
 
             ),
             config=search_space,
-            resources_per_trial={"cpu": 1},
+            resources_per_trial={"cpu": 7},
+            object_store_memory=10 * 1024 * 1024 * 1024,
+            logging_level=logging.ERROR, 
+            ignore_reinit_error=True, 
+            include_dashboard=False,
             verbose=1 # Reduce log spam
         )
     
