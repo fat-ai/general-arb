@@ -929,9 +929,7 @@ class BacktestEngine:
                     })
                 },
                 object_store_memory=100 * 1024 * 1024 * 1024,
-                logging_level=logging.ERROR, 
-                ignore_reinit_error=True, 
-                include_dashboard=False
+            
             )
             print(f"✅ Ray initialized. Heavy data will spill to: {self.spill_dir}")
             
