@@ -427,7 +427,7 @@ class FastBacktestEngine:
         equity_curve = [capital]
         all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
         embargo_days = 2
-        
+        global_tracker = {}
         while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_start = train_end + timedelta(days=embargo_days)
@@ -509,7 +509,7 @@ class FastBacktestEngine:
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
         
                                    
-    def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None):
+    def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, known_liquidity=None, previous_tracker=None):
 
         splash_thresh = config.get('splash_threshold', 100.0) 
         sizing_mode = config.get('sizing_mode', 'kelly')
