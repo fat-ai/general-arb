@@ -537,12 +537,11 @@ class FastBacktestEngine:
         ]
         
         if trade_events:
-            # FIX: Access keys directly on 'd' (which is the flattened event dict)
-            t_times = np.array([d.get('timestamp').timestamp() for d in trade_events], dtype=np.float64)
-            t_sides = np.array([(-1 if d.get('is_sell') else 1) for d in trade_events], dtype=np.int8)
-            t_vols = np.array([float(d.get('trade_volume', 0)) for d in trade_events], dtype=np.float64)
-            t_prices = np.array([float(d.get('p_market_all', 0)) for d in trade_events], dtype=np.float64)
-            t_cids = np.array([str(d.get('contract_id')) for d in trade_events])
+            t_times = np.array([e.get('timestamp').timestamp() for e in trade_events], dtype=np.float64)
+            t_sides = np.array([(-1 if e.get('is_sell') else 1) for e in trade_events], dtype=np.int8)
+            t_vols = np.array([float(e.get('trade_volume', 0)) for e in trade_events], dtype=np.float64)
+            t_prices = np.array([float(e.get('p_market_all', 0)) for e in trade_events], dtype=np.float64)
+            t_cids = np.array([str(e.get('contract_id')) for e in trade_events])
         else:
             t_times, t_sides, t_vols, t_prices, t_cids = np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
 
@@ -566,8 +565,8 @@ class FastBacktestEngine:
             for event in batch:
                 ev_type = event['event_type']
                 data = event['data']
-                cid = data.get('contract_id')
-                current_ts = data.get('timestamp')
+                cid = event.get('contract_id')
+                current_ts = event.get('timestamp')
 
                 if ev_type == 'NEW_CONTRACT':
                     tracker[cid] = {
