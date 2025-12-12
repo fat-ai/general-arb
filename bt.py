@@ -29,7 +29,7 @@ from filelock import FileLock
 from risk_engine import KellyOptimizer
 
 # Store optimal weights here so we don't re-optimize every tick
-target_weights_map = {} 
+
 last_optimization_time = 0
 OPTIMIZATION_INTERVAL = 3600  # Re-optimize every 1 hour (in seconds)
 REBALANCE_BUFFER = 0.05       # 5% buffer: Don't trade if weight change is < 5%
@@ -355,6 +355,7 @@ class FastBacktestEngine:
         self.profiler_data = profiler_data
         self.market_lifecycle = {}
         self.last_optimization_ts = 0.0
+        self.target_weights_map = {}
         
         if not event_log.empty:
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
@@ -475,7 +476,11 @@ class FastBacktestEngine:
                     if l is None or l == 0: l = 1.0
                     global_liq[row['contract_id']] = l
                     
-                result = self._run_single_period(batches, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end, known_liquidity=global_liq)
+                result = self._run_single_period(
+                    batches, fold_wallet_scores, config, fw_slope, fw_intercept, 
+                    start_time=train_end, known_liquidity=global_liq,
+                    previous_tracker=global_tracker 
+                )
                 global_tracker = result['tracker_state']
                 local_curve = result.get('equity_curve', [result['final_value']])
                 period_growth = [x / 10000.0 for x in local_curve]
@@ -522,7 +527,7 @@ class FastBacktestEngine:
         cash = 10000.0
         equity_curve = []
         positions = {}
-        tracker = {}
+        tracker = previous_tracker if previous_tracker is not None else {}
         market_liq = {}
         trade_count = 0
         volume_traded = 0.0
@@ -702,7 +707,7 @@ class FastBacktestEngine:
                                             token_p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
                                             edge = token_p_model - avg_exec_price
                                             
-                                        edge = calc_model - calc_price
+                         
             
                                         # Edge & Safety Checks
                                         if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
@@ -774,13 +779,13 @@ class FastBacktestEngine:
                                                             weights = optimizer.optimize_with_explicit_views(
                                                                 pd.Series(mus, index=valid_cids), cov, fraction=sizing_val, max_leverage=1.0
                                                             )
-                                                            target_weights_map = weights.to_dict()
-                                                            last_optimization_time = now_sec
+                                                            self.target_weights_map = weights.to_dict()
+                                                        
                                                         except Exception:
-                                                            target_weights_map = {}
+                                                            self.target_weights_map = {}
                                                 
                                                 # Read Target
-                                                ideal_weight = target_weights_map.get(cid, 0.0)
+                                                ideal_weight = self.target_weights_map.get(cid, 0.0)
                                                 pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
                                                 
                                                 if ideal_weight > 0.01:
