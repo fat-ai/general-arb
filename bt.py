@@ -354,6 +354,7 @@ class FastBacktestEngine:
         self.event_log = event_log
         self.profiler_data = profiler_data
         self.market_lifecycle = {}
+        self.last_optimization_ts = 0.0
         
         if not event_log.empty:
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
@@ -475,7 +476,7 @@ class FastBacktestEngine:
                     global_liq[row['contract_id']] = l
                     
                 result = self._run_single_period(batches, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end, known_liquidity=global_liq)
-                
+                global_tracker = result['tracker_state']
                 local_curve = result.get('equity_curve', [result['final_value']])
                 period_growth = [x / 10000.0 for x in local_curve]
                 scaled_curve = [capital * x for x in period_growth]
@@ -695,8 +696,11 @@ class FastBacktestEngine:
                                         calc_model = p_model
                                         
                                         if outcome_tag == 'No':
-                                            calc_price = 1.0 - avg_exec_price
-                                            calc_model = 1.0 - p_model
+                                            token_p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
+                                            edge = token_p_model - avg_exec_price
+                                        else:
+                                            token_p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
+                                            edge = token_p_model - avg_exec_price
                                             
                                         edge = calc_model - calc_price
             
@@ -710,8 +714,8 @@ class FastBacktestEngine:
                                             elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
                                             elif sizing_mode == 'kelly':
                                                 # Check if optimization is needed
-                                                now_sec = time.time()
-                                                if now_sec - last_optimization_time > OPTIMIZATION_INTERVAL:
+                                                sim_now = current_ts.timestamp()
+                                                if sim_now - self.last_optimization_ts > OPTIMIZATION_INTERVAL:
                                                     # 1. Build Expectations
                                                     active_set = list(positions.keys())
                                                     if cid not in active_set: active_set.append(cid)
@@ -741,8 +745,6 @@ class FastBacktestEngine:
                                                         # (Assuming positive net_weight = bullish on THIS token)
                                                         curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
                                                         
-                                                  
-                                                        
                                                         # ROI Calc
                                                         safe_price = max(curr_p, 0.001)
                                                         expected_roi = (curr_mod / safe_price) - 1.0
@@ -755,6 +757,8 @@ class FastBacktestEngine:
                                                         mus.append(ann_ret)
                                                         valid_cids.append(c_id)
                                                         price_series[c_id] = hist_data[-60:]
+
+                                                        self.last_optimization_ts = sim_now
             
                                                     # 2. Optimize
                                                     if valid_cids:
