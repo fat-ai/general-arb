@@ -94,19 +94,13 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     if profiler_data.empty: return {}
     valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
     
-    # Filter for sufficient volume
     counts = valid.groupby(['wallet_id', 'entity_type']).size()
     sufficient = counts[counts >= min_trades].index
     valid.set_index(['wallet_id', 'entity_type'], inplace=True)
-    filtered = valid.loc[valid.index.intersection(sufficient)].reset_index()
+    filtered = valid.loc[valid.index.intersection(sufficient)].reset_index() 
+
+    filtered['prediction'] = filtered['bet_price']
     
-    # === FIXED BRIER CALCULATION ===
-    # 1. Determine Prediction: 1.0 if Long (tokens > 0), 0.0 if Short (tokens < 0)
-    # This uses the 'tokens' column which correctly inherits the sign from the trade data
-    filtered['prediction'] = np.where(filtered['tokens'] > 0, 1.0, 0.0)
-    
-    # 2. Calculate Score: Distance between Prediction and Outcome
-    # (Prediction - Outcome)^2
     filtered['brier'] = (filtered['prediction'] - filtered['outcome']) ** 2
     
     scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
@@ -216,6 +210,7 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     Does NOT fail silently.
     """
     order_dir = "asc" if side == "Buy" else "desc"
+    outcome_index = "1" if outcome_tag == "Yes" else "0"
     
     query = """
     query ($market: String!, $block: Int!, $outcome: String!) {
@@ -231,7 +226,7 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     variables = {
         "market": market_id, 
         "block": int(block_number),
-        "outcome": outcome_tag
+        "outcome": outcome_index
     }
 
     # Configuration for Retries
@@ -641,26 +636,18 @@ class FastBacktestEngine:
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(event.get('outcome', 0))
-                        
-                        # 1. CALCULATE SETTLEMENT (Signed)
-                        # Long (+100 shares) * 1.0 = +100 Cash (Payout)
-                        # Short (-100 shares) * 1.0 = -100 Cash (Liability Paid)
-                        # Short (-100 shares) * 0.0 = 0 Cash (Liability Extinguished)
-                        final_settlement = pos['shares'] * outcome
-                        
-                        # 2. UPDATE CASH
-                        cash += final_settlement
-                        
-                        # 3. CALCULATE PNL (For Stats)
-                        # Long: Profit = Payout - Cost
+                        shares_abs = abs(pos['shares'])
                         if pos['side'] == 1:
-                            pnl = final_settlement - pos['size']
-                        # Short: Profit = Proceeds (size) + Liability Paid (Negative Settlement)
-                        # Example: Sold for $60 (size). Shares -100.
-                        # Case A (Lose): Outcome 1.0. Settlement -100. PNL = 60 + (-100) = -40.
-                        # Case B (Win): Outcome 0.0. Settlement 0. PNL = 60 + 0 = +60.
+                            payout = shares_abs * outcome
                         else:
-                            pnl = pos['size'] + final_settlement
+                            # Short position pays out if outcome is 0.0 (No)
+                            # You reclaim 1.0 collateral minus the outcome 
+                            payout = shares_abs * (1.0 - outcome)
+                        
+                        cash += payout
+                        
+                        # Recalculate PnL for stats (Payout - Cost Basis)
+                        pnl = payout - pos['cost_basis']
 
                         if pnl > 0: wins += 1
                         elif pnl < 0: losses += 1
@@ -868,7 +855,18 @@ class FastBacktestEngine:
                                                     # A. Record Position
                                                     # FIX: Use Signed Shares (+ for Buy, - for Sell)
                                                     final_shares = shares if side == 1 else -shares
-                                                    
+                                                    if side == 1:
+                                                        # Long: You pay cash equal to the fill amount
+                                                        trade_cost = filled_cash
+                                                        cash -= trade_cost
+                                                    else:
+                                                        # Short: You Lock Collateral (1.0) and Receive Proceeds (Price)
+                                                        # Net Cost = (Shares * 1.0) - Proceeds
+                                                        collateral_needed = abs(final_shares) * 1.0
+                                                        proceeds = filled_cash
+                                                        trade_cost = collateral_needed - proceeds
+                                                        cash -= trade_cost
+                                                        
                                                     positions[cid] = {
                                                         'side': side, 
                                                         'size': filled_cash,
@@ -946,13 +944,18 @@ class FastBacktestEngine:
                                         penalty_price = max(0.01, min(penalty_price, 0.99))
                                         filled_cash = shares_to_close * penalty_price
 
-                                    # FIX: CASH FLOW ON EXIT
-                                    # If Buying to Close (Exit Side 1): Pay Cash (-)
-                                    # If Selling to Close (Exit Side -1): Receive Cash (+)
                                     if exit_side == 1:
-                                        cash -= filled_cash
+                                        # We were Short (Side -1), now Buying back (Side 1)
+                                        # We pay cash to buy back, but we UNLOCK our $1.00 collateral
+                                        cost_to_close = filled_cash
+                                        collateral_unlocked = shares_to_close * 1.0
+                                        net_cash_change = collateral_unlocked - cost_to_close
+                                        cash += net_cash_change
                                     else:
-                                        cash += filled_cash
+                                        # We were Long (Side 1), now Selling (Side -1)
+                                        # We simply receive the cash proceeds
+                                        net_cash_change = filled_cash
+                                        cash += net_cash_change
 
                                     # PNL Calculation (for stats only)
                                     # Entry Cost was pos['size']. 
