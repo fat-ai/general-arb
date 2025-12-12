@@ -440,9 +440,9 @@ class FastBacktestEngine:
             outcome_map = {}
             res_time_map = {}
             for ts, row in valid_res.iterrows():
-                cid = row['data']['contract_id']
+                cid = row['contract_id']
                 resolved_ids.add(cid)
-                outcome_map[cid] = float(row['data']['outcome'])
+                outcome_map[cid] = float(row['outcome'])
                 res_time_map[cid] = ts
             
             train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
@@ -470,9 +470,9 @@ class FastBacktestEngine:
                 init_events = past_events[past_events['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
                 global_liq = {}
                 for _, row in init_events.iterrows():
-                    l = row['data'].get('liquidity')
+                    l = row.get('liquidity')
                     if l is None or l == 0: l = 1.0
-                    global_liq[row['data']['contract_id']] = l
+                    global_liq[row['contract_id']] = l
                     
                 result = self._run_single_period(batches, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end, known_liquidity=global_liq)
                 
