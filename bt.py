@@ -869,7 +869,8 @@ class FastBacktestEngine:
                                                         
                                                     positions[cid] = {
                                                         'side': side, 
-                                                        'size': filled_cash,
+                                                        'cost_basis': trade_cost, 
+                                                        'size': filled_cash,       
                                                         'shares': final_shares, 
                                                         'entry': avg_p, 
                                                         'entry_signal': raw_net
@@ -943,7 +944,7 @@ class FastBacktestEngine:
                                         penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
                                         penalty_price = max(0.01, min(penalty_price, 0.99))
                                         filled_cash = shares_to_close * penalty_price
-
+                                
                                     if exit_side == 1:
                                         # We were Short (Side -1), now Buying back (Side 1)
                                         # We pay cash to buy back, but we UNLOCK our $1.00 collateral
@@ -956,7 +957,7 @@ class FastBacktestEngine:
                                         # We simply receive the cash proceeds
                                         net_cash_change = filled_cash
                                         cash += net_cash_change
-
+                                
                                     # PNL Calculation (for stats only)
                                     # Entry Cost was pos['size']. 
                                     # If Long: Profit = Exit - Entry
@@ -968,17 +969,14 @@ class FastBacktestEngine:
                                     
                                     del positions[cid]
             
-                                    if filled_cash > pos['size']: wins += 1
-                                    elif filled_cash < pos['size']: losses += 1
+                        
                                     
                         
             current_val = cash
             for cid, pos in positions.items():
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                # FIX: Value = Signed Shares * Price
-                # Long: +100 * 0.60 = +60 Asset
-                # Short: -100 * 0.60 = -60 Liability
-                current_val += (pos['shares'] * last_p)
+                collateral_adjust = max(0, -pos['shares']) * 1.0
+                final_value += (pos['shares'] * last_p) + collateral_adjust
             
             equity_curve.append(current_val)
 
