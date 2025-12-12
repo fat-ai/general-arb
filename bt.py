@@ -676,10 +676,18 @@ class FastBacktestEngine:
                     
                     # 1. State Update
                     if cid not in market_liq: 
-                        init_liq = known_liquidity.get(cid, 0.0)
+                        # FIX: Cast to float to handle string data types
+                        raw_liq = known_liquidity.get(cid, 0.0) if known_liquidity else 0.0
+                        try:
+                            init_liq = float(raw_liq)
+                        except (ValueError, TypeError):
+                            init_liq = 0.0
+
                         if init_liq < 5000.0 and vol < 1000.0:
                             continue
-                        market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
+                        
+                        # Store as float for downstream math
+                        market_liq[cid] = init_liq if init_liq > 0 else 1.0
                     
                     if cid not in tracker: 
                         tracker[cid] = {
