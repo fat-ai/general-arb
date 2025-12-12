@@ -1154,8 +1154,7 @@ class BacktestEngine:
             ),
             config=search_space,
             resources_per_trial={"cpu": 4},
-            include_dashboard=False,
-            verbose=1 # Reduce log spam
+
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
