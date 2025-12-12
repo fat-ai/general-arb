@@ -358,18 +358,25 @@ class FastBacktestEngine:
         if not event_log.empty:
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
             for ts, row in new_contracts.iterrows():
-                data = row['data']
-                cid = data.get('contract_id')
+          
+                cid = row.get('contract_id')
                 if cid:
-                    scheduled_end = data.get('end_date')
-                    if not scheduled_end or pd.isna(scheduled_end):
-                        scheduled_end = pd.Timestamp.max
-                    self.market_lifecycle[cid] = {'start': ts, 'end': scheduled_end, 'liquidity': data.get('liquidity', 1.0),'condition_id': data.get('condition_id'), 'outcome_tag': data.get('token_outcome_label', 'Yes')}
+                    scheduled_end = row.get('end_date')
+                    if pd.isna(scheduled_end): scheduled_end = pd.Timestamp.max
+                    
+                    self.market_lifecycle[cid] = {
+                        'start': ts, 
+                        'end': scheduled_end, 
+                        'liquidity': row.get('liquidity', 1.0),
+                        'condition_id': row.get('condition_id'),
+                        'outcome_tag': row.get('token_outcome_label', 'Yes')
+                    }
             
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
             for ts, row in resolutions.iterrows():
-                cid = row['data'].get('contract_id')
-                if cid in self.market_lifecycle: self.market_lifecycle[cid]['end'] = ts
+                cid = row.get('contract_id')
+                if cid in self.market_lifecycle: 
+                    self.market_lifecycle[cid]['end'] = ts
 
         else:
             pass
@@ -525,11 +532,12 @@ class FastBacktestEngine:
 
         # --- PRE-CALCULATION START ---
         trade_events = [
-            e['data'] for b in batches for e in b 
-            if e['event_type'] == 'PRICE_UPDATE' and e['data'].get('timestamp') is not None
+            e for b in batches for e in b 
+            if e['event_type'] == 'PRICE_UPDATE' and e.get('timestamp') is not None
         ]
         
         if trade_events:
+            # FIX: Access keys directly on 'd' (which is the flattened event dict)
             t_times = np.array([d.get('timestamp').timestamp() for d in trade_events], dtype=np.float64)
             t_sides = np.array([(-1 if d.get('is_sell') else 1) for d in trade_events], dtype=np.int8)
             t_vols = np.array([float(d.get('trade_volume', 0)) for d in trade_events], dtype=np.float64)
