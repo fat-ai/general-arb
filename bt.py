@@ -89,31 +89,6 @@ def plot_performance(equity_curve, trades_count):
 
 # --- HELPERS ---
 
-@njit
-def fast_kelly_objective(F, M, Q, I_k):
-    k = I_k.shape[0]
-    n = len(M)
-    Q_safe = np.empty_like(Q)
-    for i in range(n):
-        Q_safe[i] = max(1e-9, min(Q[i], 1.0 - 1e-9))
-    
-    total_log_wealth = 0.0
-    for i in range(k):
-        port_return = 0.0
-        for j in range(n):
-            f_val = F[j]
-            if f_val == 0: continue
-            outcome = I_k[i, j]
-            q_val = Q_safe[j]
-            if f_val > 0:  
-                gains = (outcome - q_val) / q_val
-            else: 
-                gains = (q_val - outcome) / (1.0 - q_val)
-            port_return += f_val * gains
-        W = 1.0 + port_return
-        if W <= 1e-9: return 1e9 
-        total_log_wealth += np.log(W)
-    return -total_log_wealth / k
 
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
     if profiler_data.empty: return {}
@@ -141,31 +116,49 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 def persistent_disk_cache(func):
     """
     Thread-safe and Process-safe disk cache using FileLock.
-    Ensures multiple Ray workers don't corrupt the cache.
+    Uses ATOMIC WRITES (temp -> rename) to ensure Ray workers never 
+    read partial/corrupt files if a process crashes mid-write.
     """
     def wrapper(*args, **kwargs):
+        # 1. Generate unique key
         key_str = f"{func.__name__}:{args}:{kwargs}"
         key_hash = hashlib.md5(key_str.encode('utf-8', errors='ignore')).hexdigest()
         
         file_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
         lock_path = DISK_CACHE_DIR / f"{key_hash}.lock"
 
-        # Critical Section: Lock before check/write
+        # Critical Section: Lock ensures only one worker generates/writes at a time
         with FileLock(str(lock_path)):
             if file_path.exists():
                 try:
                     with open(file_path, 'rb') as f:
                         return pickle.load(f)
-                except Exception:
-                    pass # Ignore corrupt, re-fetch
+                except (EOFError, pickle.UnpicklingError, Exception) as e:
+                    # FIX 1: Auto-delete corrupt files so we don't crash repeatedly
+                    log.warning(f"⚠️ Corrupt cache found ({file_path.name}). Deleting and re-computing...")
+                    try: os.remove(file_path)
+                    except: pass
 
+            # Compute result
             result = func(*args, **kwargs)
 
+            # FIX 2: Atomic Write Pattern
+            # Write to a temp file first. If this crashes, the real cache file is untouched.
+            temp_path = file_path.with_suffix(f".tmp.{os.getpid()}")
             try:
-                with open(file_path, 'wb') as f:
+                with open(temp_path, 'wb') as f:
                     pickle.dump(result, f)
-            except Exception:
-                pass
+                    f.flush()            # Flush internal buffer
+                    os.fsync(f.fileno()) # Force write to physical disk
+                
+                # Atomic Move: This is instant and safe
+                os.replace(temp_path, file_path)
+                
+            except Exception as e:
+                log.warning(f"Cache write failed: {e}")
+                try: os.remove(temp_path)
+                except: pass
+                
             return result
     return wrapper
 
@@ -181,35 +174,37 @@ BLOCK_ENDPOINTS = [
 def fetch_block_by_timestamp(timestamp_sec: int):
     """
     Finds the exact Polygon block number for a timestamp.
-    Tries DefiLlama first (Reliable), then falls back to Graph subgraphs.
+    Raises RuntimeError if fails, ensuring we don't simulate with missing data.
     """
-    # Strategy A: DefiLlama (Fastest & Most Reliable)
+    # 1. DefiLlama (Fastest)
     try:
         url = LLAMA_BLOCK_URL.format(int(timestamp_sec))
-        resp = requests.get(url, timeout=3)
+        resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            if 'height' in data:
-                return int(data['height'])
-    except:
+            if 'height' in data: return int(data['height'])
+    except Exception:
         pass 
         
-    # Strategy B: Subgraph Fallbacks
+    # 2. Subgraph Fallbacks (with Retries)
     query = "query ($ts: BigInt!) { blocks(first: 1, orderBy: timestamp, orderDirection: desc, where: { timestamp_lte: $ts }) { number } }"
     variables = {"ts": int(timestamp_sec)}
     
-    for url in BLOCK_ENDPOINTS:
-        try:
-            resp = requests.post(url, json={'query': query, 'variables': variables}, timeout=3)
-            if resp.status_code != 200: continue
-            data = resp.json()
-            if 'errors' in data: continue
-            blocks = data.get('data', {}).get('blocks', [])
-            if blocks:
-                return int(blocks[0]['number'])
-        except:
-            continue
-    return None
+    for attempt in range(3): # Retry logic
+        for url in BLOCK_ENDPOINTS:
+            try:
+                resp = requests.post(url, json={'query': query, 'variables': variables}, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if 'errors' not in data:
+                        blocks = data.get('data', {}).get('blocks', [])
+                        if blocks: return int(blocks[0]['number'])
+            except:
+                continue
+        time.sleep(1) # Backoff between major attempts
+
+    # FIX: Raise error instead of returning None
+    raise RuntimeError(f"Could not fetch block for timestamp {timestamp_sec}")
 
 # 2. ORDER BOOK SNAPSHOT
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
@@ -645,14 +640,8 @@ class FastBacktestEngine:
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(event.get('outcome', 0))
-                        payout = 0.0
-                        if outcome == 0.5: 
-                            payout = pos['shares'] * 0.50
-                        else:
-                            is_win = (pos['side'] == 1 and outcome == 1.0) or (pos['side'] == -1 and outcome == 0.0)
-                            if is_win: payout = pos['shares']
-                        
-                        cash += payout
+                        final_settlement = pos['shares'] * outcome
+                        cash += final_settlement
                         
                         if payout > pos['size']: wins += 1
                         elif payout < pos['size']: losses += 1
@@ -782,8 +771,7 @@ class FastBacktestEngine:
                                                         
                                                         # Get History
                                                         track_data = tracker.get(c_id, {})
-                                                        raw_hist = track_data.get('history', [0.5]*60)
-                                                        hist_data = [1.0 - p for p in raw_hist] if m_inf.get('outcome_tag') == 'No' else raw_hist
+                                                        hist_data = track_data.get('history', [0.5]*60)
                                                         
                                                         if np.std(hist_data) < 0.0001:
                                                           continue
@@ -858,14 +846,21 @@ class FastBacktestEngine:
             
                                                 if filled_cash > 0:
                                                     # A. Record Position
+                                                    final_shares = shares if side == 1 else -shares
+                                                    
                                                     positions[cid] = {
                                                         'side': side, 
                                                         'size': filled_cash,
-                                                        'shares': shares, 
+                                                        'shares': final_shares, 
                                                         'entry': avg_p, 
                                                         'entry_signal': raw_net
                                                     }
-                                                    cash -= filled_cash
+                                                    
+                                                    if side == 1:
+                                                        cash -= filled_cash
+                                                    else:
+                                                        cash += filled_cash
+                                                        
                                                     trade_count += 1
                                                     volume_traded += filled_cash
                                                     
@@ -905,6 +900,7 @@ class FastBacktestEngine:
                                 
                                 if should_close:
                                     exit_side = -1 if pos['side'] == 1 else 1
+                                    shares_to_close = abs(pos['shares'])
                                     target_exit_cash = pos['shares'] * curr_p 
                                     market_info = self.market_lifecycle.get(cid)
                                     cond_id = market_info.get('condition_id') if market_info else None
@@ -914,15 +910,21 @@ class FastBacktestEngine:
                                         cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
                                         cid_indices, t_times, t_sides, t_vols, t_prices
                                     )
-                                    
+
                                     # Fallback for total market failure
                                     if filled_cash == 0:
                                         penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
                                         penalty_price = max(0.01, min(penalty_price, 0.99))
                                         if pos['side'] == 1: filled_cash = pos['shares'] * penalty_price
                                         else: filled_cash = pos['shares'] * (1.0 - penalty_price)
+
+                                    if exit_side == 1: # Buying to close (Short Cover)
+                                        cash -= filled_cash
+                                    else:              # Selling to close (Long Liquidation)
+                                        cash += filled_cash
+                                
+                                    del positions[cid]
             
-                                    cash += filled_cash
                                     if filled_cash > pos['size']: wins += 1
                                     elif filled_cash < pos['size']: losses += 1
                                     del positions[cid]
@@ -986,8 +988,6 @@ class BacktestEngine:
                         }
                     })
                 },
-                object_store_memory=100 * 1024 * 1024 * 1024,
-            
             )
             print(f"✅ Ray initialized. Heavy data will spill to: {self.spill_dir}")
             
@@ -1606,7 +1606,7 @@ class BacktestEngine:
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
-            if 'e+' in token_str or '.' in token_str: return False
+            if not token_str.isdigit(): return False
             last_ts = 2147483647 # Int32 Max
             
             while True:
@@ -1932,9 +1932,12 @@ class BacktestEngine:
         log.info("Transforming Data (Robust Mode)...")
         
         # 1. TIME NORMALIZATION
-        markets['created_at'] = pd.to_datetime(markets['created_at'], errors='coerce').dt.tz_localize(None)
-        markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], errors='coerce').dt.tz_localize(None)
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
+        def to_utc_naive(series):
+            return pd.to_datetime(series, errors='coerce', utc=True).dt.tz_localize(None)
+
+        markets['created_at'] = to_utc_naive(markets['created_at'])
+        markets['resolution_timestamp'] = to_utc_naive(markets['resolution_timestamp'])
+        trades['timestamp'] = to_utc_naive(trades['timestamp'])
         
         # 2. STRING NORMALIZATION
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower().astype('category')
@@ -1983,7 +1986,10 @@ class BacktestEngine:
         
         # 3. CRITICAL: Filter "Post-Mortem" Trades
         # Drop trades that happened AFTER the market resolved
-        prof_data = prof_data[prof_data['timestamp'] < prof_data['res_time']]
+        prof_data = prof_data[
+            (prof_data['timestamp'] < prof_data['res_time']) | 
+            (prof_data['res_time'].isna())
+        ]
         
         prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
         matched_mask = prof_data['outcome'].isin([0.0, 1.0])
