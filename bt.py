@@ -217,12 +217,11 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/poly
 @persistent_disk_cache
 def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcome_tag: str = "Yes"):
     """
-    Fetches historical Order Book from The Graph.
-    NOW SUPPORTS "NO" TOKENS explicitly.
+    Fetches historical Order Book from The Graph with robust retry logic.
+    Does NOT fail silently.
     """
     order_dir = "asc" if side == "Buy" else "desc"
     
-    # FIX: Replaced hardcoded "Yes" with variable $outcome
     query = """
     query ($market: String!, $block: Int!, $outcome: String!) {
       market(id: $market, block: {number: $block}) {
@@ -237,17 +236,67 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     variables = {
         "market": market_id, 
         "block": int(block_number),
-        "outcome": outcome_tag  # Pass "Yes" or "No"
+        "outcome": outcome_tag
     }
+
+    # Configuration for Retries
+    MAX_RETRIES = 5
+    BASE_DELAY = 1.0 # Seconds
     
-    try:
-        resp = requests.post(ORDERBOOK_SUBGRAPH_URL, json={'query': query, 'variables': variables}, timeout=4)
-        data = resp.json()
-        if 'errors' in data: return []
-        market_data = data.get('data', {}).get('market')
-        if not market_data: return []
-        return market_data.get('priceLevels', [])
-    except: return []
+    for attempt in range(MAX_RETRIES):
+        try:
+            # We create a fresh session or use a global one, but explicit headers help
+            resp = requests.post(
+                ORDERBOOK_SUBGRAPH_URL, 
+                json={'query': query, 'variables': variables}, 
+                timeout=10, # Increased timeout for heavy subgraph load
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'errors' in data:
+                    # Graph errors are often transient sync issues; treat as retryable
+                    # unless it's a syntax error (unlikely here).
+                    log.warning(f"Subgraph GraphQLError: {data['errors'][0].get('message')}")
+                    time.sleep(BASE_DELAY * (2 ** attempt))
+                    continue
+                    
+                market_data = data.get('data', {}).get('market')
+                if not market_data: 
+                    return [] # Valid empty state (Market didn't exist at block)
+                return market_data.get('priceLevels', [])
+
+            elif resp.status_code == 429:
+                # Rate Limit: Aggressive Backoff
+                sleep_time = BASE_DELAY * (2 ** attempt) + np.random.uniform(0, 1)
+                log.warning(f"Rate Limit (429) fetching liquidity. Sleeping {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+                continue
+                
+            elif 500 <= resp.status_code < 600:
+                # Server Error: Standard Backoff
+                time.sleep(BASE_DELAY * (2 ** attempt))
+                continue
+            
+            else:
+                # 4xx Errors (Client) -> Likely invalid ID or Query. 
+                # Log and return empty (safe) or raise. 
+                log.error(f"Client Error {resp.status_code} fetching liquidity.")
+                return []
+
+        except requests.exceptions.RequestException as e:
+            # Network/Timeout errors
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(BASE_DELAY * (2 ** attempt))
+                continue
+            else:
+                # FAIL LOUDLY: Do not return empty list if network is down.
+                # This ensures we don't simulate "0 liquidity" due to WiFi drop.
+                raise RuntimeError(f"Failed to fetch liquidity after {MAX_RETRIES} attempts: {e}")
+                
+    # If loop finishes without success
+    raise RuntimeError(f"Exhausted retries fetching liquidity for {market_id}")
 
 # 3. TIER 1: TRADE LOG MATCHING
 @njit
@@ -1557,14 +1606,12 @@ class BacktestEngine:
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
-            
             if 'e+' in token_str or '.' in token_str: return False
-
             last_ts = 2147483647 # Int32 Max
             
             while True:
                 try:
-                    # DUAL QUERY
+                    # DUAL QUERY: Fetches trades where the token was either the Maker Asset or Taker Asset
                     query = """
                     query($token: String!, $max_ts: Int!) {
                       asMaker: orderFilledEvents(
@@ -1596,6 +1643,7 @@ class BacktestEngine:
                         batch_maker = r_json.get('data', {}).get('asMaker', [])
                         batch_taker = r_json.get('data', {}).get('asTaker', [])
                         
+                        # Tag them explicitly to identify flow source
                         tagged_rows = [(r, 'maker') for r in batch_maker] + [(r, 'taker') for r in batch_taker]
                         if not tagged_rows: break 
                         
@@ -1609,23 +1657,30 @@ class BacktestEngine:
                             ts_val = float(row['timestamp'])
                             min_batch_ts = min(min_batch_ts, ts_val)
                             
-                            # --- STRICT DATE CHECK ---
                             if ts_val < CUTOFF_TS:
                                 stop_signal = True
                                 continue
-                            # -------------------------
                             
                             try:
+                                # LOGIC FIX: Explicitly derive Side from Asset Flow
+                                # ------------------------------------------------
+                                # CASE A: source == 'maker' -> Query filtered by `makerAssetId == token`
+                                # The Maker provided the Token (Sold). The Taker provided USDC (Bought).
+                                # ACTION: Taker BUY.
                                 if source == 'maker':
-                                    size = float(row.get('makerAmountFilled') or 0.0)
-                                    usdc = float(row.get('takerAmountFilled') or 0.0)
-                                    user = str(row.get('taker') or 'unknown')
-                                    side_mult = 1
+                                    size = float(row.get('makerAmountFilled') or 0.0) # Token Amount
+                                    usdc = float(row.get('takerAmountFilled') or 0.0) # USDC Amount
+                                    user = str(row.get('taker') or 'unknown')         # The Aggressor
+                                    side_mult = 1  # POSITIVE = Buy (Adding to Position)
+                                    
+                                # CASE B: source == 'taker' -> Query filtered by `takerAssetId == token`
+                                # The Taker provided the Token (Sold). The Maker provided USDC (Bought).
+                                # ACTION: Taker SELL.
                                 else:
-                                    size = float(row.get('takerAmountFilled') or 0.0)
-                                    usdc = float(row.get('makerAmountFilled') or 0.0)
-                                    user = str(row.get('taker') or 'unknown')
-                                    side_mult = -1
+                                    size = float(row.get('takerAmountFilled') or 0.0) # Token Amount
+                                    usdc = float(row.get('makerAmountFilled') or 0.0) # USDC Amount
+                                    user = str(row.get('taker') or 'unknown')         # The Aggressor
+                                    side_mult = -1 # NEGATIVE = Sell (Reducing Position)
                                 
                                 if size == 0: continue
                                 price = usdc / size
@@ -1634,7 +1689,8 @@ class BacktestEngine:
                                 rows.append({
                                     'timestamp': ts_str,
                                     'tradeAmount': usdc,
-                                    'outcomeTokensAmount': size * side_mult * 1e18,
+                                    # side_mult ensures this is Positive for Buys, Negative for Sells.
+                                    'outcomeTokensAmount': size * side_mult * 1e18, 
                                     'user': user,
                                     'contract_id': token_str,
                                     'price': price,
@@ -1646,21 +1702,19 @@ class BacktestEngine:
                         if rows:
                             with csv_lock:
                                 writer.writerows(rows)
-                              
                         
-                        # Stop if we hit the time limit
                         if stop_signal: break
                         
                         if int(min_batch_ts) >= int(last_ts): last_ts = int(min_batch_ts) - 1
                         else: last_ts = min_batch_ts
                         
-                        # Stop if we went past cutoff
                         if min_batch_ts < CUTOFF_TS: break
                         
                     else:
+                        # Basic backoff for non-200 responses inside the loop
                         time.sleep(2)
                         continue
-
+        
                 except Exception:
                     break 
             
