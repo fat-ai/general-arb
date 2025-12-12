@@ -275,10 +275,11 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
                 continue
             
             else:
-                # 4xx Errors (Client) -> Likely invalid ID or Query. 
-                # Log and return empty (safe) or raise. 
-                log.error(f"Client Error {resp.status_code} fetching liquidity.")
-                return []
+                # FIX: Fail loudly on Client Errors (400/404) to prevent simulating 
+                # "Zero Liquidity" for invalid Market IDs.
+                msg = f"Client Error {resp.status_code} fetching liquidity for {market_id}"
+                log.error(msg)
+                raise ValueError(msg)
 
         except requests.exceptions.RequestException as e:
             # Network/Timeout errors
@@ -640,14 +641,32 @@ class FastBacktestEngine:
                     if cid in positions:
                         pos = positions[cid]
                         outcome = float(event.get('outcome', 0))
+                        
+                        # 1. CALCULATE SETTLEMENT (Signed)
+                        # Long (+100 shares) * 1.0 = +100 Cash (Payout)
+                        # Short (-100 shares) * 1.0 = -100 Cash (Liability Paid)
+                        # Short (-100 shares) * 0.0 = 0 Cash (Liability Extinguished)
                         final_settlement = pos['shares'] * outcome
+                        
+                        # 2. UPDATE CASH
                         cash += final_settlement
                         
-                        if payout > pos['size']: wins += 1
-                        elif payout < pos['size']: losses += 1
+                        # 3. CALCULATE PNL (For Stats)
+                        # Long: Profit = Payout - Cost
+                        if pos['side'] == 1:
+                            pnl = final_settlement - pos['size']
+                        # Short: Profit = Proceeds (size) + Liability Paid (Negative Settlement)
+                        # Example: Sold for $60 (size). Shares -100.
+                        # Case A (Lose): Outcome 1.0. Settlement -100. PNL = 60 + (-100) = -40.
+                        # Case B (Win): Outcome 0.0. Settlement 0. PNL = 60 + 0 = +60.
+                        else:
+                            pnl = pos['size'] + final_settlement
+
+                        if pnl > 0: wins += 1
+                        elif pnl < 0: losses += 1
 
                         del positions[cid]
-
+                        
                 elif ev_type == 'PRICE_UPDATE':
                    
                     if current_ts is None:
@@ -771,6 +790,7 @@ class FastBacktestEngine:
                                                         
                                                         # Get History
                                                         track_data = tracker.get(c_id, {})
+                                               
                                                         hist_data = track_data.get('history', [0.5]*60)
                                                         
                                                         if np.std(hist_data) < 0.0001:
@@ -846,6 +866,7 @@ class FastBacktestEngine:
             
                                                 if filled_cash > 0:
                                                     # A. Record Position
+                                                    # FIX: Use Signed Shares (+ for Buy, - for Sell)
                                                     final_shares = shares if side == 1 else -shares
                                                     
                                                     positions[cid] = {
@@ -856,18 +877,21 @@ class FastBacktestEngine:
                                                         'entry_signal': raw_net
                                                     }
                                                     
+                                                    # FIX: CASH FLOW
+                                                    # If Buying (1): Pay Cash (-)
+                                                    # If Selling (-1): Receive Cash (+)
                                                     if side == 1:
                                                         cash -= filled_cash
                                                     else:
                                                         cash += filled_cash
-                                                        
+            
                                                     trade_count += 1
                                                     volume_traded += filled_cash
                                                     
                                                     # B. Update Throttle
                                                     tracker[cid]['last_trigger_ts'] = current_minute
             
-                                                    # C. Soft Reset (Preserve Momentum)
+                                                    # C. Soft Reset
                                                     if raw_net > 0:
                                                         tracker[cid]['net_weight'] -= config['splash_threshold']
                                                     else:
@@ -900,8 +924,12 @@ class FastBacktestEngine:
                                 
                                 if should_close:
                                     exit_side = -1 if pos['side'] == 1 else 1
+                                    
+                                    # FIX: Calculate Target Cash based on absolute shares
+                                    # (Execution expects positive cash/shares request)
                                     shares_to_close = abs(pos['shares'])
-                                    target_exit_cash = pos['shares'] * curr_p 
+                                    target_exit_cash = shares_to_close * curr_p 
+                                    
                                     market_info = self.market_lifecycle.get(cid)
                                     cond_id = market_info.get('condition_id') if market_info else None
                                     out_tag = market_info.get('outcome_tag', 'Yes') if market_info else 'Yes'
@@ -910,38 +938,51 @@ class FastBacktestEngine:
                                         cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
                                         cid_indices, t_times, t_sides, t_vols, t_prices
                                     )
-
+                                    
                                     # Fallback for total market failure
                                     if filled_cash == 0:
+                                        # (Keep existing penalty logic, but apply to cash flow correctly below)
                                         penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
                                         penalty_price = max(0.01, min(penalty_price, 0.99))
-                                        if pos['side'] == 1: filled_cash = pos['shares'] * penalty_price
-                                        else: filled_cash = pos['shares'] * (1.0 - penalty_price)
+                                        filled_cash = shares_to_close * penalty_price
 
-                                    if exit_side == 1: # Buying to close (Short Cover)
+                                    # FIX: CASH FLOW ON EXIT
+                                    # If Buying to Close (Exit Side 1): Pay Cash (-)
+                                    # If Selling to Close (Exit Side -1): Receive Cash (+)
+                                    if exit_side == 1:
                                         cash -= filled_cash
-                                    else:              # Selling to close (Long Liquidation)
+                                    else:
                                         cash += filled_cash
-                                
+
+                                    # PNL Calculation (for stats only)
+                                    # Entry Cost was pos['size']. 
+                                    # If Long: Profit = Exit - Entry
+                                    # If Short: Profit = Entry - Exit
+                                    pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
+                                    
+                                    if pnl > 0: wins += 1
+                                    elif pnl < 0: losses += 1
+                                    
                                     del positions[cid]
             
                                     if filled_cash > pos['size']: wins += 1
                                     elif filled_cash < pos['size']: losses += 1
-                                    del positions[cid]
-                                  
-                        # Mark to Market (End of Minute)
+                                    
+                        
             current_val = cash
             for cid, pos in positions.items():
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-                current_val += val
+                # FIX: Value = Signed Shares * Price
+                # Long: +100 * 0.60 = +60 Asset
+                # Short: -100 * 0.60 = -60 Liability
+                current_val += (pos['shares'] * last_p)
+            
             equity_curve.append(current_val)
 
         final_value = cash
         for cid, pos in positions.items():
             last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-            val = pos['shares'] * last_p if pos['side'] == 1 else pos['shares'] * (1.0 - last_p)
-            final_value += val
+            final_value += (pos['shares'] * last_p)
             
         self.tracker = tracker 
                      # --- DIAGNOSTICS ---
@@ -1531,16 +1572,14 @@ class BacktestEngine:
                     last_trade = data[-1]
                     
                     # Gamma uses 'timestamp' (seconds) or 'time' (iso string)
-                    ts_val = last_trade.get('timestamp')
-                    trade_ts = None
-                    
-                    if isinstance(ts_val, (int, float)):
-                        trade_ts = float(ts_val)
-                    elif last_trade.get('time'):
-                        try:
-                            # Quick ISO parse
-                            trade_ts = pd.to_datetime(last_trade['time']).timestamp()
-                        except: pass
+                    try:
+                        val = last_trade.get('timestamp') or last_trade.get('time')
+                        if val is None:
+                            trade_ts = float('inf')
+                        else:
+                            trade_ts = pd.to_datetime(val).timestamp()
+                    except Exception:
+                        trade_ts = float('inf')
                     
                     # If we found a valid timestamp and it's older than cutoff, STOP.
                     if trade_ts and trade_ts < cutoff_ts:
@@ -1722,17 +1761,36 @@ class BacktestEngine:
                 with open(ledger_file, "a") as lf: lf.write(f"{token_str}\n")
             return True
 
-        with open(cache_file, mode=write_mode, newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-            # Only write header if we are starting a NEW file
-            if write_mode == 'w': writer.writeheader()
+        is_resume = cache_file.exists()
+        if is_resume:
+            target_path = cache_file
+            mode = 'a'
+        else:
+            target_path = cache_file.with_suffix(f".tmp.{os.getpid()}")
+            mode = 'w'
+
+        try:
+            with open(target_path, mode=mode, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+                if mode == 'w': writer.writeheader()
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(fetch_and_write_worker, mid, writer, f) for mid in all_tokens]
+                    completed = 0
+                    for _ in concurrent.futures.as_completed(futures):
+                        completed += 1
+                        if completed % 100 == 0: print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
             
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                futures = [executor.submit(fetch_and_write_worker, mid, writer, f) for mid in all_tokens]
-                completed = 0
-                for _ in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    if completed % 100 == 0: print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
+            # ATOMIC SWAP (Only for fresh fetches)
+            if not is_resume:
+                os.replace(target_path, cache_file)
+                print(f"\n✅ Fetch complete. Saved atomically to {cache_file.name}")
+                
+        except Exception as e:
+            # Cleanup temp file on crash
+            if not is_resume and target_path.exists():
+                os.remove(target_path)
+            raise e
 
         print("\n✅ Fetch complete.")
         try: df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
@@ -1940,17 +1998,22 @@ class BacktestEngine:
         trades['timestamp'] = to_utc_naive(trades['timestamp'])
         
         # 2. STRING NORMALIZATION
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower().astype('category')
-        trades['contract_id'] = trades['contract_id'].astype(str).str.strip().str.lower().astype('category')
-        if 'user' in trades.columns:
-            trades['user'] = trades['user'].astype(str).astype('category')
+        def clean_id(series):
+            return series.astype(str).str.strip().str.lower().str.replace('^0x', '', regex=True)
+
+        markets['contract_id'] = clean_id(markets['contract_id'])
+        trades['contract_id'] = clean_id(trades['contract_id'])
             
         # 3. FILTER TO COMMON IDs
         common_ids_set = set(markets['contract_id']).intersection(set(trades['contract_id']))
         common_ids = sorted(list(common_ids_set))
+        
+        # FIX: Raise Error instead of silent failure
         if not common_ids:
-            log.error("❌ NO COMMON IDS FOUND.")
-            return pd.DataFrame(), pd.DataFrame()
+            # logging the error is good, but we must stop execution
+            msg = "❌ CRITICAL: No overlapping Contract IDs found between Markets and Trades. Check your data sources."
+            log.error(msg)
+            raise ValueError(msg)
             
         markets = markets[markets['contract_id'].isin(common_ids)].copy()
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
