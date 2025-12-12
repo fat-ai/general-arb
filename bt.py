@@ -456,24 +456,19 @@ class FastBacktestEngine:
             test_slice = self.event_log[(self.event_log.index >= test_start) & (self.event_log.index < test_end)]
             if not test_slice.empty:
                 batches = []
-                grouped = test_slice.groupby(pd.Grouper(freq='1min'))
-                for _, group in grouped:
-                    if not group.empty:
-                        batch_events = []
-                        for ts, row in group.iterrows():
-                            data = row['data']
-                            data['timestamp'] = ts
-                            if row['event_type'] == 'NEW_CONTRACT':
-                                if data.get('liquidity', 0) == 0: data['liquidity'] = 10000.0
-                            batch_events.append({'event_type': row['event_type'], 'data': data})
-                        batches.append(batch_events)
+                from itertools import groupby
+                def get_minute_key(x):
+                    return x['timestamp'].floor('1min')
+
+                for ts, group in groupby(records, key=lambda x: x['timestamp'].floor('1min')):
+                    batches.append(list(group))
                 
                 past_events = self.event_log[self.event_log.index < test_end]
                 init_events = past_events[past_events['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
                 global_liq = {}
                 for _, row in init_events.iterrows():
                     l = row['data'].get('liquidity')
-                    if l is None or l == 0: l = 10000.0
+                    if l is None or l == 0: l = 1.0
                     global_liq[row['data']['contract_id']] = l
                     
                 result = self._run_single_period(batches, fold_wallet_scores, config, fw_slope, fw_intercept, start_time=train_end, known_liquidity=global_liq)
@@ -538,8 +533,6 @@ class FastBacktestEngine:
             if e['event_type'] == 'PRICE_UPDATE' and e['data'].get('timestamp') is not None
         ]
         
-
-            
         if trade_events:
             t_times = np.array([d.get('timestamp').timestamp() for d in trade_events], dtype=np.float64)
             t_sides = np.array([(-1 if d.get('is_sell') else 1) for d in trade_events], dtype=np.int8)
@@ -559,7 +552,7 @@ class FastBacktestEngine:
         # --- PRE-CALCULATION END ---
         
         for batch in batches:
-            # STRICT SERIAL EXECUTION: Sort by timestamp
+    
             batch.sort(key=lambda e: (
                 e['data'].get('timestamp', pd.Timestamp.min),
                 EVENT_PRIORITY.get(e['event_type'], 99),
@@ -580,6 +573,15 @@ class FastBacktestEngine:
                         'last_trigger_ts': None,
                         'history': [0.5] * 60  # Seed with neutral data to allow startup
                     }
+                    
+                    if cid not in self.market_lifecycle:
+                        self.market_lifecycle[cid] = {
+                            'start': current_ts, 
+                            'end': event.get('end_date', pd.Timestamp.max),
+                            'liquidity': event.get('liquidity', 1.0),
+                            'condition_id': event.get('condition_id'),
+                            'outcome_tag': event.get('token_outcome_label', 'Yes')
+                        }
 
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
@@ -604,15 +606,17 @@ class FastBacktestEngine:
                     if current_ts is None:
                         continue
 
-                    vol = float(data.get('trade_volume', 0.0))
+                    vol = float(event.get('trade_volume', 0.0))
+                    avg_exec_price = event.get('p_market_all', 0.5)
+                    is_sell = event.get('is_sell', False)
+                    wallet_id = str(event.get('wallet_id'))
+                    
                     # 1. State Update
                     if cid not in market_liq: 
                         init_liq = known_liquidity.get(cid, 0.0)
                         if init_liq < 5000.0 and vol < 1000.0:
                             continue
                         market_liq[cid] = known_liquidity.get(cid, 1.0) if known_liquidity else 1.0
-                    
-                    avg_exec_price = data.get('p_market_all', 0.5)
                     
                     if cid not in tracker: 
                         tracker[cid] = {
@@ -629,7 +633,6 @@ class FastBacktestEngine:
                     if len(tracker[cid]['history']) > 60:
                         tracker[cid]['history'].pop(0)
                     
-                    
                     last_ts = tracker[cid].get('last_update_ts', current_ts)
                     elapsed_seconds = (current_ts - last_ts).total_seconds()
                     decay_exponent = elapsed_seconds / 60.0
@@ -645,8 +648,8 @@ class FastBacktestEngine:
 
                     # 2. Signal Generation
                     if vol >= 1.0:
-                        w_id = str(data.get('wallet_id'))
-                        brier = wallet_scores.get((w_id, 'default_topic'))
+                     
+                        brier = wallet_scores.get((wallet_id, 'default_topic'))
                         if brier is None:
                             pred_brier = fw_intercept + (fw_slope * np.log(max(vol, 1.0)))
                             brier = max(0.10, min(pred_brier, 0.35))
@@ -655,7 +658,7 @@ class FastBacktestEngine:
                         skill_factor = np.log1p(raw_skill * 100)
                         weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
                         
-                        trade_direction = -1.0 if data.get('is_sell') else 1.0
+                        trade_direction = -1.0 if is_sell else 1.0
                         tracker[cid]['net_weight'] += (weight * trade_direction)
                         raw_net = tracker[cid]['net_weight']
                         abs_net = abs(raw_net)
@@ -1956,39 +1959,28 @@ class BacktestEngine:
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # 5. BUILD EVENT LOG
-        events_ts, events_type, events_data = [], [], []
-
-        # A. NEW_CONTRACT
-        for _, row in markets.iterrows():
-            if pd.isna(row['created_at']): continue
-            events_ts.append(row['created_at'])
-            events_type.append('NEW_CONTRACT')
-            
-            liq = row.get('liquidity')
-            # GHOST MARKET FIX: Default to 10k
-            safe_liq = float(liq) if liq is not None and float(liq) > 0 else 1.0
-            res_ts = row.get('resolution_timestamp')
-            if pd.isna(res_ts): res_ts = None
-                
-            events_data.append({
-                'contract_id': row['contract_id'], 
-                'p_market_all': 0.5, 
-                'liquidity': safe_liq,
-                'end_date': res_ts,
-                'condition_id': row.get('condition_id'),
-                'token_outcome_label': row.get('token_outcome_label', 'Yes')
-            })
+        # --- A. NEW_CONTRACT Events ---
+        # Create directly from markets DataFrame columns
+        df_new = pd.DataFrame({
+            'timestamp': markets['created_at'],
+            'contract_id': markets['contract_id'],
+            'event_type': 'NEW_CONTRACT',
+            # Specific payload columns (sparse)
+            'liquidity': markets['liquidity'].fillna(1.0),
+            'condition_id': markets['condition_id'],
+            'token_outcome_label': markets['token_outcome_label'].fillna('Yes'),
+            'end_date': markets['resolution_timestamp'],
+            # Fill other columns with reasonable defaults or NaNs
+            'p_market_all': 0.5 
+        })
             
         # B. RESOLUTION
-        for _, row in markets.iterrows():
-            if pd.isna(row['resolution_timestamp']): continue
-            events_ts.append(row['resolution_timestamp'])
-            events_type.append('RESOLUTION')
-            events_data.append({
-                'contract_id': row['contract_id'], 
-                'outcome': float(row['outcome'])
-            })
+        df_res = pd.DataFrame({
+            'timestamp': markets['resolution_timestamp'],
+            'contract_id': markets['contract_id'],
+            'event_type': 'RESOLUTION',
+            'outcome': markets['outcome'].astype('float32')
+        })
 
         # C. PRICE_UPDATE (Robust Logic)
         
@@ -2001,17 +1993,28 @@ class BacktestEngine:
         # We must ensure we don't process trades after the market resolves
         res_map = markets.set_index('contract_id')['resolution_timestamp']
         trades['res_time'] = trades['contract_id'].map(res_map)
-        
-        # Filter: Keep trades where timestamp < resolution_time
-        # (Handle NaT if resolution is unknown by keeping the trade)
         trades = trades[
             (trades['timestamp'] < trades['res_time']) | (trades['res_time'].isna())
         ].copy()
-        
+     
+
         trades = trades.drop_duplicates(
             subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
         ).reset_index(drop=True)
+
+        df_updates = pd.DataFrame({
+            'timestamp': trades['timestamp'],
+            'contract_id': trades['contract_id'],
+            'event_type': 'PRICE_UPDATE',
+            'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5),
+            'trade_volume': trades['tradeAmount'].astype('float32'),
+            'wallet_id': trades['user'].astype(str),
+            'is_sell': (trades['outcomeTokensAmount'] < 0)
+        })
+
+        del trades
+        gc.collect()
         
         # 2. Re-create prof_data-like vectors directly from the sorted source
         # This guarantees 1:1 alignment because we are reading from the SAME dataframe
@@ -2028,76 +2031,52 @@ class BacktestEngine:
         
         del trades
         gc.collect()
-        # 4. Append to events (Vectorized)
-        # Extend the timestamp list directly
-        events_ts.extend(t_ts)
         
-        # Create the type list in one shot
-        events_type.extend(['PRICE_UPDATE'] * len(t_ts))
-        
-        # Use list comprehension for data dicts (Faster than loop append)
-        events_data.extend([
-            {
-                'contract_id': c,
-                'p_market_all': p,
-                'wallet_id': u,
-                'trade_volume': float(v),
-                'is_sell': tok < 0
-            }
-            for c, p, u, v, tok in zip(t_cid, t_price, t_uid, t_vol, t_tokens)
-        ])
-
         # 6. FINAL SORT
-        df_ev = pd.DataFrame({
-            'timestamp': events_ts, 
-            'event_type': events_type, 
-            'data': events_data
-        })
+        df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
-        del events_ts, events_type, events_data
+        del df_new, df_res, df_updates
         gc.collect()
         
-        df_ev['timestamp'] = pd.to_datetime(df_ev['timestamp'])
+        df_ev['event_type'] = df_ev['event_type'].astype('category')
+        df_ev = df_ev.sort_values(by=['timestamp', 'event_type'], kind='stable')
         df_ev = df_ev.dropna(subset=['timestamp'])
-        df_ev['cid_temp'] = df_ev['data'].apply(lambda x: str(x.get('contract_id', '')))
-        df_ev = df_ev.sort_values(
-            by=['timestamp', 'cid_temp', 'event_type'], 
-            kind='stable'
-        )
-        df_ev = df_ev.drop(columns=['cid_temp'])
-        
-        if 'timestamp' not in df_ev.columns and df_ev.index.name == 'timestamp':
-            df_ev = df_ev.reset_index()
-            
+
         if not prof_data.empty:
             first_trade_ts = prof_data['timestamp'].min()
             start_cutoff = first_trade_ts - pd.Timedelta(days=1)
             
-            # Identify events that are too old
+            # Mask for old events
             mask_old = df_ev['timestamp'] < start_cutoff
             
-            # Split into Old and New
-            df_old = df_ev[mask_old].copy()
-            df_new = df_ev[~mask_old].copy()
+            # Split
+            df_old = df_ev[mask_old]
+            df_new = df_ev[~mask_old]
             
-            # Rescue 'NEW_CONTRACT' events from the past
-            rescued_contracts = df_old[df_old['event_type'] == 'NEW_CONTRACT'].copy()
-            rescued_contracts['timestamp'] = start_cutoff
+            # Rescue ONLY 'NEW_CONTRACT' rows from the old pile
+            rescued = df_old[df_old['event_type'] == 'NEW_CONTRACT'].copy()
             
-            # Recombine: Rescued Old Markets + All Recent Events
-            df_ev = pd.concat([rescued_contracts, df_new])
-            
-            # Sort to ensure the Rescued events come first
-            df_ev = df_ev.sort_values(by=['timestamp', 'event_type'], ascending=[True, True])
-            
-            log.info(f"⏱️ SMART SYNC: Teleported {len(rescued_contracts)} old markets to {start_cutoff}. "
-                     f"Dropped {len(df_old) - len(rescued_contracts)} irrelevant old events.")
-        
-        # 3. Final Indexing (Must happen LAST)
+            if not rescued.empty:
+                # Teleport them to the start line
+                rescued['timestamp'] = start_cutoff
+                
+                # Combine Rescued + New
+                df_ev = pd.concat([rescued, df_new])
+                
+                # Re-sort to ensure rescued events are first
+                df_ev = df_ev.sort_values(by=['timestamp', 'event_type'])
+                
+                log.info(f"⏱️ SMART SYNC: Teleported {len(rescued)} old markets. Dropped {len(df_old) - len(rescued)} old events.")
+            else:
+                # If nothing to rescue, just use the new data
+                df_ev = df_new
+
         df_ev = df_ev.set_index('timestamp')
-        # ------------------------------
-        
+        if 'contract_id' in df_ev.columns:
+            df_ev['contract_id'] = df_ev['contract_id'].astype('category')
+
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
+
         return df_ev, prof_data
       
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
