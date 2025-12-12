@@ -1157,7 +1157,7 @@ class BacktestEngine:
 
             ),
             config=search_space,
-            max_concurrent_trials=4,
+            max_concurrent_trials=2,
             resources_per_trial={"cpu": 4},
 
         )
@@ -2231,6 +2231,9 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
             
         smart_score = ret / (dd + 0.01)
         results['smart_score'] = smart_score
+        del engine
+        import gc
+        gc.collect()
         return results
         
     except Exception as e:
