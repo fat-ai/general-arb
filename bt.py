@@ -364,20 +364,15 @@ class FastBacktestEngine:
                     scheduled_end = data.get('end_date')
                     if not scheduled_end or pd.isna(scheduled_end):
                         scheduled_end = pd.Timestamp.max
-                    self.market_lifecycle[cid] = {'start': ts, 'end': scheduled_end, 'liquidity': data.get('liquidity', 10000.0),'condition_id': data.get('condition_id'), 'outcome_tag': data.get('token_outcome_label', 'Yes')}
+                    self.market_lifecycle[cid] = {'start': ts, 'end': scheduled_end, 'liquidity': data.get('liquidity', 1.0),'condition_id': data.get('condition_id'), 'outcome_tag': data.get('token_outcome_label', 'Yes')}
             
             resolutions = event_log[event_log['event_type'] == 'RESOLUTION']
             for ts, row in resolutions.iterrows():
                 cid = row['data'].get('contract_id')
                 if cid in self.market_lifecycle: self.market_lifecycle[cid]['end'] = ts
 
-            records = event_log.reset_index().to_dict('records')
-            self.minute_batches = []
-            from itertools import groupby
-            for key, group in groupby(records, key=lambda x: x['timestamp'].strftime('%Y%m%d%H%M')):
-                self.minute_batches.append(list(group))
         else:
-            self.minute_batches = []
+            pass
 
     def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
         from scipy.stats import linregress
@@ -455,14 +450,15 @@ class FastBacktestEngine:
             
             test_slice = self.event_log[(self.event_log.index >= test_start) & (self.event_log.index < test_end)]
             if not test_slice.empty:
+                records = test_slice.reset_index().to_dict('records')
                 batches = []
                 from itertools import groupby
-                def get_minute_key(x):
-                    return x['timestamp'].floor('1min')
-
                 for ts, group in groupby(records, key=lambda x: x['timestamp'].floor('1min')):
                     batches.append(list(group))
                 
+                def get_minute_key(x):
+                    return x['timestamp'].floor('1min')
+
                 past_events = self.event_log[self.event_log.index < test_end]
                 init_events = past_events[past_events['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
                 global_liq = {}
@@ -910,19 +906,13 @@ class BacktestEngine:
         self.session = requests.Session()
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
-
-        # --- FIX: Define Spill Directory ---
         self.spill_dir = Path(os.getcwd()) / "ray_spill_data"
         self.spill_dir.mkdir(parents=True, exist_ok=True)
         
         if ray.is_initialized(): ray.shutdown()
         
         try:
-            # --- ONE AND ONLY INITIALIZATION ---
             ray.init(
-                # 1. Do NOT set _temp_dir (keeps sockets in /tmp to fix "path length" error)
-                
-                # 2. Configure Object Spilling (fixes "disk full" error)
                 _system_config={
                     "object_spilling_config": json.dumps({
                         "type": "filesystem",
@@ -1997,7 +1987,6 @@ class BacktestEngine:
             (trades['timestamp'] < trades['res_time']) | (trades['res_time'].isna())
         ].copy()
      
-
         trades = trades.drop_duplicates(
             subset=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount'],
             keep='first'
@@ -2013,22 +2002,6 @@ class BacktestEngine:
             'is_sell': (trades['outcomeTokensAmount'] < 0)
         })
 
-        del trades
-        gc.collect()
-        
-        # 2. Re-create prof_data-like vectors directly from the sorted source
-        # This guarantees 1:1 alignment because we are reading from the SAME dataframe
-        t_ts = trades['timestamp'].tolist()
-        t_cid = trades['contract_id'].tolist()
-        t_uid = trades['user'].astype(str).tolist()
-        t_vol = trades['tradeAmount'].tolist()
-        t_tokens = trades['outcomeTokensAmount'].tolist()
-        
-        # 3. Handle Price (Use map to ensure correctness)
-        # We need the 'bet_price' logic from profiler data, but safe.
-        # Since we just sorted 'trades', we can calculate price on the fly.
-        t_price = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).tolist()
-        
         del trades
         gc.collect()
         
