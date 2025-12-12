@@ -582,7 +582,7 @@ class FastBacktestEngine:
                 elif ev_type == 'RESOLUTION':
                     if cid in positions:
                         pos = positions[cid]
-                        outcome = float(data.get('outcome', 0))
+                        outcome = float(event.get('outcome', 0))
                         payout = 0.0
                         if outcome == 0.5: 
                             payout = pos['shares'] * 0.50
