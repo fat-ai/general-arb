@@ -1124,6 +1124,10 @@ class BacktestEngine:
         nlp_cache_ref = ray.put(None)
         priors_ref = ray.put({})
 
+        print("🗑️ Freeing local memory for tuning...")
+        del event_log
+        del profiler_data
+        import gc
         gc.collect()
         
         # === FIXED SEARCH SPACE ===
@@ -1153,6 +1157,7 @@ class BacktestEngine:
 
             ),
             config=search_space,
+            max_concurrent_trials=4,
             resources_per_trial={"cpu": 4},
 
         )
@@ -1200,7 +1205,9 @@ class BacktestEngine:
         print("="*60 + "\n")
 
         print("\n--- Generating Visual Report ---")
-    
+        print("📥 Fetching data back for plotting...")
+        event_log = ray.get(event_log_ref)
+        profiler_data = ray.get(profiler_ref)
         # 1. FIX: Manually unpack the 'sizing' tuple for the local engine
         # (This replicates the logic inside ray_backtest_wrapper)
         if 'sizing' in best_config:
