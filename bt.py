@@ -26,6 +26,8 @@ import gzip
 from requests.adapters import HTTPAdapter, Retry
 import hashlib
 from filelock import FileLock
+from functools import wraps 
+from filelock import Timeout
 from risk_engine import KellyOptimizer
 
 # Store optimal weights here so we don't re-optimize every tick
@@ -109,51 +111,51 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
 
 def persistent_disk_cache(func):
     """
-    Thread-safe and Process-safe disk cache using FileLock.
-    Uses ATOMIC WRITES (temp -> rename) to ensure Ray workers never 
-    read partial/corrupt files if a process crashes mid-write.
+    Thread-safe and Process-safe disk cache using FileLock with TIMEOUT.
+    Prevents hangs if a worker crashes while holding the lock.
     """
+    @wraps(func) # Fix: Preserves function name/docstring
     def wrapper(*args, **kwargs):
-        # 1. Generate unique key
+        # 1. Generate unique key (Simple hashing)
         key_str = f"{func.__name__}:{args}:{kwargs}"
         key_hash = hashlib.md5(key_str.encode('utf-8', errors='ignore')).hexdigest()
         
         file_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
         lock_path = DISK_CACHE_DIR / f"{key_hash}.lock"
 
-        # Critical Section: Lock ensures only one worker generates/writes at a time
-        with FileLock(str(lock_path)):
-            if file_path.exists():
+        # Fix: Add timeout to prevent infinite hangs
+        try:
+            with FileLock(str(lock_path), timeout=5): 
+                if file_path.exists():
+                    try:
+                        with open(file_path, 'rb') as f:
+                            return pickle.load(f)
+                    except (EOFError, pickle.UnpicklingError, Exception):
+                        # Auto-delete corrupt files
+                        try: os.remove(file_path)
+                        except: pass
+
+                # Compute result
+                result = func(*args, **kwargs)
+
+                # Atomic Write
+                temp_path = file_path.with_suffix(f".tmp.{os.getpid()}")
                 try:
-                    with open(file_path, 'rb') as f:
-                        return pickle.load(f)
-                except (EOFError, pickle.UnpicklingError, Exception) as e:
-                    # FIX 1: Auto-delete corrupt files so we don't crash repeatedly
-                    log.warning(f"⚠️ Corrupt cache found ({file_path.name}). Deleting and re-computing...")
-                    try: os.remove(file_path)
+                    with open(temp_path, 'wb') as f:
+                        pickle.dump(result, f)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp_path, file_path)
+                except Exception as e:
+                    try: os.remove(temp_path)
                     except: pass
-
-            # Compute result
-            result = func(*args, **kwargs)
-
-            # FIX 2: Atomic Write Pattern
-            # Write to a temp file first. If this crashes, the real cache file is untouched.
-            temp_path = file_path.with_suffix(f".tmp.{os.getpid()}")
-            try:
-                with open(temp_path, 'wb') as f:
-                    pickle.dump(result, f)
-                    f.flush()            # Flush internal buffer
-                    os.fsync(f.fileno()) # Force write to physical disk
-                
-                # Atomic Move: This is instant and safe
-                os.replace(temp_path, file_path)
-                
-            except Exception as e:
-                log.warning(f"Cache write failed: {e}")
-                try: os.remove(temp_path)
-                except: pass
-                
-            return result
+                    
+                return result
+        except Timeout:
+            # If lock is held too long (crashed worker?), just recompute locally
+            # This prevents the entire job from freezing
+            return func(*args, **kwargs)
+            
     return wrapper
 
 # 1. ROBUST BLOCK LOOKUP (Layer 0 + Layer 1)
@@ -574,7 +576,14 @@ class FastBacktestEngine:
         wins = 0
         losses = 0
 
-        rejection_log = {'low_volume': 0, 'unsafe_price': 0, 'low_edge': 0, 'insufficient_cash': 0, 'market_expired': 0}
+        rejection_log = {
+            'low_volume': 0,
+            'unsafe_price': 0,
+            'low_edge': 0,
+            'insufficient_cash': 0,
+            'market_expired': 0,
+            'missing_metadata': 0
+        }
 
         # --- PRE-CALCULATION START ---
         trade_events = [
@@ -602,15 +611,16 @@ class FastBacktestEngine:
         
         for batch in batches:
     
+            # FIX: Remove ['data'] access. The event dictionary is flat.
             batch.sort(key=lambda e: (
-                e['data'].get('timestamp', pd.Timestamp.min),
+                e.get('timestamp', pd.Timestamp.min),
                 EVENT_PRIORITY.get(e['event_type'], 99),
-                e['data'].get('contract_id', '')
+                e.get('contract_id', '')
             ))
 
             for event in batch:
                 ev_type = event['event_type']
-                data = event['data']
+                data = event
                 cid = event.get('contract_id')
                 current_ts = event.get('timestamp')
 
@@ -853,49 +863,46 @@ class FastBacktestEngine:
             
                                                 if filled_cash > 0:
                                                     # A. Record Position
-                                                    # FIX: Use Signed Shares (+ for Buy, - for Sell)
+                                                    # Signed shares: + for Buy (long), - for Sell (short)
                                                     final_shares = shares if side == 1 else -shares
+                                                
+                                                    # Compute cash flow exactly once:
                                                     if side == 1:
-                                                        # Long: You pay cash equal to the fill amount
-                                                        trade_cost = filled_cash
-                                                        cash -= trade_cost
+                                                        # Long: pay filled_cash now (use filled_cash as cost)
+                                                        entry_cost = filled_cash
+                                                        cash -= entry_cost
+                                                        # store size as amount paid (for PnL calc)
+                                                        size_paid = entry_cost
                                                     else:
-                                                        # Short: You Lock Collateral (1.0) and Receive Proceeds (Price)
-                                                        # Net Cost = (Shares * 1.0) - Proceeds
+                                                        # Short: you lock collateral (1.0 per share) and receive proceeds = filled_cash
                                                         collateral_needed = abs(final_shares) * 1.0
                                                         proceeds = filled_cash
-                                                        trade_cost = collateral_needed - proceeds
-                                                        cash -= trade_cost
-                                                        
+                                                        # Net cash change at short entry = proceeds - collateral_locked (we can represent as reducing available cash)
+                                                        # But it's simpler to *deduct* collateral from cash (lock) and *add* proceeds:
+                                                        cash += proceeds  # you receive proceeds immediately
+                                                        cash -= collateral_needed  # lock collateral (reduces available cash)
+                                                        # for PnL bookkeeping, store size as collateral_locked (entry cost basis)
+                                                        size_paid = collateral_needed
+                                                
                                                     positions[cid] = {
-                                                        'side': side, 
-                                                        'cost_basis': trade_cost, 
-                                                        'size': filled_cash,       
-                                                        'shares': final_shares, 
-                                                        'entry': avg_p, 
+                                                        'side': side,
+                                                        'cost_basis': size_paid,
+                                                        'size': filled_cash,
+                                                        'shares': final_shares,
+                                                        'entry': avg_p,
                                                         'entry_signal': raw_net
                                                     }
-                                                    
-                                                    # FIX: CASH FLOW
-                                                    # If Buying (1): Pay Cash (-)
-                                                    # If Selling (-1): Receive Cash (+)
-                                                    if side == 1:
-                                                        cash -= filled_cash
-                                                    else:
-                                                        cash += filled_cash
-            
+                                                
                                                     trade_count += 1
                                                     volume_traded += filled_cash
-                                                    
-                                                    # B. Update Throttle
+                                                
+                                                    # Update throttle & net weight reset
                                                     tracker[cid]['last_trigger_ts'] = current_minute
-            
-                                                    # C. Soft Reset
                                                     if raw_net > 0:
                                                         tracker[cid]['net_weight'] -= config['splash_threshold']
                                                     else:
                                                         tracker[cid]['net_weight'] += config['splash_threshold']
-            
+                                                            
                                                 else:
                                                     rejection_log['low_volume'] += 1
                                             elif cash <= cost:
@@ -937,7 +944,9 @@ class FastBacktestEngine:
                                         cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
                                         cid_indices, t_times, t_sides, t_vols, t_prices
                                     )
-                                    
+
+                                    filled_cash = 0.0 if filled_cash is None else filled_cash
+
                                     # Fallback for total market failure
                                     if filled_cash == 0:
                                         # (Keep existing penalty logic, but apply to cash flow correctly below)
@@ -975,15 +984,16 @@ class FastBacktestEngine:
             current_val = cash
             for cid, pos in positions.items():
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                collateral_adjust = max(0, -pos['shares']) * 1.0
-                final_value += (pos['shares'] * last_p) + collateral_adjust
+                collateral_adjust = max(0.0, -pos['shares']) * 1.0
+                current_val += (pos['shares'] * last_p) + collateral_adjust
             
             equity_curve.append(current_val)
 
         final_value = cash
         for cid, pos in positions.items():
             last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-            final_value += (pos['shares'] * last_p)
+            collateral_adjust = max(0.0, -pos['shares']) * 1.0
+            final_value += (pos['shares'] * last_p) + collateral_adjust
             
         self.tracker = tracker 
                      # --- DIAGNOSTICS ---
@@ -1461,14 +1471,14 @@ class BacktestEngine:
             try:
                 end_date_str = row.get('endDate') # Raw API field
                 if end_date_str:
-                    # Force UTC for the market end date
-                    end_ts = pd.to_datetime(end_date_str).tz_convert('UTC')
+                    # Fix: Robust parsing that handles mixed formats/zones safely
+                    end_ts = pd.to_datetime(end_date_str, utc=True)
                     
                     # Compare against UTC "Now"
                     if end_ts > pd.Timestamp.now(tz='UTC'):
                         return 0.5
             except:
-                # If date parsing fails, default to safety (Active)
+                # Fallback only on genuine parsing errors
                 return 0.5
 
             # 3. PRICE CHECK (Only runs if Time Gate is passed)
