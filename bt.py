@@ -93,20 +93,58 @@ def plot_performance(equity_curve, trades_count):
 
 
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
+    """
+    PATCHED: Calculates Average Annualized ROI per wallet instead of Brier Scores.
+    Returns: Dict {(wallet_id, entity_type): score}
+             Score is normalized: 0.0 (Bad) to 1.0 (Good). 0.25 is neutral.
+    """
     if profiler_data.empty: return {}
-    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id'])
     
-    counts = valid.groupby(['wallet_id', 'entity_type']).size()
-    sufficient = counts[counts >= min_trades].index
-    valid.set_index(['wallet_id', 'entity_type'], inplace=True)
-    filtered = valid.loc[valid.index.intersection(sufficient)].reset_index() 
+    # Filter valid trades with resolution data
+    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id', 'res_time', 'timestamp']).copy()
+    valid = valid[valid['bet_price'].between(0.01, 0.99)] # Avoid div/0 errors
+    
+    # Calculate Duration (in years), minimum 1 hour to prevent infinite ROI
+    valid['duration_years'] = (valid['res_time'] - valid['timestamp']).dt.total_seconds() / (365 * 24 * 3600)
+    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0) # Min 1 hour
+    
+    # --- ROI Calculation Logic ---
+    # Case 1: Long (Buying Yes) -> tokens > 0
+    # ROI = (Outcome - Price) / Price
+    long_mask = valid['tokens'] > 0
+    valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
+    
+    # Case 2: Short (Selling Yes) -> tokens < 0
+    # ROI = (Price - Outcome) / (1.0 - Price)  <-- Risk is the collateral (1-P)
+    short_mask = valid['tokens'] < 0
+    valid.loc[short_mask, 'raw_roi'] = (valid.loc[short_mask, 'bet_price'] - valid.loc[short_mask, 'outcome']) / (1.0 - valid.loc[short_mask, 'bet_price'])
+    
+    # Annualize ROI: (1 + ROI)^(1/t) - 1
+    # Cap single-trade ROI to -99% to +500% to remove outliers (e.g. buying at 0.001)
+    valid['raw_roi'] = valid['raw_roi'].clip(-0.99, 5.0)
+    
+    # Log-Annualization is safer numerically: ROI_ann = ROI / duration
+    valid['ann_roi'] = valid['raw_roi'] / valid['duration_years']
+    
+    # Group by Wallet
+    stats = valid.groupby(['wallet_id', 'entity_type'])['ann_roi'].agg(['mean', 'count'])
+    
+    # Filter for minimum activity
+    qualified = stats[stats['count'] >= min_trades]
+    
+    if qualified.empty: return {}
 
-    filtered['prediction'] = filtered['bet_price']
+    # --- Normalization ---
+    # Map Annualized ROI to the 0.0 - 0.50 scale expected by the engine
+    # (Lower score in engine = Higher "Skill". Engine treats 'brier' as penalty.)
+    # We want High ROI -> Low "Brier-equivalent"
     
-    filtered['brier'] = (filtered['prediction'] - filtered['outcome']) ** 2
+    # Sigmoid normalization: 
+    # ROI of 0.0 (Neutral) -> 0.25 (Neutral score)
+    # ROI of +2.0 (200% APY) -> ~0.10 (High Skill)
+    # ROI of -2.0 (-200% APY) -> ~0.40 (Low Skill)
     
-    scores = filtered.groupby(['wallet_id', 'entity_type'])['brier'].mean()
-
+    scores = 0.25 - (np.tanh(qualified['mean'] / 2.0) * 0.15)
     return scores.to_dict()
 
 def persistent_disk_cache(func):
@@ -212,7 +250,11 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     Does NOT fail silently.
     """
     order_dir = "asc" if side == "Buy" else "desc"
-    outcome_index = "1" if outcome_tag == "Yes" else "0"
+    
+    if outcome_tag in ["0", "1"]: 
+        outcome_index = outcome_tag
+    else:
+        outcome_index = "1" if outcome_tag == "Yes" else "0"
     
     query = """
     query ($market: String!, $block: Int!, $outcome: String!) {
@@ -295,12 +337,13 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
 @njit
 def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, prices, max_window=300.0):
     """
-    Scans future trades to see what liquidity was ACTUALLY taken.
+    PATCHED: Includes Participation Rate (50%) to avoid "Perfect Liquidity" fallacy.
     """
     filled_cash = 0.0
     total_shares = 0.0
     current_idx = start_idx
     n = len(times)
+    PARTICIPATION_RATE = 0.5  # We only assume we can match 50% of historical volume
     
     if n == 0 or current_idx >= n:
         return 0.0, 0.0
@@ -310,13 +353,18 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
     while current_idx < n:
         if (times[current_idx] - start_time) > max_window:
             break
+        
         if sides[current_idx] == target_side:
             trade_vol = vols[current_idx]
             trade_px = prices[current_idx]
-            remaining = target_cash - filled_cash
-            take_vol = min(trade_vol, remaining)
             
-            if take_vol > 0:
+            # Apply Participation Constraint
+            available_vol = trade_vol * PARTICIPATION_RATE
+            
+            remaining = target_cash - filled_cash
+            take_vol = min(available_vol, remaining)
+            
+            if take_vol > 0.01: # Ignore dust
                 shares = take_vol / trade_px
                 filled_cash += take_vol
                 total_shares += shares
@@ -332,16 +380,13 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
 # 4. ORCHESTRATOR
 def execute_hybrid_waterfall(
     cid, condition_id, outcome_tag, side, cost, current_ts, 
-    cid_indices, t_times, t_sides, t_vols, t_prices
+    cid_indices, t_times, t_sides, t_vols, t_prices,
+    explicit_outcome_index=None  # <-- Added Parameter
 ):
     """
-    Symmetric execution: Tier 1 (Logs) -> Tier 2 (Subgraph)
-    
-    CRITICAL UPDATE:
-    - Uses 'cid' (Token ID) for Tier 1 (Matching specific token trades).
-    - Uses 'condition_id' (Market ID) for Tier 2 (Fetching Order Book).
+    PATCHED: Prioritizes explicit outcome index for Subgraph lookups.
     """
-    # Tier 1: Trade Logs (Uses Token ID)
+    # Tier 1: Trade Logs (Uses Token ID - unaffected by index issues)
     t1_avg, t1_filled_cash = 0.0, 0.0
     if cid in cid_indices and len(t_times) > 0:
         c_idxs = cid_indices[cid]
@@ -361,15 +406,26 @@ def execute_hybrid_waterfall(
     final_shares = (t1_filled_cash / t1_avg) if (t1_filled_cash > 0 and t1_avg > 0) else 0.0
     remainder = cost - t1_filled_cash
     
-    # Tier 2: Subgraph Snapshot (Uses Condition ID)
+    # Tier 2: Subgraph Snapshot (Uses Outcome Index)
     if remainder > 10.0:
         exact_block = fetch_block_by_timestamp(current_ts.timestamp())
         if exact_block:
             side_str = "Buy" if side == 1 else "Sell"
             
-            # FIX: Use condition_id (Market ID), fallback to cid if missing (though unlikely to work)
-            lookup_id = condition_id if condition_id else cid
-            book_levels = fetch_resting_liquidity(lookup_id, exact_block, side_str, outcome_tag)
+            # Use explicit index if passed (from market_lifecycle), else fallback
+            if explicit_outcome_index is not None:
+                outcome_idx_str = str(explicit_outcome_index)
+            else:
+                outcome_idx_str = "1" if outcome_tag == "Yes" else "0"
+            
+            # Overwrite fetch_resting_liquidity to accept raw index string
+            # (Note: You must slightly modify fetch_resting_liquidity to take index_str directly 
+            #  or handle it here. Assuming we pass index_str to a modified fetcher):
+            
+            # Inline modification of fetch call logic for this patch:
+            # We assume fetch_resting_liquidity expects 'outcome_tag' usually, 
+            # but we will pass the INDEX as the tag and update the fetcher below.
+            book_levels = fetch_resting_liquidity(condition_id or cid, exact_block, side_str, outcome_idx_str)
             
             t2_filled = 0.0
             t2_shares = 0.0
@@ -648,16 +704,27 @@ class FastBacktestEngine:
                         outcome = float(event.get('outcome', 0))
                         shares_abs = abs(pos['shares'])
                         if pos['side'] == 1:
+                            # Long: Simple (Payout - Cost)
                             payout = shares_abs * outcome
+                            cash += payout
+                            pnl = payout - pos['cost_basis']
                         else:
-                            # Short position pays out if outcome is 0.0 (No)
-                            # You reclaim 1.0 collateral minus the outcome 
-                            payout = shares_abs * (1.0 - outcome)
-                        
-                        cash += payout
-                        
-                        # Recalculate PnL for stats (Payout - Cost Basis)
-                        pnl = payout - pos['cost_basis']
+                            # Short: 
+                            # Payout (if Outcome=0) = 1.0 * shares (Collateral returned)
+                            # Payout (if Outcome=1) = 0.0
+                            # Cost Basis = Collateral Locked ($1.00/share)
+                            # Size = Proceeds Received ($0.40/share)
+                            
+                            # You get back collateral * (1-outcome)
+                            collateral_returned = shares_abs * (1.0 - outcome)
+                            
+                            # Net Cash Impact at Exit: +Collateral Returned
+                            # (Note: Proceeds were added to cash at Entry)
+                            cash += collateral_returned
+                            
+                            # Profit = (Proceeds + Collateral Returned) - Collateral Locked
+                            # Variable mapping: size=Proceeds, cost_basis=Collateral
+                            pnl = (pos['size'] + collateral_returned) - pos['cost_basis']
 
                         if pnl > 0: wins += 1
                         elif pnl < 0: losses += 1
@@ -798,7 +865,7 @@ class FastBacktestEngine:
                                                
                                                         hist_data = track_data.get('history', [0.5]*60)
                                                         
-                                                        if np.std(hist_data) < 0.0001:
+                                                        if np.std(hist_data) < 1e-9:
                                                           continue
                                                             
                                                         if len(hist_data) < 10: continue
@@ -945,12 +1012,13 @@ class FastBacktestEngine:
                                     target_exit_cash = shares_to_close * curr_p 
                                     
                                     market_info = self.market_lifecycle.get(cid)
-                                    cond_id = market_info.get('condition_id') if market_info else None
-                                    out_tag = market_info.get('outcome_tag', 'Yes') if market_info else 'Yes'
-                                    
-                                    avg_p, filled_cash, _ = execute_hybrid_waterfall(
-                                        cid, cond_id, out_tag, exit_side, target_exit_cash, data.get('timestamp'),
-                                        cid_indices, t_times, t_sides, t_vols, t_prices
+                                    cond_id = market_info.get('condition_id')
+                                    out_tag = market_info.get('outcome_tag', 'Yes')
+                                    out_idx = 1 if out_tag == 'Yes' else 0
+                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                        cid, cond_id, out_tag, side, cost, current_ts,
+                                        cid_indices, t_times, t_sides, t_vols, t_prices,
+                                        explicit_outcome_index=out_idx
                                     )
 
                                     filled_cash = 0.0 if filled_cash is None else filled_cash
