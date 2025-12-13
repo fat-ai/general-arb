@@ -111,20 +111,27 @@ def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 2
     # --- ROI Calculation Logic ---
     # Case 1: Long (Buying Yes) -> tokens > 0
     # ROI = (Outcome - Price) / Price
+    # 1. Calculate Raw ROI (Keep existing logic for Long/Short payout structure)
     long_mask = valid['tokens'] > 0
     valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
     
-    # Case 2: Short (Selling Yes) -> tokens < 0
-    # ROI = (Price - Outcome) / (1.0 - Price)  <-- Risk is the collateral (1-P)
     short_mask = valid['tokens'] < 0
     valid.loc[short_mask, 'raw_roi'] = (valid.loc[short_mask, 'bet_price'] - valid.loc[short_mask, 'outcome']) / (1.0 - valid.loc[short_mask, 'bet_price'])
     
-    # Annualize ROI: (1 + ROI)^(1/t) - 1
-    # Cap single-trade ROI to -99% to +500% to remove outliers (e.g. buying at 0.001)
+    # 2. Safety Clipping
+    # Clip ROI to -99% (avoid -1.0/log(0) issues) and +500%
     valid['raw_roi'] = valid['raw_roi'].clip(-0.99, 5.0)
     
-    # Log-Annualization is safer numerically: ROI_ann = ROI / duration
-    valid['ann_roi'] = valid['raw_roi'] / valid['duration_years']
+    # 3. Geometric Calculation (CAGR)
+    # Formula: (1 + ROI) ^ (1 / Years) - 1
+    # We clip duration to min 1 hour (1/8760) to prevent exponent explosion
+    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0)
+    
+    # Use log-space for numerical stability: exp(ln(1+r) / t) - 1
+    valid['ann_roi'] = np.expm1(np.log1p(valid['raw_roi']) / valid['duration_years'])
+    
+    # Cap annualized ROI at reasonably high number (e.g. 10000% APY) to kill outliers
+    valid['ann_roi'] = valid['ann_roi'].clip(-0.99, 100.0)
     
     # Group by Wallet
     stats = valid.groupby(['wallet_id', 'entity_type'])['ann_roi'].agg(['mean', 'count'])
@@ -335,17 +342,17 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
 
 # 3. TIER 1: TRADE LOG MATCHING
 @njit
-@njit
 def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, prices, limit_price, max_window=300.0):
     """
-    PATCHED: Now accepts 'limit_price' to enable partial fills (Limit Order logic).
-    Skips specific historical trades that are outside our price bounds.
+    PATCHED: Matches against OPPOSITE side flow (Liquidity Provision logic) 
+    or assumes implied liquidity exists if opposite trades are occurring.
     """
     filled_cash = 0.0
     total_shares = 0.0
     current_idx = start_idx
     n = len(times)
-    PARTICIPATION_RATE = 0.5 
+    # Conservative participation: only assume we can take 10% of opposite flow
+    PARTICIPATION_RATE = 0.50 
     
     if n == 0 or current_idx >= n:
         return 0.0, 0.0
@@ -356,13 +363,16 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
         if (times[current_idx] - start_time) > max_window:
             break
         
-        # Check Side MATCH
-        if sides[current_idx] == target_side:
+        # --- PATCH 1 START: Counter-Party Matching ---
+        # If we want to BUY (1), we need a SELLER (-1) to hit us (Maker)
+        # or we need to see Selling pressure to know there is liquidity to take.
+        # Strict Backtest: Match against -target_side
+        if sides[current_idx] == -target_side:
             trade_px = prices[current_idx]
             
-            # --- NEW: LIMIT PRICE CHECK ---
-            # If Buying (1), skip if trade price is too high (> limit)
-            # If Selling (-1), skip if trade price is too low (< limit)
+            # Limit Check (Standard logic)
+            # If Buying (1), we want trade_px <= limit
+            # If Selling (-1), we want trade_px >= limit
             is_valid_price = False
             if target_side == 1:
                 if trade_px <= limit_price: is_valid_price = True
@@ -373,15 +383,18 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
                 trade_vol = vols[current_idx]
                 available_vol = trade_vol * PARTICIPATION_RATE
                 remaining = target_cash - filled_cash
-                take_vol = min(available_vol, remaining)
                 
-                if take_vol > 0.01:
-                    shares = take_vol / trade_px
-                    filled_cash += take_vol
+                # Calculate cost in cash terms
+                take_cash = min(available_vol * trade_px, remaining)
+                
+                if take_cash > 0.01:
+                    shares = take_cash / trade_px
+                    filled_cash += take_cash
                     total_shares += shares
                 
                 if filled_cash >= target_cash * 0.999:
                     break
+        # --- PATCH 1 END ---
                     
         current_idx += 1
         
@@ -844,21 +857,23 @@ class FastBacktestEngine:
                                     # --- 2. CALCULATE EDGE ---
                                     if days_remaining > 0:
                                         # Model Probability
-                                        p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
+                                        sigma_est = config['splash_threshold'] * 2.0
+                                        z_score = raw_net / sigma_est
+                                        p_statistical = norm.cdf(z_score)
+                                        confidence_decay = np.exp(-0.01 * days_remaining) 
+                                        p_model = 0.5 + ((p_statistical - 0.5) * confidence_decay)
+                                        p_model = max(0.01, min(0.99, p_model))
                                         
                                         outcome_tag = market_info.get('outcome_tag', 'Yes')
-                                        calc_price = avg_exec_price
-                                        calc_model = p_model
                                         
-                                        if outcome_tag == 'No':
-                                            token_p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
-                                            edge = token_p_model - avg_exec_price
+                                        # Map to Token Probability
+                                        if outcome_tag == 'Yes':
+                                            token_p_model = p_model
                                         else:
-                                            token_p_model = 0.5 + (np.tanh(raw_net / 2000.0) * 0.49)
-                                            edge = token_p_model - avg_exec_price
+                                            token_p_model = 1.0 - p_model
                                             
-                         
-            
+                                        edge = token_p_model - avg_exec_price
+               
                                         # Edge & Safety Checks
                                         if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
                                             
