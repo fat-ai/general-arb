@@ -94,63 +94,49 @@ def plot_performance(equity_curve, trades_count):
 
 def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
     """
-    PATCHED: Calculates Average Annualized ROI per wallet instead of Brier Scores.
-    Returns: Dict {(wallet_id, entity_type): score}
-             Score is normalized: 0.0 (Bad) to 1.0 (Good). 0.25 is neutral.
+    PATCHED: Calculates Average Annualized ROI per wallet.
+    Corrects Short ROI math to use implied 'No' token prices.
     """
     if profiler_data.empty: return {}
     
-    # Filter valid trades with resolution data
+    # Filter valid trades
     valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id', 'res_time', 'timestamp']).copy()
-    valid = valid[valid['bet_price'].between(0.01, 0.99)] # Avoid div/0 errors
+    valid = valid[valid['bet_price'].between(0.01, 0.99)] 
     
-    # Calculate Duration (in years), minimum 1 hour to prevent infinite ROI
+    # Calculate Duration (in years), minimum 1 hour
     valid['duration_years'] = (valid['res_time'] - valid['timestamp']).dt.total_seconds() / (365 * 24 * 3600)
-    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0) # Min 1 hour
+    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0) 
     
-    # --- ROI Calculation Logic ---
-    # Case 1: Long (Buying Yes) -> tokens > 0
-    # ROI = (Outcome - Price) / Price
-    # 1. Calculate Raw ROI (Keep existing logic for Long/Short payout structure)
+    # --- ROI Calculation Logic (Fixed) ---
+    
+    # 1. LONG (Buying Yes): Profit = (Outcome - Price) / Price
     long_mask = valid['tokens'] > 0
     valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
     
+    # 2. SHORT (Selling Yes / Buying No): 
+    # Implied Price of 'No' = (1.0 - Bet Price)
+    # Implied Outcome of 'No' = (1.0 - Outcome)
+    # Profit = (Outcome_No - Price_No) / Price_No
     short_mask = valid['tokens'] < 0
-    valid.loc[short_mask, 'raw_roi'] = (valid.loc[short_mask, 'bet_price'] - valid.loc[short_mask, 'outcome']) / (1.0 - valid.loc[short_mask, 'bet_price'])
     
-    # 2. Safety Clipping
-    # Clip ROI to -99% (avoid -1.0/log(0) issues) and +500%
+    # Calculate explicitly for clarity
+    price_no = 1.0 - valid.loc[short_mask, 'bet_price']
+    outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
+    
+    valid.loc[short_mask, 'raw_roi'] = (outcome_no - price_no) / price_no
+    
+    # 3. Safety Clipping & Geometric Calculation (Same as before)
     valid['raw_roi'] = valid['raw_roi'].clip(-0.99, 5.0)
-    
-    # 3. Geometric Calculation (CAGR)
-    # Formula: (1 + ROI) ^ (1 / Years) - 1
-    # We clip duration to min 1 hour (1/8760) to prevent exponent explosion
-    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0)
-    
-    # Use log-space for numerical stability: exp(ln(1+r) / t) - 1
     valid['ann_roi'] = np.expm1(np.log1p(valid['raw_roi']) / valid['duration_years'])
-    
-    # Cap annualized ROI at reasonably high number (e.g. 10000% APY) to kill outliers
     valid['ann_roi'] = valid['ann_roi'].clip(-0.99, 100.0)
     
     # Group by Wallet
     stats = valid.groupby(['wallet_id', 'entity_type'])['ann_roi'].agg(['mean', 'count'])
-    
-    # Filter for minimum activity
     qualified = stats[stats['count'] >= min_trades]
     
     if qualified.empty: return {}
 
-    # --- Normalization ---
-    # Map Annualized ROI to the 0.0 - 0.50 scale expected by the engine
-    # (Lower score in engine = Higher "Skill". Engine treats 'brier' as penalty.)
-    # We want High ROI -> Low "Brier-equivalent"
-    
-    # Sigmoid normalization: 
-    # ROI of 0.0 (Neutral) -> 0.25 (Neutral score)
-    # ROI of +2.0 (200% APY) -> ~0.10 (High Skill)
-    # ROI of -2.0 (-200% APY) -> ~0.40 (Low Skill)
-    
+    # Normalization (0.25 = Neutral)
     scores = 0.25 - (np.tanh(qualified['mean'] / 2.0) * 0.15)
     return scores.to_dict()
 
@@ -842,10 +828,74 @@ class FastBacktestEngine:
                             last_trigger = tracker[cid].get('last_trigger_ts')
             
                             if last_trigger != current_minute:
-                                
-                                # RISK CHECK: Check Position Limits
+
                                 if cid not in positions:
                                     
+                                    has_position = cid in positions
+                                    if has_position:
+                                    pos = positions[cid]
+                                    curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                                    
+                                    # Calculate PnL %
+                                    if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
+                                    else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
+                                    
+                                    should_close = False
+                                    
+                                    # 1. Stop Loss
+                                    if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
+                                    
+                                    # 2. Smart Exit (Signal Reversal)
+                                    if use_smart_exit:
+                                        cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                                        # Long but signal dropped significantly below entry
+                                        if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
+                                        # Short but signal rose significantly above entry
+                                        if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
+                                    
+                                    if should_close:
+                                        # --- EXECUTE EXIT ---
+                                        exit_side = -1 if pos['side'] == 1 else 1
+                                        shares_to_close = abs(pos['shares'])
+                                        
+                                        # (Existing Exit Execution Logic...)
+                                        market_info = self.market_lifecycle.get(cid)
+                                        cond_id = market_info.get('condition_id')
+                                        out_tag = market_info.get('outcome_tag', 'Yes')
+                                        out_idx = 1 if out_tag == 'Yes' else 0
+                                        
+                                        avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                            cid, cond_id, out_tag, exit_side, 0.0, current_ts, # Cost 0.0 implied for sizing calc if needed
+                                            cid_indices, t_times, t_sides, t_vols, t_prices,
+                                            explicit_outcome_index=out_idx
+                                        )
+
+                                        # Fallback Fill
+                                        if filled_cash is None or filled_cash <= 1e-6:
+                                            penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
+                                            penalty_price = max(0.01, min(penalty_price, 0.99))
+                                            filled_cash = shares_to_close * penalty_price
+                                    
+                                        # Cash Update (Existing Logic)
+                                        if exit_side == 1: # Buying back short
+                                            cost_to_close = filled_cash
+                                            collateral_unlocked = shares_to_close * 1.0
+                                            cash += (collateral_unlocked - cost_to_close)
+                                        else: # Selling long
+                                            cash += filled_cash
+                                    
+                                        # Record Stats
+                                        pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
+                                        if pnl > 0: wins += 1
+                                        elif pnl < 0: losses += 1
+                                        
+                                        del positions[cid]
+                                        
+                                        # *** CRITICAL UPDATE ***
+                                        # We successfully closed the position.
+                                        # Mark as flat so the Entry Logic below can run IMMEDIATELY.
+                                        has_position = False
+                                        
                                     # --- 1. PREPARE DATA ---
                                     market_info = self.market_lifecycle.get(cid)
                                     if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
@@ -940,13 +990,26 @@ class FastBacktestEngine:
                                                             prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
                                                             cov = (cov * 0.8) + (prior * 0.2)
                                                             
+                                                            ANNUALIZATION_FACTOR = 525600
+                                                            cov_annual = cov_step * ANNUALIZATION_FACTOR
+                                                            
+                                                            # Shrinkage (Applied to the Annualized Covariance)
+                                                            prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
+                                                            cov_final = (cov_annual * 0.8) + (prior * 0.2)
+                                                            
                                                             optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                            
+                                                            # Now both inputs are Annualized:
                                                             weights = optimizer.optimize_with_explicit_views(
-                                                                pd.Series(mus, index=valid_cids), cov, fraction=sizing_val, max_leverage=1.0
+                                                                pd.Series(mus, index=valid_cids), 
+                                                                cov_final, 
+                                                                fraction=sizing_val, 
+                                                                max_leverage=1.0
                                                             )
                                                             self.target_weights_map = weights.to_dict()
                                                         
-                                                        except Exception:
+                                                        except Exception as e:
+                                                            # print(f"Optimization failed: {e}")
                                                             self.target_weights_map = {}
                                                 
                                                 # Read Target
@@ -1054,8 +1117,6 @@ class FastBacktestEngine:
                                 if should_close:
                                     exit_side = -1 if pos['side'] == 1 else 1
                                     
-                                    # FIX: Calculate Target Cash based on absolute shares
-                                    # (Execution expects positive cash/shares request)
                                     shares_to_close = abs(pos['shares'])
                                     target_exit_cash = shares_to_close * curr_p 
                                     
