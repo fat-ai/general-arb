@@ -822,14 +822,73 @@ class FastBacktestEngine:
                         abs_net = abs(raw_net)
             
                         if abs_net > config['splash_threshold']:
-                            
+                            has_position = cid in positions
+                            if ev_type != 'RESOLUTION' and cid in positions:
+                                pos = positions[cid]
+                                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                                
+                                if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
+                                else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
+                                
+                                should_close = False
+                                if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
+                                if use_smart_exit:
+                                    cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                                    if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
+                                    if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
+                                
+                                if should_close:
+                                    exit_side = -1 if pos['side'] == 1 else 1
+                                    
+                                    shares_to_close = abs(pos['shares'])
+                                    target_exit_cash = shares_to_close * curr_p 
+                                    
+                                    market_info = self.market_lifecycle.get(cid)
+                                    cond_id = market_info.get('condition_id')
+                                    out_tag = market_info.get('outcome_tag', 'Yes')
+                                    out_idx = 1 if out_tag == 'Yes' else 0
+                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                        cid, cond_id, out_tag, side, cost, current_ts,
+                                        cid_indices, t_times, t_sides, t_vols, t_prices,
+                                        explicit_outcome_index=out_idx
+                                    )
+
+                                    if filled_cash is None or filled_cash <= 1e-6:
+                                        # Fallback: Assume we cross the spread + penalty
+                                        penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
+                                        penalty_price = max(0.01, min(penalty_price, 0.99))
+                                        filled_cash = shares_to_close * penalty_price
+                                
+                                    if exit_side == 1:
+                                        # We were Short (Side -1), now Buying back (Side 1)
+                                        # We pay cash to buy back, but we UNLOCK our $1.00 collateral
+                                        cost_to_close = filled_cash
+                                        collateral_unlocked = shares_to_close * 1.0
+                                        net_cash_change = collateral_unlocked - cost_to_close
+                                        cash += net_cash_change
+                                    else:
+                                        # We were Long (Side 1), now Selling (Side -1)
+                                        # We simply receive the cash proceeds
+                                        net_cash_change = filled_cash
+                                        cash += net_cash_change
+                                
+                                    # PNL Calculation (for stats only)
+                                    # Entry Cost was pos['size']. 
+                                    # If Long: Profit = Exit - Entry
+                                    # If Short: Profit = Entry - Exit
+                                    pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
+                                    
+                                    if pnl > 0: wins += 1
+                                    elif pnl < 0: losses += 1
+                                    
+                                    del positions[cid]
                             # THROTTLE CHECK: Have we fired in this minute?
                             current_minute = current_ts.floor('1min')
                             last_trigger = tracker[cid].get('last_trigger_ts')
             
                             if last_trigger != current_minute:
 
-                                if cid not in positions:
+                                if not has_position:
                                     
                                     has_position = cid in positions
                                     if has_position:
@@ -890,10 +949,7 @@ class FastBacktestEngine:
                                         elif pnl < 0: losses += 1
                                         
                                         del positions[cid]
-                                        
-                                        # *** CRITICAL UPDATE ***
-                                        # We successfully closed the position.
-                                        # Mark as flat so the Entry Logic below can run IMMEDIATELY.
+
                                         has_position = False
                                         
                                     # --- 1. PREPARE DATA ---
@@ -985,26 +1041,19 @@ class FastBacktestEngine:
                                                         try:
                                                             df_prices = pd.DataFrame(price_series)
                                                             df_rets = df_prices.pct_change().fillna(0) + 1e-9
-                                                            cov = df_rets.cov()
-                                                            # Shrinkage
-                                                            prior = pd.DataFrame(np.eye(len(valid_cids)) * df_rets.var().mean(), index=cov.index, columns=cov.columns)
-                                                            cov = (cov * 0.8) + (prior * 0.2)
                                                             
+                                                            # Calculate Covariance and Annualize it (Minutes in Year = 525600)
+                                                            cov_step = df_rets.cov()
                                                             ANNUALIZATION_FACTOR = 525600
                                                             cov_annual = cov_step * ANNUALIZATION_FACTOR
                                                             
-                                                            # Shrinkage (Applied to the Annualized Covariance)
+                                                            # Shrinkage (Applied to Annualized Covariance)
                                                             prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
                                                             cov_final = (cov_annual * 0.8) + (prior * 0.2)
                                                             
                                                             optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
-                                                            
-                                                            # Now both inputs are Annualized:
                                                             weights = optimizer.optimize_with_explicit_views(
-                                                                pd.Series(mus, index=valid_cids), 
-                                                                cov_final, 
-                                                                fraction=sizing_val, 
-                                                                max_leverage=1.0
+                                                                pd.Series(mus, index=valid_cids), cov_final, fraction=sizing_val, max_leverage=1.0
                                                             )
                                                             self.target_weights_map = weights.to_dict()
                                                         
@@ -1098,71 +1147,7 @@ class FastBacktestEngine:
                                             else: rejection_log['unsafe_price'] += 1
                                     else:
                                         rejection_log['market_expired'] += 1
-                                                
-                            # Stop Loss / Smart Exit (Check every event)
-                            if ev_type != 'RESOLUTION' and cid in positions:
-                                pos = positions[cid]
-                                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                                
-                                if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
-                                else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
-                                
-                                should_close = False
-                                if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
-                                if use_smart_exit:
-                                    cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                                    if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
-                                    if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
-                                
-                                if should_close:
-                                    exit_side = -1 if pos['side'] == 1 else 1
-                                    
-                                    shares_to_close = abs(pos['shares'])
-                                    target_exit_cash = shares_to_close * curr_p 
-                                    
-                                    market_info = self.market_lifecycle.get(cid)
-                                    cond_id = market_info.get('condition_id')
-                                    out_tag = market_info.get('outcome_tag', 'Yes')
-                                    out_idx = 1 if out_tag == 'Yes' else 0
-                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                        cid, cond_id, out_tag, side, cost, current_ts,
-                                        cid_indices, t_times, t_sides, t_vols, t_prices,
-                                        explicit_outcome_index=out_idx
-                                    )
-
-                                    if filled_cash is None or filled_cash <= 1e-6:
-                                        # Fallback: Assume we cross the spread + penalty
-                                        penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
-                                        penalty_price = max(0.01, min(penalty_price, 0.99))
-                                        filled_cash = shares_to_close * penalty_price
-                                
-                                    if exit_side == 1:
-                                        # We were Short (Side -1), now Buying back (Side 1)
-                                        # We pay cash to buy back, but we UNLOCK our $1.00 collateral
-                                        cost_to_close = filled_cash
-                                        collateral_unlocked = shares_to_close * 1.0
-                                        net_cash_change = collateral_unlocked - cost_to_close
-                                        cash += net_cash_change
-                                    else:
-                                        # We were Long (Side 1), now Selling (Side -1)
-                                        # We simply receive the cash proceeds
-                                        net_cash_change = filled_cash
-                                        cash += net_cash_change
-                                
-                                    # PNL Calculation (for stats only)
-                                    # Entry Cost was pos['size']. 
-                                    # If Long: Profit = Exit - Entry
-                                    # If Short: Profit = Entry - Exit
-                                    pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
-                                    
-                                    if pnl > 0: wins += 1
-                                    elif pnl < 0: losses += 1
-                                    
-                                    del positions[cid]
-            
-                        
-                                    
-                        
+                                                   
             current_val = cash
             for cid, pos in positions.items():
                 last_p = tracker.get(cid, {}).get('last_price', pos['entry'])
