@@ -335,15 +335,17 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
 
 # 3. TIER 1: TRADE LOG MATCHING
 @njit
-def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, prices, max_window=300.0):
+@njit
+def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, prices, limit_price, max_window=300.0):
     """
-    PATCHED: Includes Participation Rate (50%) to avoid "Perfect Liquidity" fallacy.
+    PATCHED: Now accepts 'limit_price' to enable partial fills (Limit Order logic).
+    Skips specific historical trades that are outside our price bounds.
     """
     filled_cash = 0.0
     total_shares = 0.0
     current_idx = start_idx
     n = len(times)
-    PARTICIPATION_RATE = 0.5  # We only assume we can match 50% of historical volume
+    PARTICIPATION_RATE = 0.5 
     
     if n == 0 or current_idx >= n:
         return 0.0, 0.0
@@ -354,23 +356,33 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
         if (times[current_idx] - start_time) > max_window:
             break
         
+        # Check Side MATCH
         if sides[current_idx] == target_side:
-            trade_vol = vols[current_idx]
             trade_px = prices[current_idx]
             
-            # Apply Participation Constraint
-            available_vol = trade_vol * PARTICIPATION_RATE
+            # --- NEW: LIMIT PRICE CHECK ---
+            # If Buying (1), skip if trade price is too high (> limit)
+            # If Selling (-1), skip if trade price is too low (< limit)
+            is_valid_price = False
+            if target_side == 1:
+                if trade_px <= limit_price: is_valid_price = True
+            else:
+                if trade_px >= limit_price: is_valid_price = True
             
-            remaining = target_cash - filled_cash
-            take_vol = min(available_vol, remaining)
-            
-            if take_vol > 0.01: # Ignore dust
-                shares = take_vol / trade_px
-                filled_cash += take_vol
-                total_shares += shares
-            
-            if filled_cash >= target_cash * 0.999:
-                break
+            if is_valid_price:
+                trade_vol = vols[current_idx]
+                available_vol = trade_vol * PARTICIPATION_RATE
+                remaining = target_cash - filled_cash
+                take_vol = min(available_vol, remaining)
+                
+                if take_vol > 0.01:
+                    shares = take_vol / trade_px
+                    filled_cash += take_vol
+                    total_shares += shares
+                
+                if filled_cash >= target_cash * 0.999:
+                    break
+                    
         current_idx += 1
         
     if total_shares == 0:
@@ -381,12 +393,17 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
 def execute_hybrid_waterfall(
     cid, condition_id, outcome_tag, side, cost, current_ts, 
     cid_indices, t_times, t_sides, t_vols, t_prices,
-    explicit_outcome_index=None  # <-- Added Parameter
+    explicit_outcome_index=None,
+    limit_price=None # <-- NEW ARGUMENT
 ):
     """
-    PATCHED: Prioritizes explicit outcome index for Subgraph lookups.
+    PATCHED: Enforces 'limit_price' across both Trade Logs (Tier 1) and Orderbook (Tier 2).
     """
-    # Tier 1: Trade Logs (Uses Token ID - unaffected by index issues)
+    # Default limits if none provided (Safety fallback)
+    if limit_price is None:
+        limit_price = 1.0 if side == 1 else 0.0
+        
+    # Tier 1: Trade Logs (Pass limit_price down)
     t1_avg, t1_filled_cash = 0.0, 0.0
     if cid in cid_indices and len(t_times) > 0:
         c_idxs = cid_indices[cid]
@@ -399,42 +416,46 @@ def execute_hybrid_waterfall(
             real_start_idx = c_idxs[start_pos]
             t1_avg, t1_filled_cash = match_trade_future(
                 target_side=side, target_cash=cost, start_idx=real_start_idx,
-                times=t_times, sides=t_sides, vols=t_vols, prices=t_prices
+                times=t_times, sides=t_sides, vols=t_vols, prices=t_prices,
+                limit_price=limit_price # <-- PASS IT HERE
             )
             
     final_filled_cash = t1_filled_cash
     final_shares = (t1_filled_cash / t1_avg) if (t1_filled_cash > 0 and t1_avg > 0) else 0.0
     remainder = cost - t1_filled_cash
     
-    # Tier 2: Subgraph Snapshot (Uses Outcome Index)
+    # Tier 2: Order Book Snapshot
     if remainder > 10.0:
         exact_block = fetch_block_by_timestamp(current_ts.timestamp())
         if exact_block:
             side_str = "Buy" if side == 1 else "Sell"
             
-            # Use explicit index if passed (from market_lifecycle), else fallback
             if explicit_outcome_index is not None:
                 outcome_idx_str = str(explicit_outcome_index)
             else:
                 outcome_idx_str = "1" if outcome_tag == "Yes" else "0"
-            
-            # Overwrite fetch_resting_liquidity to accept raw index string
-            # (Note: You must slightly modify fetch_resting_liquidity to take index_str directly 
-            #  or handle it here. Assuming we pass index_str to a modified fetcher):
-            
-            # Inline modification of fetch call logic for this patch:
-            # We assume fetch_resting_liquidity expects 'outcome_tag' usually, 
-            # but we will pass the INDEX as the tag and update the fetcher below.
+
             book_levels = fetch_resting_liquidity(condition_id or cid, exact_block, side_str, outcome_idx_str)
             
             t2_filled = 0.0
             t2_shares = 0.0
+            
             for level in book_levels:
                 lvl_price = float(level['price'])
                 lvl_vol = float(level['volume'])
-                lvl_cap_cash = lvl_vol * lvl_price
                 
+                # --- NEW: STOP if price crosses limit ---
+                # Order books are sorted best-to-worst.
+                # If we hit a bad price, we stop immediately (Partial fill).
+                if side == 1: # Buying
+                    if lvl_price > limit_price: break 
+                else: # Selling
+                    if lvl_price < limit_price: break
+                # ----------------------------------------
+
+                lvl_cap_cash = lvl_vol * lvl_price
                 take_cash = min(remainder - t2_filled, lvl_cap_cash)
+                
                 if take_cash > 0:
                     t2_filled += take_cash
                     t2_shares += (take_cash / lvl_price)
@@ -866,7 +887,7 @@ class FastBacktestEngine:
                                                         hist_data = track_data.get('history', [0.5]*60)
                                                         
                                                         if np.std(hist_data) < 1e-9:
-                                                          continue
+                                                          pass
                                                             
                                                         if len(hist_data) < 10: continue
                                                         
@@ -930,10 +951,22 @@ class FastBacktestEngine:
                                                 side = 1 if edge > 0 else -1
                                                 cond_id = market_info.get('condition_id')
                                                 out_tag = market_info.get('outcome_tag', 'Yes')
-                                                
+                                                out_idx = 1 if out_tag == 'Yes' else 0
+
+                                                # --- NEW: CALCULATE LIMIT PRICE ---
+                                                # Buy Limit = Signal + 25% (Cap at 0.99)
+                                                # Sell Limit = Signal - 25% (Floor at 0.01)
+                                                if side == 1:
+                                                    limit_p = min(0.99, avg_exec_price * 1.25)
+                                                else:
+                                                    limit_p = max(0.01, avg_exec_price * 0.75)
+
+                                                # Pass limit_p to the function
                                                 avg_p, filled_cash, shares = execute_hybrid_waterfall(
                                                     cid, cond_id, out_tag, side, cost, current_ts,
-                                                    cid_indices, t_times, t_sides, t_vols, t_prices
+                                                    cid_indices, t_times, t_sides, t_vols, t_prices,
+                                                    explicit_outcome_index=out_idx,
+                                                    limit_price=limit_p  # <-- NEW
                                                 )
             
                                                 if filled_cash > 0:
@@ -1021,11 +1054,8 @@ class FastBacktestEngine:
                                         explicit_outcome_index=out_idx
                                     )
 
-                                    filled_cash = 0.0 if filled_cash is None else filled_cash
-
-                                    # Fallback for total market failure
-                                    if filled_cash == 0:
-                                        # (Keep existing penalty logic, but apply to cash flow correctly below)
+                                    if filled_cash is None or filled_cash <= 1e-6:
+                                        # Fallback: Assume we cross the spread + penalty
                                         penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
                                         penalty_price = max(0.01, min(penalty_price, 0.99))
                                         filled_cash = shares_to_close * penalty_price
@@ -1487,18 +1517,17 @@ class BacktestEngine:
         
         while True:
             try:
-                print(f"Offset:{offset}")
                 # Gamma API
                 params = {"limit": 500, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
-                print(f"Rows Retreived:{len(rows)}")
                 if not rows: break
                 all_rows.extend(rows)
                 
                 offset += len(rows)
+                if len(rows) < 500: break # Optimization: Stop if partial page
            
             except Exception: break
         
@@ -1519,14 +1548,12 @@ class BacktestEngine:
                 else: tokens = raw
                 
                 if isinstance(tokens, list) and len(tokens) > 0:
-                    # Clean all IDs
                     clean_ids = []
                     for t in tokens:
                         if isinstance(t, (int, float)):
                             clean_ids.append(str(t))
                         else:
                             clean_ids.append(str(t).strip())
-                    # Join with comma for storage
                     return ",".join(clean_ids)
                 return None
             except: return None
@@ -1537,47 +1564,43 @@ class BacktestEngine:
         df = df.dropna(subset=['contract_id'])
         df['contract_id'] = df['contract_id'].astype(str)
 
+        # --- PATCH: PREPARE OUTCOME LABELS ---
+        # Ensure 'outcomes' column is parsed correctly (str -> list)
+        def parse_outcomes(val):
+            if isinstance(val, list): return val
+            if isinstance(val, str):
+                try: return json.loads(val)
+                except: pass
+            return ["No", "Yes"] # Default fallback
+            
+        df['outcomes_clean'] = df['outcomes'].apply(parse_outcomes)
+
         # Normalization
         def derive_outcome(row):
-            # 1. Trust explicit outcome first (Gold Standard)
+            # 1. Trust explicit outcome first
             if pd.notna(row.get('outcome')): 
                 return float(row['outcome'])
 
-            # 2. TIME GATE: Check if the market has actually ended
+            # 2. TIME GATE
             try:
-                end_date_str = row.get('endDate') # Raw API field
+                end_date_str = row.get('endDate')
                 if end_date_str:
-                    # Fix: Robust parsing that handles mixed formats/zones safely
                     end_ts = pd.to_datetime(end_date_str, utc=True)
-                    
-                    # Compare against UTC "Now"
                     if end_ts > pd.Timestamp.now(tz='UTC'):
                         return 0.5
-            except:
-                # Fallback only on genuine parsing errors
-                return 0.5
+            except: return 0.5
 
-            # 3. PRICE CHECK (Only runs if Time Gate is passed)
+            # 3. PRICE CHECK
             try:
                 prices = row.get('outcomePrices')
-                if isinstance(prices, str): 
-                    prices = json.loads(prices)
+                if isinstance(prices, str): prices = json.loads(prices)
+                if not isinstance(prices, list) or len(prices) != 2: return 0.5
+                p0, p1 = float(prices[0]), float(prices[1])
                 
-                # Safety: Ensure it's a list
-                if not isinstance(prices, list) or len(prices) != 2: 
-                    return 0.5
-                
-                # Safety: Convert elements to float (handles strings inside list)
-                p0 = float(prices[0])
-                p1 = float(prices[1])
-                
-                # Strict 99% threshold, but ONLY for markets past their end date
                 if p1 >= 0.99: return 1.0
                 if p0 >= 0.99: return 0.0
-                
                 return 0.5
-            except: 
-                return 0.5
+            except: return 0.5
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
@@ -1586,6 +1609,7 @@ class BacktestEngine:
         df = df.dropna(subset=['resolution_timestamp', 'outcome'])
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
+        
         # 1. Split contract_id into list
         df['contract_id_list'] = df['contract_id'].str.split(',')
         
@@ -1593,22 +1617,49 @@ class BacktestEngine:
         df = df.explode('contract_id_list')
         df['contract_id'] = df['contract_id_list'].str.strip()
         
-        # 3. Assign Label based on order (Assumes [No, Yes] standard from API)
-        # We group by the original index to determine position (0=No, 1=Yes)
+        # 3. Assign Token Index (0, 1, ...)
         df['token_index'] = df.groupby(level=0).cumcount()
-        df['token_outcome_label'] = np.where(df['token_index'] == 0, "No", "Yes")
         
-        # 4. Invert Outcome: If Market resolved Yes (1.0), "No" token pays 0.0
-        # If Market resolved No (0.0), "No" token pays 1.0
-        # If Market is Active (0.5), it stays 0.5
-        df['outcome'] = np.where(
-            df['token_outcome_label'] == 'Yes', 
-            df['outcome'], 
-            np.where(df['outcome'] == 0.5, 0.5, 1.0 - df['outcome'])
-        )
+        # --- PATCH: MAP INDEX TO ACTUAL LABEL ---
+        def map_label(row):
+            idx = row['token_index']
+            labels = row['outcomes_clean']
+            if idx < len(labels):
+                return str(labels[idx])
+            # Fallback for weird data shapes
+            return "Yes" if idx == 1 else "No"
+
+        df['token_outcome_label'] = df.apply(map_label, axis=1)
+        
+        # 4. Invert Outcome Logic
+        # If token_outcome_label is the "Winner" (matches market outcome), payout is 1.0
+        # If market is Active (0.5), everyone is 0.5
+        # Note: Gamma 'outcome' is typically "1" (Index 1 wins) or "0" (Index 0 wins) for binary
+        # But we normalized it to a 0.0-1.0 float in derive_outcome.
+        
+        # Simplified Logic using text matching to be safe:
+        # If Market Outcome was "0.0" -> That means Index 0 won.
+        # If Market Outcome was "1.0" -> That means Index 1 won.
+        
+        # We need to map the Market Outcome (float) to the Winning Index (int)
+        # Usually: 0.0 -> Index 0 Wins. 1.0 -> Index 1 Wins.
+        
+        def final_token_payout(row):
+            m_out = row['outcome'] # 0.0, 1.0, or 0.5
+            if m_out == 0.5: return 0.5
+            
+            # If market resolved to 1.0 (Yes/Index 1), and this token is Index 1 -> Win
+            # If market resolved to 0.0 (No/Index 0), and this token is Index 0 -> Win
+            
+            # Floating point safety check
+            if abs(m_out - row['token_index']) < 0.1:
+                return 1.0
+            return 0.0
+
+        df['outcome'] = df.apply(final_token_payout, axis=1)
 
         # Cleanup
-        df = df.drop(columns=['contract_id_list', 'token_index'])
+        df = df.drop(columns=['contract_id_list', 'token_index', 'outcomes_clean'])
         if not df.empty: df.to_parquet(cache_file)
         return df
         
