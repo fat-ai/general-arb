@@ -814,9 +814,11 @@ class FastBacktestEngine:
                         del positions[cid]
                         
                 elif ev_type == 'PRICE_UPDATE':
-                   
+                    
                     if current_ts is None:
                         continue
+
+                    current_minute = current_ts.floor('1min')
 
                     vol = float(event.get('trade_volume', 0.0))
                     avg_exec_price = event.get('p_market_all', 0.5)
@@ -825,7 +827,6 @@ class FastBacktestEngine:
                     
                     # 1. State Update
                     if cid not in market_liq: 
-                        # FIX: Cast to float to handle string data types
                         raw_liq = known_liquidity.get(cid, 0.0) if known_liquidity else 0.0
                         try:
                             init_liq = float(raw_liq)
@@ -835,7 +836,6 @@ class FastBacktestEngine:
                         if init_liq < 5000.0 and vol < 1000.0:
                             continue
                         
-                        # Store as float for downstream math
                         market_liq[cid] = init_liq if init_liq > 0 else 1.0
                     
                     if cid not in tracker: 
@@ -860,13 +860,69 @@ class FastBacktestEngine:
                     tracker[cid]['net_weight'] *= time_decay_multiplier
                     tracker[cid]['last_update_ts'] = current_ts
                     
-                    # Dynamic Liquidity Update
                     if abs(avg_exec_price - prev_p) > 0.005 and vol > 10.0:
-                        raw_implied = (vol / abs(avg_exec_price - prev_p)) * 0.5
                         implied_liq = (vol / abs(avg_exec_price - prev_p)) * 0.5
                         market_liq[cid] = (market_liq[cid] * 0.9) + (implied_liq * 0.1)
 
-                    # 2. Signal Generation
+                    if cid in positions:
+                        pos = positions[cid]
+                        curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
+                        
+                        # Calculate PnL %
+                        if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
+                        else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
+                        
+                        should_close = False
+                        
+                        # 1. Stop Loss
+                        if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
+                        
+                        # 2. Smart Exit (Signal Reversal)
+                        if use_smart_exit and not should_close:
+                            cur_net = tracker.get(cid, {}).get('net_weight', 0)
+                            # Long but signal dropped
+                            if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
+                            # Short but signal rose
+                            if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
+                        
+                        if should_close:
+                            exit_side = -1 if pos['side'] == 1 else 1
+                            shares_to_close = abs(pos['shares'])
+                            
+                            market_info = self.market_lifecycle.get(cid)
+                            if market_info:
+                                cond_id = market_info.get('condition_id')
+                                out_tag = market_info.get('outcome_tag', 'Yes')
+                                out_idx = 1 if out_tag == 'Yes' else 0
+                                
+                                avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                    cid, cond_id, out_tag, exit_side, 0.0, current_ts,
+                                    cid_indices, t_times, t_sides, t_vols, t_prices,
+                                    explicit_outcome_index=out_idx
+                                )
+
+                                # Fallback Fill if waterfall returns nothing
+                                if filled_cash is None or filled_cash <= 1e-6:
+                                    penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
+                                    penalty_price = max(0.01, min(penalty_price, 0.99))
+                                    filled_cash = shares_to_close * penalty_price
+
+                                if exit_side == 1: # Buying back short
+                                    cost_to_close = filled_cash
+                                    collateral_unlocked = shares_to_close * 1.0
+                                    cash += (collateral_unlocked - cost_to_close)
+                                else: # Selling long
+                                    cash += filled_cash
+
+                                # Record Stats
+                                pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
+                                if pnl > 0: wins += 1
+                                elif pnl < 0: losses += 1
+                                
+                                del positions[cid]
+                                # IMPORTANT: Continue to next event to avoid re-entering immediately in the same tick
+                                continue
+                                
                     if vol >= 1.0:
     
                         # A. Retrieve ROI Score (Default to None)
@@ -899,354 +955,198 @@ class FastBacktestEngine:
                         abs_net = abs(raw_net)
             
                         if abs_net > config['splash_threshold']:
-                            has_position = cid in positions
-                            if ev_type != 'RESOLUTION' and cid in positions:
-                                pos = positions[cid]
-                                curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                                
-                                if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
-                                else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
-                                
-                                should_close = False
-                                if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
-                                if use_smart_exit:
-                                    cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                                    if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
-                                    if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
-                                
-                                if should_close:
-                                    exit_side = -1 if pos['side'] == 1 else 1
-                                    
-                                    shares_to_close = abs(pos['shares'])
-                                    target_exit_cash = shares_to_close * curr_p 
-                                    
-                                    market_info = self.market_lifecycle.get(cid)
-                                    cond_id = market_info.get('condition_id')
-                                    out_tag = market_info.get('outcome_tag', 'Yes')
-                                    out_idx = 1 if out_tag == 'Yes' else 0
-                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                        cid, cond_id, out_tag, side, cost, current_ts,
-                                        cid_indices, t_times, t_sides, t_vols, t_prices,
-                                        explicit_outcome_index=out_idx
-                                    )
-
-                                    if filled_cash is None or filled_cash <= 1e-6:
-                                        # Fallback: Assume we cross the spread + penalty
-                                        penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
-                                        penalty_price = max(0.01, min(penalty_price, 0.99))
-                                        filled_cash = shares_to_close * penalty_price
-                                
-                                    if exit_side == 1:
-                                        # We were Short (Side -1), now Buying back (Side 1)
-                                        # We pay cash to buy back, but we UNLOCK our $1.00 collateral
-                                        cost_to_close = filled_cash
-                                        collateral_unlocked = shares_to_close * 1.0
-                                        net_cash_change = collateral_unlocked - cost_to_close
-                                        cash += net_cash_change
-                                    else:
-                                        # We were Long (Side 1), now Selling (Side -1)
-                                        # We simply receive the cash proceeds
-                                        net_cash_change = filled_cash
-                                        cash += net_cash_change
-                                
-                                    # PNL Calculation (for stats only)
-                                    # Entry Cost was pos['size']. 
-                                    # If Long: Profit = Exit - Entry
-                                    # If Short: Profit = Entry - Exit
-                                    pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
-                                    
-                                    if pnl > 0: wins += 1
-                                    elif pnl < 0: losses += 1
-                                    
-                                    del positions[cid]
-                            # THROTTLE CHECK: Have we fired in this minute?
-                            current_minute = current_ts.floor('1min')
+                            
                             last_trigger = tracker[cid].get('last_trigger_ts')
-            
+
                             if last_trigger != current_minute:
 
-                                if not has_position:
+                                if cid not in positions:
                                     
-                                    has_position = cid in positions
-                                    if has_position:
-                                    pos = positions[cid]
-                                    curr_p = tracker.get(cid, {}).get('last_price', pos['entry'])
-                                    
-                                    # Calculate PnL %
-                                    if pos['side'] == 1: pnl_pct = (curr_p - pos['entry']) / pos['entry']
-                                    else: pnl_pct = (pos['entry'] - curr_p) / (1.0 - pos['entry'])
-                                    
-                                    should_close = False
-                                    
-                                    # 1. Stop Loss
-                                    if stop_loss_pct and pnl_pct < -stop_loss_pct: should_close = True
-                                    
-                                    # 2. Smart Exit (Signal Reversal)
-                                    if use_smart_exit:
-                                        cur_net = tracker.get(cid, {}).get('net_weight', 0)
-                                        # Long but signal dropped significantly below entry
-                                        if pos['side'] == 1 and (cur_net - pos['entry_signal']) < -(splash_thresh * smart_exit_ratio): should_close = True
-                                        # Short but signal rose significantly above entry
-                                        if pos['side'] == -1 and (cur_net - pos['entry_signal']) > (splash_thresh * smart_exit_ratio): should_close = True
-                                    
-                                    if should_close:
-                                        # --- EXECUTE EXIT ---
-                                        exit_side = -1 if pos['side'] == 1 else 1
-                                        shares_to_close = abs(pos['shares'])
-                                        
-                                        # (Existing Exit Execution Logic...)
-                                        market_info = self.market_lifecycle.get(cid)
-                                        cond_id = market_info.get('condition_id')
-                                        out_tag = market_info.get('outcome_tag', 'Yes')
-                                        out_idx = 1 if out_tag == 'Yes' else 0
-                                        
-                                        avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                            cid, cond_id, out_tag, exit_side, 0.0, current_ts, # Cost 0.0 implied for sizing calc if needed
-                                            cid_indices, t_times, t_sides, t_vols, t_prices,
-                                            explicit_outcome_index=out_idx
-                                        )
-
-                                        # Fallback Fill
-                                        if filled_cash is None or filled_cash <= 1e-6:
-                                            penalty_price = curr_p - SPREAD_PENALTY if pos['side'] == 1 else curr_p + SPREAD_PENALTY
-                                            penalty_price = max(0.01, min(penalty_price, 0.99))
-                                            filled_cash = shares_to_close * penalty_price
-                                    
-                                        # Cash Update (Existing Logic)
-                                        if exit_side == 1: # Buying back short
-                                            cost_to_close = filled_cash
-                                            collateral_unlocked = shares_to_close * 1.0
-                                            cash += (collateral_unlocked - cost_to_close)
-                                        else: # Selling long
-                                            cash += filled_cash
-                                    
-                                        # Record Stats
-                                        pnl = (filled_cash - pos['size']) if pos['side'] == 1 else (pos['size'] - filled_cash)
-                                        if pnl > 0: wins += 1
-                                        elif pnl < 0: losses += 1
-                                        
-                                        del positions[cid]
-
-                                        has_position = False
-                                        
-                                    # --- 1. PREPARE DATA ---
                                     market_info = self.market_lifecycle.get(cid)
+                                    
                                     if not market_info or 'end' not in market_info or market_info['end'] == pd.Timestamp.max:
                                         rejection_log['missing_metadata'] = rejection_log.get('missing_metadata', 0) + 1
-                                        continue 
-            
-                                    days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
-                                    
-                                    # --- 2. CALCULATE EDGE ---
-                                    if days_remaining > 0:
-                                        # Model Probability
-                                        sigma_est = config['splash_threshold'] * 2.0
-                                        z_score = raw_net / sigma_est
-                                        p_statistical = norm.cdf(z_score)
-                                        confidence_decay = np.exp(-0.01 * days_remaining) 
-                                        p_model = 0.5 + ((p_statistical - 0.5) * confidence_decay)
-                                        p_model = max(0.01, min(0.99, p_model))
+                                        pass 
+                                    else:
+                                        days_remaining = (market_info['end'] - current_ts).total_seconds() / 86400.0
                                         
-                                        outcome_tag = market_info.get('outcome_tag', 'Yes')
-                                        
-                                        # Map to Token Probability
-                                        if outcome_tag == 'Yes':
-                                            token_p_model = p_model
-                                        else:
-                                            token_p_model = 1.0 - p_model
+                                        # --- 2. CALCULATE EDGE ---
+                                        if days_remaining > 0:
+                                            # Model Probability
+                                            sigma_est = config['splash_threshold'] * 2.0
+                                            z_score = raw_net / sigma_est
+                                            p_statistical = norm.cdf(z_score)
+                                            confidence_decay = np.exp(-0.01 * days_remaining) 
+                                            p_model = 0.5 + ((p_statistical - 0.5) * confidence_decay)
+                                            p_model = max(0.01, min(0.99, p_model))
                                             
-                                        edge = token_p_model - avg_exec_price
-               
-                                        # Edge & Safety Checks
-                                        if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
+                                            outcome_tag = market_info.get('outcome_tag', 'Yes')
                                             
-                                            # --- 3. DETERMINE SIZING (COST) ---
-                                            target_f = 0.0
-                                            cost = 0.0
-                                            if sizing_mode == 'fixed_pct': target_f = sizing_val
-                                            elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
-                                            elif sizing_mode == 'kelly':
-                                                # Check if optimization is needed
-                                                sim_now = current_ts.timestamp()
-                                                if sim_now - self.last_optimization_ts > OPTIMIZATION_INTERVAL:
-                                                    # 1. Build Expectations
-                                                    active_set = list(positions.keys())
-                                                    if cid not in active_set: active_set.append(cid)
-                                                    
-                                                    mus, valid_cids, price_series = [], [], {}
-                                                    
-                                                    for c_id in active_set:
-                                                        m_inf = self.market_lifecycle.get(c_id)
-                                                        if not m_inf: continue
+                                            if outcome_tag == 'Yes': token_p_model = p_model
+                                            else: token_p_model = 1.0 - p_model
+                                                
+                                            edge = token_p_model - avg_exec_price
+                    
+                                            # Edge & Safety Checks
+                                            if abs(edge) >= edge_thresh and (0.02 <= avg_exec_price <= 0.98):
+                                                
+                                                # --- 3. DETERMINE SIZING (COST) ---
+                                                target_f = 0.0
+                                                cost = 0.0
+                                                if sizing_mode == 'fixed_pct': target_f = sizing_val
+                                                elif sizing_mode == 'fixed': cost = sizing_val; target_f = -1 
+                                                elif sizing_mode == 'kelly':
+                                                    # Check if optimization is needed
+                                                    sim_now = current_ts.timestamp()
+                                                    if sim_now - self.last_optimization_ts > OPTIMIZATION_INTERVAL:
+                                                        # 1. Build Expectations
+                                                        active_set = list(positions.keys())
+                                                        if cid not in active_set: active_set.append(cid)
                                                         
-                                                        # Get History
-                                                        track_data = tracker.get(c_id, {})
-                                               
-                                                        hist_data = track_data.get('history', [0.5]*60)
+                                                        mus, valid_cids, price_series = [], [], {}
                                                         
-                                                        if np.std(hist_data) < 1e-9:
-                                                          pass
+                                                        for c_id in active_set:
+                                                            m_inf = self.market_lifecycle.get(c_id)
+                                                            if not m_inf: continue
                                                             
-                                                        if len(hist_data) < 10: continue
-                                                        
-                                                        # Current metrics
-                                                        # Current metrics (Use as-is)
-                                                        curr_p = track_data.get('last_price', 0.5)
-                                                        curr_net = track_data.get('net_weight', 0)
-                                                        
-                                                        # Model prob of THIS token winning
-                                                        # (Assuming positive net_weight = bullish on THIS token)
-                                                        curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
-                                                        
-                                                        # ROI Calc
-                                                        safe_price = max(curr_p, 0.001)
-                                                        expected_roi = (curr_mod / safe_price) - 1.0
-                                                        
-                                                        # Annualize
-                                                        rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
-                                                        time_factor = min(365.0 / (rem_days + 1.0), 52.0)
-                                                        ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0 if expected_roi > -1.0 else -1.0
-                                                        
-                                                        mus.append(ann_ret)
-                                                        valid_cids.append(c_id)
-                                                        price_series[c_id] = hist_data[-60:]
+                                                            # Get History
+                                                            track_data = tracker.get(c_id, {})
+                                                            hist_data = track_data.get('history', [0.5]*60)
+                                                            
+                                                            if np.std(hist_data) < 1e-9:
+                                                                pass
+                                                                
+                                                            if len(hist_data) < 10: continue
+                                                            
+                                                            # Current metrics
+                                                            curr_p = track_data.get('last_price', 0.5)
+                                                            curr_net = track_data.get('net_weight', 0)
+                                                            
+                                                            # Model prob of THIS token winning
+                                                            curr_mod = 0.5 + (np.tanh(curr_net / 2000.0) * 0.49)
+                                                            
+                                                            # ROI Calc
+                                                            safe_price = max(curr_p, 0.001)
+                                                            expected_roi = (curr_mod / safe_price) - 1.0
+                                                            
+                                                            # Annualize
+                                                            rem_days = max(0.5, (m_inf['end'] - current_ts).total_seconds() / 86400.0)
+                                                            time_factor = min(365.0 / (rem_days + 1.0), 52.0)
+                                                            ann_ret = ((1.0 + expected_roi) ** time_factor) - 1.0 if expected_roi > -1.0 else -1.0
+                                                            
+                                                            mus.append(ann_ret)
+                                                            valid_cids.append(c_id)
+                                                            price_series[c_id] = hist_data[-60:]
 
                                                         self.last_optimization_ts = sim_now
-            
-                                                    # 2. Optimize
-                                                    if valid_cids:
-                                                        try:
-                                                            # --- PATCH START: Time-Aligned Covariance ---
-                                                            aligned_series = {}
-                                                            for c_id in valid_cids:
-                                                                hist_data = tracker[c_id]['history']
-                                                                # Convert list of tuples to Series
-                                                                ts_index = [x[0] for x in hist_data]
-                                                                vals = [x[1] for x in hist_data]
-                                                                
-                                                                # Create Series, Remove Duplicates, Resample to 1min, FFill
-                                                                s = pd.Series(vals, index=ts_index)
-                                                                s = s[~s.index.duplicated(keep='last')]
-                                                                # Resample to 1 minute to align all assets
-                                                                s = s.resample('1min').last().ffill()
-                                                                
-                                                                # Slice to last 60 minutes common to all (approx)
-                                                                aligned_series[c_id] = s
-                                                    
-                                                            # Combine into one DataFrame (aligned by time)
-                                                            df_prices = pd.DataFrame(aligned_series).ffill().dropna()
-                                                            
-                                                            # Only proceed if we have enough overlapping data
-                                                            if len(df_prices) > 10:
-                                                                df_rets = df_prices.pct_change().fillna(0)
-                                                                
-                                                                # Covariance Calculation
-                                                                cov_step = df_rets.cov()
-                                                                ANNUALIZATION_FACTOR = 525600 # Minutes in a year
-                                                                cov_annual = cov_step * ANNUALIZATION_FACTOR
-                                                                
-                                                                # Shrinkage
-                                                                prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
-                                                                cov_final = (cov_annual * 0.8) + (prior * 0.2)
-                                                                
-                                                                optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
-                                                                weights = optimizer.optimize_with_explicit_views(
-                                                                    pd.Series(mus, index=valid_cids), cov_final, fraction=sizing_val, max_leverage=1.0
-                                                                )
-                                                                self.target_weights_map = weights.to_dict()
-                                                            else:
-                                                                 self.target_weights_map = {}
+                
+                                                        # 2. Optimize
+                                                        if valid_cids:
+                                                            try:
+                                                                # --- Time-Aligned Covariance ---
+                                                                aligned_series = {}
+                                                                for c_id in valid_cids:
+                                                                    hist_data = tracker[c_id]['history']
+                                                                    ts_index = [x[0] for x in hist_data]
+                                                                    vals = [x[1] for x in hist_data]
+                                                                    
+                                                                    s = pd.Series(vals, index=ts_index)
+                                                                    s = s[~s.index.duplicated(keep='last')]
+                                                                    s = s.resample('1min').last().ffill()
+                                                                    aligned_series[c_id] = s
                                                         
-                                                        except Exception as e:
-                                                            print(f"Optimization failed: {e}")
-                                                            self.target_weights_map = {}
-                                                
-                                                # Read Target
-                                                ideal_weight = self.target_weights_map.get(cid, 0.0)
-                                                pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
-                                                
-                                                if ideal_weight > 0.01:
-                                                    target_f = ideal_weight
-                                                    cost = pf_val * target_f
-                                            
-                                            if target_f > 0:
-                                                target_f = min(target_f, 0.20)
-                                                cost = cash * target_f
-                                            
-                                            # --- 4. EXECUTE TRADE ---
-                                            if cost > 5.0 and cash > cost:
-                                                side = 1 if edge > 0 else -1
-                                                cond_id = market_info.get('condition_id')
-                                                out_tag = market_info.get('outcome_tag', 'Yes')
-                                                out_idx = 1 if out_tag == 'Yes' else 0
-
-                                                # --- NEW: CALCULATE LIMIT PRICE ---
-                                                # Buy Limit = Signal + 25% (Cap at 0.99)
-                                                # Sell Limit = Signal - 25% (Floor at 0.01)
-                                                if side == 1:
-                                                    limit_p = min(0.99, avg_exec_price * 1.25)
-                                                else:
-                                                    limit_p = max(0.01, avg_exec_price * 0.75)
-
-                                                # Pass limit_p to the function
-                                                avg_p, filled_cash, shares = execute_hybrid_waterfall(
-                                                    cid, cond_id, out_tag, side, cost, current_ts,
-                                                    cid_indices, t_times, t_sides, t_vols, t_prices,
-                                                    explicit_outcome_index=out_idx,
-                                                    limit_price=limit_p  # <-- NEW
-                                                )
-            
-                                                if filled_cash > 0:
-                                                    # A. Record Position
-                                                    # Signed shares: + for Buy (long), - for Sell (short)
-                                                    final_shares = shares if side == 1 else -shares
-                                                
-                                                    # Compute cash flow exactly once:
-                                                    if side == 1:
-                                                        # Long: pay filled_cash now (use filled_cash as cost)
-                                                        entry_cost = filled_cash
-                                                        cash -= entry_cost
-                                                        # store size as amount paid (for PnL calc)
-                                                        size_paid = entry_cost
-                                                    else:
-                                                        # Short: you lock collateral (1.0 per share) and receive proceeds = filled_cash
-                                                        collateral_needed = abs(final_shares) * 1.0
-                                                        proceeds = filled_cash
-                                                        # Net cash change at short entry = proceeds - collateral_locked (we can represent as reducing available cash)
-                                                        # But it's simpler to *deduct* collateral from cash (lock) and *add* proceeds:
-                                                        cash += proceeds  # you receive proceeds immediately
-                                                        cash -= collateral_needed  # lock collateral (reduces available cash)
-                                                        # for PnL bookkeeping, store size as collateral_locked (entry cost basis)
-                                                        size_paid = collateral_needed
-                                                
-                                                    positions[cid] = {
-                                                        'side': side,
-                                                        'cost_basis': size_paid,
-                                                        'size': filled_cash,
-                                                        'shares': final_shares,
-                                                        'entry': avg_p,
-                                                        'entry_signal': raw_net
-                                                    }
-                                                
-                                                    trade_count += 1
-                                                    volume_traded += filled_cash
-                                                
-                                                    # Update throttle & net weight reset
-                                                    tracker[cid]['last_trigger_ts'] = current_minute
-                                                    if raw_net > 0:
-                                                        tracker[cid]['net_weight'] -= config['splash_threshold']
-                                                    else:
-                                                        tracker[cid]['net_weight'] += config['splash_threshold']
+                                                                df_prices = pd.DataFrame(aligned_series).ffill().dropna()
+                                                                
+                                                                if len(df_prices) > 10:
+                                                                    df_rets = df_prices.pct_change().fillna(0)
+                                                                    cov_step = df_rets.cov()
+                                                                    ANNUALIZATION_FACTOR = 525600 
+                                                                    cov_annual = cov_step * ANNUALIZATION_FACTOR
+                                                                    
+                                                                    prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
+                                                                    cov_final = (cov_annual * 0.8) + (prior * 0.2)
+                                                                    
+                                                                    optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                                    weights = optimizer.optimize_with_explicit_views(
+                                                                        pd.Series(mus, index=valid_cids), cov_final, fraction=sizing_val, max_leverage=1.0
+                                                                    )
+                                                                    self.target_weights_map = weights.to_dict()
+                                                                else:
+                                                                     self.target_weights_map = {}
                                                             
-                                                else:
-                                                    rejection_log['low_volume'] += 1
-                                            elif cash <= cost:
-                                                rejection_log['insufficient_cash'] += 1
+                                                            except Exception as e:
+                                                                # print(f"Optimization failed: {e}") 
+                                                                self.target_weights_map = {}
+                                                    
+                                                    # Read Target
+                                                    ideal_weight = self.target_weights_map.get(cid, 0.0)
+                                                    pf_val = cash + sum(positions[c]['shares'] * tracker[c]['last_price'] for c in positions)
+                                                    
+                                                    if ideal_weight > 0.01:
+                                                        target_f = ideal_weight
+                                                        cost = pf_val * target_f
+                                                
+                                                if target_f > 0:
+                                                    target_f = min(target_f, 0.20)
+                                                    cost = cash * target_f
+                                                
+                                                # --- 4. EXECUTE TRADE ---
+                                                if cost > 5.0 and cash > cost:
+                                                    side = 1 if edge > 0 else -1
+                                                    cond_id = market_info.get('condition_id')
+                                                    out_tag = market_info.get('outcome_tag', 'Yes')
+                                                    out_idx = 1 if out_tag == 'Yes' else 0
+
+                                                    # Limit Price Logic
+                                                    if side == 1: limit_p = min(0.99, avg_exec_price * 1.25)
+                                                    else: limit_p = max(0.01, avg_exec_price * 0.75)
+
+                                                    avg_p, filled_cash, shares = execute_hybrid_waterfall(
+                                                        cid, cond_id, out_tag, side, cost, current_ts,
+                                                        cid_indices, t_times, t_sides, t_vols, t_prices,
+                                                        explicit_outcome_index=out_idx,
+                                                        limit_price=limit_p
+                                                    )
+                
+                                                    if filled_cash > 0:
+                                                        final_shares = shares if side == 1 else -shares
+                                                    
+                                                        if side == 1:
+                                                            entry_cost = filled_cash
+                                                            cash -= entry_cost
+                                                            size_paid = entry_cost
+                                                        else:
+                                                            collateral_needed = abs(final_shares) * 1.0
+                                                            proceeds = filled_cash
+                                                            cash += proceeds 
+                                                            cash -= collateral_needed
+                                                            size_paid = collateral_needed
+                                                    
+                                                        positions[cid] = {
+                                                            'side': side,
+                                                            'cost_basis': size_paid,
+                                                            'size': filled_cash,
+                                                            'shares': final_shares,
+                                                            'entry': avg_p,
+                                                            'entry_signal': raw_net
+                                                        }
+                                                    
+                                                        trade_count += 1
+                                                        volume_traded += filled_cash
+                                                    
+                                                        tracker[cid]['last_trigger_ts'] = current_minute
+                                                        if raw_net > 0: tracker[cid]['net_weight'] -= config['splash_threshold']
+                                                        else: tracker[cid]['net_weight'] += config['splash_threshold']
+                                                                
+                                                    else:
+                                                        rejection_log['low_volume'] += 1
+                                                elif cash <= cost:
+                                                    rejection_log['insufficient_cash'] += 1
+                                            else:
+                                                if abs(edge) < edge_thresh: rejection_log['low_edge'] += 1
+                                                else: rejection_log['unsafe_price'] += 1
                                         else:
-                                            if abs(edge) < edge_thresh: rejection_log['low_edge'] += 1
-                                            else: rejection_log['unsafe_price'] += 1
-                                    else:
-                                        rejection_log['market_expired'] += 1
+                                            rejection_log['market_expired'] += 1
                                                    
             current_val = cash
             for cid, pos in positions.items():
