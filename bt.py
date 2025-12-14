@@ -1334,8 +1334,8 @@ class BacktestEngine:
 
             ),
             config=search_space,
-            max_concurrent_trials=2,
-            resources_per_trial={"cpu": 4},
+            max_concurrent_trials=1,
+            resources_per_trial={"cpu": 30},
 
         )
     
