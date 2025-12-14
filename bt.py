@@ -59,31 +59,62 @@ today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
 
 def plot_performance(equity_curve, trades_count):
-    """Generates a performance chart. Safe for headless servers."""
+    """
+    Generates a performance chart with Max Drawdown Annotation.
+    Safe for headless servers.
+    """
     try:
         import matplotlib
-        import matplotlib.pyplot as plt
-
         matplotlib.use('Agg') 
         import matplotlib.pyplot as plt
+        import pandas as pd
+        
+        # 1. Prepare Data
+        series = pd.Series(equity_curve)
+        x_axis = range(len(equity_curve))
+        
+        # 2. Calculate Drawdown Stats
+        running_max = series.cummax()
+        drawdown = (series - running_max) / running_max
+        
+        # Find the index of the deepest drawdown (the trough)
+        max_dd_pct = drawdown.min()
+        max_dd_idx = drawdown.idxmin()
+        max_dd_val = series[max_dd_idx]
         
         plt.figure(figsize=(12, 6))
-        # Plot Logic
-        x_axis = range(len(equity_curve))
+        
+        # 3. Plot Main Equity Curve
         plt.plot(x_axis, equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
         plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Starting Capital')
         
+        # 4. Add Max Drawdown Arrow Annotation
+        # We point TO the trough (xy) FROM a text position slightly above/left (xytext)
+        if len(equity_curve) > 0 and max_dd_idx > 0:
+            plt.annotate(
+                f'Max DD: {max_dd_pct:.1%}', 
+                xy=(max_dd_idx, max_dd_val),             # Arrow tip (at the trough)
+                xytext=(max_dd_idx, max_dd_val * 1.05),  # Text location (5% above)
+                arrowprops=dict(facecolor='red', shrink=0.05, width=1.5, headwidth=8),
+                color='white',
+                fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", fc="red", ec="none", alpha=0.6)
+            )
+            # Optional: Mark the exact point with a red dot
+            plt.scatter([max_dd_idx], [max_dd_val], color='red', zorder=5, s=30)
+
         plt.title(f"Strategy Performance ({trades_count} Trades)", fontsize=14)
         plt.xlabel("Time Steps", fontsize=10)
         plt.ylabel("Capital ($)", fontsize=10)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
-        plt.legend()
+        plt.legend(loc='upper left')
         
         # Save logic
         filename = "c7_equity_curve.png"
         plt.savefig(filename, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"\n📈 CHART GENERATED: Saved to '{filename}'")
+        print(f"\n📈 CHART GENERATED: Saved to '{filename}' (Max DD: {max_dd_pct:.1%})")
+        
     except ImportError:
         print("Matplotlib not installed or failed, skipping chart.")
     except Exception as e:
@@ -91,54 +122,42 @@ def plot_performance(equity_curve, trades_count):
 
 # --- HELPERS ---
 
-
-def fast_calculate_brier_scores(profiler_data: pd.DataFrame, min_trades: int = 20):
+def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20):
     """
-    PATCHED: Calculates Average Annualized ROI per wallet.
-    Corrects Short ROI math to use implied 'No' token prices.
+    PATCHED: Returns Raw Average ROI per wallet.
+    No normalization, no mapping to Brier scores.
     """
     if profiler_data.empty: return {}
     
     # Filter valid trades
-    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id', 'res_time', 'timestamp']).copy()
+    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']).copy()
     valid = valid[valid['bet_price'].between(0.01, 0.99)] 
     
-    # Calculate Duration (in years), minimum 1 hour
-    valid['duration_years'] = (valid['res_time'] - valid['timestamp']).dt.total_seconds() / (365 * 24 * 3600)
-    valid['duration_years'] = valid['duration_years'].clip(lower=1/8760.0) 
-    
-    # --- ROI Calculation Logic (Fixed) ---
-    
-    # 1. LONG (Buying Yes): Profit = (Outcome - Price) / Price
+    # 1. Calculate Raw ROI (Robust)
+    # LONG: (Outcome - Price) / Price
     long_mask = valid['tokens'] > 0
     valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
     
-    # 2. SHORT (Selling Yes / Buying No): 
-    # Implied Price of 'No' = (1.0 - Bet Price)
-    # Implied Outcome of 'No' = (1.0 - Outcome)
-    # Profit = (Outcome_No - Price_No) / Price_No
+    # SHORT: (Outcome_No - Price_No) / Price_No
     short_mask = valid['tokens'] < 0
-    
-    # Calculate explicitly for clarity
     price_no = 1.0 - valid.loc[short_mask, 'bet_price']
     outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
-    
+    price_no = price_no.clip(lower=0.01)
     valid.loc[short_mask, 'raw_roi'] = (outcome_no - price_no) / price_no
     
-    # 3. Safety Clipping & Geometric Calculation (Same as before)
-    valid['raw_roi'] = valid['raw_roi'].clip(-0.99, 5.0)
-    valid['ann_roi'] = np.expm1(np.log1p(valid['raw_roi']) / valid['duration_years'])
-    valid['ann_roi'] = valid['ann_roi'].clip(-0.99, 100.0)
+    # 2. Outlier Clipping
+    # Clip single-trade ROI to range [-100%, +300%] to dampen variance
+    valid['raw_roi'] = valid['raw_roi'].clip(-1.0, 3.0)
     
-    # Group by Wallet
-    stats = valid.groupby(['wallet_id', 'entity_type'])['ann_roi'].agg(['mean', 'count'])
+    # 3. Aggregation
+    # We simply return the Mean ROI. 
+    # Positive = Profitable Trader. Negative = Unprofitable.
+    stats = valid.groupby(['wallet_id', 'entity_type'])['raw_roi'].agg(['mean', 'count'])
     qualified = stats[stats['count'] >= min_trades]
     
     if qualified.empty: return {}
 
-    # Normalization (0.25 = Neutral)
-    scores = 0.25 - (np.tanh(qualified['mean'] / 2.0) * 0.15)
-    return scores.to_dict()
+    return qualified['mean'].to_dict()
 
 def persistent_disk_cache(func):
     """
@@ -249,10 +268,18 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     else:
         outcome_index = "1" if outcome_tag == "Yes" else "0"
     
+    target_book_side = "1" if side == "Buy" else "0"  # Schema dependent (0=Bid, 1=Ask usually)
+
+    # 2. Add 'side' to the query variables
     query = """
-    query ($market: String!, $block: Int!, $outcome: String!) {
+    query ($market: String!, $block: Int!, $outcome: String!, $side: String!) {
       market(id: $market, block: {number: $block}) {
-        priceLevels(where: {outcome: $outcome}, orderBy: price, orderDirection: %s, first: 50) {
+        priceLevels(
+            where: { outcome: $outcome, side: $side }, # <--- CRITICAL FIX
+            orderBy: price, 
+            orderDirection: %s, 
+            first: 50
+        ) {
           price
           volume
         }
@@ -263,7 +290,8 @@ def fetch_resting_liquidity(market_id: str, block_number: int, side: str, outcom
     variables = {
         "market": market_id, 
         "block": int(block_number),
-        "outcome": outcome_index
+        "outcome": outcome_index,
+        "side": target_book_side 
     }
 
     # Configuration for Retries
@@ -511,33 +539,61 @@ class FastBacktestEngine:
             pass
 
     def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
+        """
+        PATCHED: Regresses Volume vs ROI (instead of Brier).
+        Returns (Slope, Intercept) to predict ROI for unknown wallets.
+        """
         from scipy.stats import linregress
-        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.25
-        if 'outcome' not in profiler_data.columns or profiler_data.empty: return SAFE_SLOPE, SAFE_INTERCEPT
+        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 # Default to Neutral ROI (0%)
+        
+        if 'outcome' not in profiler_data.columns or profiler_data.empty: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
+            
         valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+        
+        # Filter
         if cutoff_date:
             if 'res_time' in valid.columns: valid = valid[valid['res_time'] < cutoff_date]
             else: valid = valid[valid['timestamp'] < cutoff_date]
         if known_wallet_ids: valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
         if len(valid) < 50: return SAFE_SLOPE, SAFE_INTERCEPT
+        
         valid = valid.copy()
-        valid['prediction'] = np.where(valid['tokens'] > 0, 1.0, 0.0)
-        valid['brier'] = (valid['prediction'] - valid['outcome']) ** 2
+        
+        # Re-calculate ROI for regression
+        long_mask = valid['tokens'] > 0
+        valid.loc[long_mask, 'roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
+        
+        short_mask = valid['tokens'] < 0
+        price_no = 1.0 - valid.loc[short_mask, 'bet_price']
+        outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
+        price_no = price_no.clip(lower=0.01)
+        valid.loc[short_mask, 'roi'] = (outcome_no - price_no) / price_no
+        
+        valid['roi'] = valid['roi'].clip(-1.0, 3.0)
         valid['log_vol'] = np.log1p(valid['usdc_vol'])
+        
         try:
-            slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['brier'])
+            slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['roi'])
             
+            # Validation: We only accept the model if High Volume correlates with Positive ROI
             if not np.isfinite(slope) or not np.isfinite(intercept):
                 return SAFE_SLOPE, SAFE_INTERCEPT
                 
-            if slope >= 0: return SAFE_SLOPE, SAFE_INTERCEPT
-            if slope > -0.002: return SAFE_SLOPE, SAFE_INTERCEPT
-            if p_val >= 0.20: return SAFE_SLOPE, SAFE_INTERCEPT
-            confidence = 1.0 - (p_val / 0.20)
-            final_slope = slope * confidence
-            final_intercept = np.clip(intercept, 0.15, 0.35)
+            # If correlation is weak or negative, return neutral
+            if p_val > 0.10: return SAFE_SLOPE, SAFE_INTERCEPT
+            
+            # Damping: Reduce the slope confidence
+            final_slope = slope * 0.5
+            final_intercept = intercept * 0.5
+            
+            # Safety Clamps for the Intercept (Base ROI)
+            # We don't want to assume fresh wallets are wildly profitable/unprofitable
+            final_intercept = max(-0.10, min(0.10, final_intercept))
+            
             return final_slope, final_intercept
-        except: return SAFE_SLOPE, SAFE_INTERCEPT
+        except: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
 
     def run_walk_forward(self, config: dict) -> dict:
         if self.event_log.empty: return {'total_return': 0.0, 'sharpe': 0.0, 'trades': 0}
@@ -580,7 +636,7 @@ class FastBacktestEngine:
             train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
             train_profiler = train_profiler.dropna(subset=['outcome'])
             
-            fold_wallet_scores = fast_calculate_brier_scores(train_profiler, min_trades=5)
+            fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5)
             known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
@@ -812,15 +868,30 @@ class FastBacktestEngine:
 
                     # 2. Signal Generation
                     if vol >= 1.0:
-                     
-                        brier = wallet_scores.get((wallet_id, 'default_topic'))
-                        if brier is None:
-                            pred_brier = fw_intercept + (fw_slope * np.log(max(vol, 1.0)))
-                            brier = max(0.10, min(pred_brier, 0.35))
+    
+                        # A. Retrieve ROI Score (Default to None)
+                        roi_score = wallet_scores.get((wallet_id, 'default_topic'))
                         
-                        raw_skill = max(0.0, 0.25 - brier)
+                        # B. Fallback for Unknown Wallets
+                        if roi_score is None:
+                            # Predict ROI based on volume
+                            pred_roi = fw_intercept + (fw_slope * np.log(max(vol, 1.0)))
+                            # Clamp prediction to reasonable bounds (e.g. -10% to +10%)
+                            roi_score = max(-0.10, min(0.10, pred_roi))
+                        
+                        # C. Calculate Skill Component
+                        # We only follow POSITIVE ROI. Negative ROI is ignored (or could be faded).
+                        # Baseline is 0.0.
+                        raw_skill = max(0.0, roi_score)
+                        
+                        # D. Weighting Formula
+                        # Log-scaling: A 10% ROI (0.10) -> log1p(10) ~ 2.4. 
+                        # Multiplier becomes (1 + 2.4) = 3.4x volume.
+                        # We cap the multiplier to avoid one lucky trader moving the market too much.
                         skill_factor = np.log1p(raw_skill * 100)
-                        weight = vol * (1.0 + min(skill_factor * 5.0, 10.0))
+                        weight_multiplier = 1.0 + min(skill_factor * 2.0, 10.0)
+                        
+                        weight = vol * weight_multiplier
                         
                         trade_direction = -1.0 if is_sell else 1.0
                         tracker[cid]['net_weight'] += (weight * trade_direction)
