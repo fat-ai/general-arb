@@ -333,11 +333,10 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
     PATCHED: Matches against OPPOSITE side flow (Liquidity Provision logic) 
     or assumes implied liquidity exists if opposite trades are occurring.
     """
-    filled_cash = 0.0
+    filled_cost = 0.0
     total_shares = 0.0
     current_idx = start_idx
     n = len(times)
-    # Conservative participation: only assume we can take 10% of opposite flow
     PARTICIPATION_RATE = 0.50 
     
     if n == 0 or current_idx >= n:
@@ -349,13 +348,12 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
         if (times[current_idx] - start_time) > max_window:
             break
         
-        # --- PATCH 1 START: Counter-Party Matching ---
         # If we want to BUY (1), we need a SELLER (-1) to hit us (Maker)
         # or we need to see Selling pressure to know there is liquidity to take.
         # Strict Backtest: Match against -target_side
         if sides[current_idx] == -target_side:
             trade_px = prices[current_idx]
-            
+            trade_vol_usdc = vols[current_idx]
             # Limit Check (Standard logic)
             # If Buying (1), we want trade_px <= limit
             # If Selling (-1), we want trade_px >= limit
@@ -365,28 +363,39 @@ def match_trade_future(target_side, target_cash, start_idx, times, sides, vols, 
             else:
                 if trade_px >= limit_price: is_valid_price = True
             
-            if is_valid_price:
-                trade_vol = vols[current_idx]
-                available_vol = trade_vol * PARTICIPATION_RATE
-                remaining = target_cash - filled_cash
+            if is_valid_price and trade_px > 0.001 and trade_px < 0.999:
+                trade_shares = trade_vol_usdc / trade_px
+                my_max_shares = trade_shares * PARTICIPATION_RATE
+                if target_side == 1:
+                    cost_per_share = trade_px
+                else:
+                    cost_per_share = 1.0 - trade_px
                 
-                # Calculate cost in cash terms
-                take_cash = min(available_vol * trade_px, remaining)
-                
-                if take_cash > 0.01:
-                    shares = take_cash / trade_px
-                    filled_cash += take_cash
-                    total_shares += shares
-                
-                if filled_cash >= target_cash * 0.999:
+                remaining_cash = target_cash - filled_cost
+                affordable_shares = remaining_cash / cost_per_share
+                fill_shares = min(my_max_shares, affordable_shares)
+
+                if fill_shares > 1e-6:
+                    # Accumulate
+                    cost_consumed = fill_shares * cost_per_share
+                    filled_cost += cost_consumed
+                    total_shares += fill_shares
+
+                if filled_cost >= target_cash * 0.999:
                     break
-        # --- PATCH 1 END ---
                     
         current_idx += 1
         
-    if total_shares == 0:
-        return 0.0, 0.0
-    return (filled_cash / total_shares), filled_cash
+    if total_shares > 0:
+        avg_cost_per_share = filled_cost / total_shares
+        if target_side == 1:
+            avg_exec_price = avg_cost_per_share
+        else:
+            avg_exec_price = 1.0 - avg_cost_per_share
+    else:
+        avg_exec_price = 0.0
+
+    return avg_exec_price, filled_cost
 
 # 4. ORCHESTRATOR
 def execute_hybrid_waterfall(
@@ -661,7 +670,6 @@ class FastBacktestEngine:
             'missing_metadata': 0
         }
 
-        # --- PRE-CALCULATION START ---
         trade_events = [
             e for b in batches for e in b 
             if e['event_type'] == 'PRICE_UPDATE' and e.get('timestamp') is not None
@@ -683,11 +691,9 @@ class FastBacktestEngine:
         
         for k in cid_indices:
             cid_indices[k] = np.array(cid_indices[k], dtype=np.int64)
-        # --- PRE-CALCULATION END ---
         
         for batch in batches:
-    
-            # FIX: Remove ['data'] access. The event dictionary is flat.
+
             batch.sort(key=lambda e: (
                 e.get('timestamp', pd.Timestamp.min),
                 EVENT_PRIORITY.get(e['event_type'], 99),
@@ -786,7 +792,7 @@ class FastBacktestEngine:
                     
                     prev_p = tracker[cid]['last_price']
                     tracker[cid]['last_price'] = avg_exec_price
-                    tracker[cid]['history'].append((avg_exec_price))
+                    tracker[cid]['history'].append((current_ts, avg_exec_price))
                     
                     if len(tracker[cid]['history']) > 60:
                         tracker[cid]['history'].pop(0)
@@ -1039,26 +1045,49 @@ class FastBacktestEngine:
                                                     # 2. Optimize
                                                     if valid_cids:
                                                         try:
-                                                            df_prices = pd.DataFrame(price_series)
-                                                            df_rets = df_prices.pct_change().fillna(0) + 1e-9
+                                                            # --- PATCH START: Time-Aligned Covariance ---
+                                                            aligned_series = {}
+                                                            for c_id in valid_cids:
+                                                                hist_data = tracker[c_id]['history']
+                                                                # Convert list of tuples to Series
+                                                                ts_index = [x[0] for x in hist_data]
+                                                                vals = [x[1] for x in hist_data]
+                                                                
+                                                                # Create Series, Remove Duplicates, Resample to 1min, FFill
+                                                                s = pd.Series(vals, index=ts_index)
+                                                                s = s[~s.index.duplicated(keep='last')]
+                                                                # Resample to 1 minute to align all assets
+                                                                s = s.resample('1min').last().ffill()
+                                                                
+                                                                # Slice to last 60 minutes common to all (approx)
+                                                                aligned_series[c_id] = s
+                                                    
+                                                            # Combine into one DataFrame (aligned by time)
+                                                            df_prices = pd.DataFrame(aligned_series).ffill().dropna()
                                                             
-                                                            # Calculate Covariance and Annualize it (Minutes in Year = 525600)
-                                                            cov_step = df_rets.cov()
-                                                            ANNUALIZATION_FACTOR = 525600
-                                                            cov_annual = cov_step * ANNUALIZATION_FACTOR
-                                                            
-                                                            # Shrinkage (Applied to Annualized Covariance)
-                                                            prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
-                                                            cov_final = (cov_annual * 0.8) + (prior * 0.2)
-                                                            
-                                                            optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
-                                                            weights = optimizer.optimize_with_explicit_views(
-                                                                pd.Series(mus, index=valid_cids), cov_final, fraction=sizing_val, max_leverage=1.0
-                                                            )
-                                                            self.target_weights_map = weights.to_dict()
+                                                            # Only proceed if we have enough overlapping data
+                                                            if len(df_prices) > 10:
+                                                                df_rets = df_prices.pct_change().fillna(0)
+                                                                
+                                                                # Covariance Calculation
+                                                                cov_step = df_rets.cov()
+                                                                ANNUALIZATION_FACTOR = 525600 # Minutes in a year
+                                                                cov_annual = cov_step * ANNUALIZATION_FACTOR
+                                                                
+                                                                # Shrinkage
+                                                                prior = pd.DataFrame(np.eye(len(valid_cids)) * cov_annual.var().mean(), index=cov_annual.index, columns=cov_annual.columns)
+                                                                cov_final = (cov_annual * 0.8) + (prior * 0.2)
+                                                                
+                                                                optimizer = KellyOptimizer(pd.DataFrame(columns=valid_cids))
+                                                                weights = optimizer.optimize_with_explicit_views(
+                                                                    pd.Series(mus, index=valid_cids), cov_final, fraction=sizing_val, max_leverage=1.0
+                                                                )
+                                                                self.target_weights_map = weights.to_dict()
+                                                            else:
+                                                                 self.target_weights_map = {}
                                                         
                                                         except Exception as e:
-                                                            # print(f"Optimization failed: {e}")
+                                                            print(f"Optimization failed: {e}")
                                                             self.target_weights_map = {}
                                                 
                                                 # Read Target
