@@ -29,9 +29,12 @@ from filelock import FileLock
 from functools import wraps 
 from filelock import Timeout
 from risk_engine import KellyOptimizer
+import matplotlib
+matplotlib.use('Agg') # Force non-interactive backend immediately
+import matplotlib.pyplot as plt
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick
-from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
+from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId, AggregatorId
 from nautilus_trader.model.objects import Price, Quantity, Money, Currency
 from nautilus_trader.model.enums import (
     OrderSide,
@@ -80,10 +83,6 @@ def plot_performance(equity_curve, trades_count):
     Safe for headless servers.
     """
     try:
-        import matplotlib
-        matplotlib.use('Agg') 
-        import matplotlib.pyplot as plt
-        import pandas as pd
         
         # 1. Prepare Data
         series = pd.Series(equity_curve)
@@ -234,6 +233,8 @@ class PolyStrategyConfig(StrategyConfig):
     decay_factor: float = 0.95
     wallet_scores: dict = {}
     instrument_ids: list = []
+    fw_slope: float = 0.0
+    fw_intercept: float = 0.0
     
     # Risk & Execution Parameters
     sizing_mode: str = 'fixed'    # Options: 'fixed', 'fixed_pct', 'kelly'
@@ -254,6 +255,8 @@ class PolymarketNautilusStrategy(Strategy):
         self.equity_history = []
         self.wins = 0
         self.losses = 0
+        self.fw_slope = config.fw_slope
+        self.fw_intercept = config.fw_intercept
         
         # Track active average entry prices for Stop Loss/Smart Exit
         # Format: {InstrumentId: {'avg_price': float, 'net_qty': float}}
@@ -306,7 +309,12 @@ class PolymarketNautilusStrategy(Strategy):
 
         # 4. Signal Generation (Wallet Profiling)
         if vol >= 1.0:
-            roi_score = self.config.wallet_scores.get((wallet_id, 'default_topic'), 0.0)
+            wallet_key = (wallet_id, 'default_topic')
+            if wallet_key in self.config.wallet_scores:
+                roi_score = self.config.wallet_scores[wallet_key]
+            else:
+                log_vol = np.log1p(vol)
+                roi_score = self.fw_intercept + self.fw_slope * log_vol
             
             # Logarithmic scaling of skill
             raw_skill = max(0.0, roi_score)
@@ -321,11 +329,8 @@ class PolymarketNautilusStrategy(Strategy):
                 # Dampen signal after firing
                 tracker['net_weight'] -= (self.config.splash_threshold * np.sign(tracker['net_weight']))
 
-        # 6. Record Equity (Every tick is expensive, maybe sample this?)
-        # For production, move this to on_bar or sample every N ticks
-        # usdc = Currency.from_str("USDC")
-        # self.equity_history.append(self.portfolio.net_equity_total(usdc).as_double())
-
+        # 6. Record Equity
+     
     def _check_risk_triggers(self, inst_id, current_price):
         """Handle Stop Loss and Smart Exits"""
         if inst_id not in self.positions_tracker: return
@@ -350,11 +355,20 @@ class PolymarketNautilusStrategy(Strategy):
         # B. Smart Exit (Take Profit based on signal fading)
         # If we have a profit, and the signal has decayed to near zero, exit early.
         if self.config.use_smart_exit and pnl_pct > self.config.edge_threshold:
-            cid = inst_id.value
             current_signal = self.trackers.get(cid, {}).get('net_weight', 0)
-            # If signal is weak relative to threshold * ratio, take profit
-            if abs(current_signal) < (self.config.splash_threshold * self.config.smart_exit_ratio):
-                self._close_position(inst_id, current_price, "SMART_EXIT")
+            pos_data = self.positions_tracker.get(inst_id)
+            
+            # Check if signal has weakened in the SAME direction as position
+            if pos_data:
+                is_long = pos_data['net_qty'] > 0
+                threshold = self.config.splash_threshold * self.config.smart_exit_ratio
+                
+                # Long position: Exit if signal drops below positive threshold
+                if is_long and current_signal < threshold:
+                    self._close_position(inst_id, current_price, "SMART_EXIT")
+                # Short position: Exit if signal rises above negative threshold  
+                elif not is_long and current_signal > -threshold:
+                    self._close_position(inst_id, current_price, "SMART_EXIT")
 
     def _execute_entry(self, cid, signal, price):
         # Safety Clamps
@@ -425,6 +439,19 @@ class PolymarketNautilusStrategy(Strategy):
         fill_qty = event.last_qty.as_double()
         is_buy = (event.order_side == OrderSide.BUY)
         signed_qty = fill_qty if is_buy else -fill_qty
+
+        if inst_id in self.positions_tracker:
+        curr = self.positions_tracker[inst_id]
+        old_qty = curr['net_qty']
+        
+        if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
+            # Calculate realized PnL on the closed portion
+            closed_qty = min(abs(old_qty), abs(fill_qty))
+            pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
+            realized_pnl = pnl_per_share * closed_qty
+            
+            if realized_pnl > 0: self.wins += 1
+            elif realized_pnl < 0: self.losses += 1
         
         if inst_id not in self.positions_tracker:
             self.positions_tracker[inst_id] = {'avg_price': fill_price, 'net_qty': signed_qty}
@@ -434,9 +461,16 @@ class PolymarketNautilusStrategy(Strategy):
             new_qty = old_qty + signed_qty
             
             # If increasing position, update avg price
-            if (old_qty >= 0 and signed_qty > 0) or (old_qty <= 0 and signed_qty < 0):
-                total_cost = (abs(old_qty) * curr['avg_price']) + (fill_qty * fill_price)
-                curr['avg_price'] = total_cost / abs(new_qty)
+            if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
+                 # Adding to existing position - update average
+                total_cost = (old_qty * curr['avg_price']) + (signed_qty * fill_price)
+                curr['avg_price'] = total_cost / new_qty
+            elif old_qty * signed_qty < 0:
+                # Reducing or flipping position
+                if abs(new_qty) > 0.001:
+                    # If flipping, new avg is just the flip fill price
+                    if old_qty * new_qty < 0:
+                        curr['avg_price'] = fill_price
             
             curr['net_qty'] = new_qty
             
@@ -627,7 +661,7 @@ class FastBacktestEngine:
         pct_changes = series.pct_change().dropna()
         sharpe = 0.0
         if len(pct_changes) > 1 and pct_changes.std() > 0:
-            sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 1440)
+            sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 288)
 
         wl_ratio = total_wins / total_losses if total_losses > 0 else 0.0
         return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
@@ -719,7 +753,8 @@ class FastBacktestEngine:
             decay_factor=float(config.get('decay_factor', 0.95)),
             wallet_scores=wallet_scores,
             instrument_ids=list(inst_map.values()),
-            
+            fw_slope=float(fw_slope),
+            fw_intercept=float(fw_intercept),
             # Execution / Risk Params
             sizing_mode=str(config.get('sizing_mode', 'fixed')),
             fixed_size=float(config.get('fixed_size', 10.0)),
@@ -744,6 +779,11 @@ class FastBacktestEngine:
         equity_curve = strategy.equity_history
         if not equity_curve: equity_curve = [10000.0]
         final_val = equity_curve[-1]
+
+        del strategy
+        del engine
+        import gc
+        gc.collect()
 
         return {
             'final_value': final_val,
@@ -920,11 +960,17 @@ class TuningRunner:
         # 4. Splash Threshold (Asc - prefer lower threshold if scores are tied)
         def sort_key(t):
             metrics = t.last_result or {}
+            
+            # Replace NaN/None with -inf for sorting
+            def safe_get(key, default=-99.0):
+                val = metrics.get(key, default)
+                return val if (val is not None and not np.isnan(val)) else -99.0
+            
             return (
-                metrics.get('smart_score', -99.0),
-                metrics.get('total_return', -99.0),
-                metrics.get('trades', 0),
-                -t.config.get('splash_threshold', 0), # Negative for Ascending
+                safe_get('smart_score'),
+                safe_get('total_return'),
+                safe_get('trades', 0),
+                -t.config.get('splash_threshold', 0),
                 t.trial_id
             )
         sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
@@ -1209,30 +1255,28 @@ class TuningRunner:
 
         # Normalization
         def derive_outcome(row):
-            # 1. Trust explicit outcome first
-            if pd.notna(row.get('outcome')): 
-                return float(row['outcome'])
-
-            # 2. TIME GATE
-            try:
-                end_date_str = row.get('endDate')
-                if end_date_str:
-                    end_ts = pd.to_datetime(end_date_str, utc=True)
-                    if end_ts > pd.Timestamp.now(tz='UTC'):
-                        return 0.5
-            except: return 0.5
-
-            # 3. PRICE CHECK
-            try:
-                prices = row.get('outcomePrices')
-                if isinstance(prices, str): prices = json.loads(prices)
-                if not isinstance(prices, list) or len(prices) != 2: return 0.5
-                p0, p1 = float(prices[0]), float(prices[1])
-                
-                if p1 >= 0.99: return 1.0
-                if p0 >= 0.99: return 0.0
-                return 0.5
-            except: return 0.5
+            # 1. Trust explicit outcome
+            outcome_val = row.get('outcome')
+            if pd.notna(outcome_val):
+                val = float(outcome_val)
+                if val in [0.0, 1.0]:
+                    return val
+            
+            # 2. Check resolution status
+            is_resolved = row.get('closed', False) or row.get('resolved', False)
+            
+            # 3. If resolved but missing outcome, mark as INVALID (filter later)
+            if is_resolved and pd.isna(outcome_val):
+                return np.nan  # Mark for deletion
+            
+            # 4. Active markets
+            end_date_str = row.get('endDate')
+            if end_date_str:
+                end_ts = pd.to_datetime(end_date_str, utc=True)
+                if end_ts > pd.Timestamp.now(tz='UTC'):
+                    return 0.5
+            
+            return np.nan
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
@@ -1397,7 +1441,26 @@ class TuningRunner:
             parts = str(mid_str).split(',')
             for p in parts:
                 if len(p) > 5: all_tokens.append(p.strip())
+                    
         all_tokens = list(set(all_tokens))
+
+        completed_tokens = set()
+        if ledger_file.exists():
+            try:
+                with open(ledger_file, 'r') as f:
+                     completed_tokens = set(line.strip() for line in f if line.strip())
+            except Exception as e:
+                print(f"⚠️ Could not read ledger: {e}")
+        
+        pending_tokens = [t for t in all_tokens if t not in completed_tokens]
+        print(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
+        
+        if not pending_tokens and cache_file.exists():
+             print("✅ All tokens previously fetched.")
+             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        
+        # Use 'pending_tokens' for the actual work
+        all_tokens = pending_tokens
             
         print(f"Stream-fetching {len(all_tokens)} tokens via SUBGRAPH...")
         print(f"Constraint: STRICT {days_back} DAY HISTORY LIMIT.")
@@ -1477,42 +1540,37 @@ class TuningRunner:
                                 continue
                             
                             try:
-                                # LOGIC FIX: Explicitly derive Side from Asset Flow
-                                # ------------------------------------------------
-                                # CASE A: source == 'maker' -> Query filtered by `makerAssetId == token`
-                                # The Maker provided the Token (Sold). The Taker provided USDC (Bought).
-                                # ACTION: Taker BUY.
+                                # Scale amounts based on asset type (USDC: 10**6, Tokens: 10**18)
                                 if source == 'maker':
-                                    size = float(row.get('makerAmountFilled') or 0.0) # Token Amount
-                                    usdc = float(row.get('takerAmountFilled') or 0.0) # USDC Amount
-                                    user = str(row.get('taker') or 'unknown')         # The Aggressor
-                                    side_mult = 1  # POSITIVE = Buy (Adding to Position)
-                                    
-                                # CASE B: source == 'taker' -> Query filtered by `takerAssetId == token`
-                                # The Taker provided the Token (Sold). The Maker provided USDC (Bought).
-                                # ACTION: Taker SELL.
+                                    size = float(row.get('makerAmountFilled') or 0.0) / 1e18  # Token amount
+                                    usdc = float(row.get('takerAmountFilled') or 0.0) / 1e6   # USDC amount
+                                    user = str(row.get('taker') or 'unknown')                # Aggressor: Taker buys token
+                                    side_mult = 1  # Buy (long)
                                 else:
-                                    size = float(row.get('takerAmountFilled') or 0.0) # Token Amount
-                                    usdc = float(row.get('makerAmountFilled') or 0.0) # USDC Amount
-                                    user = str(row.get('taker') or 'unknown')         # The Aggressor
-                                    side_mult = -1 # NEGATIVE = Sell (Reducing Position)
-                                
-                                if size == 0: continue
+                                    size = float(row.get('takerAmountFilled') or 0.0) / 1e18  # Token amount
+                                    usdc = float(row.get('makerAmountFilled') or 0.0) / 1e6   # USDC amount
+                                    user = str(row.get('taker') or 'unknown')                # Aggressor: Taker sells token
+                                    side_mult = -1 # Sell (short)
+                            
+                                if size <= 0 or usdc <= 0: continue  # Skip invalid trades
+                            
                                 price = usdc / size
+                                if not (0.01 <= price <= 0.99): continue  # Skip extreme prices (data errors)
+                            
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
-                                
+                            
                                 rows.append({
                                     'timestamp': ts_str,
                                     'tradeAmount': usdc,
-                                    # side_mult ensures this is Positive for Buys, Negative for Sells.
-                                    'outcomeTokensAmount': size * side_mult * 1e18, 
+                                    'outcomeTokensAmount': size * side_mult,  # Signed, scaled correctly (no *1e18)
                                     'user': user,
                                     'contract_id': token_str,
                                     'price': price,
-                                    'size': size,
+                                    'size': size,  # Absolute size
                                     'side_mult': side_mult
                                 })
-                            except: continue
+                            except:
+                                continue
                         
                         if rows:
                             with csv_lock:
@@ -1859,6 +1917,9 @@ class TuningRunner:
         prof_data = prof_data.dropna(subset=['bet_price'])
 
         prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] <= 1.0)]
+
+        if prof_data['usdc_vol'].max() > 1e6:  # Heuristic for unscaled data
+            raise ValueError("❌ Data units appear unscaled (usdc_vol too large). Check fetching logic.")
         
         prof_data['entity_type'] = 'default_topic'
         
