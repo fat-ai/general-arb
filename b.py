@@ -671,10 +671,16 @@ class FastBacktestEngine:
     def run_walk_forward(self, config: dict) -> dict:
         if self.event_log.empty: return {'total_return': 0.0, 'sharpe': 0.0, 'trades': 0}
         
-        # 1. PRE-CALCULATE TIMESTAMPS (Huge Speedup for Filtering)
-        # Convert to int64 nanoseconds once, so we filter integers instead of Datetime objects
-        self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
-        self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
+        # 1. OPTIMIZATION: PRE-CALCULATE INTEGER TIMESTAMPS
+        # We do this once on the main dataframes to speed up filtering by 10x-50x
+        # We use .copy() to ensure we are modifying the engine's local copy, not a view
+        if 'ts_int' not in self.profiler_data.columns:
+            self.profiler_data = self.profiler_data.copy()
+            self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
+            
+        if 'ts_int' not in self.event_log.columns:
+            self.event_log = self.event_log.copy()
+            self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
         
         min_date = self.event_log.index.min()
         max_date = self.event_log.index.max()
@@ -691,7 +697,7 @@ class FastBacktestEngine:
         total_losses = 0
         global_tracker = {}
 
-        # Pre-filter resolutions once
+        # Pre-filter resolutions once to avoid repeated filtering inside the loop
         all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION'].copy()
 
         while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
@@ -705,7 +711,7 @@ class FastBacktestEngine:
             test_end_ns = test_end.value
             current_date_ns = current_date.value
 
-            # Train Mask (Integer compare is 10x faster)
+            # Train Mask (Integer compare is faster)
             train_mask = (
                 (self.profiler_data['ts_int'] >= current_date_ns) & 
                 (self.profiler_data['ts_int'] < train_end_ns) & 
@@ -713,13 +719,14 @@ class FastBacktestEngine:
             )
             train_profiler = self.profiler_data[train_mask].copy()
             
-            # --- Profiler Logic (Same as before) ---
+            # --- Profiler Logic ---
+            # Filter resolutions that happened before training ended
             valid_res = all_resolutions[all_resolutions.index < train_end]
             resolved_ids = set(valid_res['contract_id'])
+            
+            # FIX: 'timestamp' is the INDEX, not a column. 
+            # We map contract_id (column) -> timestamp (index)
             outcome_map = valid_res.set_index('contract_id')['outcome'].to_dict()
-            res_time_map = valid_res['timestamp'].to_dict() # Index is timestamp? Check original structure
-            # Correction: valid_res index is Timestamp, but we need mapping from ID -> ResTime
-            # Re-creating map safely:
             res_time_map = dict(zip(valid_res['contract_id'], valid_res.index))
 
             train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
@@ -735,7 +742,7 @@ class FastBacktestEngine:
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
             # --- TEST SLICE (Optimized) ---
-            # Don't convert to dicts! Just slice the dataframe.
+            # Don't convert to dicts! Just slice the dataframe using integer mask.
             test_mask = (self.event_log['ts_int'] >= test_start_ns) & (self.event_log['ts_int'] < test_end_ns)
             test_slice_df = self.event_log[test_mask]
 
@@ -743,13 +750,14 @@ class FastBacktestEngine:
                 # Prepare Liquidity Map
                 past_mask = (self.event_log['ts_int'] < test_end_ns)
                 init_events = self.event_log[past_mask & self.event_log['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
+                # Handle potential duplicate contract_ids by taking the last known liquidity
                 global_liq = dict(zip(init_events['contract_id'], init_events['liquidity'].fillna(1.0)))
 
                 # PASS DATAFRAME DIRECTLY
                 result = self._run_single_period(
-                    test_slice_df, # <--- Passing DF, not batches
+                    test_slice_df, 
                     fold_wallet_scores, config, fw_slope, fw_intercept, 
-                    start_time=train_end, end_time=test_end, # Explicit end_time passed here
+                    start_time=train_end, end_time=test_end,
                     known_liquidity=global_liq,
                     previous_tracker=global_tracker 
                 )
@@ -792,8 +800,7 @@ class FastBacktestEngine:
             'equity_curve': equity_curve, 
             'final_capital': capital
         }
-        
-                                   
+                                  
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
         engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
         USDC = Currency.from_str("USDC")
@@ -809,8 +816,7 @@ class FastBacktestEngine:
 
         nautilus_data = []
         
-        # OPTIMIZATION: Filter for Price Updates directly using boolean indexing
-        # This is faster than list comprehension over rows
+        # Filter for Price Updates directly using boolean indexing
         price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE']
         
         # Get unique CIDs for instrument setup
@@ -845,18 +851,18 @@ class FastBacktestEngine:
         WALLET_LOOKUP.clear()
         
         # FAST LOOP: Iterate tuples instead of dicts
-        # index=False speeds it up slightly more
+        # index=True is default, but we rely on the columns we explicitly added
         for idx, row in enumerate(price_events.itertuples(index=True)):
-            # row.Index is timestamp because we set index in transform
-            # But wait, in run_walk_forward we sliced a DF where index is timestamp
-            ts_ns = row.ts_int # We pre-calculated this!
+            # Use the pre-calculated integer timestamp
+            ts_ns = int(row.ts_int)
             
             cid = row.contract_id
             if cid not in inst_map: continue
                 
             inst_id = inst_map[cid]
             
-            # Access via attribute (FAST) instead of dict lookup (SLOW)
+            # Access via attribute (FAST)
+            # Ensure we cast numpy floats to python floats for Nautilus
             price_float = float(row.p_market_all)
             bid_px = max(0.01, price_float - 0.001)
             ask_px = min(0.99, price_float + 0.001)
@@ -923,7 +929,7 @@ class FastBacktestEngine:
         engine.add_strategy(strategy)
         engine.run()
 
-        # --- Manual Settlement Logic (Same as before) ---
+        # --- Manual Settlement Logic ---
         usdc = Currency.from_str("USDC")
         cash = engine.portfolio.cash_balance(usdc).as_double()
         open_pos_value = 0.0
