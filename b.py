@@ -802,33 +802,47 @@ class FastBacktestEngine:
         }
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
-        engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
-        USDC = Currency.from_str("USDC")
+        # Local import to handle configuration correctly
+        from nautilus_trader.config import BacktestVenueConfig
         
-        engine.add_venue(
-            oms_type=OmsType.NETTING, 
-            account_type=AccountType.MARGIN, 
-            base_currency=USDC, 
+        USDC = Currency.from_str("USDC")
+        venue_symbol = "POLY" # Using string for config name
+        venue_id = Venue("POLY") # Keep Identifier for Instruments
+        
+        # 1. CONFIGURE VENUE (The correct way)
+        poly_venue = BacktestVenueConfig(
+            name=venue_symbol,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            base_currency=USDC,
             starting_balances=[Money(10_000, USDC)]
         )
 
+        # 2. CONFIGURE ENGINE
+        engine_config = BacktestEngineConfig(
+            trader_id="POLY-BOT",
+            venues=[poly_venue] # Pass venue config here
+        )
+        
+        engine = BacktestEngine(config=engine_config)
+        
+        # 3. INSTRUMENTS & DATA
         nautilus_data = []
         
-        # Filter for Price Updates directly using boolean indexing
+        # Filter for Price Updates
         price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE']
-        
-        # Get unique CIDs for instrument setup
         unique_cids = price_events['contract_id'].unique()
         
         inst_map = {}
         for cid in unique_cids:
-            inst_id = InstrumentId(Symbol(cid), venue)
+            # Use the Venue Identifier object here
+            inst_id = InstrumentId(Symbol(cid), venue_id)
             inst_map[cid] = inst_id
             
             inst = CryptoPerpetual(
                 instrument_id=inst_id, 
                 raw_symbol=Symbol(cid), 
-                venue=venue, 
+                venue=venue_id, 
                 base_currency=USDC, 
                 quote_currency=USDC,
                 price_precision=2, 
@@ -848,24 +862,19 @@ class FastBacktestEngine:
 
         WALLET_LOOKUP.clear()
         
-        # FAST LOOP: Iterate tuples instead of dicts
-        # index=True is default, but we rely on the columns we explicitly added
-        for idx, row in enumerate(price_events.itertuples(index=True)):
-            # Use the pre-calculated integer timestamp
+        # 4. FAST LOOP (Itertuples index=False)
+        for row in price_events.itertuples(index=False):
             ts_ns = int(row.ts_int)
-            
             cid = row.contract_id
             if cid not in inst_map: continue
                 
             inst_id = inst_map[cid]
-            
-            # Access via attribute (FAST)
-            # Ensure we cast numpy floats to python floats for Nautilus
             price_float = float(row.p_market_all)
+            
+            # Synthetic Quote
             bid_px = max(0.01, price_float - 0.001)
             ask_px = min(0.99, price_float + 0.001)
             
-            # Synthetic Quote
             quote = QuoteTick(
                 instrument_id=inst_id,
                 bid_price=Price.from_str(f"{bid_px:.4f}"),
@@ -878,8 +887,7 @@ class FastBacktestEngine:
             nautilus_data.append(quote)
 
             # Trade Tick
-            tr_id_str = f"{ts_ns}_{idx}"
-            # Store wallet info for the Strategy to lookup
+            tr_id_str = f"{ts_ns}_{row.wallet_id}"
             WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
             
             tick = TradeTick(
@@ -904,6 +912,7 @@ class FastBacktestEngine:
 
         engine.add_data(nautilus_data)
 
+        # 5. STRATEGY CONFIG
         strat_config = PolyStrategyConfig(
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
@@ -927,9 +936,8 @@ class FastBacktestEngine:
         engine.add_strategy(strategy)
         engine.run()
 
-        # --- Manual Settlement Logic ---
-        usdc = Currency.from_str("USDC")
-        cash = engine.portfolio.cash_balance(usdc).as_double()
+        # 6. MANUAL SETTLEMENT (Valuation)
+        cash = engine.portfolio.cash_balance(USDC).as_double()
         open_pos_value = 0.0
         
         for inst_id in engine.portfolio.positions:
@@ -944,7 +952,6 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                # Use passed end_time for settlement check
                 if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
                     pos_val = signed_qty * final_outcome
                     open_pos_value += pos_val
