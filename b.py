@@ -333,6 +333,7 @@ class PolymarketNautilusStrategy(Strategy):
      
     def _check_risk_triggers(self, inst_id, current_price):
         """Handle Stop Loss and Smart Exits"""
+        cid = inst_id.value
         if inst_id not in self.positions_tracker: return
         
         pos_data = self.positions_tracker[inst_id]
@@ -441,8 +442,8 @@ class PolymarketNautilusStrategy(Strategy):
         signed_qty = fill_qty if is_buy else -fill_qty
 
         if inst_id in self.positions_tracker:
-        curr = self.positions_tracker[inst_id]
-        old_qty = curr['net_qty']
+            curr = self.positions_tracker[inst_id]
+            old_qty = curr['net_qty']
         
         if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
             # Calculate realized PnL on the closed portion
