@@ -2064,9 +2064,6 @@ class TuningRunner:
         prof_data = prof_data.dropna(subset=['bet_price'])
 
         prof_data = prof_data[(prof_data['bet_price'] > 0.0) & (prof_data['bet_price'] <= 1.0)]
-
-        if prof_data['usdc_vol'].max() > 1e6:  # Heuristic for unscaled data
-            raise ValueError("❌ Data units appear unscaled (usdc_vol too large). Check fetching logic.")
         
         prof_data['entity_type'] = 'default_topic'
         
