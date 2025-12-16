@@ -4,6 +4,7 @@ numpy         # For all numerical operations (Kelly, vectors)
 scipy         # For optimization (C6) and QMC/stats (C6)
 pandas        # For data handling (C4) and P&L (C7)
 numba
+pyarrow
 
 # --- NLP (C2) ---
 spacy>=3.7.3,<3.8.0
