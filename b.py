@@ -313,17 +313,19 @@ class PolymarketNautilusStrategy(Strategy):
         tracker['last_update_ts'] = tick.ts_event
 
         # --- C. Signal Generation ---
-        if vol >= 1.0:
+        usdc_vol = vol * price  # Calculate dollar volume
+        if usdc_vol >= 1.0:  # Filter by dollar volume, not share count
             wallet_key = (wallet_id, 'default_topic')
             if wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
             else:
-                log_vol = np.log1p(vol)
+                log_vol = np.log1p(usdc_vol)  # Use dollar volume for model
                 roi_score = self.fw_intercept + self.fw_slope * log_vol
                 roi_score = max(-0.5, min(0.5, roi_score))
             
             raw_skill = max(0.0, roi_score)
-            weight = vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
+            # Weight by dollar volume with skill multiplier
+            weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
             
             direction = -1.0 if is_sell else 1.0
             tracker['net_weight'] += (weight * direction)
@@ -396,6 +398,8 @@ class PolymarketNautilusStrategy(Strategy):
         
         # Sizing Logic
         capital = self.portfolio.cash_balance(Currency.from_str("USDC")).as_double()
+        if capital < 100.0:
+            return
         
         if self.config.sizing_mode == 'kelly':
             target_exposure = capital * self.config.kelly_fraction
@@ -608,10 +612,16 @@ class FastBacktestEngine:
         # We use .copy() to ensure we are modifying the engine's local copy, not a view
         if 'ts_int' not in self.profiler_data.columns:
             self.profiler_data = self.profiler_data.copy()
+            # Ensure datetime type before converting
+            if not pd.api.types.is_datetime64_any_dtype(self.profiler_data['timestamp']):
+                self.profiler_data['timestamp'] = pd.to_datetime(self.profiler_data['timestamp'])
             self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
             
         if 'ts_int' not in self.event_log.columns:
             self.event_log = self.event_log.copy()
+            # Ensure datetime index
+            if not isinstance(self.event_log.index, pd.DatetimeIndex):
+                self.event_log.index = pd.to_datetime(self.event_log.index)
             self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
         
         min_date = self.event_log.index.min()
@@ -727,6 +737,7 @@ class FastBacktestEngine:
             'trades': total_trades, 
             'wins': total_wins, 
             'losses': total_losses,
+            'win_loss_ratio': total_wins / max(1, total_losses),
             'equity_curve': equity_curve, 
             'final_capital': capital
         }
@@ -749,13 +760,26 @@ class FastBacktestEngine:
         engine = BacktestEngine(config=engine_config)
         
         # 2. CONFIGURE VENUE (Explicit Args - Safe Mode)
-        engine.add_venue(
-            venue=venue_id,
-            oms_type=OmsType.NETTING,
-            account_type=AccountType.MARGIN,
-            base_currency=USDC,
-            starting_balances=[Money(10_000, USDC)]
-        )
+        try:
+            # Try modern API first
+            from nautilus_trader.config import BacktestVenueConfig
+            venue_config = BacktestVenueConfig(
+                name="POLY",
+                oms_type=OmsType.NETTING,
+                account_type=AccountType.MARGIN,
+                base_currency=USDC,
+                starting_balances=[f"10000 {USDC.code}"]
+            )
+            engine.add_venue(venue_config)
+        except (TypeError, AttributeError):
+            # Fallback to direct method call
+            engine.add_venue(
+                venue=venue_id,
+                oms_type=OmsType.NETTING,
+                account_type=AccountType.MARGIN,
+                base_currency=USDC,
+                starting_balances=[Money(10_000, USDC)]
+            )
         
         # 3. INSTRUMENTS & DATA
         nautilus_data = []
@@ -1322,7 +1346,13 @@ class TuningRunner:
             'createdAt': 'created_at', 'volume': 'volume',
             'conditionId': 'condition_id'
         }
+        # Only rename columns that actually exist
         markets = markets.rename(columns={k:v for k,v in rename_map.items() if k in markets.columns})
+        
+        # Ensure condition_id exists (fallback to contract_id if missing)
+        if 'condition_id' not in markets.columns:
+            markets['condition_id'] = markets['contract_id']
+            
 
         markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
@@ -2156,6 +2186,7 @@ class TuningRunner:
             'event_type': 'PRICE_UPDATE',
             'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
             'trade_volume': trades['tradeAmount'].astype('float32'),
+            'size': trades['size'].astype('float32'),  
             'wallet_id': trades['user'].astype('category'),
             'is_sell': (trades['outcomeTokensAmount'] < 0)
         })
