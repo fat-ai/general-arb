@@ -804,10 +804,8 @@ class FastBacktestEngine:
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
         engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
         USDC = Currency.from_str("USDC")
-        venue = Venue("POLY")
         
         engine.add_venue(
-            venue=venue, 
             oms_type=OmsType.NETTING, 
             account_type=AccountType.MARGIN, 
             base_currency=USDC, 
