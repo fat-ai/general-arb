@@ -251,6 +251,7 @@ class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
         self.trackers = {} 
+        self.last_known_prices = {}
         self.instrument_map = {i.value: i for i in config.instrument_ids}
         self.equity_history = []
         self.wins = 0
@@ -287,6 +288,7 @@ class PolymarketNautilusStrategy(Strategy):
         cid = tick.instrument_id.value
         vol = tick.quantity.as_double()
         price = tick.price.as_double()
+        self.last_known_prices[tick.instrument_id.value] = price
 
         usdc_vol = vol * price
         if usdc_vol >= 1.0: 
@@ -586,6 +588,7 @@ class FastBacktestEngine:
                 cid = row.get('contract_id')
                 if cid in self.market_lifecycle: 
                     self.market_lifecycle[cid]['end'] = ts
+                    self.market_lifecycle[cid]['final_outcome'] = float(row.get('outcome', 0.0))
 
         else:
             pass
@@ -912,7 +915,7 @@ class FastBacktestEngine:
                 else:
                     # Not resolved yet: Mark to Last Market Price
                     # This is what net_equity_total does, but we calculate explicitly for safety
-                    last_price = strategy.positions_tracker.get(inst_id, {}).get('avg_price', 0.5) 
+                    last_price = strategy.last_known_prices.get(cid, 0.5)
                     # Ideally use last Tick price, but avg_price is a safe fallback for valuation
                     pos_val = signed_qty * last_price 
                     open_pos_value += pos_val
