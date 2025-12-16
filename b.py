@@ -278,58 +278,129 @@ class PolymarketNautilusStrategy(Strategy):
         self.equity_history.append(total_equity)
 
     def on_trade_tick(self, tick: TradeTick):
-        # 1. Metadata Retrieval (Side-Channel)
+        # 1. Metadata Retrieval
         tid_val = tick.trade_id.value
         if tid_val not in WALLET_LOOKUP:
             return
             
         wallet_id, is_sell = WALLET_LOOKUP[tid_val]
-        
         cid = tick.instrument_id.value
         vol = tick.quantity.as_double()
         price = tick.price.as_double()
-        
-        # 2. Update Tracker (Decay)
+
+        usdc_vol = vol_tokens * price
+        if usdc_vol >= 1.0: 
+            wallet_key = (wallet_id, 'default_topic')
+            if wallet_key in self.config.wallet_scores:
+                roi_score = self.config.wallet_scores[wallet_key]
+            else:
+                # Model expects Log(USDC_Volume)
+                log_vol = np.log1p(usdc_vol)
+                roi_score = self.fw_intercept + self.fw_slope * log_vol
+                roi_score = max(-0.5, min(0.5, roi_score))
+            
+            raw_skill = max(0.0, roi_score)
+            
+            # Weight is now driven by Capital ($), not Share Count
+            weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
+            
+            direction = -1.0 if is_sell else 1.0
+            tracker['net_weight'] += (weight * direction)
+
+        # --- A. IMMEDIATE RISK CHECK (Stop Loss Only) ---
+        # We check price-based risk BEFORE updating signals to limit downside instantly
+        self._check_stop_loss(tick.instrument_id, price)
+
+        # --- B. Update Tracker (Signal Calculation) ---
         if cid not in self.trackers:
             self.trackers[cid] = {'net_weight': 0.0, 'last_update_ts': tick.ts_event}
         
         tracker = self.trackers[cid]
         elapsed_seconds = (tick.ts_event - tracker['last_update_ts']) / 1e9
         
-        # Optimization: Only decay if significant time passed
+        # Decay
         if elapsed_seconds > 0:
-            # Apply decay
             decay = self.config.decay_factor ** (elapsed_seconds / 60.0)
             tracker['net_weight'] *= decay
         
         tracker['last_update_ts'] = tick.ts_event
 
-        # 3. Check Risk Management (Stop Loss / Smart Exit)
-        self._check_risk_triggers(tick.instrument_id, price)
-
-        # 4. Signal Generation (Wallet Profiling)
+        # Signal Generation (Wallet Profiling)
         if vol >= 1.0:
             wallet_key = (wallet_id, 'default_topic')
             if wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
             else:
+                # Use fresh wallet model (slope/intercept from config)
                 log_vol = np.log1p(vol)
                 roi_score = self.fw_intercept + self.fw_slope * log_vol
+                roi_score = max(-0.5, min(0.5, roi_score)) # Safety Clamp
             
-            # Logarithmic scaling of skill
             raw_skill = max(0.0, roi_score)
             weight = vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
             
             direction = -1.0 if is_sell else 1.0
             tracker['net_weight'] += (weight * direction)
 
-            # 5. Entry Trigger
-            if abs(tracker['net_weight']) > self.config.splash_threshold:
-                self._execute_entry(cid, tracker['net_weight'], price)
-                # Dampen signal after firing
-                tracker['net_weight'] -= (self.config.splash_threshold * np.sign(tracker['net_weight']))
+        # --- C. SMART EXIT CHECK (Alpha-based Exit) ---
+        # Check this AFTER the signal update so we use the freshest intelligence
+        self._check_smart_exit(tick.instrument_id, price)
 
-        # 6. Record Equity
+        # --- D. Entry Trigger ---
+        if abs(tracker['net_weight']) > self.config.splash_threshold:
+            self._execute_entry(cid, tracker['net_weight'], price)
+            # Dampen signal after firing
+            tracker['net_weight'] -= (self.config.splash_threshold * np.sign(tracker['net_weight']))
+
+    def _check_stop_loss(self, inst_id, current_price):
+        """Check Stop Loss (Price Dependent Only)"""
+        if inst_id not in self.positions_tracker: return
+        
+        pos_data = self.positions_tracker[inst_id]
+        net_qty = pos_data['net_qty']
+        avg_price = pos_data['avg_price']
+        
+        if abs(net_qty) < 1.0: return # Ignore dust
+
+        # Calculate Unrealized PnL %
+        if net_qty > 0: # Long
+            pnl_pct = (current_price - avg_price) / avg_price
+        else: # Short
+            pnl_pct = (avg_price - current_price) / avg_price
+
+        if self.config.stop_loss and pnl_pct < -self.config.stop_loss:
+            self._close_position(inst_id, current_price, "STOP_LOSS")
+
+    def _check_smart_exit(self, inst_id, current_price):
+        """Check Smart Exit (Signal Dependent)"""
+        if not self.config.use_smart_exit: return
+        if inst_id not in self.positions_tracker: return
+
+        cid = inst_id.value # Fix: Define cid
+        pos_data = self.positions_tracker[inst_id]
+        net_qty = pos_data['net_qty']
+        avg_price = pos_data['avg_price']
+        
+        if abs(net_qty) < 1.0: return
+
+        # Calculate PnL %
+        if net_qty > 0: pnl_pct = (current_price - avg_price) / avg_price
+        else: pnl_pct = (avg_price - current_price) / avg_price
+
+        # Only Smart Exit if we are profitable enough (Edge Threshold)
+        if pnl_pct > self.config.edge_threshold:
+            current_signal = self.trackers.get(cid, {}).get('net_weight', 0)
+            
+            # Check if signal has weakened or reversed against our position
+            threshold = self.config.splash_threshold * self.config.smart_exit_ratio
+            is_long = net_qty > 0
+            
+            # Long: Exit if signal drops below +threshold
+            if is_long and current_signal < threshold:
+                self._close_position(inst_id, current_price, "SMART_EXIT")
+            # Short: Exit if signal rises above -threshold
+            elif not is_long and current_signal > -threshold:
+                self._close_position(inst_id, current_price, "SMART_EXIT")
      
     def _check_risk_triggers(self, inst_id, current_price):
         """Handle Stop Loss and Smart Exits"""
@@ -382,17 +453,22 @@ class PolymarketNautilusStrategy(Strategy):
         capital = self.portfolio.cash_balance(Currency.from_str("USDC")).as_double()
         
         if self.config.sizing_mode == 'kelly':
-            # Simple Kelly approximation: Fraction of Capital
-            # Full Kelly would require win_prob input, assuming fixed fraction here
             target_exposure = capital * self.config.kelly_fraction
-            qty_to_trade = target_exposure / price
             
         elif self.config.sizing_mode == 'fixed_pct':
              target_exposure = capital * self.config.fixed_size # e.g. 0.05
-             qty_to_trade = target_exposure / price
              
         else: # Fixed USDC amount
             qty_to_trade = self.config.fixed_size / price
+
+        if side == OrderSide.BUY:
+            # Long Risk = Price
+            qty_to_trade = target_exposure / price
+        else:
+            # Short Risk = 1.0 - Price
+            # Safety clamp for price approx 1.0
+            risk_per_share = max(0.01, 1.0 - price)
+            qty_to_trade = target_exposure / risk_per_share
 
         if qty_to_trade < 1.0: return
 
@@ -548,6 +624,30 @@ class FastBacktestEngine:
         
         valid['roi'] = valid['roi'].clip(-1.0, 3.0)
         valid['log_vol'] = np.log1p(valid['usdc_vol'])
+
+        wallet_stats = valid.groupby('wallet_id').agg({
+            'roi': 'mean',
+            'log_vol': 'mean',
+            'usdc_vol': 'count'
+        }).rename(columns={'usdc_vol': 'trade_count'})
+
+        # Only learn from wallets that have a representative history (min 5 trades)
+        qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 5]
+
+        # Ensure we have enough unique entities to form a regression
+        if len(qualified_wallets) < 10: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
+
+        try:
+            # Regress Average Skill vs Average Volume
+            slope, intercept, r_val, p_val, std_err = linregress(
+                qualified_wallets['log_vol'], 
+                qualified_wallets['roi']
+            )
+            
+            # Validation: We only accept if High Volume correlates with Positive ROI
+            if not np.isfinite(slope) or not np.isfinite(intercept):
+                return SAFE_SLOPE, SAFE_INTERCEPT
         
         try:
             slope, intercept, r_val, p_val, std_err = linregress(valid['log_vol'], valid['roi'])
