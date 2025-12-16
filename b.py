@@ -34,7 +34,7 @@ matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick
-from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId, AggregatorId
+from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
 from nautilus_trader.model.objects import Price, Quantity, Money, Currency
 from nautilus_trader.model.enums import (
     OrderSide,
@@ -837,10 +837,10 @@ class FastBacktestEngine:
                 WALLET_LOOKUP[tr_id_str] = (str(e['wallet_id']), bool(e['is_sell']))
                 
                 tick = TradeTick(
-                    instrument_id=inst_id,
-                    price=Price.from_str(f"{price_float:.4f}"),
+                    instrument_id=inst_map[e['contract_id']],
+                    price=Price.from_str(str(e['p_market_all'])),
                     quantity=Quantity.from_str(str(e['trade_volume'])),
-                    aggregator_id=AggregatorId("SIM"),
+                    aggressor_side=AggressorSide.BUYER if not e['is_sell'] else AggressorSide.SELLER,
                     trade_id=TradeId(tr_id_str),
                     ts_event=ts_ns,
                     ts_init=ts_ns
