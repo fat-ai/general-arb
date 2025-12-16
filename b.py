@@ -780,22 +780,22 @@ class FastBacktestEngine:
             inst_map[cid] = inst_id
             
             inst = CryptoPerpetual(
-                instrument_id=inst_id, 
-                raw_symbol=Symbol(cid),
-                base_currency=USDC, 
-                quote_currency=USDC,
-                price_precision=2, 
-                size_precision=4,
-                price_increment=Price.from_str("0.01"), 
-                size_increment=Quantity.from_str("0.0001"),
-                min_quantity=Quantity.from_str("0.01"), 
-                max_quantity=Quantity.from_str("100000"),
-                min_price=Price.from_str("0.01"), 
-                max_price=Price.from_str("1.00"),
-                maker_fee=Decimal("0"), 
-                taker_fee=Decimal("0"), 
-                ts_event=0, 
-                ts_init=0
+                inst_id, 
+                Symbol(cid),
+                USDC, 
+                USDC,
+                2, 
+                4,
+                Price.from_str("0.01"), 
+                Quantity.from_str("0.0001"),
+                Quantity.from_str("0.01"), 
+                Quantity.from_str("100000"),
+                Price.from_str("0.01"), 
+                Price.from_str("1.00"),
+                Decimal("0"), 
+                Decimal("0"), 
+                0, 
+                0
             )
             engine.add_instrument(inst)
 
