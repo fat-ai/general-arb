@@ -973,7 +973,78 @@ class TuningRunner:
             # Fallback if the custom config fails
             if not ray.is_initialized():
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
+                
+    def _fast_load_trades(self, csv_path, start_date, end_date):
+        """
+        PATCH 1: OPTIMIZED LOADER
+        1. Reads massive CSV in chunks to keep RAM usage low.
+        2. Filters by date string BEFORE parsing (Massive CPU/RAM speedup).
+        3. Caches the filtered dataset to Parquet for instant future re-runs.
+        """
+        import pandas as pd
+        import os
+        import gc
+        
+        # 1. Check for Cached Parquet (Instant Load)
+        # Hash based on file size and date window to ensure freshness
+        file_hash = f"{os.path.getsize(csv_path)}_{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
+        cache_path = self.cache_dir / f"trades_opt_{file_hash}.parquet"
+        
+        if cache_path.exists():
+            print(f"⚡ FAST LOAD: Using cached parquet: {cache_path.name}")
+            return pd.read_parquet(cache_path)
 
+        print(f"🐢 SLOW LOAD: Processing 30GB+ CSV in chunks (One-time op)...")
+        
+        # 2. Setup for String Filtering (Faster than Date Parsing)
+        # We assume the CSV contains ISO format dates (e.g. 2024-01-01T...) which sort lexicographically.
+        start_str = start_date.isoformat()
+        end_str = end_date.isoformat()
+        
+        # Only load necessary columns with efficient types
+        use_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult']
+        dtypes = {
+            'tradeAmount': 'float32', 'outcomeTokensAmount': 'float32',
+            'price': 'float32', 'size': 'float32', 'side_mult': 'float32',
+            'contract_id': 'string', 'user': 'string'
+        }
+        
+        chunks = []
+        chunk_size = 2_000_000 # 2M rows per chunk (~200MB RAM)
+        
+        try:
+            with pd.read_csv(csv_path, usecols=use_cols, dtype=dtypes, chunksize=chunk_size) as reader:
+                for i, chunk in enumerate(reader):
+                    # Filter strictly by string comparison first
+                    # This avoids parsing millions of dates for rows we will discard
+                    mask = (chunk['timestamp'] >= start_str) & (chunk['timestamp'] <= end_str)
+                    filtered = chunk[mask].copy()
+                    
+                    if not filtered.empty:
+                        # Now parse dates only for the relevant subset
+                        filtered['timestamp'] = pd.to_datetime(filtered['timestamp'], utc=True).dt.tz_localize(None)
+                        chunks.append(filtered)
+                        
+                    if i % 5 == 0:
+                        print(f"   Processed {(i+1)*2}M+ lines...", end='\r')
+                        gc.collect() # Aggressive GC
+                        
+        except Exception as e:
+            print(f"\n❌ Error reading chunks: {e}")
+            return pd.DataFrame()
+
+        print("\n   Merging filtered chunks...")
+        if not chunks:
+            return pd.DataFrame(columns=use_cols)
+            
+        df = pd.concat(chunks, ignore_index=True)
+        
+        # 3. Save Cache
+        print(f"   Caching {len(df)} rows to {cache_path.name}...")
+        df.to_parquet(cache_path, compression='snappy')
+        
+        return df
+        
     def run_tuning_job(self):
 
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
@@ -1247,18 +1318,22 @@ class TuningRunner:
         
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
+            # Collect tokens from markets
             all_tokens = []
             for raw_ids in markets['contract_id']:
                 parts = str(raw_ids).split(',')
                 for p in parts:
-                    clean_p = p.strip()
-                    if len(clean_p) > 2:
-                        all_tokens.append(clean_p)
+                    if len(p.strip()) > 2: all_tokens.append(p.strip())
             target_tokens = list(set(all_tokens))
-            trades = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
-        else:
-            print(f"   Loading local trades: {os.path.basename(trades_file)}")
-            trades = pd.read_csv(trades_file, dtype={'contract_id': str, 'user': str})
+            
+            # Initial fetch (creates the CSV)
+            # We assign to _ and delete to ensure we don't hold the raw data in RAM
+            _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
+            import gc; gc.collect()
+        
+        # CALL THE NEW OPTIMIZED LOADER
+        # This handles Chunking -> Filtering -> Caching automatically
+        trades = self._fast_load_trades(trades_file, FIXED_START_DATE, FIXED_END_DATE)
 
         if trades.empty:
             print("❌ Critical: No trade data available.")
@@ -2001,15 +2076,17 @@ class TuningRunner:
         
         # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
-            'wallet_id': trades['user'].astype(str), 
-            'market_id': trades['contract_id'],
+            # 'category' uses significantly less RAM than object/string for repeated IDs
+            'wallet_id': trades['user'].astype('category'), 
+            'market_id': trades['contract_id'].astype('category'),
             'timestamp': trades['timestamp'],
-            'usdc_vol': trades['tradeAmount'].astype('float64'),
-            'tokens': trades['outcomeTokensAmount'].astype('float64'),
-            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float64'),
-            'size': trades['tradeAmount'].astype('float64'),
-            'outcome': 0.0,
-            'bet_price': 0.0
+            # Use float32 (4 bytes) instead of float64 (8 bytes)
+            'usdc_vol': trades['tradeAmount'].astype('float32'),
+            'tokens': trades['outcomeTokensAmount'].astype('float32'),
+            'price': pd.to_numeric(trades['price'], errors='coerce').astype('float32'),
+            'size': trades['tradeAmount'].astype('float32'),
+            'outcome': np.float32(0.0),
+            'bet_price': np.float32(0.0)
         })
 
         # MAP OUTCOMES
@@ -2116,9 +2193,9 @@ class TuningRunner:
             'timestamp': trades['timestamp'],
             'contract_id': trades['contract_id'],
             'event_type': 'PRICE_UPDATE',
-            'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5),
+            'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
             'trade_volume': trades['tradeAmount'].astype('float32'),
-            'wallet_id': trades['user'].astype(str),
+            'wallet_id': trades['user'].astype('category'),
             'is_sell': (trades['outcomeTokensAmount'] < 0)
         })
 
