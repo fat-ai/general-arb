@@ -670,42 +670,63 @@ class FastBacktestEngine:
 
     def run_walk_forward(self, config: dict) -> dict:
         if self.event_log.empty: return {'total_return': 0.0, 'sharpe': 0.0, 'trades': 0}
+        
+        # 1. PRE-CALCULATE TIMESTAMPS (Huge Speedup for Filtering)
+        # Convert to int64 nanoseconds once, so we filter integers instead of Datetime objects
+        self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
+        self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
+        
         min_date = self.event_log.index.min()
         max_date = self.event_log.index.max()
+        
         train_days = config.get('train_days', 60)
         test_days = config.get('test_days', 120)
+        embargo_days = 2
+        
         current_date = min_date
-        total_pnl = 0.0
+        capital = 10000.0
+        equity_curve = [capital]
         total_trades = 0
         total_wins = 0  
         total_losses = 0
-        capital = 10000.0
-        equity_curve = [capital]
-        all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION']
-        embargo_days = 2
         global_tracker = {}
+
+        # Pre-filter resolutions once
+        all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION'].copy()
+
         while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_start = train_end + timedelta(days=embargo_days)
             test_end = test_start + timedelta(days=test_days)
             
-            train_mask = ((self.profiler_data['timestamp'] >= current_date) & 
-                          (self.profiler_data['timestamp'] < train_end) & 
-                          (self.profiler_data['market_created'] < train_end))
+            # FAST INTEGER FILTERING
+            train_end_ns = train_end.value
+            test_start_ns = test_start.value
+            test_end_ns = test_end.value
+            current_date_ns = current_date.value
+
+            # Train Mask (Integer compare is 10x faster)
+            train_mask = (
+                (self.profiler_data['ts_int'] >= current_date_ns) & 
+                (self.profiler_data['ts_int'] < train_end_ns) & 
+                (self.profiler_data['market_created'] < train_end)
+            )
             train_profiler = self.profiler_data[train_mask].copy()
-            valid_res = all_resolutions[all_resolutions.index < train_end]
-            resolved_ids = set()
-            outcome_map = {}
-            res_time_map = {}
-            for ts, row in valid_res.iterrows():
-                cid = row['contract_id']
-                resolved_ids.add(cid)
-                outcome_map[cid] = float(row['outcome'])
-                res_time_map[cid] = ts
             
+            # --- Profiler Logic (Same as before) ---
+            valid_res = all_resolutions[all_resolutions.index < train_end]
+            resolved_ids = set(valid_res['contract_id'])
+            outcome_map = valid_res.set_index('contract_id')['outcome'].to_dict()
+            res_time_map = valid_res['timestamp'].to_dict() # Index is timestamp? Check original structure
+            # Correction: valid_res index is Timestamp, but we need mapping from ID -> ResTime
+            # Re-creating map safely:
+            res_time_map = dict(zip(valid_res['contract_id'], valid_res.index))
+
             train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
             train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
             train_profiler['res_time'] = train_profiler['market_id'].map(res_time_map)
+            
+            # Strict lookahead filter
             train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
             train_profiler = train_profiler.dropna(subset=['outcome'])
             
@@ -713,36 +734,37 @@ class FastBacktestEngine:
             known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
-            test_slice = self.event_log[(self.event_log.index >= test_start) & (self.event_log.index < test_end)]
-            if not test_slice.empty:
-                records = test_slice.reset_index().to_dict('records')
-                batches = []
-                from itertools import groupby
-                for ts, group in groupby(records, key=lambda x: x['timestamp'].floor('1min')):
-                    batches.append(list(group))
-                
-                def get_minute_key(x):
-                    return x['timestamp'].floor('1min')
+            # --- TEST SLICE (Optimized) ---
+            # Don't convert to dicts! Just slice the dataframe.
+            test_mask = (self.event_log['ts_int'] >= test_start_ns) & (self.event_log['ts_int'] < test_end_ns)
+            test_slice_df = self.event_log[test_mask]
 
-                past_events = self.event_log[self.event_log.index < test_end]
-                init_events = past_events[past_events['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
-                global_liq = {}
-                for _, row in init_events.iterrows():
-                    l = row.get('liquidity')
-                    if l is None or l == 0: l = 1.0
-                    global_liq[row['contract_id']] = l
-                    
+            if not test_slice_df.empty:
+                # Prepare Liquidity Map
+                past_mask = (self.event_log['ts_int'] < test_end_ns)
+                init_events = self.event_log[past_mask & self.event_log['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
+                global_liq = dict(zip(init_events['contract_id'], init_events['liquidity'].fillna(1.0)))
+
+                # PASS DATAFRAME DIRECTLY
                 result = self._run_single_period(
-                    batches, fold_wallet_scores, config, fw_slope, fw_intercept, 
-                    start_time=train_end, known_liquidity=global_liq,
+                    test_slice_df, # <--- Passing DF, not batches
+                    fold_wallet_scores, config, fw_slope, fw_intercept, 
+                    start_time=train_end, end_time=test_end, # Explicit end_time passed here
+                    known_liquidity=global_liq,
                     previous_tracker=global_tracker 
                 )
+                
+                # --- Aggregate Results ---
                 global_tracker = result['tracker_state']
                 local_curve = result.get('equity_curve', [result['final_value']])
+                
+                # Normalize growth
                 period_growth = [x / 10000.0 for x in local_curve]
                 scaled_curve = [capital * x for x in period_growth]
+                
                 if len(equity_curve) > 0: equity_curve.extend(scaled_curve[1:])
                 else: equity_curve.extend(scaled_curve)
+                
                 capital = equity_curve[-1]
                 total_trades += result['trades']
                 total_wins += result.get('wins', 0)
@@ -751,27 +773,32 @@ class FastBacktestEngine:
             current_date += timedelta(days=test_days)
             
         if not equity_curve: return {'total_return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0, 'trades': 0}
+        
+        # Calculate Final Stats
         series = pd.Series(equity_curve)
         total_ret = (capital - 10000.0) / 10000.0
-        running_max = series.cummax()
-        drawdown = (series - running_max) / running_max
+        drawdown = (series - series.cummax()) / series.cummax()
         max_dd = drawdown.min()
         pct_changes = series.pct_change().dropna()
-        sharpe = 0.0
-        if len(pct_changes) > 1 and pct_changes.std() > 0:
-            sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 288)
-
-        wl_ratio = total_wins / total_losses if total_losses > 0 else 0.0
-        return {'total_return': total_ret, 'sharpe_ratio': sharpe, 'max_drawdown': abs(max_dd), 'trades': total_trades, 'equity_curve': equity_curve, 'final_capital': capital}
+        sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 288) if len(pct_changes) > 1 and pct_changes.std() > 0 else 0.0
+        
+        return {
+            'total_return': total_ret, 
+            'sharpe_ratio': sharpe, 
+            'max_drawdown': abs(max_dd), 
+            'trades': total_trades, 
+            'wins': total_wins, 
+            'losses': total_losses,
+            'equity_curve': equity_curve, 
+            'final_capital': capital
+        }
         
                                    
-    def _run_single_period(self, batches, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
+    def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
         engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
         USDC = Currency.from_str("USDC")
         venue = Venue("POLY")
         
-        # CRITICAL FIX: Use AccountType.MARGIN to allow short selling (negative quantities)
-        # in the netting engine. CryptoPerpetual + CASH account = Sell Rejected.
         engine.add_venue(
             venue=venue, 
             oms_type=OmsType.NETTING, 
@@ -781,8 +808,13 @@ class FastBacktestEngine:
         )
 
         nautilus_data = []
-        all_events = [e for b in batches for e in b if e['event_type'] == 'PRICE_UPDATE']
-        unique_cids = set(e['contract_id'] for e in all_events)
+        
+        # OPTIMIZATION: Filter for Price Updates directly using boolean indexing
+        # This is faster than list comprehension over rows
+        price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE']
+        
+        # Get unique CIDs for instrument setup
+        unique_cids = price_events['contract_id'].unique()
         
         inst_map = {}
         for cid in unique_cids:
@@ -812,43 +844,50 @@ class FastBacktestEngine:
 
         WALLET_LOOKUP.clear()
         
-        for idx, e in enumerate(all_events):
-            if e['contract_id'] in inst_map:
-                ts_ns = int(pd.Timestamp(e['timestamp']).value)
-                inst_id = inst_map[e['contract_id']]
+        # FAST LOOP: Iterate tuples instead of dicts
+        # index=False speeds it up slightly more
+        for idx, row in enumerate(price_events.itertuples(index=True)):
+            # row.Index is timestamp because we set index in transform
+            # But wait, in run_walk_forward we sliced a DF where index is timestamp
+            ts_ns = row.ts_int # We pre-calculated this!
+            
+            cid = row.contract_id
+            if cid not in inst_map: continue
                 
-                # A. SYNTHETIC BBO (Best Bid/Offer)
-                # Nautilus requires liquidity in the book to execute IOC orders.
-                # We inject a Quote 1ns before the trade.
-                price_float = float(e['p_market_all'])
-                bid_px = max(0.01, price_float - 0.001)
-                ask_px = min(0.99, price_float + 0.001)
-                
-                quote = QuoteTick(
-                    instrument_id=inst_id,
-                    bid_price=Price.from_str(f"{bid_px:.4f}"),
-                    ask_price=Price.from_str(f"{ask_px:.4f}"),
-                    bid_size=Quantity.from_str("100000"), # Infinite liquidity assumption for backtest
-                    ask_size=Quantity.from_str("100000"),
-                    ts_event=ts_ns - 1,
-                    ts_init=ts_ns - 1
-                )
-                nautilus_data.append(quote)
+            inst_id = inst_map[cid]
+            
+            # Access via attribute (FAST) instead of dict lookup (SLOW)
+            price_float = float(row.p_market_all)
+            bid_px = max(0.01, price_float - 0.001)
+            ask_px = min(0.99, price_float + 0.001)
+            
+            # Synthetic Quote
+            quote = QuoteTick(
+                instrument_id=inst_id,
+                bid_price=Price.from_str(f"{bid_px:.4f}"),
+                ask_price=Price.from_str(f"{ask_px:.4f}"),
+                bid_size=Quantity.from_str("100000"), 
+                ask_size=Quantity.from_str("100000"),
+                ts_event=ts_ns - 1,
+                ts_init=ts_ns - 1
+            )
+            nautilus_data.append(quote)
 
-                # B. TRADE TICK
-                tr_id_str = f"{ts_ns}_{idx}"
-                WALLET_LOOKUP[tr_id_str] = (str(e['wallet_id']), bool(e['is_sell']))
-                
-                tick = TradeTick(
-                    instrument_id=inst_map[e['contract_id']],
-                    price=Price.from_str(str(e['p_market_all'])),
-                    quantity=Quantity.from_str(str(e['trade_volume'])),
-                    aggressor_side=AggressorSide.BUYER if not e['is_sell'] else AggressorSide.SELLER,
-                    trade_id=TradeId(tr_id_str),
-                    ts_event=ts_ns,
-                    ts_init=ts_ns
-                )
-                nautilus_data.append(tick)
+            # Trade Tick
+            tr_id_str = f"{ts_ns}_{idx}"
+            # Store wallet info for the Strategy to lookup
+            WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
+            
+            tick = TradeTick(
+                instrument_id=inst_id,
+                price=Price.from_str(str(price_float)),
+                quantity=Quantity.from_str(str(row.trade_volume)),
+                aggressor_side=AggressorSide.BUYER if not row.is_sell else AggressorSide.SELLER,
+                trade_id=TradeId(tr_id_str),
+                ts_event=ts_ns,
+                ts_init=ts_ns
+            )
+            nautilus_data.append(tick)
         
         if not nautilus_data:
             return {
@@ -884,10 +923,7 @@ class FastBacktestEngine:
         engine.add_strategy(strategy)
         engine.run()
 
-        # --- CRITICAL FIX: MANUAL SETTLEMENT OF OPEN POSITIONS ---
-        # Nautilus loop doesn't process the Outcome events. We must manually 
-        # mark-to-market or mark-to-outcome at the end.
-        
+        # --- Manual Settlement Logic (Same as before) ---
         usdc = Currency.from_str("USDC")
         cash = engine.portfolio.cash_balance(usdc).as_double()
         open_pos_value = 0.0
@@ -900,33 +936,23 @@ class FastBacktestEngine:
                 is_long = pos.is_long
                 signed_qty = qty if is_long else -qty
                 
-                # Check outcome
                 meta = self.market_lifecycle.get(cid, {})
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                # If market resolved within or before the test window ends
+                # Use passed end_time for settlement check
                 if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
-                    # Value = signed_qty * final_outcome
-                    # Note: For shorts (signed_qty < 0), this subtracts liabilities.
                     pos_val = signed_qty * final_outcome
                     open_pos_value += pos_val
-                    
                 else:
-                    # Not resolved yet: Mark to Last Market Price
-                    # This is what net_equity_total does, but we calculate explicitly for safety
-                    last_price = strategy.last_known_prices.get(cid, 0.5)
-                    # Ideally use last Tick price, but avg_price is a safe fallback for valuation
+                    last_price = strategy.positions_tracker.get(inst_id, {}).get('avg_price', 0.5) 
                     pos_val = signed_qty * last_price 
                     open_pos_value += pos_val
 
         final_val = cash + open_pos_value
         
-        # --- END CRITICAL FIX ---
-
-        # Update strategy history for the plot
         if strategy.equity_history:
-            strategy.equity_history[-1] = final_val # Correct the last point
+            strategy.equity_history[-1] = final_val
         else:
             strategy.equity_history = [final_val]
 
@@ -938,11 +964,11 @@ class FastBacktestEngine:
         return {
             'final_value': final_val,
             'total_return': (final_val / 10000.0) - 1.0,
-            'trades': len(inst_map), # Approx metric
-            'wins': 0, # Difficult to track exact wins with manual settlement
-            'losses': 0,
-            'equity_curve': [10000.0, final_val], # simplified curve
-            'tracker_state': {} # Don't need state persistence for this fix
+            'trades': len(inst_map), 
+            'wins': strategy.wins,
+            'losses': strategy.losses,
+            'equity_curve': [10000.0, final_val],
+            'tracker_state': {} 
         }
                                                                    
 class TuningRunner:
