@@ -802,31 +802,35 @@ class FastBacktestEngine:
         }
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
-        # Local import to handle configuration correctly
-        from nautilus_trader.config import BacktestVenueConfig
+        # Local imports to ensure availability
+        from nautilus_trader.config import BacktestVenueConfig, BacktestEngineConfig
         
         USDC = Currency.from_str("USDC")
-        venue_symbol = "POLY" # Using string for config name
+        venue_str = "POLY" 
         venue_id = Venue("POLY") # Keep Identifier for Instruments
         
-        # 1. CONFIGURE VENUE (The correct way)
-        poly_venue = BacktestVenueConfig(
-            name=venue_symbol,
+        # 1. CONFIGURE VENUE (Create the config object)
+        poly_venue_config = BacktestVenueConfig(
+            name=venue_str,
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
             base_currency=USDC,
             starting_balances=[Money(10_000, USDC)]
         )
 
-        # 2. CONFIGURE ENGINE
+        # 2. CONFIGURE ENGINE (Do NOT pass venues here)
         engine_config = BacktestEngineConfig(
             trader_id="POLY-BOT",
-            venues=[poly_venue] # Pass venue config here
         )
         
-        engine = BacktestEngine(config=engine_config)
+        # 3. INITIALIZE ENGINE (Pass venues HERE)
+        # We pass the venue config list directly to the engine constructor
+        engine = BacktestEngine(
+            config=engine_config,
+            venues=[poly_venue_config]
+        )
         
-        # 3. INSTRUMENTS & DATA
+        # 4. INSTRUMENTS & DATA
         nautilus_data = []
         
         # Filter for Price Updates
@@ -862,7 +866,7 @@ class FastBacktestEngine:
 
         WALLET_LOOKUP.clear()
         
-        # 4. FAST LOOP (Itertuples index=False)
+        # 5. FAST LOOP (Itertuples index=False)
         for row in price_events.itertuples(index=False):
             ts_ns = int(row.ts_int)
             cid = row.contract_id
@@ -912,7 +916,7 @@ class FastBacktestEngine:
 
         engine.add_data(nautilus_data)
 
-        # 5. STRATEGY CONFIG
+        # 6. STRATEGY CONFIG
         strat_config = PolyStrategyConfig(
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
@@ -936,7 +940,7 @@ class FastBacktestEngine:
         engine.add_strategy(strategy)
         engine.run()
 
-        # 6. MANUAL SETTLEMENT (Valuation)
+        # 7. MANUAL SETTLEMENT (Valuation)
         cash = engine.portfolio.cash_balance(USDC).as_double()
         open_pos_value = 0.0
         
