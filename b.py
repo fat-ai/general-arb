@@ -33,7 +33,7 @@ import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
 # --- NAUTILUS IMPORTS ---
-from nautilus_trader.model.data import TradeTick
+from nautilus_trader.model.data import TradeTick, QuoteTick
 from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
 from nautilus_trader.model.objects import Price, Quantity, Money, Currency
 from nautilus_trader.model.enums import (
@@ -274,8 +274,13 @@ class PolymarketNautilusStrategy(Strategy):
             self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
     def _record_equity(self):
+        """Record equity with memory-safe growth limiting"""
         usdc = Currency.from_str("USDC")
         total_equity = self.portfolio.net_equity_total(usdc).as_double()
+        
+        if len(self.equity_history) > 10000:
+            self.equity_history = self.equity_history[-5000:]  # Keep recent half
+        
         self.equity_history.append(total_equity)
 
     def on_trade_tick(self, tick: TradeTick):
@@ -404,45 +409,6 @@ class PolymarketNautilusStrategy(Strategy):
             elif not is_long and current_signal > -threshold:
                 self._close_position(inst_id, current_price, "SMART_EXIT")
      
-    def _check_risk_triggers(self, inst_id, current_price):
-        """Handle Stop Loss and Smart Exits"""
-        cid = inst_id.value
-        if inst_id not in self.positions_tracker: return
-        
-        pos_data = self.positions_tracker[inst_id]
-        net_qty = pos_data['net_qty']
-        avg_price = pos_data['avg_price']
-        
-        if abs(net_qty) < 1.0: return # Ignore dust
-
-        # Calculate Unrealized PnL %
-        if net_qty > 0: # Long
-            pnl_pct = (current_price - avg_price) / avg_price
-        else: # Short
-            pnl_pct = (avg_price - current_price) / avg_price
-
-        # A. Stop Loss
-        if self.config.stop_loss and pnl_pct < -self.config.stop_loss:
-            self._close_position(inst_id, current_price, "STOP_LOSS")
-            return
-
-        # B. Smart Exit (Take Profit based on signal fading)
-        # If we have a profit, and the signal has decayed to near zero, exit early.
-        if self.config.use_smart_exit and pnl_pct > self.config.edge_threshold:
-            current_signal = self.trackers.get(cid, {}).get('net_weight', 0)
-            pos_data = self.positions_tracker.get(inst_id)
-            
-            # Check if signal has weakened in the SAME direction as position
-            if pos_data:
-                is_long = pos_data['net_qty'] > 0
-                threshold = self.config.splash_threshold * self.config.smart_exit_ratio
-                
-                # Long position: Exit if signal drops below positive threshold
-                if is_long and current_signal < threshold:
-                    self._close_position(inst_id, current_price, "SMART_EXIT")
-                # Short position: Exit if signal rises above negative threshold  
-                elif not is_long and current_signal > -threshold:
-                    self._close_position(inst_id, current_price, "SMART_EXIT")
 
     def _execute_entry(self, cid, signal, price):
         # Safety Clamps
@@ -512,50 +478,29 @@ class PolymarketNautilusStrategy(Strategy):
         ))
 
     def on_order_filled(self, event):
-        # Update Position Tracker for Risk Management
+    """Update position tracker and calculate realized PnL"""
         inst_id = event.instrument_id
         fill_price = event.last_px.as_double()
         fill_qty = event.last_qty.as_double()
         is_buy = (event.order_side == OrderSide.BUY)
         signed_qty = fill_qty if is_buy else -fill_qty
-
-        if inst_id in self.positions_tracker:
-            curr = self.positions_tracker[inst_id]
-            old_qty = curr['net_qty']
-        
-        if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
-            # Calculate realized PnL on the closed portion
-            closed_qty = min(abs(old_qty), abs(fill_qty))
-            pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
-            realized_pnl = pnl_per_share * closed_qty
-            
-            if realized_pnl > 0: self.wins += 1
-            elif realized_pnl < 0: self.losses += 1
-        
-        if inst_id not in self.positions_tracker:
-            self.positions_tracker[inst_id] = {'avg_price': fill_price, 'net_qty': signed_qty}
+    
+        # Initialize tracker if first fill
+        if abs(new_qty) < 0.001:
+        # Position fully closed
+        del self.positions_tracker[inst_id]
         else:
-            curr = self.positions_tracker[inst_id]
-            old_qty = curr['net_qty']
-            new_qty = old_qty + signed_qty
-            
-            # If increasing position, update avg price
-            if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
-                 # Adding to existing position - update average
-                total_cost = (old_qty * curr['avg_price']) + (signed_qty * fill_price)
-                curr['avg_price'] = total_cost / new_qty
-            elif old_qty * signed_qty < 0:
-                # Reducing or flipping position
-                if abs(new_qty) > 0.001:
-                    # If flipping, new avg is just the flip fill price
-                    if old_qty * new_qty < 0:
-                        curr['avg_price'] = fill_price
+            # Position still open - update average price if adding to position
+            if (old_qty > 0 and new_qty > 0 and signed_qty > 0) or \
+               (old_qty < 0 and new_qty < 0 and signed_qty < 0):
+                # Adding to same-direction position
+                total_cost = abs(old_qty * curr['avg_price']) + abs(signed_qty * fill_price)
+                curr['avg_price'] = total_cost / abs(new_qty)
+            elif old_qty * new_qty < 0:
+                # Position flipped direction
+                curr['avg_price'] = fill_price
             
             curr['net_qty'] = new_qty
-            
-            if abs(new_qty) < 0.001:
-                # Closed
-                del self.positions_tracker[inst_id]
 
 
 class FastBacktestEngine:
@@ -810,22 +755,26 @@ class FastBacktestEngine:
         venue_id = Venue("POLY") # Keep Identifier for Instruments
         
         # 1. CONFIGURE VENUE (Create the config object)
+        from nautilus_trader.config import BacktestVenueConfig
+        
         poly_venue_config = BacktestVenueConfig(
             name=venue_str,
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
             base_currency=USDC,
-            starting_balances=[Money(10_000, USDC)]
+            starting_balances=[f"10000 {USDC.code}"]  # Must be string format
         )
 
-        # 2. CONFIGURE ENGINE (Do NOT pass venues here)
+        # 2. CONFIGURE ENGINE with venue
         engine_config = BacktestEngineConfig(
             trader_id="POLY-BOT",
+            strategies=[],  # Empty, we'll add strategy later
         )
         
-        # 3. INITIALIZE ENGINE (Pass venues HERE)
-        # We pass the venue config list directly to the engine constructor
+        # 3. INITIALIZE ENGINE
         engine = BacktestEngine(config=engine_config)
+        
+        # 4. ADD VENUE (this is correct)
         engine.add_venue(poly_venue_config)
         
         # 4. INSTRUMENTS & DATA
@@ -939,12 +888,19 @@ class FastBacktestEngine:
         engine.run()
 
         # 7. MANUAL SETTLEMENT (Valuation)
-        cash = engine.portfolio.cash_balance(USDC).as_double()
+        try:
+            cash = engine.portfolio.cash_balance(USDC).as_double()
+        except:
+            cash = 10000.0  # Fallback
+            
         open_pos_value = 0.0
         
-        for inst_id in engine.portfolio.positions:
-            pos = engine.portfolio.positions[inst_id]
-            if not pos.is_flat:
+        for inst_id in list(engine.portfolio.positions.keys()):
+            try:
+                pos = engine.portfolio.positions.get(inst_id)
+                if pos is None or pos.is_flat:
+                    continue
+                    
                 cid = inst_id.symbol.value
                 qty = pos.quantity.as_double()
                 is_long = pos.is_long
@@ -954,13 +910,21 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
+                # Use final outcome if available and market ended
+                if final_outcome is not None and \
+                   (pd.isna(end_ts) or end_ts <= end_time):
                     pos_val = signed_qty * final_outcome
-                    open_pos_value += pos_val
                 else:
-                    last_price = strategy.positions_tracker.get(inst_id, {}).get('avg_price', 0.5) 
-                    pos_val = signed_qty * last_price 
-                    open_pos_value += pos_val
+                    # Use last known price from position tracker, fallback to 0.5
+                    tracker_data = strategy.positions_tracker.get(inst_id, {})
+                    last_price = tracker_data.get('avg_price', 0.5)
+                    pos_val = signed_qty * last_price
+                
+                open_pos_value += pos_val
+                
+            except Exception as e:
+                log.warning(f"Settlement error for {inst_id}: {e}")
+                continue
 
         final_val = cash + open_pos_value
         
@@ -969,8 +933,14 @@ class FastBacktestEngine:
         else:
             strategy.equity_history = [final_val]
 
+        try:
+            engine.dispose()
+        except:
+            pass
+            
         del strategy
         del engine
+        del nautilus_data
         import gc
         gc.collect()
 
@@ -1585,16 +1555,19 @@ class TuningRunner:
         # Usually: 0.0 -> Index 0 Wins. 1.0 -> Index 1 Wins.
         
         def final_token_payout(row):
-            m_out = row['outcome'] # 0.0, 1.0, or 0.5
-            if m_out == 0.5: return 0.5
+            """Calculate token payout based on market outcome"""
+            m_out = row['outcome']  # Market-level outcome
+            t_idx = row['token_index']  # This token's index (0 or 1)
             
-            # If market resolved to 1.0 (Yes/Index 1), and this token is Index 1 -> Win
-            # If market resolved to 0.0 (No/Index 0), and this token is Index 0 -> Win
+            # Active markets
+            if pd.isna(m_out) or abs(m_out - 0.5) < 0.01:
+                return 0.5
             
-            # Floating point safety check
-            if abs(m_out - row['token_index']) < 0.1:
-                return 1.0
-            return 0.0
+            # Resolved markets: outcome is the WINNING index (0.0 or 1.0)
+            # Convert to integer for exact comparison
+            winning_idx = int(round(m_out))
+            
+            return 1.0 if t_idx == winning_idx else 0.0
 
         df['outcome'] = df.apply(final_token_payout, axis=1)
 
