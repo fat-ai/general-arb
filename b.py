@@ -825,10 +825,8 @@ class FastBacktestEngine:
         
         # 3. INITIALIZE ENGINE (Pass venues HERE)
         # We pass the venue config list directly to the engine constructor
-        engine = BacktestEngine(
-            config=engine_config,
-            venues=[poly_venue_config]
-        )
+        engine = BacktestEngine(config=engine_config)
+        engine.add_venue(poly_venue_config)
         
         # 4. INSTRUMENTS & DATA
         nautilus_data = []
