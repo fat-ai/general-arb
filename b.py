@@ -747,36 +747,33 @@ class FastBacktestEngine:
         }
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
-        # Local imports to ensure availability
-        from nautilus_trader.config import BacktestVenueConfig, BacktestEngineConfig
-        
+        # 1. LOCAL IMPORTS (Crucial for Ray Workers)
+        from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
+        from nautilus_trader.model.objects import Price, Quantity, Money, Currency
+        from nautilus_trader.model.data import QuoteTick, TradeTick
+        from nautilus_trader.model.enums import OrderSide, TimeInForce, OmsType, AccountType, AggressorSide
+        from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+        from nautilus_trader.model.instruments import CryptoPerpetual
+        from decimal import Decimal
+
         USDC = Currency.from_str("USDC")
-        venue_str = "POLY" 
-        venue_id = Venue("POLY") # Keep Identifier for Instruments
+        venue_id = Venue("POLY")
         
-        # 1. CONFIGURE VENUE (Create the config object)
-        from nautilus_trader.config import BacktestVenueConfig
+        # 2. INITIALIZE ENGINE (Standard Config)
+        # We do NOT pass venues here, as it causes TypeError in your version
+        engine_config = BacktestEngineConfig(trader_id="POLY-BOT")
+        engine = BacktestEngine(config=engine_config)
         
-        poly_venue_config = BacktestVenueConfig(
-            name=venue_str,
+        # 3. CONFIGURE VENUE (Using Instance Method)
+        # Matches lines 268-275 of your original b.py
+        engine.add_venue(
+            venue=venue_id,
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
             base_currency=USDC,
-            starting_balances=[f"10000 {USDC.code}"]  # Must be string format
+            starting_balances=[Money(10_000, USDC)]
         )
 
-        # 2. CONFIGURE ENGINE with venue
-        engine_config = BacktestEngineConfig(
-            trader_id="POLY-BOT",
-            strategies=[],  # Empty, we'll add strategy later
-        )
-        
-        # 3. INITIALIZE ENGINE
-        engine = BacktestEngine(config=engine_config)
-        
-        # 4. ADD VENUE (this is correct)
-        engine.add_venue(poly_venue_config)
-        
         # 4. INSTRUMENTS & DATA
         nautilus_data = []
         
@@ -786,7 +783,6 @@ class FastBacktestEngine:
         
         inst_map = {}
         for cid in unique_cids:
-            # Use the Venue Identifier object here
             inst_id = InstrumentId(Symbol(cid), venue_id)
             inst_map[cid] = inst_id
             
@@ -888,19 +884,12 @@ class FastBacktestEngine:
         engine.run()
 
         # 7. MANUAL SETTLEMENT (Valuation)
-        try:
-            cash = engine.portfolio.cash_balance(USDC).as_double()
-        except:
-            cash = 10000.0  # Fallback
-            
+        cash = engine.portfolio.cash_balance(USDC).as_double()
         open_pos_value = 0.0
         
-        for inst_id in list(engine.portfolio.positions.keys()):
-            try:
-                pos = engine.portfolio.positions.get(inst_id)
-                if pos is None or pos.is_flat:
-                    continue
-                    
+        for inst_id in engine.portfolio.positions:
+            pos = engine.portfolio.positions[inst_id]
+            if not pos.is_flat:
                 cid = inst_id.symbol.value
                 qty = pos.quantity.as_double()
                 is_long = pos.is_long
@@ -910,21 +899,13 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                # Use final outcome if available and market ended
-                if final_outcome is not None and \
-                   (pd.isna(end_ts) or end_ts <= end_time):
+                if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
                     pos_val = signed_qty * final_outcome
+                    open_pos_value += pos_val
                 else:
-                    # Use last known price from position tracker, fallback to 0.5
-                    tracker_data = strategy.positions_tracker.get(inst_id, {})
-                    last_price = tracker_data.get('avg_price', 0.5)
-                    pos_val = signed_qty * last_price
-                
-                open_pos_value += pos_val
-                
-            except Exception as e:
-                log.warning(f"Settlement error for {inst_id}: {e}")
-                continue
+                    last_price = strategy.positions_tracker.get(inst_id, {}).get('avg_price', 0.5) 
+                    pos_val = signed_qty * last_price 
+                    open_pos_value += pos_val
 
         final_val = cash + open_pos_value
         
@@ -933,14 +914,8 @@ class FastBacktestEngine:
         else:
             strategy.equity_history = [final_val]
 
-        try:
-            engine.dispose()
-        except:
-            pass
-            
         del strategy
         del engine
-        del nautilus_data
         import gc
         gc.collect()
 
