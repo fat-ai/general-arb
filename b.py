@@ -295,30 +295,10 @@ class PolymarketNautilusStrategy(Strategy):
         price = tick.price.as_double()
         self.last_known_prices[tick.instrument_id.value] = price
 
-        usdc_vol = vol * price
-        if usdc_vol >= 1.0: 
-            wallet_key = (wallet_id, 'default_topic')
-            if wallet_key in self.config.wallet_scores:
-                roi_score = self.config.wallet_scores[wallet_key]
-            else:
-                # Model expects Log(USDC_Volume)
-                log_vol = np.log1p(usdc_vol)
-                roi_score = self.fw_intercept + self.fw_slope * log_vol
-                roi_score = max(-0.5, min(0.5, roi_score))
-            
-            raw_skill = max(0.0, roi_score)
-            
-            # Weight is now driven by Capital ($), not Share Count
-            weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
-            
-            direction = -1.0 if is_sell else 1.0
-            tracker['net_weight'] += (weight * direction)
-
-        # --- A. IMMEDIATE RISK CHECK (Stop Loss Only) ---
-        # We check price-based risk BEFORE updating signals to limit downside instantly
+        # --- A. IMMEDIATE RISK CHECK ---
         self._check_stop_loss(tick.instrument_id, price)
 
-        # --- B. Update Tracker (Signal Calculation) ---
+        # --- B. Update Tracker ---
         if cid not in self.trackers:
             self.trackers[cid] = {'net_weight': 0.0, 'last_update_ts': tick.ts_event}
         
@@ -332,16 +312,15 @@ class PolymarketNautilusStrategy(Strategy):
         
         tracker['last_update_ts'] = tick.ts_event
 
-        # Signal Generation (Wallet Profiling)
+        # --- C. Signal Generation ---
         if vol >= 1.0:
             wallet_key = (wallet_id, 'default_topic')
             if wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
             else:
-                # Use fresh wallet model (slope/intercept from config)
                 log_vol = np.log1p(vol)
                 roi_score = self.fw_intercept + self.fw_slope * log_vol
-                roi_score = max(-0.5, min(0.5, roi_score)) # Safety Clamp
+                roi_score = max(-0.5, min(0.5, roi_score))
             
             raw_skill = max(0.0, roi_score)
             weight = vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
@@ -349,11 +328,10 @@ class PolymarketNautilusStrategy(Strategy):
             direction = -1.0 if is_sell else 1.0
             tracker['net_weight'] += (weight * direction)
 
-        # --- C. SMART EXIT CHECK (Alpha-based Exit) ---
-        # Check this AFTER the signal update so we use the freshest intelligence
+        # --- D. Smart Exit ---
         self._check_smart_exit(tick.instrument_id, price)
 
-        # --- D. Entry Trigger ---
+        # --- E. Entry Trigger ---
         if abs(tracker['net_weight']) > self.config.splash_threshold:
             self._execute_entry(cid, tracker['net_weight'], price)
             # Dampen signal after firing
@@ -412,38 +390,32 @@ class PolymarketNautilusStrategy(Strategy):
 
     def _execute_entry(self, cid, signal, price):
         # Safety Clamps
-        if price <= 0.02 or price >= 0.98: return
+        if price <= 0.01 or price >= 0.99: return
         
         side = OrderSide.BUY if signal > 0 else OrderSide.SELL
         
         # Sizing Logic
-        qty_to_trade = 0.0
         capital = self.portfolio.cash_balance(Currency.from_str("USDC")).as_double()
         
         if self.config.sizing_mode == 'kelly':
             target_exposure = capital * self.config.kelly_fraction
-            
         elif self.config.sizing_mode == 'fixed_pct':
-             target_exposure = capital * self.config.fixed_size # e.g. 0.05
-             
-        else: # Fixed USDC amount
-            qty_to_trade = self.config.fixed_size / price
+             target_exposure = capital * self.config.fixed_size 
+        else: # 'fixed'
+            # FIX: Explicitly define target_exposure for fixed mode
+            target_exposure = self.config.fixed_size
 
+        # Unified Quantity Calculation (Fixed Risk)
         if side == OrderSide.BUY:
-            # Long Risk = Price
             qty_to_trade = target_exposure / price
         else:
             # Short Risk = 1.0 - Price
-            # Safety clamp for price approx 1.0
             risk_per_share = max(0.01, 1.0 - price)
             qty_to_trade = target_exposure / risk_per_share
 
         if qty_to_trade < 1.0: return
 
         # Slippage / Limit Logic
-        # BUY: Allow price to be slightly higher (Aggressive Limit)
-        # SELL: Allow price to be slightly lower
-        # Using 5% slippage tolerance instead of 25%
         slippage = 0.05 
         if side == OrderSide.BUY:
             limit_px = min(0.99, price * (1 + slippage))
@@ -455,7 +427,7 @@ class PolymarketNautilusStrategy(Strategy):
             order_side=side,
             quantity=Quantity.from_str(f"{qty_to_trade:.4f}"),
             price=Price.from_str(f"{limit_px:.2f}"),
-            time_in_force=TimeInForce.IOC # Immediate or Cancel ensures we don't rest orders
+            time_in_force=TimeInForce.IOC 
         ))
 
     def _close_position(self, inst_id, price, reason):
@@ -478,30 +450,45 @@ class PolymarketNautilusStrategy(Strategy):
         ))
 
     def on_order_filled(self, event):
-    """Update position tracker and calculate realized PnL"""
+        """Update position tracker and calculate realized PnL"""
         inst_id = event.instrument_id
         fill_price = event.last_px.as_double()
         fill_qty = event.last_qty.as_double()
         is_buy = (event.order_side == OrderSide.BUY)
         signed_qty = fill_qty if is_buy else -fill_qty
-    
-        # Initialize tracker if first fill
+
+        # 1. Initialize if new
+        if inst_id not in self.positions_tracker:
+            self.positions_tracker[inst_id] = {'avg_price': fill_price, 'net_qty': signed_qty}
+            return
+
+        # 2. Retrieve current state
+        curr = self.positions_tracker[inst_id]
+        old_qty = curr['net_qty']
+        new_qty = old_qty + signed_qty
+
+        # 3. Calculate Realized PnL (if reducing position)
+        if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
+            closed_qty = min(abs(old_qty), abs(fill_qty))
+            pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
+            realized_pnl = pnl_per_share * closed_qty
+            
+            if realized_pnl > 0: self.wins += 1
+            elif realized_pnl < 0: self.losses += 1
+
+        # 4. Update Tracker State
         if abs(new_qty) < 0.001:
-        # Position fully closed
-        del self.positions_tracker[inst_id]
+            del self.positions_tracker[inst_id]
         else:
-            # Position still open - update average price if adding to position
-            if (old_qty > 0 and new_qty > 0 and signed_qty > 0) or \
-               (old_qty < 0 and new_qty < 0 and signed_qty < 0):
-                # Adding to same-direction position
-                total_cost = abs(old_qty * curr['avg_price']) + abs(signed_qty * fill_price)
+            # If adding to position, verify average price
+            if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
+                total_cost = (abs(old_qty) * curr['avg_price']) + (abs(signed_qty) * fill_price)
                 curr['avg_price'] = total_cost / abs(new_qty)
+            # If flipping direction, reset average price
             elif old_qty * new_qty < 0:
-                # Position flipped direction
                 curr['avg_price'] = fill_price
             
             curr['net_qty'] = new_qty
-
 
 class FastBacktestEngine:
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
@@ -669,8 +656,6 @@ class FastBacktestEngine:
             valid_res = all_resolutions[all_resolutions.index < train_end]
             resolved_ids = set(valid_res['contract_id'])
             
-            # FIX: 'timestamp' is the INDEX, not a column. 
-            # We map contract_id (column) -> timestamp (index)
             outcome_map = valid_res.set_index('contract_id')['outcome'].to_dict()
             res_time_map = dict(zip(valid_res['contract_id'], valid_res.index))
 
@@ -747,7 +732,7 @@ class FastBacktestEngine:
         }
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
-        # 1. LOCAL IMPORTS (Crucial for Ray Workers)
+        # Local Imports for Safety
         from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
         from nautilus_trader.model.objects import Price, Quantity, Money, Currency
         from nautilus_trader.model.data import QuoteTick, TradeTick
@@ -759,13 +744,11 @@ class FastBacktestEngine:
         USDC = Currency.from_str("USDC")
         venue_id = Venue("POLY")
         
-        # 2. INITIALIZE ENGINE (Standard Config)
-        # We do NOT pass venues here, as it causes TypeError in your version
+        # 1. INITIALIZE ENGINE (Standard Config)
         engine_config = BacktestEngineConfig(trader_id="POLY-BOT")
         engine = BacktestEngine(config=engine_config)
         
-        # 3. CONFIGURE VENUE (Using Instance Method)
-        # Matches lines 268-275 of your original b.py
+        # 2. CONFIGURE VENUE (Explicit Args - Safe Mode)
         engine.add_venue(
             venue=venue_id,
             oms_type=OmsType.NETTING,
@@ -773,11 +756,9 @@ class FastBacktestEngine:
             base_currency=USDC,
             starting_balances=[Money(10_000, USDC)]
         )
-
-        # 4. INSTRUMENTS & DATA
-        nautilus_data = []
         
-        # Filter for Price Updates
+        # 3. INSTRUMENTS & DATA
+        nautilus_data = []
         price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE']
         unique_cids = price_events['contract_id'].unique()
         
@@ -809,7 +790,7 @@ class FastBacktestEngine:
 
         WALLET_LOOKUP.clear()
         
-        # 5. FAST LOOP (Itertuples index=False)
+        # 4. FAST LOOP
         for row in price_events.itertuples(index=False):
             ts_ns = int(row.ts_int)
             cid = row.contract_id
@@ -818,7 +799,6 @@ class FastBacktestEngine:
             inst_id = inst_map[cid]
             price_float = float(row.p_market_all)
             
-            # Synthetic Quote
             bid_px = max(0.01, price_float - 0.001)
             ask_px = min(0.99, price_float + 0.001)
             
@@ -833,14 +813,13 @@ class FastBacktestEngine:
             )
             nautilus_data.append(quote)
 
-            # Trade Tick
             tr_id_str = f"{ts_ns}_{row.wallet_id}"
             WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
-            
+                        
             tick = TradeTick(
                 instrument_id=inst_id,
                 price=Price.from_str(str(price_float)),
-                quantity=Quantity.from_str(str(row.trade_volume)),
+                quantity=Quantity.from_str(str(row.size)),  # Change from row.trade_volume to row.size
                 aggressor_side=AggressorSide.BUYER if not row.is_sell else AggressorSide.SELLER,
                 trade_id=TradeId(tr_id_str),
                 ts_event=ts_ns,
@@ -849,17 +828,11 @@ class FastBacktestEngine:
             nautilus_data.append(tick)
         
         if not nautilus_data:
-            return {
-                'final_value': 10000.0, 
-                'total_return': 0.0, 
-                'trades': 0, 
-                'equity_curve': [], 
-                'tracker_state': {}
-            }
+            return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'equity_curve': [], 'tracker_state': {}}
 
         engine.add_data(nautilus_data)
 
-        # 6. STRATEGY CONFIG
+        # 5. STRATEGY CONFIG
         strat_config = PolyStrategyConfig(
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
@@ -883,13 +856,14 @@ class FastBacktestEngine:
         engine.add_strategy(strategy)
         engine.run()
 
-        # 7. MANUAL SETTLEMENT (Valuation)
-        cash = engine.portfolio.cash_balance(USDC).as_double()
+        # 6. MANUAL SETTLEMENT
+        try: cash = engine.portfolio.cash_balance(USDC).as_double()
+        except: cash = 10000.0
+            
         open_pos_value = 0.0
-        
-        for inst_id in engine.portfolio.positions:
-            pos = engine.portfolio.positions[inst_id]
-            if not pos.is_flat:
+        for inst_id in list(engine.portfolio.positions.keys()):
+            pos = engine.portfolio.positions.get(inst_id)
+            if pos and not pos.is_flat:
                 cid = inst_id.symbol.value
                 qty = pos.quantity.as_double()
                 is_long = pos.is_long
@@ -899,25 +873,22 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
+                if final_outcome is not None and \
+                   (pd.isna(end_ts) or end_ts <= end_time):
                     pos_val = signed_qty * final_outcome
-                    open_pos_value += pos_val
                 else:
-                    last_price = strategy.positions_tracker.get(inst_id, {}).get('avg_price', 0.5) 
-                    pos_val = signed_qty * last_price 
-                    open_pos_value += pos_val
+                    # Use last known price from position tracker, fallback to 0.5
+                    last_price = strategy.last_known_prices.get(cid, 0.5)  # Change from tracker_data.get('avg_price', 0.5)
+                    pos_val = signed_qty * last_price
+                open_pos_value += pos_val
 
         final_val = cash + open_pos_value
-        
-        if strategy.equity_history:
-            strategy.equity_history[-1] = final_val
-        else:
-            strategy.equity_history = [final_val]
+        if strategy.equity_history: strategy.equity_history[-1] = final_val
+        else: strategy.equity_history = [final_val]
 
-        del strategy
-        del engine
-        import gc
-        gc.collect()
+        engine.dispose()
+        del strategy; del engine; del nautilus_data
+        import gc; gc.collect()
 
         return {
             'final_value': final_val,
