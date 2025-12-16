@@ -781,8 +781,7 @@ class FastBacktestEngine:
             
             inst = CryptoPerpetual(
                 instrument_id=inst_id, 
-                raw_symbol=Symbol(cid), 
-                venue=venue_id, 
+                raw_symbol=Symbol(cid),
                 base_currency=USDC, 
                 quote_currency=USDC,
                 price_precision=2, 
