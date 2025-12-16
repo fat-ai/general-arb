@@ -755,31 +755,19 @@ class FastBacktestEngine:
         USDC = Currency.from_str("USDC")
         venue_id = Venue("POLY")
         
-        # 1. INITIALIZE ENGINE (Standard Config)
+        # 1. INITIALIZE ENGINE (Standard Config - NO venues arg)
         engine_config = BacktestEngineConfig(trader_id="POLY-BOT")
         engine = BacktestEngine(config=engine_config)
         
         # 2. CONFIGURE VENUE (Explicit Args - Safe Mode)
-        try:
-            # Try modern API first
-            from nautilus_trader.config import BacktestVenueConfig
-            venue_config = BacktestVenueConfig(
-                name="POLY",
-                oms_type=OmsType.NETTING,
-                account_type=AccountType.MARGIN,
-                base_currency=USDC,
-                starting_balances=[f"10000 {USDC.code}"]
-            )
-            engine.add_venue(venue_config)
-        except (TypeError, AttributeError):
-            # Fallback to direct method call
-            engine.add_venue(
-                venue=venue_id,
-                oms_type=OmsType.NETTING,
-                account_type=AccountType.MARGIN,
-                base_currency=USDC,
-                starting_balances=[Money(10_000, USDC)]
-            )
+        # This works on all versions of Nautilus
+        engine.add_venue(
+            venue=venue_id,
+            oms_type=OmsType.NETTING,
+            account_type=AccountType.MARGIN,
+            base_currency=USDC,
+            starting_balances=[Money(10_000, USDC)]
+        )
         
         # 3. INSTRUMENTS & DATA
         nautilus_data = []
@@ -839,11 +827,11 @@ class FastBacktestEngine:
 
             tr_id_str = f"{ts_ns}_{row.wallet_id}"
             WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
-                        
+            
             tick = TradeTick(
                 instrument_id=inst_id,
                 price=Price.from_str(str(price_float)),
-                quantity=Quantity.from_str(str(row.size)),  # Change from row.trade_volume to row.size
+                quantity=Quantity.from_str(str(row.trade_volume)),
                 aggressor_side=AggressorSide.BUYER if not row.is_sell else AggressorSide.SELLER,
                 trade_id=TradeId(tr_id_str),
                 ts_event=ts_ns,
@@ -897,12 +885,11 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                if final_outcome is not None and \
-                   (pd.isna(end_ts) or end_ts <= end_time):
+                if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
                     pos_val = signed_qty * final_outcome
                 else:
-                    # Use last known price from position tracker, fallback to 0.5
-                    last_price = strategy.last_known_prices.get(cid, 0.5)  # Change from tracker_data.get('avg_price', 0.5)
+                    tracker_data = strategy.positions_tracker.get(inst_id, {})
+                    last_price = tracker_data.get('avg_price', 0.5)
                     pos_val = signed_qty * last_price
                 open_pos_value += pos_val
 
