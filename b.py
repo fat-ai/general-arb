@@ -1038,7 +1038,7 @@ class FastBacktestEngine:
         final_val = cash + open_pos_value
 
         if not strategy.equity_history:
-        strategy.equity_history = [10000.0, final_val]
+            strategy.equity_history = [10000.0, final_val]
         else:
             # Update the last point to match the precise settlement value
             strategy.equity_history[-1] = final_val
