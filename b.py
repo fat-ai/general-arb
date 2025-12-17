@@ -836,7 +836,7 @@ class FastBacktestEngine:
             tick = TradeTick(
                 instrument_id=inst_id,
                 price=Price.from_str(str(price_float)),
-                quantity=Quantity.from_str(str(row.trade_volume)),
+                size=Quantity.from_str(str(row.trade_volume)),
                 aggressor_side=AggressorSide.BUYER if not row.is_sell else AggressorSide.SELLER,
                 trade_id=TradeId(tr_id_str),
                 ts_event=ts_ns,
