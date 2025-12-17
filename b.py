@@ -829,7 +829,8 @@ class FastBacktestEngine:
             )
             nautilus_data.append(quote)
 
-            tr_id_str = f"{ts_ns}_{row.wallet_id}"
+            raw_id = f"{ts_ns}_{idx}_{cid}"
+            tr_id_str = hashlib.md5(raw_id.encode('utf-8')).hexdigest()
             WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
             
             tick = TradeTick(
