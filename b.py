@@ -1,4 +1,5 @@
 import os
+import random
 import logging
 import numpy as np
 import pandas as pd
@@ -50,6 +51,24 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 from decimal import Decimal
 
+def set_global_seed(seed: int):
+    """
+    Sets seeds for Python, NumPy, and Hash randomization to ensure
+    deterministic results across distributed Ray workers.
+    """
+    # 1. Python's built-in random
+    random.seed(seed)
+    
+    # 2. NumPy (critical for pandas and scipy)
+    np.random.seed(seed)
+    
+    # 3. Environment Hashing (affects set/dict iteration order)
+    # Note: This affects subprocesses spawned AFTER this call.
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+SEED = 42
+set_global_seed(SEED)
+
 # Store optimal weights here so we don't re-optimize every tick
 
 last_optimization_time = 0
@@ -65,6 +84,7 @@ np.random.seed(SEED)
 
 DISK_CACHE_DIR = Path("polymarket_cache/subgraph_ops")
 DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_VERSION = "1.0.0"
 
 def force_clear_cache(cache_dir):
     path = Path(cache_dir)
@@ -138,6 +158,57 @@ def plot_performance(equity_curve, trades_count):
 
 # --- HELPERS ---
 
+def calculate_sharpe_ratio(returns, periods_per_year=252, rf=0.0):
+    """
+    Calculates Annualized Sharpe Ratio.
+    
+    Args:
+        returns (pd.Series/np.array): Period percentage returns.
+        periods_per_year (int): Annualization factor.
+                                Use 252 for Daily data.
+                                Use 72576 for 5-minute data (252 * 288).
+        rf (float): Risk-free rate (annualized). Default 0.0.
+    """
+    returns = np.array(returns)
+    if len(returns) < 2:
+        return 0.0
+        
+    # Convert annualized Rf to per-period Rf
+    rf_per_period = rf / periods_per_year
+    excess_returns = returns - rf_per_period
+    
+    std_dev = np.std(excess_returns, ddof=1)
+    if std_dev <= 1e-9:
+        return 0.0
+        
+    return np.sqrt(periods_per_year) * (np.mean(excess_returns) / std_dev)
+
+def calculate_max_drawdown(equity_curve):
+    """
+    Robust NumPy-based Max Drawdown calculation.
+    Returns: (max_dd_pct, dd_index, equity_at_trough)
+    """
+    # Convert to array and ensure float type
+    equity = np.array(equity_curve, dtype=np.float64)
+    
+    if len(equity) < 2:
+        return 0.0, 0, equity[0] if len(equity) > 0 else 0.0
+
+    # Calculate Running Peak
+    running_max = np.maximum.accumulate(equity)
+    
+    # Avoid division by zero
+    running_max[running_max == 0] = 1e-9
+    
+    # Calculate Drawdown Vector
+    drawdown = (equity - running_max) / running_max
+    
+    # Find Max Drawdown (Min value)
+    idx = np.argmin(drawdown)
+    max_dd = drawdown[idx]
+    
+    return max_dd, idx, equity[idx]
+
 def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20):
     """
     PATCHED: Returns Raw Average ROI per wallet.
@@ -147,6 +218,13 @@ def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20):
     
     # Filter valid trades
     valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']).copy()
+    
+    if cutoff_date is not None:
+        # Prefer resolution time for cutoff to ensure we only score 
+        # based on events fully resolved known before the cutoff.
+        time_col = 'res_time' if 'res_time' in valid.columns else 'timestamp'
+        valid = valid[valid[time_col] < cutoff_date]
+        
     valid = valid[valid['bet_price'].between(0.01, 0.99)] 
     
     # 1. Calculate Raw ROI (Robust)
@@ -177,13 +255,16 @@ def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20):
 
 def persistent_disk_cache(func):
     """
-    Thread-safe and Process-safe disk cache using FileLock with TIMEOUT.
-    Prevents hangs if a worker crashes while holding the lock.
+    Thread-safe and Process-safe disk cache using FileLock.
+    Includes CACHE_VERSION to prevent staleness on logic updates.
     """
-    @wraps(func) # Fix: Preserves function name/docstring
+    @wraps(func)
     def wrapper(*args, **kwargs):
-        # 1. Generate unique key (Simple hashing)
-        key_str = f"{func.__name__}:{args}:{kwargs}"
+
+        payload = [func.__name__, CACHE_VERSION, args, kwargs]
+        key_str = str(payload)
+        
+        # Use MD5 (or SHA256) to create filename
         key_hash = hashlib.md5(key_str.encode('utf-8', errors='ignore')).hexdigest()
         
         file_path = DISK_CACHE_DIR / f"{key_hash}.pkl"
@@ -369,7 +450,11 @@ class PolymarketNautilusStrategy(Strategy):
         if not self.config.use_smart_exit: return
         if inst_id not in self.positions_tracker: return
 
-        cid = inst_id.value # Fix: Define cid
+        cid = inst_id.value 
+        if cid not in self.trackers: 
+            return
+            
+        current_signal = self.trackers[cid].get('net_weight', 0.0)
         pos_data = self.positions_tracker[inst_id]
         net_qty = pos_data['net_qty']
         avg_price = pos_data['avg_price']
@@ -460,7 +545,11 @@ class PolymarketNautilusStrategy(Strategy):
         ))
 
     def on_order_filled(self, event):
-        """Update position tracker and calculate realized PnL"""
+        """
+        Update position tracker and calculate realized PnL.
+        PATCHED: Correctly handles average price updates during accumulation, 
+        reduction, and direction flipping.
+        """
         inst_id = event.instrument_id
         fill_price = event.last_px.as_double()
         fill_qty = event.last_qty.as_double()
@@ -478,6 +567,7 @@ class PolymarketNautilusStrategy(Strategy):
         new_qty = old_qty + signed_qty
 
         # 3. Calculate Realized PnL (if reducing position)
+        # Occurs if signs are different (e.g. Long + Sell, or Short + Buy)
         if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
             closed_qty = min(abs(old_qty), abs(fill_qty))
             pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
@@ -488,15 +578,25 @@ class PolymarketNautilusStrategy(Strategy):
 
         # 4. Update Tracker State
         if abs(new_qty) < 0.001:
-            del self.positions_tracker[inst_id]
+            if inst_id in self.positions_tracker:
+                del self.positions_tracker[inst_id]
         else:
-            # If adding to position, verify average price
+            # Case A: Increasing Position (Adding to Winner/Loser)
             if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
+                # Weighted average: (old_cost + new_cost) / total_qty
+                # We use abs() because we want the absolute price, not negative price for shorts
                 total_cost = (abs(old_qty) * curr['avg_price']) + (abs(signed_qty) * fill_price)
                 curr['avg_price'] = total_cost / abs(new_qty)
-            # If flipping direction, reset average price
+            
+            # Case B: Direction Flip (Long -> Short or Short -> Long)
             elif old_qty * new_qty < 0:
+                # The position was closed and a new one opened in opposite direction.
+                # The avg price is simply the fill price of the new remaining qty.
                 curr['avg_price'] = fill_price
+            
+            # Case C: Reducing Position (Partial Exit)
+            # We do NOT update avg_price. If you buy at $10 and sell half at $12, 
+            # the remaining half still has a basis of $10.
             
             curr['net_qty'] = new_qty
 
@@ -515,11 +615,18 @@ class FastBacktestEngine:
                 cid = row.get('contract_id')
                 if cid:
                     scheduled_end = row.get('end_date')
-                    if pd.isna(scheduled_end): scheduled_end = pd.Timestamp.max
-                    
+                    if pd.isna(scheduled_end): 
+                        scheduled_end_ns = np.iinfo(np.int64).max
+                    else:
+                        # Ensure we have a timestamp before accessing .value
+                        scheduled_end_ns = pd.Timestamp(scheduled_end).value
+
+                    # Access the index timestamp correctly
+                    start_ns = ts.value if isinstance(ts, pd.Timestamp) else pd.Timestamp(ts).value
+
                     self.market_lifecycle[cid] = {
-                        'start': ts, 
-                        'end': scheduled_end, 
+                        'start': start_ns, 
+                        'end': scheduled_end_ns, 
                         'liquidity': row.get('liquidity', 1.0),
                         'condition_id': row.get('condition_id'),
                         'outcome_tag': row.get('token_outcome_label', 'Yes')
@@ -547,6 +654,8 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
             
         valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+        
+        valid = valid[valid['usdc_vol'] >= 1.0]
         
         # Filter
         if cutoff_date:
@@ -682,6 +791,12 @@ class FastBacktestEngine:
             # Strict lookahead filter
             train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
             train_profiler = train_profiler.dropna(subset=['outcome'])
+
+            fold_wallet_scores = fast_calculate_rois(
+                train_profiler, 
+                min_trades=5, 
+                cutoff_date=train_end
+            )
             
             fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5)
             known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
@@ -726,20 +841,27 @@ class FastBacktestEngine:
             
             current_date += timedelta(days=test_days)
             
-        if not equity_curve: return {'total_return': 0.0, 'sharpe': 0.0, 'max_drawdown': 0.0, 'trades': 0}
+        if not equity_curve: 
+            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'max_drawdown': 0.0, 'trades': 0}
         
-        # Calculate Final Stats
+        # [PATCH] Use robust NumPy calculation
+        max_dd_pct, _, _ = calculate_max_drawdown(equity_curve)
+        
+        # Calculate other stats
         series = pd.Series(equity_curve)
         total_ret = (capital - 10000.0) / 10000.0
-        drawdown = (series - series.cummax()) / series.cummax()
-        max_dd = drawdown.min()
         pct_changes = series.pct_change().dropna()
-        sharpe = (pct_changes.mean() / pct_changes.std()) * np.sqrt(252 * 288) if len(pct_changes) > 1 and pct_changes.std() > 0 else 0.0
+        
+        sharpe = calculate_sharpe_ratio(
+            pct_changes, 
+            periods_per_year=72576, 
+            rf=0.02 # Example: 2% Risk-Free Rate assumption
+        )
         
         return {
             'total_return': total_ret, 
             'sharpe_ratio': sharpe, 
-            'max_drawdown': abs(max_dd), 
+            'max_drawdown': abs(max_dd_pct), # Return positive magnitude for reporting
             'trades': total_trades, 
             'wins': total_wins, 
             'losses': total_losses,
@@ -898,29 +1020,37 @@ class FastBacktestEngine:
                 final_outcome = meta.get('final_outcome')
                 end_ts = meta.get('end')
                 
-                if final_outcome is not None and (pd.isna(end_ts) or end_ts <= end_time):
+                end_time_ns = end_time.value
+                
+                # Check if market has a known outcome AND resolved/expired before our window ended
+                if final_outcome is not None and (end_ts is None or end_ts <= end_time_ns):
                     pos_val = signed_qty * final_outcome
                 else:
                     tracker_data = strategy.positions_tracker.get(inst_id, {})
                     last_price = tracker_data.get('avg_price', 0.5)
                     pos_val = signed_qty * last_price
+                    
                 open_pos_value += pos_val
 
         final_val = cash + open_pos_value
-        if strategy.equity_history: strategy.equity_history[-1] = final_val
-        else: strategy.equity_history = [final_val]
 
+        if not strategy.equity_history:
+        strategy.equity_history = [10000.0, final_val]
+        else:
+            # Update the last point to match the precise settlement value
+            strategy.equity_history[-1] = final_val
+    
         engine.dispose()
         del strategy; del engine; del nautilus_data
         import gc; gc.collect()
-
+    
         return {
             'final_value': final_val,
             'total_return': (final_val / 10000.0) - 1.0,
             'trades': len(inst_map), 
-            'wins': strategy.wins,
+            'wins': strategy.wins, # Assumes 'strategy' obj logic is preserved
             'losses': strategy.losses,
-            'equity_curve': [10000.0, final_val],
+            'equity_curve': strategy.equity_history, 
             'tracker_state': {} 
         }
                                                                    
@@ -1145,9 +1275,12 @@ class TuningRunner:
 
             ),
             config=search_space,
+            metric="smart_score",
+            mode="max",
+            fail_fast=True, 
+            max_failures=0,
             max_concurrent_trials=1,
             resources_per_trial={"cpu": 30},
-
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
@@ -1824,6 +1957,18 @@ class TuningRunner:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
                     futures = [executor.submit(fetch_and_write_worker, mid, writer, f) for mid in all_tokens]
                     completed = 0
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            # This raises if the worker thread crashed
+                            future.result()
+                        except Exception as e:
+                            # Log error but allow other workers to continue
+                            print(f"\n⚠️ Worker Error: {e}")
+                            
+                        completed += 1
+                        if completed % 100 == 0: 
+                            print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
+                            
                     for _ in concurrent.futures.as_completed(futures):
                         completed += 1
                         if completed % 100 == 0: print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
@@ -2180,6 +2325,27 @@ class TuningRunner:
             keep='first'
         ).reset_index(drop=True)
 
+        dedup_cols = [
+            'timestamp', 'contract_id', 'user', 'tradeAmount', 
+            'price', 'outcomeTokensAmount', 'size'
+        ]
+
+        if 'side_mult' in trades.columns:
+            dedup_cols.append('side_mult')
+
+        trades = trades.sort_values(by=dedup_cols, kind='stable')
+
+        res_map = markets.set_index('contract_id')['resolution_timestamp']
+        trades['res_time'] = trades['contract_id'].map(res_map)
+        trades = trades[
+            (trades['timestamp'] < trades['res_time']) | (trades['res_time'].isna())
+        ].copy()
+
+        trades = trades.drop_duplicates(
+            subset=dedup_cols,
+            keep='first'
+        ).reset_index(drop=True)
+
         df_updates = pd.DataFrame({
             'timestamp': trades['timestamp'],
             'contract_id': trades['contract_id'],
@@ -2246,6 +2412,9 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
     Production-ready wrapper that correctly unpacks Ray search space parameters
     into a flat configuration dictionary compatible with PolyStrategyConfig.
     """
+    
+    worker_seed = config.get("seed", 42)
+    set_global_seed(worker_seed)
     
     # 1. Validation
     decay = config.get('decay_factor', 0.95)
