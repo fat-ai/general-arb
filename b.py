@@ -807,7 +807,7 @@ class FastBacktestEngine:
         WALLET_LOOKUP.clear()
         
         # 4. FAST LOOP
-        for row in price_events.itertuples(index=False):
+        for idx, row in enumerate(price_events.itertuples(index=True)):
             ts_ns = int(row.ts_int)
             cid = row.contract_id
             if cid not in inst_map: continue
