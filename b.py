@@ -780,23 +780,26 @@ class FastBacktestEngine:
             inst_map[cid] = inst_id
             
             inst = CryptoPerpetual(
-                inst_id,                            # 1. instrument_id
-                Symbol(cid),                        # 2. raw_symbol
-                USDC,                               # 3. base_currency
-                USDC,                               # 4. quote_currency
-                USDC,                               # 5. settlement_currency (ADDED THIS)
-                2,                                  # 6. price_precision
-                4,                                  # 7. size_precision
-                Price.from_str("0.01"),             # 8. price_increment
-                Quantity.from_str("0.0001"),        # 9. size_increment
-                Quantity.from_str("0.01"),          # 10. min_quantity
-                Quantity.from_str("100000"),        # 11. max_quantity
-                Price.from_str("0.01"),             # 12. min_price
-                Price.from_str("1.00"),             # 13. max_price
-                Decimal("0"),                       # 14. maker_fee
-                Decimal("0"),                       # 15. taker_fee
-                0,                                  # 16. ts_event
-                0                                   # 17. ts_init
+                inst_id,                       # 1. instrument_id
+                Symbol(cid),                   # 2. raw_symbol
+                USDC,                          # 3. base_currency
+                USDC,                          # 4. quote_currency
+                USDC,                          # 5. settlement_currency
+                False,                         # 6. is_inverse (BOOL) <--- The previously missing argument
+                2,                             # 7. price_precision (INT)
+                4,                             # 8. size_precision (INT)
+                Price.from_str("0.01"),        # 9. price_increment (PRICE)
+                Quantity.from_str("0.0001"),   # 10. size_increment (QUANTITY)
+                0,                             # 11. ts_event (UINT64)
+                0,                             # 12. ts_init (UINT64)
+                
+                # Arguments after ts_init have defaults, so we use keywords safely:
+                min_quantity=Quantity.from_str("0.01"),
+                max_quantity=Quantity.from_str("100000"),
+                min_price=Price.from_str("0.01"),
+                max_price=Price.from_str("1.00"),
+                maker_fee=Decimal("0"),
+                taker_fee=Decimal("0")
             )
             
             engine.add_instrument(inst)
