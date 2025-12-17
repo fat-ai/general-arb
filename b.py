@@ -209,7 +209,7 @@ def calculate_max_drawdown(equity_curve):
     
     return max_dd, idx, equity[idx]
 
-def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20):
+def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20, cutoff_date=None):
     """
     PATCHED: Returns Raw Average ROI per wallet.
     No normalization, no mapping to Brier scores.
