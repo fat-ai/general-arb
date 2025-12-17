@@ -32,7 +32,7 @@ from risk_engine import KellyOptimizer
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
+
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
 from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
@@ -228,26 +228,42 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/poly
 
 WALLET_LOOKUP = {}
 
-@dataclass
+
 class PolyStrategyConfig(StrategyConfig):
-    # Core Alpha Parameters
-    splash_threshold: float = 1000.0
-    decay_factor: float = 0.95
-    wallet_scores: dict = {}
-    instrument_ids: list = []
-    fw_slope: float = 0.0
-    fw_intercept: float = 0.0
-    
-    # Risk & Execution Parameters
-    sizing_mode: str = 'fixed'    # Options: 'fixed', 'fixed_pct', 'kelly'
-    fixed_size: float = 10.0      # Used for both Fixed Cash ($10) and Fixed Pct (0.05)
-    kelly_fraction: float = 0.1   # Used only if sizing_mode == 'kelly'
-    stop_loss: float = None       # e.g., 0.10 for 10%. None = Disabled.
-    
-    # Smart Exit Logic
-    use_smart_exit: bool = False
-    smart_exit_ratio: float = 0.5
-    edge_threshold: float = 0.05
+    def __init__(self, 
+                 splash_threshold: float = 1000.0,
+                 decay_factor: float = 0.95,
+                 wallet_scores: dict = None,
+                 instrument_ids: list = None,
+                 fw_slope: float = 0.0,
+                 fw_intercept: float = 0.0,
+                 sizing_mode: str = 'fixed',
+                 fixed_size: float = 10.0,
+                 kelly_fraction: float = 0.1,
+                 stop_loss: float = None,
+                 use_smart_exit: bool = False,
+                 smart_exit_ratio: float = 0.5,
+                 edge_threshold: float = 0.05,
+                 **kwargs):
+        
+        # Initialize the Cython base class
+        # We pass **kwargs up in case Nautilus requires standard args like 'instrument_id'
+        super().__init__(**kwargs)
+        
+        # Manually assign your custom parameters
+        self.splash_threshold = splash_threshold
+        self.decay_factor = decay_factor
+        self.wallet_scores = wallet_scores if wallet_scores is not None else {}
+        self.instrument_ids = instrument_ids if instrument_ids is not None else []
+        self.fw_slope = fw_slope
+        self.fw_intercept = fw_intercept
+        self.sizing_mode = sizing_mode
+        self.fixed_size = fixed_size
+        self.kelly_fraction = kelly_fraction
+        self.stop_loss = stop_loss
+        self.use_smart_exit = use_smart_exit
+        self.smart_exit_ratio = smart_exit_ratio
+        self.edge_threshold = edge_threshold
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
