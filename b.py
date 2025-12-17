@@ -922,8 +922,6 @@ class FastBacktestEngine:
                 0,                             # 12. ts_init (UINT64)
                 margin_init=Decimal("1.0"),
                 margin_maint=Decimal("1.0"),
-                maker_fee=Decimal("0"),
-                taker_fee=Decimal("0"),
                 # Arguments after ts_init have defaults, so we use keywords safely:
                 min_quantity=Quantity.from_str("0.01"),
                 max_quantity=Quantity.from_str("100000"),
