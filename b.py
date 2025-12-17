@@ -230,40 +230,28 @@ WALLET_LOOKUP = {}
 
 
 class PolyStrategyConfig(StrategyConfig):
-    def __init__(self, 
-                 splash_threshold: float = 1000.0,
-                 decay_factor: float = 0.95,
-                 wallet_scores: dict = None,
-                 instrument_ids: list = None,
-                 fw_slope: float = 0.0,
-                 fw_intercept: float = 0.0,
-                 sizing_mode: str = 'fixed',
-                 fixed_size: float = 10.0,
-                 kelly_fraction: float = 0.1,
-                 stop_loss: float = None,
-                 use_smart_exit: bool = False,
-                 smart_exit_ratio: float = 0.5,
-                 edge_threshold: float = 0.05,
-                 **kwargs):
-        
-        # Initialize the Cython base class
-        # We pass **kwargs up in case Nautilus requires standard args like 'instrument_id'
-        super().__init__(**kwargs)
-        
-        # Manually assign your custom parameters
-        self.splash_threshold = splash_threshold
-        self.decay_factor = decay_factor
-        self.wallet_scores = wallet_scores if wallet_scores is not None else {}
-        self.instrument_ids = instrument_ids if instrument_ids is not None else []
-        self.fw_slope = fw_slope
-        self.fw_intercept = fw_intercept
-        self.sizing_mode = sizing_mode
-        self.fixed_size = fixed_size
-        self.kelly_fraction = kelly_fraction
-        self.stop_loss = stop_loss
-        self.use_smart_exit = use_smart_exit
-        self.smart_exit_ratio = smart_exit_ratio
-        self.edge_threshold = edge_threshold
+    # Core Alpha Parameters
+    splash_threshold = 1000.0
+    decay_factor = 0.95
+    
+    # Initialize mutable defaults to None to avoid shared state bugs
+    # We will set these manually in the instantiation step
+    wallet_scores = None 
+    instrument_ids = None
+    
+    fw_slope = 0.0
+    fw_intercept = 0.0
+    
+    # Risk & Execution Parameters
+    sizing_mode = 'fixed'
+    fixed_size = 10.0
+    kelly_fraction = 0.1
+    stop_loss = None
+    
+    # Smart Exit Logic
+    use_smart_exit = False
+    smart_exit_ratio = 0.5
+    edge_threshold = 0.05
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
@@ -868,21 +856,23 @@ class FastBacktestEngine:
         engine.add_data(nautilus_data)
 
         # 5. STRATEGY CONFIG
-        strat_config = PolyStrategyConfig(
-            splash_threshold=float(config.get('splash_threshold', 1000.0)),
-            decay_factor=float(config.get('decay_factor', 0.95)),
-            wallet_scores=wallet_scores,
-            instrument_ids=list(inst_map.values()),
-            fw_slope=float(fw_slope),
-            fw_intercept=float(fw_intercept),
-            sizing_mode=str(config.get('sizing_mode', 'fixed')),
-            fixed_size=float(config.get('fixed_size', 10.0)),
-            kelly_fraction=float(config.get('kelly_fraction', 0.1)),
-            stop_loss=config.get('stop_loss'), 
-            use_smart_exit=bool(config.get('use_smart_exit', False)),
-            smart_exit_ratio=float(config.get('smart_exit_ratio', 0.5)),
-            edge_threshold=float(config.get('edge_threshold', 0.05))
-        )
+        base_inst_id = list(inst_map.values())[0]
+        strat_config = PolyStrategyConfig(instrument_id=base_inst_id)
+
+        # 2. Manually inject custom parameters (Bypasses __init__ restrictions)
+        strat_config.splash_threshold = float(config.get('splash_threshold', 1000.0))
+        strat_config.decay_factor = float(config.get('decay_factor', 0.95))
+        strat_config.wallet_scores = wallet_scores
+        strat_config.instrument_ids = list(inst_map.values())
+        strat_config.fw_slope = float(fw_slope)
+        strat_config.fw_intercept = float(fw_intercept)
+        strat_config.sizing_mode = str(config.get('sizing_mode', 'fixed'))
+        strat_config.fixed_size = float(config.get('fixed_size', 10.0))
+        strat_config.kelly_fraction = float(config.get('kelly_fraction', 0.1))
+        strat_config.stop_loss = config.get('stop_loss')
+        strat_config.use_smart_exit = bool(config.get('use_smart_exit', False))
+        strat_config.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
+        strat_config.edge_threshold = float(config.get('edge_threshold', 0.05))
         
         strategy = PolymarketNautilusStrategy(strat_config)
         if previous_tracker: 
