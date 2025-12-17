@@ -798,7 +798,7 @@ class FastBacktestEngine:
                 cutoff_date=train_end
             )
             
-            fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5)
+         
             known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
@@ -920,7 +920,10 @@ class FastBacktestEngine:
                 Quantity.from_str("0.0001"),   # 10. size_increment (QUANTITY)
                 0,                             # 11. ts_event (UINT64)
                 0,                             # 12. ts_init (UINT64)
-                
+                margin_init=Decimal("1.0"),
+                margin_maint=Decimal("1.0"),
+                maker_fee=Decimal("0"),
+                taker_fee=Decimal("0"),
                 # Arguments after ts_init have defaults, so we use keywords safely:
                 min_quantity=Quantity.from_str("0.01"),
                 max_quantity=Quantity.from_str("100000"),
