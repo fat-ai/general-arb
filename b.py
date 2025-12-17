@@ -291,7 +291,7 @@ class PolymarketNautilusStrategy(Strategy):
             
         wallet_id, is_sell = WALLET_LOOKUP[tid_val]
         cid = tick.instrument_id.value
-        vol = tick.quantity.as_double()
+        vol = tick.size.as_double()
         price = tick.price.as_double()
         self.last_known_prices[tick.instrument_id.value] = price
 
@@ -429,7 +429,7 @@ class PolymarketNautilusStrategy(Strategy):
         self.submit_order(self.order_factory.limit(
             instrument_id=self.instrument_map[cid],
             order_side=side,
-            quantity=Quantity.from_str(f"{qty_to_trade:.4f}"),
+            size=Quantity.from_str(f"{qty_to_trade:.4f}"),
             price=Price.from_str(f"{limit_px:.2f}"),
             time_in_force=TimeInForce.IOC 
         ))
