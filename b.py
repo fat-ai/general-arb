@@ -32,6 +32,7 @@ from risk_engine import KellyOptimizer
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
+from dataclasses import dataclass, field
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
 from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
@@ -227,6 +228,7 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/poly
 
 WALLET_LOOKUP = {}
 
+@dataclass
 class PolyStrategyConfig(StrategyConfig):
     # Core Alpha Parameters
     splash_threshold: float = 1000.0
