@@ -345,7 +345,7 @@ class PolymarketNautilusStrategy(Strategy):
         self.losses = 0
         self.fw_slope = config.fw_slope
         self.fw_intercept = config.fw_intercept
-        
+        self.wallet_lookup = {}
         # Track active average entry prices for Stop Loss/Smart Exit
         # Format: {InstrumentId: {'avg_price': float, 'net_qty': float}}
         self.positions_tracker = {} 
@@ -371,10 +371,10 @@ class PolymarketNautilusStrategy(Strategy):
     def on_trade_tick(self, tick: TradeTick):
         # 1. Metadata Retrieval
         tid_val = tick.trade_id.value
-        if tid_val not in WALLET_LOOKUP:
+        if tid_val not in self.wallet_lookup:
             return
             
-        wallet_id, is_sell = WALLET_LOOKUP[tid_val]
+        wallet_id, is_sell = self.wallet_lookup[tid_val]
         cid = tick.instrument_id.value
         vol = tick.size.as_double()
         price = tick.price.as_double()
@@ -926,6 +926,8 @@ class FastBacktestEngine:
             base_currency=USDC,
             starting_balances=[Money(10_000, USDC)]
         )
+
+        local_wallet_lookup = {}
         
         # 3. INSTRUMENTS & DATA
         nautilus_data = []
@@ -990,7 +992,7 @@ class FastBacktestEngine:
 
             raw_id = f"{ts_ns}_{idx}_{cid}"
             tr_id_str = hashlib.md5(raw_id.encode('utf-8')).hexdigest()
-            WALLET_LOOKUP[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
+            local_wallet_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
             
             tick = TradeTick(
                 instrument_id=inst_id,
@@ -1005,7 +1007,9 @@ class FastBacktestEngine:
         
         if not nautilus_data:
             return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'equity_curve': [], 'tracker_state': {}}
-
+            
+        nautilus_data.sort(key=lambda x: x.ts_event)
+        
         engine.add_data(nautilus_data)
 
         # 5. STRATEGY CONFIG
@@ -1029,8 +1033,11 @@ class FastBacktestEngine:
         )
         
         strategy = PolymarketNautilusStrategy(strat_config)
+   
+        strategy.wallet_lookup = local_wallet_lookup
+        
         if previous_tracker: 
-            strategy.trackers = previous_tracker
+            strategy.trackers = previous_tracker    
             
         engine.add_strategy(strategy)
         engine.run()
