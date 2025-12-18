@@ -920,9 +920,9 @@ class FastBacktestEngine:
                 ts_activation,                          # 11. ts_event
                 ts_activation,                          # 12. ts_init
                 
-                # Optional kwargs (usually safe after positionals)
-                maker_fee=0.0,
-                taker_fee=0.0,
+                # Optional kwargs
+                maker_fee=Decimal("0.0"),  
+                taker_fee=Decimal("0.0"),
                 min_quantity=Quantity.from_str("0.01"),
                 max_quantity=Quantity.from_str("1000000")
             )
