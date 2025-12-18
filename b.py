@@ -980,7 +980,7 @@ class FastBacktestEngine:
 
         # 5. STRATEGY CONFIG
         base_inst_id = list(inst_map.values())[0]
-        strat_config = PolyStrategyConfig(instrument_id=base_inst_id)
+        strat_config = PolyStrategyConfig()
 
         # 2. Manually inject custom parameters (Bypasses __init__ restrictions)
         strat_config.splash_threshold = float(config.get('splash_threshold', 1000.0))
