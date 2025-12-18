@@ -33,6 +33,7 @@ from risk_engine import KellyOptimizer
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
+from typing import Optional, List, Dict
 
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
@@ -312,27 +313,23 @@ WALLET_LOOKUP = {}
 
 class PolyStrategyConfig(StrategyConfig):
     # Core Alpha Parameters
-    splash_threshold = 1000.0
-    decay_factor = 0.95
-    
-    # Initialize mutable defaults to None to avoid shared state bugs
-    # We will set these manually in the instantiation step
-    wallet_scores = None 
-    instrument_ids = None
-    
-    fw_slope = 0.0
-    fw_intercept = 0.0
+    splash_threshold: float = 1000.0
+    decay_factor: float = 0.95
+    wallet_scores: Optional[Dict] = None 
+    instrument_ids: Optional[List[str]] = None
+    fw_slope: float = 0.0
+    fw_intercept: float = 0.0
     
     # Risk & Execution Parameters
-    sizing_mode = 'fixed'
-    fixed_size = 10.0
-    kelly_fraction = 0.1
-    stop_loss = None
+    sizing_mode: str = 'fixed'
+    fixed_size: float = 10.0
+    kelly_fraction: float = 0.1
+    stop_loss: Optional[float] = None
     
     # Smart Exit Logic
-    use_smart_exit = False
-    smart_exit_ratio = 0.5
-    edge_threshold = 0.05
+    use_smart_exit: bool = False
+    smart_exit_ratio: float = 0.5
+    edge_threshold: float = 0.05
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
@@ -872,12 +869,12 @@ class FastBacktestEngine:
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
         # Local Imports for Safety
+        from nautilus_trader.model.instruments import BinaryOption
         from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
         from nautilus_trader.model.objects import Price, Quantity, Money, Currency
         from nautilus_trader.model.data import QuoteTick, TradeTick
         from nautilus_trader.model.enums import OrderSide, TimeInForce, OmsType, AccountType, AggressorSide
         from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
-        from nautilus_trader.model.instruments import CryptoPerpetual
         from decimal import Decimal
 
         USDC = Currency.from_str("USDC")
@@ -903,32 +900,31 @@ class FastBacktestEngine:
         unique_cids = price_events['contract_id'].unique()
         
         inst_map = {}
+        ts_activation = int(start_time.value)
+        ts_expiration = int(end_time.value) + (365 * 24 * 60 * 60 * 1_000_000_000)
         for cid in unique_cids:
             inst_id = InstrumentId(Symbol(cid), venue_id)
             inst_map[cid] = inst_id
             
-            inst = CryptoPerpetual(
-                inst_id,                       # 1. instrument_id
-                Symbol(cid),                   # 2. raw_symbol
-                USDC,                          # 3. base_currency
-                USDC,                          # 4. quote_currency
-                USDC,                          # 5. settlement_currency
-                False,                         # 6. is_inverse (BOOL) <--- The previously missing argument
-                2,                             # 7. price_precision (INT)
-                4,                             # 8. size_precision (INT)
-                Price.from_str("0.01"),        # 9. price_increment (PRICE)
-                Quantity.from_str("0.0001"),   # 10. size_increment (QUANTITY)
-                0,                             # 11. ts_event (UINT64)
-                0,                             # 12. ts_init (UINT64)
-                margin_init=Decimal("1.0"),
-                margin_maint=Decimal("1.0"),
-                # Arguments after ts_init have defaults, so we use keywords safely:
+            inst = BinaryOption(
+                inst_id,                                # 1. instrument_id
+                Symbol(cid),                            # 2. raw_symbol
+                AssetClass.BINARY_OPTION,               # 3. asset_class
+                USDC,                                   # 4. currency
+                6,                                      # 5. price_precision
+                4,                                      # 6. size_precision
+                Price.from_str("0.000001"),             # 7. price_increment
+                Quantity.from_str("0.0001"),            # 8. size_increment
+                ts_activation,                          # 9. activation_ns
+                ts_expiration,                          # 10. expiration_ns
+                ts_activation,                          # 11. ts_event
+                ts_activation,                          # 12. ts_init
+                
+                # Optional kwargs (usually safe after positionals)
+                maker_fee=0.0,
+                taker_fee=0.0,
                 min_quantity=Quantity.from_str("0.01"),
-                max_quantity=Quantity.from_str("100000"),
-                min_price=Price.from_str("0.01"),
-                max_price=Price.from_str("1.00"),
-                maker_fee=Decimal("0"),
-                taker_fee=Decimal("0")
+                max_quantity=Quantity.from_str("1000000")
             )
             
             engine.add_instrument(inst)
@@ -943,9 +939,14 @@ class FastBacktestEngine:
                 
             inst_id = inst_map[cid]
             price_float = float(row.p_market_all)
+
+            real_size_val = getattr(row, 'size', 0.0)
+            if real_size_val <= 0.0001: real_size_val = 0.01
+
+            size_str = f"{real_size_val:.4f}"
             
-            bid_px = max(0.01, price_float - 0.001)
-            ask_px = min(0.99, price_float + 0.001)
+            bid_px = max(0.01, price_float - 0.0001)
+            ask_px = min(0.99, price_float + 0.0001)
             
             quote = QuoteTick(
                 instrument_id=inst_id,
@@ -1088,15 +1089,11 @@ class TuningRunner:
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
                 
     def _fast_load_trades(self, csv_path, start_date, end_date):
-        """
-        PATCH 1: OPTIMIZED LOADER
-        1. Reads massive CSV in chunks to keep RAM usage low.
-        2. Filters by date string BEFORE parsing (Massive CPU/RAM speedup).
-        3. Caches the filtered dataset to Parquet for instant future re-runs.
-        """
+
         import pandas as pd
         import os
         import gc
+        import glob
         
         # 1. Check for Cached Parquet (Instant Load)
         # Hash based on file size and date window to ensure freshness
@@ -1107,7 +1104,7 @@ class TuningRunner:
             print(f"⚡ FAST LOAD: Using cached parquet: {cache_path.name}")
             return pd.read_parquet(cache_path)
 
-        print(f"🐢 SLOW LOAD: Processing 30GB+ CSV in chunks (One-time op)...")
+        print(f"🐢 SLOW LOAD: Processing Trades CSV in chunks (One-time op)...")
         
         # 2. Setup for String Filtering (Faster than Date Parsing)
         # We assume the CSV contains ISO format dates (e.g. 2024-01-01T...) which sort lexicographically.
@@ -1124,35 +1121,47 @@ class TuningRunner:
         
         chunks = []
         chunk_size = 2_000_000 # 2M rows per chunk (~200MB RAM)
+
+        temp_dir = self.cache_dir / f"temp_chunks_{file_hash}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
         
+        for f in temp_dir.glob("*.parquet"): os.remove(f)
+            
         try:
             with pd.read_csv(csv_path, usecols=use_cols, dtype=dtypes, chunksize=chunk_size) as reader:
                 for i, chunk in enumerate(reader):
-                    # Filter strictly by string comparison first
-                    # This avoids parsing millions of dates for rows we will discard
+     
                     mask = (chunk['timestamp'] >= start_str) & (chunk['timestamp'] <= end_str)
                     filtered = chunk[mask].copy()
                     
                     if not filtered.empty:
-                        # Now parse dates only for the relevant subset
+     
                         filtered['timestamp'] = pd.to_datetime(filtered['timestamp'], utc=True).dt.tz_localize(None)
-                        chunks.append(filtered)
+                        
+                        temp_file = temp_dir / f"chunk_{i:05d}.parquet"
+                        filtered.to_parquet(temp_file, compression='snappy')
+                        chunk_count += 1
                         
                     if i % 5 == 0:
                         print(f"   Processed {(i+1)*2}M+ lines...", end='\r')
-                        gc.collect() # Aggressive GC
+                        gc.collect() 
                         
         except Exception as e:
             print(f"\n❌ Error reading chunks: {e}")
             return pd.DataFrame()
 
         print("\n   Merging filtered chunks...")
-        if not chunks:
-            return pd.DataFrame(columns=use_cols)
-            
-        df = pd.concat(chunks, ignore_index=True)
         
-        # 3. Save Cache
+        all_files = sorted(list(temp_dir.glob("*.parquet")))
+        
+        if not all_files:
+             return pd.DataFrame(columns=use_cols)
+
+        df = pd.read_parquet(all_files)
+        
+        import shutil
+        shutil.rmtree(temp_dir)
+        
         print(f"   Caching {len(df)} rows to {cache_path.name}...")
         df.to_parquet(cache_path, compression='snappy')
         
