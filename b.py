@@ -980,22 +980,22 @@ class FastBacktestEngine:
 
         # 5. STRATEGY CONFIG
         base_inst_id = list(inst_map.values())[0]
-        strat_config = PolyStrategyConfig()
-
-        # 2. Manually inject custom parameters (Bypasses __init__ restrictions)
-        strat_config.splash_threshold = float(config.get('splash_threshold', 1000.0))
-        strat_config.decay_factor = float(config.get('decay_factor', 0.95))
-        strat_config.wallet_scores = wallet_scores
-        strat_config.instrument_ids = list(inst_map.values())
-        strat_config.fw_slope = float(fw_slope)
-        strat_config.fw_intercept = float(fw_intercept)
-        strat_config.sizing_mode = str(config.get('sizing_mode', 'fixed'))
-        strat_config.fixed_size = float(config.get('fixed_size', 10.0))
-        strat_config.kelly_fraction = float(config.get('kelly_fraction', 0.1))
-        strat_config.stop_loss = config.get('stop_loss')
-        strat_config.use_smart_exit = bool(config.get('use_smart_exit', False))
-        strat_config.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
-        strat_config.edge_threshold = float(config.get('edge_threshold', 0.05))
+        
+        strat_config = PolyStrategyConfig(
+            instrument_ids=list(inst_map.values()),
+            splash_threshold=float(config.get('splash_threshold', 1000.0)),
+            decay_factor=float(config.get('decay_factor', 0.95)),
+            wallet_scores=wallet_scores,
+            fw_slope=float(fw_slope),
+            fw_intercept=float(fw_intercept),
+            sizing_mode=str(config.get('sizing_mode', 'fixed')),
+            fixed_size=float(config.get('fixed_size', 10.0)),
+            kelly_fraction=float(config.get('kelly_fraction', 0.1)),
+            stop_loss=config.get('stop_loss'),
+            use_smart_exit=bool(config.get('use_smart_exit', False)),
+            smart_exit_ratio=float(config.get('smart_exit_ratio', 0.5)),
+            edge_threshold=float(config.get('edge_threshold', 0.05))
+        )
         
         strategy = PolymarketNautilusStrategy(strat_config)
         if previous_tracker: 
