@@ -317,6 +317,7 @@ class PolyStrategyConfig(StrategyConfig):
     decay_factor: float = 0.95
     wallet_scores: Optional[Dict] = None 
     instrument_ids: Optional[List[str]] = None
+    min_signal_volume: float = 10.0
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
     
@@ -338,6 +339,8 @@ class PolymarketNautilusStrategy(Strategy):
         self.last_known_prices = {}
         self.instrument_map = {i.value: i for i in config.instrument_ids}
         self.equity_history = []
+        self.break_even = 0      
+        self.total_closed = 0
         self.wins = 0
         self.losses = 0
         self.fw_slope = config.fw_slope
@@ -398,6 +401,9 @@ class PolymarketNautilusStrategy(Strategy):
 
         # --- C. Signal Generation ---
         usdc_vol = vol * price  # Calculate dollar volume
+        if usdc_vol < self.config.min_signal_volume:
+            return
+            
         if usdc_vol >= 1.0:  # Filter by dollar volume, not share count
             wallet_key = (wallet_id, 'default_topic')
             if wallet_key in self.config.wallet_scores:
@@ -569,6 +575,13 @@ class PolymarketNautilusStrategy(Strategy):
             closed_qty = min(abs(old_qty), abs(fill_qty))
             pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
             realized_pnl = pnl_per_share * closed_qty
+            self.total_closed += 1
+            if realized_pnl > 0: 
+                self.wins += 1
+            elif realized_pnl < 0: 
+                self.losses += 1
+            else:
+                self.break_even += 1
             
             if realized_pnl > 0: self.wins += 1
             elif realized_pnl < 0: self.losses += 1
@@ -825,8 +838,8 @@ class FastBacktestEngine:
                 local_curve = result.get('equity_curve', [result['final_value']])
                 
                 # Normalize growth
-                period_growth = [x / 10000.0 for x in local_curve]
-                scaled_curve = [capital * x for x in period_growth]
+                returns = pd.Series(local_curve).pct_change().fillna(0)
+                scaled_curve = capital * (1 + returns).cumprod()
                 
                 if len(equity_curve) > 0: equity_curve.extend(scaled_curve[1:])
                 else: equity_curve.extend(scaled_curve)
@@ -869,6 +882,7 @@ class FastBacktestEngine:
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
         # Local Imports for Safety
+        from nautilus_trader.model.enums import AssetClass
         from nautilus_trader.model.instruments import BinaryOption
         from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
         from nautilus_trader.model.objects import Price, Quantity, Money, Currency
@@ -907,24 +921,20 @@ class FastBacktestEngine:
             inst_map[cid] = inst_id
             
             inst = BinaryOption(
-                inst_id,                                # 1. instrument_id
-                Symbol(cid),                            # 2. raw_symbol
-                AssetClass.BINARY_OPTION,               # 3. asset_class
-                USDC,                                   # 4. currency
-                6,                                      # 5. price_precision
-                4,                                      # 6. size_precision
-                Price.from_str("0.000001"),             # 7. price_increment
-                Quantity.from_str("0.0001"),            # 8. size_increment
-                ts_activation,                          # 9. activation_ns
-                ts_expiration,                          # 10. expiration_ns
-                ts_activation,                          # 11. ts_event
-                ts_activation,                          # 12. ts_init
-                
-                # Optional kwargs
-                maker_fee=Decimal("0.0"),  
+                instrument_id=inst_id,
+                raw_symbol=Symbol(cid),
+                asset_class=AssetClass.BINARY_OPTION,
+                currency=USDC,
+                price_precision=6,
+                size_precision=4,
+                price_increment=Price.from_str("0.000001"),
+                size_increment=Quantity.from_str("0.0001"),
+                activation_ns=ts_activation,
+                expiration_ns=ts_expiration,
+                ts_event=ts_activation,
+                ts_init=ts_activation,
+                maker_fee=Decimal("0.0"),
                 taker_fee=Decimal("0.0"),
-                min_quantity=Quantity.from_str("0.01"),
-                max_quantity=Quantity.from_str("1000000")
             )
             
             engine.add_instrument(inst)
@@ -986,6 +996,7 @@ class FastBacktestEngine:
             instrument_ids=list(inst_map.values()),
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
+            min_signal_volume=float(config.get('min_signal_volume', 10.0)),
             wallet_scores=wallet_scores,
             fw_slope=float(fw_slope),
             fw_intercept=float(fw_intercept),
@@ -1049,11 +1060,11 @@ class FastBacktestEngine:
         return {
             'final_value': final_val,
             'total_return': (final_val / 10000.0) - 1.0,
-            'trades': len(inst_map), 
+            'trades': strategy.total_closed,
             'wins': strategy.wins, # Assumes 'strategy' obj logic is preserved
             'losses': strategy.losses,
             'equity_curve': strategy.equity_history, 
-            'tracker_state': {} 
+            'tracker_state': strategy.trackers
         }
                                                                    
 class TuningRunner:
@@ -1126,6 +1137,8 @@ class TuningRunner:
         temp_dir.mkdir(parents=True, exist_ok=True)
         
         for f in temp_dir.glob("*.parquet"): os.remove(f)
+
+        chunk_count = 0
             
         try:
             with pd.read_csv(csv_path, usecols=use_cols, dtype=dtypes, chunksize=chunk_size) as reader:
