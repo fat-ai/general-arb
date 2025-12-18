@@ -364,11 +364,9 @@ class PolymarketNautilusStrategy(Strategy):
         """Record equity with memory-safe growth limiting"""
         usdc = Currency.from_str("USDC")
         total_equity = self.portfolio.net_equity_total(usdc).as_double()
-        
-        if len(self.equity_history) > 10000:
-            self.equity_history = self.equity_history[-5000:]  # Keep recent half
-        
-        self.equity_history.append(total_equity)
+        now_ts = pd.Timestamp(self.clock.utc_now())
+        self.equity_history.append((now_ts, total_equity))
+
 
     def on_trade_tick(self, tick: TradeTick):
         # 1. Metadata Retrieval
@@ -657,7 +655,7 @@ class FastBacktestEngine:
         PATCHED: Regresses Volume vs ROI (instead of Brier).
         Returns (Slope, Intercept) to predict ROI for unknown wallets.
         """
-        from scipy.stats import linregress
+        from scipy.stats import theilslopes
         SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 # Default to Neutral ROI (0%)
         
         if 'outcome' not in profiler_data.columns or profiler_data.empty: 
@@ -704,18 +702,15 @@ class FastBacktestEngine:
 
         try:
             # Regress Average Skill vs Average Volume
-            slope, intercept, r_val, p_val, std_err = linregress(
-                qualified_wallets['log_vol'], 
-                qualified_wallets['roi']
-            )
+            slope, intercept, low_slope, high_slope = theilslopes(y, x, alpha=0.90)
             
             # Validation: We only accept if High Volume correlates with Positive ROI
-            if not np.isfinite(slope) or not np.isfinite(intercept):
+            if low_slope <= 0 <= high_slope:
                 return SAFE_SLOPE, SAFE_INTERCEPT
         
                 
-            # If correlation is weak or negative, return neutral
-            if p_val > 0.10: return SAFE_SLOPE, SAFE_INTERCEPT
+            if not np.isfinite(slope) or not np.isfinite(intercept):
+                return SAFE_SLOPE, SAFE_INTERCEPT
             
             # Damping: Reduce the slope confidence
             final_slope = slope * 0.5
@@ -758,7 +753,7 @@ class FastBacktestEngine:
         
         current_date = min_date
         capital = 10000.0
-        equity_curve = [capital]
+        full_equity_curve = []
         total_trades = 0
         total_wins = 0  
         total_losses = 0
@@ -836,6 +831,16 @@ class FastBacktestEngine:
                 # --- Aggregate Results ---
                 global_tracker = result['tracker_state']
                 local_curve = result.get('equity_curve', [result['final_value']])
+                start_capital_this_fold = 10000.0
+
+                for ts, val in local_history:
+                    growth_factor = val / start_capital_this_fold
+                    current_global_equity = capital * growth_factor
+                    full_equity_curve.append((ts, current_global_equity))
+                
+                # Update capital for next fold based on the final point
+                if full_equity_curve:
+                    capital = full_equity_curve[-1][1]
                 
                 # Normalize growth
                 returns = pd.Series(local_curve).pct_change().fillna(0)
@@ -853,20 +858,34 @@ class FastBacktestEngine:
             
         if not equity_curve: 
             return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'max_drawdown': 0.0, 'trades': 0}
+
+        df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
+        df_eq = df_eq.set_index('ts').sort_index()
+        
+        # 2. Resample to Daily (End of Day) and Fill Forward
+        # This fixes the "irregular frequency" issue completely.
+        daily_eq = df_eq.resample('D').last().ffill()
+        
+        # 3. Calculate Metrics on DAILY Data
+        # Use 252 for standard annualization
+        daily_returns = daily_eq['equity'].pct_change().dropna()
+        
+        sharpe = calculate_sharpe_ratio(
+            daily_returns, 
+            periods_per_year=252, # [FIX] Standard Daily Annualization
+            rf=0.02 
+        )
         
         # [PATCH] Use robust NumPy calculation
         max_dd_pct, _, _ = calculate_max_drawdown(equity_curve)
         
         # Calculate other stats
         series = pd.Series(equity_curve)
-        total_ret = (capital - 10000.0) / 10000.0
-        pct_changes = series.pct_change().dropna()
+  
+        equity_values = [x[1] for x in full_equity_curve]
+        max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
         
-        sharpe = calculate_sharpe_ratio(
-            pct_changes, 
-            periods_per_year=72576, 
-            rf=0.02 # Example: 2% Risk-Free Rate assumption
-        )
+        total_ret = (capital - 10000.0) / 10000.0
         
         return {
             'total_return': total_ret, 
@@ -876,7 +895,7 @@ class FastBacktestEngine:
             'wins': total_wins, 
             'losses': total_losses,
             'win_loss_ratio': total_wins / max(1, total_losses),
-            'equity_curve': equity_curve, 
+            'equity_curve': equity_values, 
             'final_capital': capital
         }
                                   
