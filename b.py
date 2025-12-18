@@ -942,7 +942,7 @@ class FastBacktestEngine:
             inst = BinaryOption(
                 instrument_id=inst_id,
                 raw_symbol=Symbol(cid),
-                asset_class=AssetClass.BINARY_OPTION,
+                asset_class=AssetClass.OPTION,
                 currency=USDC,
                 price_precision=6,
                 size_precision=4,
