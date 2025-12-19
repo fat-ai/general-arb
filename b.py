@@ -998,7 +998,7 @@ class FastBacktestEngine:
             inst_id = inst_map[cid]
             price_float = float(row.p_market_all)
 
-            market_liq_score = known_liquidity.get(cid, 0)
+            market_liq_score = float(known_liquidity.get(cid, 0))
             real_size_val = getattr(row, 'size', 0.0)
 
             if market_liq_score > 100.0:
