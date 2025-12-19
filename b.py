@@ -324,7 +324,7 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/poly
 class PolyStrategyConfig(StrategyConfig):
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
-    
+    min_signal_volume: float = 1.0
     wallet_scores: Optional[Dict[Any, Any]] = None
     active_instrument_ids: Optional[List[Any]] = None
     
@@ -2532,11 +2532,11 @@ class TuningRunner:
         gc.collect()
         
         df_ev['event_type'] = df_ev['event_type'].astype('category')
+        
         df_ev = df_ev.sort_values(
             by=['timestamp', 'event_type', 'contract_id'], 
             kind='stable'
         )
-        df_ev = df_ev.dropna(subset=['timestamp'])
 
         if not prof_data.empty:
             first_trade_ts = prof_data['timestamp'].min()
@@ -2566,8 +2566,11 @@ class TuningRunner:
             else:
                 # If nothing to rescue, just use the new data
                 df_ev = df_new
+        
+        df_ev = df_ev.dropna(subset=['timestamp'])
 
         df_ev = df_ev.set_index('timestamp')
+        
         if 'contract_id' in df_ev.columns:
             df_ev['contract_id'] = df_ev['contract_id'].astype('category')
 
@@ -2584,6 +2587,12 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         event_log = ray.get(event_log)
     if isinstance(profiler_data, ray.ObjectRef):
         profiler_data = ray.get(profiler_data)
+
+    if event_log is not None:
+        event_log = event_log.copy()
+    if profiler_data is not None:
+        profiler_data = profiler_data.copy()
+        
     if isinstance(nlp_cache, ray.ObjectRef):
         nlp_cache = ray.get(nlp_cache)
     if isinstance(priors, ray.ObjectRef):
@@ -2596,6 +2605,8 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
     if len(profiler_data[profiler_data['outcome'].isin([0.0, 1.0])]) == 0:
         print("⚠️ Trial skipped: No valid outcomes in profiler")
         return {'smart_score': -99.0}
+
+    
     
     config_str = json.dumps(config, sort_keys=True, default=str)
     # Generate a deterministic 32-bit integer seed from the config hash
