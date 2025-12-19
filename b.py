@@ -318,22 +318,20 @@ ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/poly
 
 
 class PolyStrategyConfig(StrategyConfig):
-    # Core Alpha Parameters
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
-    wallet_scores: Optional[Dict] = None 
-    instrument_ids: List[InstrumentId] = Field(default_factory=list)
-    min_signal_volume: float = 10.0
+    
+    wallet_scores: dict = None 
+    instrument_ids: list = None
+    
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
     
-    # Risk & Execution Parameters
     sizing_mode: str = 'fixed'
     fixed_size: float = 10.0
     kelly_fraction: float = 0.1
-    stop_loss: Optional[float] = None
+    stop_loss: float = None
     
-    # Smart Exit Logic
     use_smart_exit: bool = False
     smart_exit_ratio: float = 0.5
     edge_threshold: float = 0.05
@@ -1061,10 +1059,9 @@ class FastBacktestEngine:
         base_inst_id = list(inst_map.values())[0]
         
         strat_config = PolyStrategyConfig(
-            instrument_ids=list(inst_map.values()),
+            instrument_ids=list(inst_map.values()), 
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
-            min_signal_volume=float(config.get('min_signal_volume', 10.0)),
             wallet_scores=wallet_scores,
             fw_slope=float(fw_slope),
             fw_intercept=float(fw_intercept),
