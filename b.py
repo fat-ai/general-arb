@@ -1293,7 +1293,7 @@ class TuningRunner:
         
         log.info("📉 Optimizing DataFrame memory footprint...")
         if 'wallet_id' in profiler_data.columns:
-            profiler_data['wallet_id'] = profiler_data['wallet_id'].astype('category')
+            profiler_data['wallet_id'] = profiler_data['wallet_id'].astype('string')
         if 'market_id' in profiler_data.columns:
             profiler_data['market_id'] = profiler_data['market_id'].astype('category')
         if 'entity_type' in profiler_data.columns:
@@ -2324,8 +2324,8 @@ class TuningRunner:
         # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
             # 'category' uses significantly less RAM than object/string for repeated IDs
-            'wallet_id': trades['user'].astype('category'), 
-            'market_id': trades['contract_id'].astype('category'),
+            'wallet_id': trades['user'].astype('string'), 
+            'market_id': trades['contract_id'].astype('string'),
             'timestamp': trades['timestamp'],
             # Use float32 (4 bytes) instead of float64 (8 bytes)
             'usdc_vol': trades['tradeAmount'].astype('float32'),
