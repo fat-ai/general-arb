@@ -167,6 +167,10 @@ def plot_performance(full_equity_curve, trades_count):
 
 # --- HELPERS ---
 
+def normalize_contract_id(id_str):
+    """Single source of truth for ID normalization"""
+    return str(id_str).strip().lower().replace('0x', '')
+
 def calculate_sharpe_ratio(returns, periods_per_year=252, rf=0.0):
     """
     Calculates Annualized Sharpe Ratio.
@@ -1125,7 +1129,13 @@ class FastBacktestEngine:
             # Preserve the timestamp, only update the value
             last_ts = strategy.equity_history[-1][0]
             strategy.equity_history[-1] = (last_ts, final_val)
-    
+
+        s_closed = strategy.total_closed
+        s_wins = strategy.wins
+        s_losses = strategy.losses
+        s_equity = strategy.equity_history
+        s_trackers = strategy.trackers
+        
         engine.dispose()
         del strategy; del engine; del nautilus_data
         import gc; gc.collect()
@@ -1258,6 +1268,26 @@ class TuningRunner:
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
         
         df_markets, df_trades = self._load_data()
+
+        # DIAGNOSTIC BLOCK
+        print("\n🔍 DATA INTEGRITY CHECK:")
+        print(f"Markets shape: {df_markets.shape}")
+        print(f"Trades shape: {df_trades.shape}")
+        print(f"Markets contract_id sample: {df_markets['contract_id'].head(3).tolist()}")
+        print(f"Trades contract_id sample: {df_trades['contract_id'].head(3).tolist()}")
+        print(f"Markets contract_id dtype: {df_markets['contract_id'].dtype}")
+        print(f"Trades contract_id dtype: {df_trades['contract_id'].dtype}")
+        
+        # Check overlap BEFORE transformation
+        markets_ids = set(df_markets['contract_id'].astype(str).str.strip().str.lower())
+        trades_ids = set(df_trades['contract_id'].astype(str).str.strip().str.lower())
+        overlap = markets_ids.intersection(trades_ids)
+        print(f"Pre-transform overlap: {len(overlap)} common IDs")
+        if len(overlap) == 0:
+            print("❌ FATAL: No overlap before transformation!")
+            print(f"Market IDs (first 5): {list(markets_ids)[:5]}")
+            print(f"Trade IDs (first 5): {list(trades_ids)[:5]}")
+            sys.exit(1)
  
         float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
         for c in float_cols:
@@ -1265,6 +1295,9 @@ class TuningRunner:
         
         # Use categorical for repeated strings
         df_trades['contract_id'] = df_trades['contract_id'].astype('category')
+
+        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
+
         df_trades['user'] = df_trades['user'].astype('category')
         
         if df_markets.empty or df_trades.empty: 
@@ -1278,7 +1311,12 @@ class TuningRunner:
 
         actual_cols = [c for c in safe_cols if c in df_markets.columns]
         markets = df_markets[actual_cols].copy()
+
+        
         markets['contract_id'] = markets['contract_id'].astype(str)
+
+        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
             ascending=[True, True],
@@ -1505,11 +1543,15 @@ class TuningRunner:
         markets = markets[actual_cols].copy()
 
         markets['contract_id'] = markets['contract_id'].astype(str)
+
+        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
             ascending=[True, True],
             kind='stable'
         )
+        
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         
         # ---------------------------------------------------------
@@ -1561,7 +1603,11 @@ class TuningRunner:
         print("   Synchronizing data...")
         
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
+        
         trades['contract_id'] = trades['contract_id'].str.strip()
+
+        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
+        
         trades['user'] = trades['user'].astype(str).str.strip()
         
         trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0.0)
@@ -1592,7 +1638,11 @@ class TuningRunner:
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
         
         markets = markets.explode(['contract_id_list', 'token_index'])
+        
         markets['contract_id'] = markets['contract_id_list'].str.strip()
+
+        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        
         markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
         
         def calculate_token_outcome(row):
@@ -2302,7 +2352,12 @@ class TuningRunner:
             return series.astype(str).str.strip().str.lower().str.replace('^0x', '', regex=True)
 
         markets['contract_id'] = clean_id(markets['contract_id'])
+
+        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        
         trades['contract_id'] = clean_id(trades['contract_id'])
+
+        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
             
         # 3. FILTER TO COMMON IDs
         common_ids_set = set(markets['contract_id']).intersection(set(trades['contract_id']))
@@ -2523,6 +2578,22 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
     Production-ready wrapper that correctly unpacks Ray search space parameters
     into a flat configuration dictionary compatible with PolyStrategyConfig.
     """
+    if isinstance(event_log, ray.ObjectRef):
+        event_log = ray.get(event_log)
+    if isinstance(profiler_data, ray.ObjectRef):
+        profiler_data = ray.get(profiler_data)
+    if isinstance(nlp_cache, ray.ObjectRef):
+        nlp_cache = ray.get(nlp_cache)
+    if isinstance(priors, ray.ObjectRef):
+        priors = ray.get(priors)
+
+    if event_log.empty or profiler_data.empty:
+        print("⚠️ Trial skipped: Empty input data")
+        return {'smart_score': -99.0}
+    
+    if len(profiler_data[profiler_data['outcome'].isin([0.0, 1.0])]) == 0:
+        print("⚠️ Trial skipped: No valid outcomes in profiler")
+        return {'smart_score': -99.0}
     
     config_str = json.dumps(config, sort_keys=True, default=str)
     # Generate a deterministic 32-bit integer seed from the config hash
