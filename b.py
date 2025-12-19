@@ -105,10 +105,17 @@ def plot_performance(full_equity_curve, trades_count):
     Generates a performance chart with Max Drawdown Annotation.
     Safe for headless servers.
     """
+    if not full_equity_curve: return
+    # Extract values if tuples, otherwise use as-is
+    if isinstance(full_equity_curve[0], tuple):
+        equity_values = [x[1] for x in full_equity_curve]
+    else:
+        equity_values = full_equity_curve
+    
     try:
         
         # 1. Prepare Data
-        series = pd.Series(full_equity_curve)
+        series = pd.Series(equity_values)
         x_axis = range(len(full_equity_curve))
         
         # 2. Calculate Drawdown Stats
@@ -334,6 +341,7 @@ class PolyStrategyConfig(StrategyConfig):
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
+        self.clock = self.portfolio.clock
         self.trackers = {} 
         self.last_known_prices = {}
         self.instrument_map = {i.value: i for i in config.instrument_ids}
@@ -363,7 +371,15 @@ class PolymarketNautilusStrategy(Strategy):
         """Record equity with memory-safe growth limiting"""
         usdc = Currency.from_str("USDC")
         total_equity = self.portfolio.net_equity_total(usdc).as_double()
-        now_ts = pd.Timestamp(self.clock.utc_now())
+        
+        if hasattr(self, 'clock') and self.clock is not None:
+            try:
+                now_ts = pd.Timestamp(self.clock.utc_now())
+            except:
+                now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
+        else:
+            now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
+        
         self.equity_history.append((now_ts, total_equity))
 
 
@@ -664,8 +680,15 @@ class FastBacktestEngine:
         
         # Filter
         if cutoff_date:
-            if 'res_time' in valid.columns: valid = valid[valid['res_time'] < cutoff_date]
-            else: valid = valid[valid['timestamp'] < cutoff_date]
+            if 'res_time' in valid.columns and valid['res_time'].notna().any():
+                valid = valid[valid['res_time'] < cutoff_date]
+            elif 'timestamp' in valid.columns:
+                valid = valid[valid['timestamp'] < cutoff_date]
+            else:
+                # Fallback: filter by index if it's a DatetimeIndex
+                if isinstance(valid.index, pd.DatetimeIndex):
+                    valid = valid[valid.index < cutoff_date]
+                    
         if known_wallet_ids: valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
         if len(valid) < 50: return SAFE_SLOPE, SAFE_INTERCEPT
         
@@ -778,7 +801,11 @@ class FastBacktestEngine:
                 (self.profiler_data['market_created'] < train_end)
             )
             train_profiler = self.profiler_data[train_mask].copy()
-            train_profiler = train_profiler[train_profiler['res_time'] < train_end]
+            if 'res_time' in train_profiler.columns:
+                train_profiler = train_profiler[train_profiler['res_time'] < train_end]
+            else:
+                print("⚠️ Warning: res_time column missing, using timestamp instead")
+                train_profiler = train_profiler[train_profiler['timestamp'] < train_end]
             train_profiler = train_profiler.sort_values(
                 by=['timestamp', 'wallet_id', 'market_id'], 
                 kind='stable'
@@ -850,7 +877,7 @@ class FastBacktestEngine:
                 
                 # Update global capital for the next fold
                 capital = full_equity_curve[-1][1]
-                full_equity_curve.append(capital)
+  
                 
                 total_trades += result['trades']
                 total_wins += result.get('wins', 0)
@@ -897,7 +924,7 @@ class FastBacktestEngine:
             'wins': total_wins, 
             'losses': total_losses,
             'win_loss_ratio': total_wins / max(1, total_losses),
-            'full_equity_curve': equity_values, 
+            'full_equity_curve': full_equity_curve, 
             'final_capital': capital
         }
                                   
@@ -1430,14 +1457,19 @@ class TuningRunner:
         trade_count = final_results.get('trades', 0)
         
         if curve_data:
-            # 3. Plot
+            # 3. Plot (function now handles both formats)
             plot_performance(curve_data, trade_count)
             
-            # 4. Optional: Quick Terminal "Sparkline"
-            start = curve_data[0]
-            end = curve_data[-1]
-            peak = max(curve_data)
-            low = min(curve_data)
+            # 4. Extract values for terminal output
+            if isinstance(curve_data[0], (tuple, list)):
+                values = [x[1] for x in curve_data]
+            else:
+                values = curve_data
+                
+            start = values[0]
+            end = values[-1]
+            peak = max(values)
+            low = min(values)
             print(f"   Start: ${start:.0f} -> Peak: ${peak:.0f} -> End: ${end:.0f}")
             print(f"   Lowest Point: ${low:.0f}")
         else:
