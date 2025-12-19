@@ -1296,7 +1296,7 @@ class TuningRunner:
         # Use categorical for repeated strings
         df_trades['contract_id'] = df_trades['contract_id'].astype('category')
 
-        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
+        df_trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
 
         df_trades['user'] = df_trades['user'].astype('category')
         
