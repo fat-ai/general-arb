@@ -60,7 +60,7 @@ class KellyOptimizer:
     """
     
     def __init__(self, returns_df: pd.DataFrame, risk_free_rate: float = 0.0):
-        self.returns = returns_df
+        self.returns = returns_df.astype(np.float64)
         self.r_f = risk_free_rate
         
         # 1. Expected Returns (Simple Mean)
