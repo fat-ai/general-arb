@@ -326,7 +326,7 @@ class PolyStrategyConfig(StrategyConfig):
     decay_factor: float = 0.95
     
     wallet_scores: dict = None 
-    instrument_ids: list = None
+    active_instrument_ids: list = None
     
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
@@ -346,7 +346,8 @@ class PolymarketNautilusStrategy(Strategy):
         self.clock = self.portfolio.clock
         self.trackers = {} 
         self.last_known_prices = {}
-        self.instrument_map = {i.value: i for i in config.instrument_ids}
+        target_ids = config.active_instrument_ids if config.active_instrument_ids else []
+        self.instrument_map = {i.value: i for i in target_ids}
         self.equity_history = []
         self.break_even = 0      
         self.total_closed = 0
@@ -360,8 +361,9 @@ class PolymarketNautilusStrategy(Strategy):
         self.positions_tracker = {} 
 
     def on_start(self):
-        for inst_id in self.config.instrument_ids:
-            self.subscribe_trade_ticks(inst_id)
+        if self.config.active_instrument_ids:
+            for inst_id in self.config.active_instrument_ids:
+                self.subscribe_trade_ticks(inst_id)
         self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
     def on_timer(self, event):
@@ -1063,7 +1065,7 @@ class FastBacktestEngine:
         base_inst_id = list(inst_map.values())[0]
         
         strat_config = PolyStrategyConfig(
-            instrument_ids=list(inst_map.values()), 
+            active_instrument_ids=list(inst_map.values()),
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
             wallet_scores=wallet_scores,
@@ -1143,11 +1145,11 @@ class FastBacktestEngine:
         return {
             'final_value': final_val,
             'total_return': (final_val / 10000.0) - 1.0,
-            'trades': strategy.total_closed,
-            'wins': strategy.wins, # Assumes 'strategy' obj logic is preserved
-            'losses': strategy.losses,
-            'full_equity_curve': strategy.equity_history, 
-            'tracker_state': strategy.trackers
+            'trades': s_closed,   # Use local variable
+            'wins': s_wins,       # Use local variable
+            'losses': s_losses,   # Use local variable
+            'full_equity_curve': s_equity, 
+            'tracker_state': s_trackers
         }
                                                                    
 class TuningRunner:
