@@ -573,15 +573,13 @@ class PolymarketNautilusStrategy(Strategy):
             pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
             realized_pnl = pnl_per_share * closed_qty
             self.total_closed += 1
+            
             if realized_pnl > 0: 
                 self.wins += 1
             elif realized_pnl < 0: 
                 self.losses += 1
             else:
                 self.break_even += 1
-            
-            if realized_pnl > 0: self.wins += 1
-            elif realized_pnl < 0: self.losses += 1
 
         # 4. Update Tracker State
         if abs(new_qty) < 0.001:
@@ -1094,10 +1092,15 @@ class FastBacktestEngine:
         final_val = cash + open_pos_value
 
         if not strategy.equity_history:
-            strategy.equity_history = [10000.0, final_val]
+            # Create synthetic start/end tuples if history is empty
+            strategy.equity_history = [
+                (start_time, 10000.0), 
+                (end_time, final_val)
+            ]
         else:
-            # Update the last point to match the precise settlement value
-            strategy.equity_history[-1] = final_val
+            # Preserve the timestamp, only update the value
+            last_ts = strategy.equity_history[-1][0]
+            strategy.equity_history[-1] = (last_ts, final_val)
     
         engine.dispose()
         del strategy; del engine; del nautilus_data
