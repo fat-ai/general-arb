@@ -69,6 +69,7 @@ def set_global_seed(seed: int):
 
 SEED = 42
 set_global_seed(SEED)
+os.environ["PYTHONHASHSEED"] = str(SEED)
 
 # Store optimal weights here so we don't re-optimize every tick
 
@@ -780,6 +781,11 @@ class FastBacktestEngine:
                 (self.profiler_data['market_created'] < train_end)
             )
             train_profiler = self.profiler_data[train_mask].copy()
+
+            train_profiler = train_profiler.sort_values(
+                by=['timestamp', 'wallet_id', 'market_id'], 
+                kind='stable'
+            )
             
             # --- Profiler Logic ---
             # Filter resolutions that happened before training ended
@@ -790,6 +796,7 @@ class FastBacktestEngine:
             res_time_map = dict(zip(valid_res['contract_id'], valid_res.index))
 
             train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
+            
             train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
             train_profiler['res_time'] = train_profiler['market_id'].map(res_time_map)
             
@@ -1560,7 +1567,10 @@ class TuningRunner:
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
-        trades = trades.sort_values(by=present_sort_cols, kind='stable')
+        trades = trades.sort_values(
+            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            kind='stable'
+        ).reset_index(drop=True)
         trades = trades.drop_duplicates(subset=present_sort_cols, keep='first').reset_index(drop=True)
         
         print(f"✅ SYSTEM READY.")
@@ -2416,7 +2426,10 @@ class TuningRunner:
         gc.collect()
         
         df_ev['event_type'] = df_ev['event_type'].astype('category')
-        df_ev = df_ev.sort_values(by=['timestamp', 'event_type'], kind='stable')
+        df_ev = df_ev.sort_values(
+            by=['timestamp', 'event_type', 'contract_id'], 
+            kind='stable'
+        )
         df_ev = df_ev.dropna(subset=['timestamp'])
 
         if not prof_data.empty:
@@ -2462,8 +2475,12 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
     into a flat configuration dictionary compatible with PolyStrategyConfig.
     """
     
-    worker_seed = config.get("seed", 42)
-    set_global_seed(worker_seed)
+    config_str = json.dumps(config, sort_keys=True, default=str)
+    # Generate a deterministic 32-bit integer seed from the config hash
+    trial_seed = int(hashlib.md5(config_str.encode()).hexdigest(), 16) % (2**31)
+    
+    # Apply the seed to Python, NumPy, and environment variables
+    set_global_seed(trial_seed)
     
     # 1. Validation
     decay = config.get('decay_factor', 0.95)
