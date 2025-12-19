@@ -34,7 +34,7 @@ import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
 from typing import Optional, List, Dict
-
+from pydantic import Field
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
 from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
@@ -316,7 +316,7 @@ class PolyStrategyConfig(StrategyConfig):
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
     wallet_scores: Optional[Dict] = None 
-    instrument_ids: Optional[List[str]] = None
+    instrument_ids: List[InstrumentId] = Field(default_factory=list)
     min_signal_volume: float = 10.0
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
