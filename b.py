@@ -33,7 +33,7 @@ from risk_engine import KellyOptimizer
 import matplotlib
 matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from pydantic import Field
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
@@ -325,8 +325,8 @@ class PolyStrategyConfig(StrategyConfig):
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
     
-    wallet_scores: dict = None 
-    active_instrument_ids: list = None
+    wallet_scores: Optional[Dict[Any, Any]] = None
+    active_instrument_ids: Optional[List[Any]] = None
     
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
