@@ -309,8 +309,6 @@ def persistent_disk_cache(func):
 
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
-WALLET_LOOKUP = {}
-
 
 class PolyStrategyConfig(StrategyConfig):
     # Core Alpha Parameters
@@ -781,11 +779,12 @@ class FastBacktestEngine:
                 (self.profiler_data['market_created'] < train_end)
             )
             train_profiler = self.profiler_data[train_mask].copy()
-
+            train_profiler = train_profiler[train_profiler['res_time'] < train_end]
             train_profiler = train_profiler.sort_values(
                 by=['timestamp', 'wallet_id', 'market_id'], 
                 kind='stable'
             )
+            
             
             # --- Profiler Logic ---
             # Filter resolutions that happened before training ended
@@ -966,8 +965,6 @@ class FastBacktestEngine:
             )
             
             engine.add_instrument(inst)
-
-        WALLET_LOOKUP.clear()
         
         # 4. FAST LOOP
         for idx, row in enumerate(price_events.itertuples(index=True)):
@@ -978,20 +975,38 @@ class FastBacktestEngine:
             inst_id = inst_map[cid]
             price_float = float(row.p_market_all)
 
+            market_liq_score = known_liquidity.get(cid, 0)
             real_size_val = getattr(row, 'size', 0.0)
-            if real_size_val <= 0.0001: real_size_val = 0.01
 
-            size_str = f"{real_size_val:.4f}"
+            if market_liq_score > 100.0:
+                # STRICT MODEL: Top-of-Book is ~1% of Total Liquidity
+                # This scales dynamically: A $1M market gives you $10k depth. A $1k market gives you $10.
+                # No magic caps. No arbitrary 5x multipliers.
+                simulated_depth = market_liq_score * 0.01
+            else:
+                # FALLBACK: If API data is missing/zero, we must assume the market 
+                # is at least as deep as the trade that just happened.
+                simulated_depth = real_size_val
+
+            # Ensure we don't have broken zero-depth quotes
+            simulated_depth = max(10.0, simulated_depth)
+            depth_str = f"{simulated_depth:.4f}"
             
-            bid_px = max(0.01, price_float - 0.0001)
-            ask_px = min(0.99, price_float + 0.0001)
+            spread = max(0.005, price_float * 0.01)
+            bid_px = max(0.005, price_float - spread)
+            ask_px = min(0.995, price_float + spread)
+            
+            if bid_px >= ask_px:
+                diff = ask_px - bid_px
+                bid_px -= (diff / 2)
+                ask_px += (diff / 2)
             
             quote = QuoteTick(
                 instrument_id=inst_id,
                 bid_price=Price.from_str(f"{bid_px:.4f}"),
                 ask_price=Price.from_str(f"{ask_px:.4f}"),
-                bid_size=Quantity.from_str("100000"), 
-                ask_size=Quantity.from_str("100000"),
+                bid_size=Quantity.from_str(depth_str),
+                ask_size=Quantity.from_str(depth_str),
                 ts_event=ts_ns - 1,
                 ts_init=ts_ns - 1
             )
