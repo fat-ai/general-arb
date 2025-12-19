@@ -842,11 +842,16 @@ class FastBacktestEngine:
                 if not local_curve: continue
 
                 # Calculate growth factor for this period
-                start_val = local_curve[0]
-                end_val = local_curve[-1]
-                period_return = (end_val - start_val) / start_val
-
-                capital = capital * (1 + period_return)
+                start_val = local_curve[0][1] 
+                
+                # Stitch the curve: Scale this fold's growth to global capital
+                for ts, val in local_curve:
+                    growth = val / start_val
+                    current_val = capital * growth
+                    full_equity_curve.append((ts, current_val))
+                
+                # Update global capital for the next fold
+                capital = full_equity_curve[-1][1]
                 full_equity_curve.append(capital)
                 
                 total_trades += result['trades']
@@ -1882,6 +1887,7 @@ class TuningRunner:
 
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
+        # add id
         
         # Append if file exists, write new if not
         write_mode = 'a' if cache_file.exists() else 'w'
@@ -1975,6 +1981,7 @@ class TuningRunner:
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                             
                                 rows.append({
+                                #     'id': row.get('id'),
                                     'timestamp': ts_str,
                                     'tradeAmount': usdc,
                                     'outcomeTokensAmount': size * side_mult,  # Signed, scaled correctly (no *1e18)
