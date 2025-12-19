@@ -100,7 +100,7 @@ FIXED_END_DATE   = pd.Timestamp("2025-12-07")
 today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
 
-def plot_performance(equity_curve, trades_count):
+def plot_performance(full_equity_curve, trades_count):
     """
     Generates a performance chart with Max Drawdown Annotation.
     Safe for headless servers.
@@ -108,8 +108,8 @@ def plot_performance(equity_curve, trades_count):
     try:
         
         # 1. Prepare Data
-        series = pd.Series(equity_curve)
-        x_axis = range(len(equity_curve))
+        series = pd.Series(full_equity_curve)
+        x_axis = range(len(full_equity_curve))
         
         # 2. Calculate Drawdown Stats
         running_max = series.cummax()
@@ -123,12 +123,12 @@ def plot_performance(equity_curve, trades_count):
         plt.figure(figsize=(12, 6))
         
         # 3. Plot Main Equity Curve
-        plt.plot(x_axis, equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
+        plt.plot(x_axis, full_equity_curve, color='#00ff00', linewidth=1.5, label='Portfolio Value')
         plt.axhline(y=10000, color='r', linestyle='--', alpha=0.5, label='Starting Capital')
         
         # 4. Add Max Drawdown Arrow Annotation
         # We point TO the trough (xy) FROM a text position slightly above/left (xytext)
-        if len(equity_curve) > 0 and max_dd_idx > 0:
+        if len(full_equity_curve) > 0 and max_dd_idx > 0:
             plt.annotate(
                 f'Max DD: {max_dd_pct:.1%}', 
                 xy=(max_dd_idx, max_dd_val),             # Arrow tip (at the trough)
@@ -185,13 +185,13 @@ def calculate_sharpe_ratio(returns, periods_per_year=252, rf=0.0):
         
     return np.sqrt(periods_per_year) * (np.mean(excess_returns) / std_dev)
 
-def calculate_max_drawdown(equity_curve):
+def calculate_max_drawdown(full_equity_curve):
     """
     Robust NumPy-based Max Drawdown calculation.
     Returns: (max_dd_pct, dd_index, equity_at_trough)
     """
     # Convert to array and ensure float type
-    equity = np.array(equity_curve, dtype=np.float64)
+    equity = np.array(full_equity_curve, dtype=np.float64)
     
     if len(equity) < 2:
         return 0.0, 0, equity[0] if len(equity) > 0 else 0.0
@@ -694,7 +694,8 @@ class FastBacktestEngine:
 
         # Only learn from wallets that have a representative history (min 5 trades)
         qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 5]
-
+        x = qualified_wallets['log_vol'].values
+        y = qualified_wallets['roi'].values
         # Ensure we have enough unique entities to form a regression
         if len(qualified_wallets) < 10: 
             return SAFE_SLOPE, SAFE_INTERCEPT
@@ -836,33 +837,25 @@ class FastBacktestEngine:
                 
                 # --- Aggregate Results ---
                 global_tracker = result['tracker_state']
-                local_curve = result.get('equity_curve', [result['final_value']])
-                start_capital_this_fold = 10000.0
+                local_curve = result.get('full_equity_curve', [])
 
-                for ts, val in local_history:
-                    growth_factor = val / start_capital_this_fold
-                    current_global_equity = capital * growth_factor
-                    full_equity_curve.append((ts, current_global_equity))
+                if not local_curve: continue
+
+                # Calculate growth factor for this period
+                start_val = local_curve[0]
+                end_val = local_curve[-1]
+                period_return = (end_val - start_val) / start_val
+
+                capital = capital * (1 + period_return)
+                full_equity_curve.append(capital)
                 
-                # Update capital for next fold based on the final point
-                if full_equity_curve:
-                    capital = full_equity_curve[-1][1]
-                
-                # Normalize growth
-                returns = pd.Series(local_curve).pct_change().fillna(0)
-                scaled_curve = capital * (1 + returns).cumprod()
-                
-                if len(equity_curve) > 0: equity_curve.extend(scaled_curve[1:])
-                else: equity_curve.extend(scaled_curve)
-                
-                capital = equity_curve[-1]
                 total_trades += result['trades']
                 total_wins += result.get('wins', 0)
                 total_losses += result.get('losses', 0)
             
             current_date += timedelta(days=test_days)
             
-        if not equity_curve: 
+        if not full_equity_curve: 
             return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'max_drawdown': 0.0, 'trades': 0}
 
         df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
@@ -883,10 +876,10 @@ class FastBacktestEngine:
         )
         
         # [PATCH] Use robust NumPy calculation
-        max_dd_pct, _, _ = calculate_max_drawdown(equity_curve)
+        max_dd_pct, _, _ = calculate_max_drawdown(full_equity_curve)
         
         # Calculate other stats
-        series = pd.Series(equity_curve)
+        series = pd.Series(full_equity_curve)
   
         equity_values = [x[1] for x in full_equity_curve]
         max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
@@ -901,7 +894,7 @@ class FastBacktestEngine:
             'wins': total_wins, 
             'losses': total_losses,
             'win_loss_ratio': total_wins / max(1, total_losses),
-            'equity_curve': equity_values, 
+            'full_equity_curve': equity_values, 
             'final_capital': capital
         }
                                   
@@ -1028,7 +1021,7 @@ class FastBacktestEngine:
             nautilus_data.append(tick)
         
         if not nautilus_data:
-            return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'equity_curve': [], 'tracker_state': {}}
+            return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'full_equity_curve': [], 'tracker_state': {}}
             
         nautilus_data.sort(key=lambda x: x.ts_event)
         
@@ -1111,7 +1104,7 @@ class FastBacktestEngine:
             'trades': strategy.total_closed,
             'wins': strategy.wins, # Assumes 'strategy' obj logic is preserved
             'losses': strategy.losses,
-            'equity_curve': strategy.equity_history, 
+            'full_equity_curve': strategy.equity_history, 
             'tracker_state': strategy.trackers
         }
                                                                    
@@ -1425,7 +1418,7 @@ class TuningRunner:
         final_results = engine.run_walk_forward(best_config)
         
         # 2. Extract Curve
-        curve_data = final_results.get('equity_curve', [])
+        curve_data = final_results.get('full_equity_curve', [])
         trade_count = final_results.get('trades', 0)
         
         if curve_data:
@@ -1918,6 +1911,7 @@ class TuningRunner:
                         orderDirection: desc
                         where: { makerAssetId: $token, timestamp_lt: $max_ts }
                       ) {
+                        id
                         timestamp, makerAmountFilled, takerAmountFilled, maker, taker
                       }
                       asTaker: orderFilledEvents(
@@ -1926,6 +1920,7 @@ class TuningRunner:
                         orderDirection: desc
                         where: { takerAssetId: $token, timestamp_lt: $max_ts }
                       ) {
+                        id
                         timestamp, makerAmountFilled, takerAmountFilled, maker, taker
                       }
                     }
