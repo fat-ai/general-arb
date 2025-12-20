@@ -389,7 +389,9 @@ class PolymarketNautilusStrategy(Strategy):
         # Safety check for portfolio access
         if not self.portfolio: return
 
-        total_equity = self.portfolio.net_equity_total(usdc).as_double()
+        total_equity = 0.0
+        for account in self.portfolio.accounts.values():
+            total_equity += account.balance_total(usdc).as_double()
         
         if hasattr(self, 'clock') and self.clock is not None:
             try:
@@ -515,7 +517,9 @@ class PolymarketNautilusStrategy(Strategy):
         # Check Portfolio existence
         if not self.portfolio: return
 
-        capital = self.portfolio.net_equity_total(Currency.from_str("USDC")).as_double()
+        inst_id = self.instrument_map[cid]
+        account = self.portfolio.account(inst_id.venue)
+        capital = account.balance_total(Currency.from_str("USDC")).as_double()
         if capital < 100.0:
             return
         
