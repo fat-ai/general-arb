@@ -893,33 +893,24 @@ class FastBacktestEngine:
                 total_losses += result.get('losses', 0)
             
             current_date += timedelta(days=test_days)
-            
-        if not full_equity_curve: 
-            return {'total_return': 0.0, 'sharpe_ratio': 0.0, 'max_drawdown': 0.0, 'trades': 0}
 
+        if not full_equity_curve: 
+            return {
+                'total_return': 0.0, 
+                'sharpe_ratio': 0.0, 
+                'max_drawdown': 0.0, 
+                'trades': 0
+            }
+
+        # Calculate final metrics
         df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
+        df_eq['ts'] = pd.to_datetime(df_eq['ts'])
         df_eq = df_eq.set_index('ts').sort_index()
         
-        # 2. Resample to Daily (End of Day) and Fill Forward
-        # This fixes the "irregular frequency" issue completely.
-        daily_eq = df_eq.resample('D').last().ffill()
+        daily_returns = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
         
-        # 3. Calculate Metrics on DAILY Data
-        # Use 252 for standard annualization
-        daily_returns = daily_eq['equity'].pct_change().dropna()
+        sharpe = calculate_sharpe_ratio(daily_returns, periods_per_year=252, rf=0.02)
         
-        sharpe = calculate_sharpe_ratio(
-            daily_returns, 
-            periods_per_year=252, # [FIX] Standard Daily Annualization
-            rf=0.02 
-        )
-        
-        # [PATCH] Use robust NumPy calculation
-        max_dd_pct, _, _ = calculate_max_drawdown(full_equity_curve)
-        
-        # Calculate other stats
-        series = pd.Series(full_equity_curve)
-  
         equity_values = [x[1] for x in full_equity_curve]
         max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
         
@@ -928,12 +919,10 @@ class FastBacktestEngine:
         return {
             'total_return': total_ret, 
             'sharpe_ratio': sharpe, 
-            'max_drawdown': abs(max_dd_pct), # Return positive magnitude for reporting
+            'max_drawdown': abs(max_dd_pct), 
             'trades': total_trades, 
             'wins': total_wins, 
             'losses': total_losses,
-            'win_loss_ratio': total_wins / max(1, total_losses),
-            'full_equity_curve': full_equity_curve, 
             'final_capital': capital
         }
                                   
