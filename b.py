@@ -855,6 +855,10 @@ class FastBacktestEngine:
                 min_trades=5, 
                 cutoff_date=train_end
             )
+
+            if 'wallet_scores' in config and config['wallet_scores']:
+                # If we passed explicit scores, use them instead of the empty fold scores
+                fold_wallet_scores = config['wallet_scores']
             
             if fold_wallet_scores:
                 known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys())))
