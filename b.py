@@ -564,7 +564,8 @@ class PolymarketNautilusStrategy(Strategy):
 
         if not self.portfolio: return
 
-        position = self.portfolio.positions.get(inst_id)
+        all_positions = self.portfolio.positions()
+        position = all_positions.get(inst_id)
         
         if not position or position.is_flat: 
 
@@ -1105,8 +1106,9 @@ class FastBacktestEngine:
             cash = 10000.0
             
         open_pos_value = 0.0
-        for inst_id in list(engine.portfolio.positions.keys()):
-            pos = engine.portfolio.positions.get(inst_id)
+        all_positions = engine.portfolio.positions() 
+        for inst_id in list(all_positions.keys()):
+            pos = all_positions.get(inst_id)
             if pos and not pos.is_flat:
                 cid = inst_id.symbol.value
                 qty = pos.quantity.as_double()
