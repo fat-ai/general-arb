@@ -555,7 +555,7 @@ class PolymarketNautilusStrategy(Strategy):
         self.submit_order(self.order_factory.limit(
             instrument_id=self.instrument_map[cid],
             order_side=side,
-            size=Quantity.from_str(qty_str),
+            quantity=Quantity.from_str(qty_str),
             price=Price.from_str(f"{limit_px:.2f}"),
             time_in_force=TimeInForce.IOC 
         ))
