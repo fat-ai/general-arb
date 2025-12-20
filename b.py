@@ -325,25 +325,31 @@ def persistent_disk_cache(func):
 
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
-@dataclass
 class PolyStrategyConfig(StrategyConfig):
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
     min_signal_volume: float = 1.0
     wallet_scores: Optional[Dict[Any, Any]] = None
     active_instrument_ids: Optional[List[Any]] = None
-    
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
-    
     sizing_mode: str = 'fixed'
     fixed_size: float = 10.0
     kelly_fraction: float = 0.1
     stop_loss: Optional[float] = None
-    
     use_smart_exit: bool = False
     smart_exit_ratio: float = 0.5
     edge_threshold: float = 0.05
+
+    def __init__(self, **kwargs):
+        # 1. Pop our custom field so the parent class doesn't complain
+        active_ids = kwargs.pop("active_instrument_ids", None)
+        
+        # 2. Initialize the parent with the remaining valid config arguments
+        super().__init__(**kwargs)
+        
+        # 3. Force-set our custom field (bypassing "frozen" checks if they exist)
+        object.__setattr__(self, "active_instrument_ids", active_ids)
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
