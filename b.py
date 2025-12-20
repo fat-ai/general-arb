@@ -330,39 +330,25 @@ class PolyStrategyConfig(StrategyConfig):
     decay_factor: float = 0.95
     min_signal_volume: float = 1.0
     wallet_scores: Optional[Dict[Any, Any]] = None
-    active_instrument_ids: Optional[List[Any]] = None
     fw_slope: float = 0.0
     fw_intercept: float = 0.0
+    
     sizing_mode: str = 'fixed'
     fixed_size: float = 10.0
     kelly_fraction: float = 0.1
     stop_loss: Optional[float] = None
+    
     use_smart_exit: bool = False
     smart_exit_ratio: float = 0.5
     edge_threshold: float = 0.05
-
-    def __init__(self, **kwargs):
-        # 1. Pop our custom field so the parent class doesn't complain
-        active_ids = kwargs.pop("active_instrument_ids", None)
-        
-        # 2. Initialize the parent with the remaining valid config arguments
-        super().__init__(**kwargs)
-        
-        # 3. Force-set our custom field (bypassing "frozen" checks if they exist)
-        object.__setattr__(self, "active_instrument_ids", active_ids)
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
         self.trackers = {} 
         self.last_known_prices = {}
-        target_ids = config.active_instrument_ids if config.active_instrument_ids else []
+        self.active_instrument_ids = []
         self.instrument_map = {}
-        for i in target_ids:
-            if hasattr(i, 'value'): 
-                self.instrument_map[i.value] = i
-            else:
-                pass
         
         self.equity_history = []
         self.break_even = 0      
@@ -375,9 +361,13 @@ class PolymarketNautilusStrategy(Strategy):
         self.positions_tracker = {} 
 
     def on_start(self):
+      
+        for inst_id in self.active_instrument_ids:
+             if hasattr(inst_id, 'value'): 
+                self.instrument_map[inst_id.value] = inst_id
 
-        if self.config.active_instrument_ids:
-            for inst_id in self.config.active_instrument_ids:
+        if self.active_instrument_ids:
+            for inst_id in self.active_instrument_ids:
                 if isinstance(inst_id, InstrumentId):
                     self.subscribe_trade_ticks(inst_id)
         
@@ -1085,7 +1075,6 @@ class FastBacktestEngine:
         base_inst_id = list(inst_map.values())[0]
         
         strat_config = PolyStrategyConfig(
-            active_instrument_ids=list(inst_map.values()),
             splash_threshold=float(config.get('splash_threshold', 1000.0)),
             decay_factor=float(config.get('decay_factor', 0.95)),
             wallet_scores=wallet_scores,
@@ -1100,7 +1089,12 @@ class FastBacktestEngine:
             edge_threshold=float(config.get('edge_threshold', 0.05))
         )
         
+        # 2. Create Strategy
         strategy = PolymarketNautilusStrategy(strat_config)
+
+        # 3. MANUAL INJECTION (The Fix)
+        # We attach the list directly to the instance, bypassing the strict Config struct
+        strategy.active_instrument_ids = list(inst_map.values())
    
         strategy.wallet_lookup = local_wallet_lookup
         
