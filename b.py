@@ -334,7 +334,7 @@ class PolyStrategyConfig(StrategyConfig):
     sizing_mode: str = 'fixed'
     fixed_size: float = 10.0
     kelly_fraction: float = 0.1
-    stop_loss: float = None
+    stop_loss: Optional[float] = None
     
     use_smart_exit: bool = False
     smart_exit_ratio: float = 0.5
@@ -343,15 +343,15 @@ class PolyStrategyConfig(StrategyConfig):
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
-        # FIX 1: Removed self.clock = self.portfolio.clock (CRITICAL FIX)
-        # Accessing portfolio in __init__ causes a crash because it hasn't been injected yet.
-        
         self.trackers = {} 
         self.last_known_prices = {}
-        
-        # Initialize instrument map safely
         target_ids = config.active_instrument_ids if config.active_instrument_ids else []
-        self.instrument_map = {i.value: i for i in target_ids}
+        self.instrument_map = {}
+        for i in target_ids:
+            if hasattr(i, 'value'): 
+                self.instrument_map[i.value] = i
+            else:
+                pass
         
         self.equity_history = []
         self.break_even = 0      
@@ -364,14 +364,13 @@ class PolymarketNautilusStrategy(Strategy):
         self.positions_tracker = {} 
 
     def on_start(self):
-        # FIX 1 (Continued): Initialize clock here, when portfolio is ready.
         self.clock = self.portfolio.clock
         
         if self.config.active_instrument_ids:
             for inst_id in self.config.active_instrument_ids:
-                self.subscribe_trade_ticks(inst_id)
+                if isinstance(inst_id, InstrumentId):
+                    self.subscribe_trade_ticks(inst_id)
         
-        # Use a safe timer check
         if self.clock:
             self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
@@ -425,10 +424,8 @@ class PolymarketNautilusStrategy(Strategy):
         if elapsed_seconds < 0:
             elapsed_seconds = 0.0
         
-        # Decay
         if elapsed_seconds > 0:
             decay = self.config.decay_factor ** (elapsed_seconds / 60.0)
-            tracker['net_weight'] *= decay
         
         tracker['last_update_ts'] = tick.ts_event
 
@@ -529,8 +526,6 @@ class PolymarketNautilusStrategy(Strategy):
             risk_per_share = max(0.01, 1.0 - price)
             qty_to_trade = target_exposure / risk_per_share
 
-        # FIX 2: Dust Prevention
-        # If quantity is too small, it will format to "0.0000" and crash or be rejected.
         if qty_to_trade < 0.01:
             return
 
@@ -555,9 +550,14 @@ class PolymarketNautilusStrategy(Strategy):
         if not self.portfolio: return
 
         position = self.portfolio.positions.get(inst_id)
-        if not position or position.is_flat: return
+        
+        if not position or position.is_flat: 
+            if inst_id in self.positions_tracker:
+                del self.positions_tracker[inst_id]
+            return
         
         side = OrderSide.SELL if position.is_long else OrderSide.BUY
+        
         qty = position.quantity.as_double()
         
         if side == OrderSide.BUY: limit_px = 0.99
@@ -2614,6 +2614,10 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         # 2. Prepare the Flat Configuration Dictionary
         # We copy the config to avoid mutating the Ray object store reference
         run_config = config.copy()
+
+        for k, v in run_config.items():
+            if isinstance(v, (np.generic)):
+                run_config[k] = v.item()
 
         # UNPACK SIZING TUPLE: ("fixed_pct", 0.05) -> mode="fixed_pct", val=0.05
         # This handles the complex search space definition in your tuning runner.
