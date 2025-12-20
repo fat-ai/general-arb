@@ -455,7 +455,7 @@ class PolymarketNautilusStrategy(Strategy):
         # --- E. Entry Trigger ---
         if abs(tracker['net_weight']) > self.config.splash_threshold:
             self._execute_entry(cid, tracker['net_weight'], price)
-            tracker['net_weight'] -= (self.config.splash_threshold * np.sign(tracker['net_weight']))
+            tracker['net_weight'] = 0.0
 
     def _check_stop_loss(self, inst_id, current_price):
         if inst_id not in self.positions_tracker: return
@@ -520,11 +520,15 @@ class PolymarketNautilusStrategy(Strategy):
         else: 
             target_exposure = self.config.fixed_size
 
+        current_pos = self.positions_tracker.get(cid, {}).get('net_qty', 0.0)
+        
         if side == OrderSide.BUY:
-            qty_to_trade = target_exposure / price
+            target_qty = target_exposure / price
+            qty_to_trade = max(0.0, target_qty - current_pos)
         else:
             risk_per_share = max(0.01, 1.0 - price)
-            qty_to_trade = target_exposure / risk_per_share
+            target_qty = target_exposure / risk_per_share
+            qty_to_trade = max(0.0, target_qty - abs(current_pos))
 
         if qty_to_trade < 0.01:
             return
