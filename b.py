@@ -793,7 +793,7 @@ class FastBacktestEngine:
             test_start_ns = test_start.value
             test_end_ns = test_end.value
             current_date_ns = current_date.value
-
+            safe_train_end = pd.Timestamp(train_end)
             # Train Mask (Integer compare is faster)
             train_mask = (
                 (self.profiler_data['ts_int'] >= current_date_ns) & 
