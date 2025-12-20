@@ -515,7 +515,7 @@ class PolymarketNautilusStrategy(Strategy):
         # Check Portfolio existence
         if not self.portfolio: return
 
-        capital = self.portfolio.cash_balance(Currency.from_str("USDC")).as_double()
+        capital = self.portfolio.net_equity_total(Currency.from_str("USDC")).as_double()
         if capital < 100.0:
             return
         
@@ -1091,8 +1091,14 @@ class FastBacktestEngine:
         engine.run()
 
         # 6. MANUAL SETTLEMENT
-        try: cash = engine.portfolio.cash_balance(USDC).as_double()
-        except: cash = 10000.0
+        try:
+            # Get the account for the POLY venue to read the raw cash balance
+            acct = engine.portfolio.account(venue_id)
+            # balance_total = Free Cash + Locked Margin
+            cash = acct.balance_total(USDC).as_double()
+        except Exception as e:
+            print(f"Settlement Error: {e}")
+            cash = 10000.0
             
         open_pos_value = 0.0
         for inst_id in list(engine.portfolio.positions.keys()):
