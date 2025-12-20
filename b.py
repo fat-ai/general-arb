@@ -1030,8 +1030,8 @@ class FastBacktestEngine:
             
             quote = QuoteTick(
                 instrument_id=inst_id,
-                bid_price=Price.from_str(f"{bid_px:.4f}"),
-                ask_price=Price.from_str(f"{ask_px:.4f}"),
+                bid_price=Price.from_str(f"{bid_px:.6f}"),
+                ask_price=Price.from_str(f"{ask_px:.6f}"),
                 bid_size=Quantity.from_str(depth_str),
                 ask_size=Quantity.from_str(depth_str),
                 ts_event=ts_ns - 1,
