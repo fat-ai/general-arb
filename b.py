@@ -390,8 +390,12 @@ class PolymarketNautilusStrategy(Strategy):
         if not self.portfolio: return
 
         total_equity = 0.0
-        for account in self.portfolio.accounts.values():
-            total_equity += account.balance_total(usdc).as_double()
+        if self.config.active_instrument_ids:
+            # Grab the venue from the first available instrument
+            first_venue = self.config.active_instrument_ids[0].venue
+            account = self.portfolio.account(first_venue)
+            if account:
+                total_equity = account.balance_total(usdc).as_double()
         
         if hasattr(self, 'clock') and self.clock is not None:
             try:
@@ -1106,7 +1110,8 @@ class FastBacktestEngine:
             cash = 10000.0
             
         open_pos_value = 0.0
-        for account in engine.portfolio.accounts.values():
+        account = engine.portfolio.account(venue_id)
+        if account:
             for pos in account.positions():
                 inst_id = pos.instrument_id
             if pos and not pos.is_flat:
