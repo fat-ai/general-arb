@@ -2467,16 +2467,16 @@ class TuningRunner:
 
         # --- A. NEW_CONTRACT Events ---
         # Create directly from markets DataFrame columns
+        cond_ids = markets['condition_id'] if 'condition_id' in markets.columns else markets['contract_id']
+
         df_new = pd.DataFrame({
             'timestamp': markets['created_at'],
             'contract_id': markets['contract_id'],
             'event_type': 'NEW_CONTRACT',
-            # Specific payload columns (sparse)
             'liquidity': markets['liquidity'].fillna(1.0),
-            'condition_id': markets['condition_id'],
+            'condition_id': cond_ids,  # <--- FIXED
             'token_outcome_label': markets['token_outcome_label'].fillna('Yes'),
             'end_date': markets['resolution_timestamp'],
-            # Fill other columns with reasonable defaults or NaNs
             'p_market_all': 0.5 
         })
             
