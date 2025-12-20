@@ -434,10 +434,13 @@ class PolymarketNautilusStrategy(Strategy):
         if usdc_vol < self.config.min_signal_volume:
             return
             
-        if usdc_vol >= 1.0:
+        if usdc_vol >= 1.0: 
+ 
             wallet_key = (wallet_id, 'default_topic')
-            if wallet_key in self.config.wallet_scores:
+            
+            if self.config.wallet_scores and wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
+                
             else:
                 log_vol = np.log1p(usdc_vol)
                 roi_score = self.fw_intercept + self.fw_slope * log_vol
@@ -463,7 +466,7 @@ class PolymarketNautilusStrategy(Strategy):
         pos_data = self.positions_tracker[inst_id]
         net_qty = pos_data['net_qty']
         avg_price = pos_data['avg_price']
-        
+        if avg_price == 0: return
         if abs(net_qty) < 1.0: return 
 
         if net_qty > 0: 
