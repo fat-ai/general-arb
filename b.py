@@ -831,10 +831,10 @@ class FastBacktestEngine:
             
             train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
             train_profiler['res_time'] = train_profiler['market_id'].map(res_time_map)
-            
-            # Strict lookahead filter
+
+            train_profiler['res_time'] = pd.to_datetime(train_profiler['res_time'])
+
             train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
-            train_profiler = train_profiler.dropna(subset=['outcome'])
 
             fold_wallet_scores = fast_calculate_rois(
                 train_profiler, 
