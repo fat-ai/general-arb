@@ -368,8 +368,7 @@ class PolymarketNautilusStrategy(Strategy):
         self.positions_tracker = {} 
 
     def on_start(self):
-        self.clock = self.portfolio.clock
-        
+
         if self.config.active_instrument_ids:
             for inst_id in self.config.active_instrument_ids:
                 if isinstance(inst_id, InstrumentId):
