@@ -783,6 +783,13 @@ class FastBacktestEngine:
         # Pre-filter resolutions once to avoid repeated filtering inside the loop
         all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION'].copy()
 
+        if 'created_int' not in self.profiler_data.columns:
+
+            if not pd.api.types.is_datetime64_any_dtype(self.profiler_data['market_created']):
+                self.profiler_data['market_created'] = pd.to_datetime(self.profiler_data['market_created'])
+
+            self.profiler_data['created_int'] = self.profiler_data['market_created'].astype(np.int64)
+
         while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
             test_start = train_end + timedelta(days=embargo_days)
@@ -798,7 +805,7 @@ class FastBacktestEngine:
             train_mask = (
                 (self.profiler_data['ts_int'] >= current_date_ns) & 
                 (self.profiler_data['ts_int'] < train_end_ns) & 
-                (self.profiler_data['market_created'] < train_end)
+                (self.profiler_data['created_int'] < train_end_ns) 
             )
             train_profiler = self.profiler_data[train_mask].copy()
             if 'res_time' in train_profiler.columns:
