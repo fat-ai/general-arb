@@ -343,11 +343,16 @@ class PolyStrategyConfig(StrategyConfig):
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
-        self.clock = self.portfolio.clock
+        # FIX 1: Removed self.clock = self.portfolio.clock (CRITICAL FIX)
+        # Accessing portfolio in __init__ causes a crash because it hasn't been injected yet.
+        
         self.trackers = {} 
         self.last_known_prices = {}
+        
+        # Initialize instrument map safely
         target_ids = config.active_instrument_ids if config.active_instrument_ids else []
         self.instrument_map = {i.value: i for i in target_ids}
+        
         self.equity_history = []
         self.break_even = 0      
         self.total_closed = 0
@@ -356,24 +361,32 @@ class PolymarketNautilusStrategy(Strategy):
         self.fw_slope = config.fw_slope
         self.fw_intercept = config.fw_intercept
         self.wallet_lookup = {}
-        # Track active average entry prices for Stop Loss/Smart Exit
-        # Format: {InstrumentId: {'avg_price': float, 'net_qty': float}}
         self.positions_tracker = {} 
 
     def on_start(self):
+        # FIX 1 (Continued): Initialize clock here, when portfolio is ready.
+        self.clock = self.portfolio.clock
+        
         if self.config.active_instrument_ids:
             for inst_id in self.config.active_instrument_ids:
                 self.subscribe_trade_ticks(inst_id)
-        self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
+        
+        # Use a safe timer check
+        if self.clock:
+            self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
     def on_timer(self, event):
         if event.name == "equity_heartbeat":
             self._record_equity()
-            self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
+            if self.clock:
+                self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
     def _record_equity(self):
         """Record equity with memory-safe growth limiting"""
         usdc = Currency.from_str("USDC")
+        # Safety check for portfolio access
+        if not self.portfolio: return
+
         total_equity = self.portfolio.net_equity_total(usdc).as_double()
         
         if hasattr(self, 'clock') and self.clock is not None:
@@ -385,7 +398,6 @@ class PolymarketNautilusStrategy(Strategy):
             now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
         
         self.equity_history.append((now_ts, total_equity))
-
 
     def on_trade_tick(self, tick: TradeTick):
         # 1. Metadata Retrieval
@@ -409,6 +421,10 @@ class PolymarketNautilusStrategy(Strategy):
         tracker = self.trackers[cid]
         elapsed_seconds = (tick.ts_event - tracker['last_update_ts']) / 1e9
         
+        # FIX 3: Prevent Time Travel Crash (Negative Decay)
+        if elapsed_seconds < 0:
+            elapsed_seconds = 0.0
+        
         # Decay
         if elapsed_seconds > 0:
             decay = self.config.decay_factor ** (elapsed_seconds / 60.0)
@@ -417,21 +433,20 @@ class PolymarketNautilusStrategy(Strategy):
         tracker['last_update_ts'] = tick.ts_event
 
         # --- C. Signal Generation ---
-        usdc_vol = vol * price  # Calculate dollar volume
+        usdc_vol = vol * price
         if usdc_vol < self.config.min_signal_volume:
             return
             
-        if usdc_vol >= 1.0:  # Filter by dollar volume, not share count
+        if usdc_vol >= 1.0:
             wallet_key = (wallet_id, 'default_topic')
             if wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
             else:
-                log_vol = np.log1p(usdc_vol)  # Use dollar volume for model
+                log_vol = np.log1p(usdc_vol)
                 roi_score = self.fw_intercept + self.fw_slope * log_vol
                 roi_score = max(-0.5, min(0.5, roi_score))
             
             raw_skill = max(0.0, roi_score)
-            # Weight by dollar volume with skill multiplier
             weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
             
             direction = -1.0 if is_sell else 1.0
@@ -443,30 +458,26 @@ class PolymarketNautilusStrategy(Strategy):
         # --- E. Entry Trigger ---
         if abs(tracker['net_weight']) > self.config.splash_threshold:
             self._execute_entry(cid, tracker['net_weight'], price)
-            # Dampen signal after firing
             tracker['net_weight'] -= (self.config.splash_threshold * np.sign(tracker['net_weight']))
 
     def _check_stop_loss(self, inst_id, current_price):
-        """Check Stop Loss (Price Dependent Only)"""
         if inst_id not in self.positions_tracker: return
         
         pos_data = self.positions_tracker[inst_id]
         net_qty = pos_data['net_qty']
         avg_price = pos_data['avg_price']
         
-        if abs(net_qty) < 1.0: return # Ignore dust
+        if abs(net_qty) < 1.0: return 
 
-        # Calculate Unrealized PnL %
-        if net_qty > 0: # Long
+        if net_qty > 0: 
             pnl_pct = (current_price - avg_price) / avg_price
-        else: # Short
+        else: 
             pnl_pct = (avg_price - current_price) / avg_price
 
         if self.config.stop_loss and pnl_pct < -self.config.stop_loss:
             self._close_position(inst_id, current_price, "STOP_LOSS")
 
     def _check_smart_exit(self, inst_id, current_price):
-        """Check Smart Exit (Signal Dependent)"""
         if not self.config.use_smart_exit: return
         if inst_id not in self.positions_tracker: return
 
@@ -481,33 +492,26 @@ class PolymarketNautilusStrategy(Strategy):
         
         if abs(net_qty) < 1.0: return
 
-        # Calculate PnL %
         if net_qty > 0: pnl_pct = (current_price - avg_price) / avg_price
         else: pnl_pct = (avg_price - current_price) / avg_price
 
-        # Only Smart Exit if we are profitable enough (Edge Threshold)
         if pnl_pct > self.config.edge_threshold:
-            current_signal = self.trackers.get(cid, {}).get('net_weight', 0)
-            
-            # Check if signal has weakened or reversed against our position
             threshold = self.config.splash_threshold * self.config.smart_exit_ratio
             is_long = net_qty > 0
             
-            # Long: Exit if signal drops below +threshold
             if is_long and current_signal < threshold:
                 self._close_position(inst_id, current_price, "SMART_EXIT")
-            # Short: Exit if signal rises above -threshold
             elif not is_long and current_signal > -threshold:
                 self._close_position(inst_id, current_price, "SMART_EXIT")
-     
 
     def _execute_entry(self, cid, signal, price):
-        # Safety Clamps
         if price <= 0.01 or price >= 0.99: return
         
         side = OrderSide.BUY if signal > 0 else OrderSide.SELL
         
-        # Sizing Logic
+        # Check Portfolio existence
+        if not self.portfolio: return
+
         capital = self.portfolio.cash_balance(Currency.from_str("USDC")).as_double()
         if capital < 100.0:
             return
@@ -516,43 +520,46 @@ class PolymarketNautilusStrategy(Strategy):
             target_exposure = capital * self.config.kelly_fraction
         elif self.config.sizing_mode == 'fixed_pct':
              target_exposure = capital * self.config.fixed_size 
-        else: # 'fixed'
-            # FIX: Explicitly define target_exposure for fixed mode
+        else: 
             target_exposure = self.config.fixed_size
 
-        # Unified Quantity Calculation (Fixed Risk)
         if side == OrderSide.BUY:
             qty_to_trade = target_exposure / price
         else:
-            # Short Risk = 1.0 - Price
             risk_per_share = max(0.01, 1.0 - price)
             qty_to_trade = target_exposure / risk_per_share
 
-        if qty_to_trade < 1.0: return
+        # FIX 2: Dust Prevention
+        # If quantity is too small, it will format to "0.0000" and crash or be rejected.
+        if qty_to_trade < 0.01:
+            return
 
-        # Slippage / Limit Logic
         slippage = 0.05 
         if side == OrderSide.BUY:
             limit_px = min(0.99, price * (1 + slippage))
         else:
             limit_px = max(0.01, price * (1 - slippage))
 
+        # Safe formatting
+        qty_str = f"{qty_to_trade:.4f}"
+        
         self.submit_order(self.order_factory.limit(
             instrument_id=self.instrument_map[cid],
             order_side=side,
-            size=Quantity.from_str(f"{qty_to_trade:.4f}"),
+            size=Quantity.from_str(qty_str),
             price=Price.from_str(f"{limit_px:.2f}"),
             time_in_force=TimeInForce.IOC 
         ))
 
     def _close_position(self, inst_id, price, reason):
+        if not self.portfolio: return
+
         position = self.portfolio.positions.get(inst_id)
         if not position or position.is_flat: return
         
         side = OrderSide.SELL if position.is_long else OrderSide.BUY
         qty = position.quantity.as_double()
         
-        # Aggressive exit limits
         if side == OrderSide.BUY: limit_px = 0.99
         else: limit_px = 0.01
             
@@ -565,29 +572,20 @@ class PolymarketNautilusStrategy(Strategy):
         ))
 
     def on_order_filled(self, event):
-        """
-        Update position tracker and calculate realized PnL.
-        PATCHED: Correctly handles average price updates during accumulation, 
-        reduction, and direction flipping.
-        """
         inst_id = event.instrument_id
         fill_price = event.last_px.as_double()
         fill_qty = event.last_qty.as_double()
         is_buy = (event.order_side == OrderSide.BUY)
         signed_qty = fill_qty if is_buy else -fill_qty
 
-        # 1. Initialize if new
         if inst_id not in self.positions_tracker:
             self.positions_tracker[inst_id] = {'avg_price': fill_price, 'net_qty': signed_qty}
             return
 
-        # 2. Retrieve current state
         curr = self.positions_tracker[inst_id]
         old_qty = curr['net_qty']
         new_qty = old_qty + signed_qty
 
-        # 3. Calculate Realized PnL (if reducing position)
-        # Occurs if signs are different (e.g. Long + Sell, or Short + Buy)
         if (old_qty > 0 and signed_qty < 0) or (old_qty < 0 and signed_qty > 0):
             closed_qty = min(abs(old_qty), abs(fill_qty))
             pnl_per_share = (fill_price - curr['avg_price']) if old_qty > 0 else (curr['avg_price'] - fill_price)
@@ -601,29 +599,18 @@ class PolymarketNautilusStrategy(Strategy):
             else:
                 self.break_even += 1
 
-        # 4. Update Tracker State
         if abs(new_qty) < 0.001:
             if inst_id in self.positions_tracker:
                 del self.positions_tracker[inst_id]
         else:
-            # Case A: Increasing Position (Adding to Winner/Loser)
             if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
-                # Weighted average: (old_cost + new_cost) / total_qty
-                # We use abs() because we want the absolute price, not negative price for shorts
                 total_cost = (abs(old_qty) * curr['avg_price']) + (abs(signed_qty) * fill_price)
                 curr['avg_price'] = total_cost / abs(new_qty)
-            
-            # Case B: Direction Flip (Long -> Short or Short -> Long)
             elif old_qty * new_qty < 0:
-                # The position was closed and a new one opened in opposite direction.
-                # The avg price is simply the fill price of the new remaining qty.
                 curr['avg_price'] = fill_price
             
-            # Case C: Reducing Position (Partial Exit)
-            # We do NOT update avg_price. If you buy at $10 and sell half at $12, 
-            # the remaining half still has a basis of $10.
-            
             curr['net_qty'] = new_qty
+
 
 class FastBacktestEngine:
     def __init__(self, event_log, profiler_data, nlp_cache, precalc_priors):
