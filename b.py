@@ -35,6 +35,7 @@ matplotlib.use('Agg') # Force non-interactive backend immediately
 import matplotlib.pyplot as plt
 from typing import Optional, List, Dict, Any
 from pydantic import Field
+from dataclasses import dataclass
 # --- NAUTILUS IMPORTS ---
 from nautilus_trader.model.data import TradeTick, QuoteTick
 from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
@@ -324,7 +325,7 @@ def persistent_disk_cache(func):
 
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
-
+@dataclass
 class PolyStrategyConfig(StrategyConfig):
     splash_threshold: float = 1000.0
     decay_factor: float = 0.95
