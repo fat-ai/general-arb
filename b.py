@@ -1110,31 +1110,32 @@ class FastBacktestEngine:
             cash = 10000.0
             
         open_pos_value = 0.0
-        account = engine.portfolio.account(venue_id)
-        if account:
-            for pos in account.positions():
-                inst_id = pos.instrument_id
-            if pos and not pos.is_flat:
-                cid = inst_id.symbol.value
-                qty = pos.quantity.as_double()
-                is_long = pos.is_long
-                signed_qty = qty if is_long else -qty
+        for inst_id, tracker_data in strategy.positions_tracker.items():
+            # Get the net quantity directly from our tracker
+            qty = tracker_data.get('net_qty', 0.0)
+            
+            # Skip if the position is effectively zero (flat)
+            if abs(qty) < 0.00001:
+                continue
+
+            cid = inst_id.symbol.value
+            
+            # Get market metadata to see if it resolved
+            meta = self.market_lifecycle.get(cid, {})
+            final_outcome = meta.get('final_outcome')
+            end_ts = meta.get('end')
+            end_time_ns = end_time.value
+            
+            # LOGIC:
+            # 1. If market resolved inside this simulation window -> Value at Outcome (0 or 1)
+            # 2. If market is still active -> Value at Last Average Price
+            if final_outcome is not None and (end_ts is None or end_ts <= end_time_ns):
+                pos_val = qty * final_outcome
+            else:
+                last_price = tracker_data.get('avg_price', 0.5)
+                pos_val = qty * last_price
                 
-                meta = self.market_lifecycle.get(cid, {})
-                final_outcome = meta.get('final_outcome')
-                end_ts = meta.get('end')
-                
-                end_time_ns = end_time.value
-                
-                # Check if market has a known outcome AND resolved/expired before our window ended
-                if final_outcome is not None and (end_ts is None or end_ts <= end_time_ns):
-                    pos_val = signed_qty * final_outcome
-                else:
-                    tracker_data = strategy.positions_tracker.get(inst_id, {})
-                    last_price = tracker_data.get('avg_price', 0.5)
-                    pos_val = signed_qty * last_price
-                    
-                open_pos_value += pos_val
+            open_pos_value += pos_val
 
         final_val = cash + open_pos_value
 
