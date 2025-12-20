@@ -256,15 +256,19 @@ def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20, cutof
     # Clip single-trade ROI to range [-100%, +300%] to dampen variance
     valid['raw_roi'] = valid['raw_roi'].clip(-1.0, 3.0)
     
-    # 3. Aggregation
-    # We simply return the Mean ROI. 
-    # Positive = Profitable Trader. Negative = Unprofitable.
     stats = valid.groupby(['wallet_id', 'entity_type'])['raw_roi'].agg(['mean', 'count'])
     qualified = stats[stats['count'] >= min_trades]
     
     if qualified.empty: return {}
 
-    return qualified['mean'].to_dict()
+    # Convert MultiIndex (Tuple) to String Key "wallet|type"
+    # This prevents "TypeError: keys must be str" during config serialization
+    result = {}
+    for (wallet, entity), row in qualified.iterrows():
+        key = f"{wallet}|{entity}"
+        result[key] = row['mean']
+        
+    return result
 
 def persistent_disk_cache(func):
     """
@@ -435,9 +439,9 @@ class PolymarketNautilusStrategy(Strategy):
             return
             
         if usdc_vol >= 1.0: 
- 
-            wallet_key = (wallet_id, 'default_topic')
             
+            wallet_key = f"{wallet_id}|default_topic"
+         
             if self.config.wallet_scores and wallet_key in self.config.wallet_scores:
                 roi_score = self.config.wallet_scores[wallet_key]
                 
@@ -844,8 +848,11 @@ class FastBacktestEngine:
                 cutoff_date=train_end
             )
             
-         
-            known_experts = sorted(list(set(k[0] for k in fold_wallet_scores.keys())))
+            if fold_wallet_scores:
+                known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys())))
+            else:
+                known_experts = []
+                
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
             # --- TEST SLICE (Optimized) ---
