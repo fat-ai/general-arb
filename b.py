@@ -174,7 +174,7 @@ def process_data_chunk(args):
     Ray Worker function to process DataFrame chunks.
     Uses Ray serialization to bypass standard multiprocessing pickle limits.
     """
-    # Imports must be inside the function for Ray workers
+
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
@@ -1090,12 +1090,13 @@ class FastBacktestEngine:
         if total_rows > 0:
             print(f"   Processing {total_rows} events with Parallel Execution (Ray)...")
             
-            # Use Ray's resource detection
-            # We reserve 2 CPUs for overhead, use the rest
+            # Resource detection
             total_cpus = int(ray.available_resources().get("CPU", 1))
-            max_workers = max(1, total_cpus - 2)
             
-            chunks = np.array_split(price_events, max_workers)
+            # OOM FIX 1: Create MORE chunks (smaller size per chunk)
+            # 4 chunks per CPU ensures workers don't hold too much RAM at once
+            num_chunks = max(1, total_cpus * 4)
+            chunks = np.array_split(price_events, num_chunks)
             
             chunk_args = []
             current_idx = 0
@@ -1105,19 +1106,34 @@ class FastBacktestEngine:
 
             nautilus_data = []
             
-            # --- EXECUTE WITH RAY (NO PICKLE ERROR) ---
-            # options(num_cpus=0) ensures sub-tasks run even if the Trial reserved all CPUs
-            futures = [process_data_chunk.options(num_cpus=0).remote(arg) for arg in chunk_args]
+            # --- EXECUTE WITH RAY (ITERATIVE) ---
+            # options(num_cpus=0) prevents deadlock
+            pending_futures = [process_data_chunk.options(num_cpus=0).remote(arg) for arg in chunk_args]
             
-            # Wait for all results (Parallel Block)
-            results_list = ray.get(futures)
+            # OOM FIX 2: Iterative Processing
+            # Instead of ray.get(all), we wait for 1 at a time.
+            # This allows Ray to clear the Object Store memory for finished tasks.
+            total_chunks = len(pending_futures)
+            completed_count = 0
             
-            # Process Results
-            for i, (ticks, chunk_lookup) in enumerate(results_list):
+            while pending_futures:
+                # Wait for the next 1 future to complete
+                done_futures, pending_futures = ray.wait(pending_futures, num_returns=1)
+                
+                # Get result for the finished chunk
+                ticks, chunk_lookup = ray.get(done_futures[0])
+                
+                # Merge immediately
                 nautilus_data.extend(ticks)
                 local_wallet_lookup.update(chunk_lookup)
                 
-            print(f"   ✅ Data Generation Complete. Sorting {len(nautilus_data)} ticks...")
+                # Explicit cleanup
+                del ticks, chunk_lookup
+                
+                completed_count += 1
+                print(f"   [Chunk {completed_count}/{total_chunks}] Merged...", end='\r')
+                
+            print(f"\n   ✅ Data Generation Complete. Sorting {len(nautilus_data)} ticks...")
             nautilus_data.sort(key=lambda x: x.ts_event)
             engine.add_data(nautilus_data)
         else:
@@ -1490,8 +1506,8 @@ class TuningRunner:
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=3,
-            resources_per_trial={"cpu": 10},
+            max_concurrent_trials=2,
+            resources_per_trial={"cpu": 15},
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
