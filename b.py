@@ -168,6 +168,91 @@ def plot_performance(full_equity_curve, trades_count):
 
 # --- HELPERS ---
 
+def process_data_chunk(args):
+    """
+    Worker function to process a chunk of DataFrame rows into Nautilus objects.
+    restoring FULL FIDELITY to the original logic (Depth + Spread).
+    """
+    from nautilus_trader.model.data import QuoteTick, TradeTick
+    from nautilus_trader.model.objects import Price, Quantity
+    from nautilus_trader.model.identifiers import TradeId
+    from nautilus_trader.model.enums import AggressorSide
+    
+    # NOW ACCEPTING: known_liquidity dict
+    df_chunk, inst_map, start_idx, known_liquidity = args
+    
+    results = []
+    
+    # Use itertuples for speed
+    for idx, row in enumerate(df_chunk.itertuples(index=True)):
+        real_idx = start_idx + idx
+        ts_ns = int(row.ts_int)
+        cid = row.contract_id
+        
+        if cid not in inst_map:
+            continue
+            
+        inst_id = inst_map[cid]
+        price_float = float(row.p_market_all)
+        
+        # --- 1. Generate Quote (ORIGINAL LOGIC RESTORED) ---
+        
+        # A. Restore Depth Logic
+        # Your original code checked a 'known_liquidity' map to determine depth
+        market_liq_score = float(known_liquidity.get(cid, 0))
+        real_size_val = getattr(row, 'size', 0.0)
+
+        if market_liq_score > 100.0:
+            # STRICT MODEL: Top-of-Book is ~1% of Total Liquidity
+            simulated_depth = market_liq_score * 0.01
+        else:
+            # FALLBACK
+            simulated_depth = real_size_val
+
+        # Ensure we don't have broken zero-depth quotes
+        simulated_depth = max(10.0, simulated_depth)
+        depth_str = f"{simulated_depth:.4f}"
+        
+        # B. Restore Spread Logic (This matches your original file exactly)
+        spread = max(0.005, price_float * 0.01)
+        bid_px = max(0.005, price_float - spread)
+        ask_px = min(0.995, price_float + spread)
+        
+        if bid_px >= ask_px:
+            diff = ask_px - bid_px
+            bid_px -= (diff / 2)
+            ask_px += (diff / 2)
+        
+        quote = QuoteTick(
+            instrument_id=inst_id,
+            bid_price=Price.from_str(f"{bid_px:.6f}"),
+            ask_price=Price.from_str(f"{ask_px:.6f}"),
+            bid_size=Quantity.from_str(depth_str),
+            ask_size=Quantity.from_str(depth_str),
+            ts_event=ts_ns - 1,
+            ts_init=ts_ns - 1
+        )
+        results.append(quote)
+
+        # --- 2. Generate Trade ---
+        tr_id_str = f"{ts_ns}-{real_idx}"
+        
+        is_sell = getattr(row, 'is_sell', False)
+        trade_vol = getattr(row, 'trade_volume', 0.0)
+        
+        tick = TradeTick(
+            instrument_id=inst_id,
+            price=Price.from_str(f"{price_float:.6f}"),
+            size=Quantity.from_str(f"{trade_vol:.4f}"),
+            aggressor_side=AggressorSide.SELLER if is_sell else AggressorSide.BUYER,
+            trade_id=TradeId(tr_id_str),
+            ts_event=ts_ns,
+            ts_init=ts_ns
+        )
+        results.append(tick)
+        
+    return results
+
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
@@ -326,45 +411,45 @@ def persistent_disk_cache(func):
 ORDERBOOK_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/paulieb14/polymarket-orderbook"
 
 class PolyStrategyConfig(StrategyConfig):
-    splash_threshold: float = 1000.0
-    decay_factor: float = 0.95
-    min_signal_volume: float = 1.0
-    wallet_scores: Optional[Dict[Any, Any]] = None
-    fw_slope: float = 0.0
-    fw_intercept: float = 0.0
-    
-    sizing_mode: str = 'fixed'
-    fixed_size: float = 10.0
-    kelly_fraction: float = 0.1
-    stop_loss: Optional[float] = None
-    
-    use_smart_exit: bool = False
-    smart_exit_ratio: float = 0.5
-    edge_threshold: float = 0.05
+    pass
 
 class PolymarketNautilusStrategy(Strategy):
     def __init__(self, config: PolyStrategyConfig):
         super().__init__(config)
         self.trackers = {} 
         self.last_known_prices = {}
-        self.active_instrument_ids = []
-        self.instrument_map = {}
         
+        # 1. INITIALIZE DEFAULTS (Vital for manual injection)
+        self.splash_threshold = 1000.0
+        self.decay_factor = 0.95
+        self.min_signal_volume = 1.0
+        self.wallet_scores = {}
+        self.active_instrument_ids = []
+        self.fw_slope = 0.0
+        self.fw_intercept = 0.0
+        self.sizing_mode = 'fixed'
+        self.fixed_size = 10.0
+        self.kelly_fraction = 0.1
+        self.stop_loss = None
+        self.use_smart_exit = False
+        self.smart_exit_ratio = 0.5
+        self.edge_threshold = 0.05
+        
+        self.instrument_map = {}
         self.equity_history = []
         self.break_even = 0      
         self.total_closed = 0
         self.wins = 0
         self.losses = 0
-        self.fw_slope = config.fw_slope
-        self.fw_intercept = config.fw_intercept
         self.wallet_lookup = {}
-        self.positions_tracker = {} 
+        self.positions_tracker = {}
 
     def on_start(self):
       
-        for inst_id in self.active_instrument_ids:
-             if hasattr(inst_id, 'value'): 
-                self.instrument_map[inst_id.value] = inst_id
+        if self.active_instrument_ids:
+            for inst_id in self.active_instrument_ids:
+                if hasattr(inst_id, 'value'): 
+                    self.instrument_map[inst_id.value] = inst_id
 
         if self.active_instrument_ids:
             for inst_id in self.active_instrument_ids:
@@ -425,32 +510,28 @@ class PolymarketNautilusStrategy(Strategy):
         
         tracker = self.trackers[cid]
         elapsed_seconds = (tick.ts_event - tracker['last_update_ts']) / 1e9
-        
-        # FIX 3: Prevent Time Travel Crash (Negative Decay)
-        if elapsed_seconds < 0:
-            elapsed_seconds = 0.0
+        if elapsed_seconds < 0: elapsed_seconds = 0.0
         
         if elapsed_seconds > 0:
-            decay = self.config.decay_factor ** (elapsed_seconds / 60.0)
+            decay = self.decay_factor ** (elapsed_seconds / 60.0)
         
         tracker['last_update_ts'] = tick.ts_event
 
         # --- C. Signal Generation ---
         usdc_vol = vol * price
-        if usdc_vol < self.config.min_signal_volume:
+        if usdc_vol < self.min_signal_volume:
             return
             
         if usdc_vol >= 1.0: 
             
             wallet_key = f"{wallet_id}|default_topic"
          
-            if self.config.wallet_scores and wallet_key in self.config.wallet_scores:
-                roi_score = self.config.wallet_scores[wallet_key]
-                
-            else:
-                log_vol = np.log1p(usdc_vol)
-                roi_score = self.fw_intercept + self.fw_slope * log_vol
-                roi_score = max(-0.5, min(0.5, roi_score))
+            if self.wallet_scores and wallet_key in self.wallet_scores:
+              roi_score = self.wallet_scores[wallet_key]
+        else:
+            # UPDATED: Use self.fw_intercept / slope
+            log_vol = np.log1p(usdc_vol)
+            roi_score = self.fw_intercept + self.fw_slope * log_vol
             
             raw_skill = max(0.0, roi_score)
             weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
@@ -462,9 +543,8 @@ class PolymarketNautilusStrategy(Strategy):
         self._check_smart_exit(tick.instrument_id, price)
 
         # --- E. Entry Trigger ---
-        if abs(tracker['net_weight']) > self.config.splash_threshold:
+        if abs(tracker['net_weight']) > self.splash_threshold:
             self._execute_entry(cid, tracker['net_weight'], price)
-            tracker['net_weight'] = 0.0
 
     def _check_stop_loss(self, inst_id, current_price):
         if inst_id not in self.positions_tracker: return
@@ -480,11 +560,11 @@ class PolymarketNautilusStrategy(Strategy):
         else: 
             pnl_pct = (avg_price - current_price) / avg_price
 
-        if self.config.stop_loss and pnl_pct < -self.config.stop_loss:
+        if self.stop_loss and pnl_pct < -self.config.stop_loss:
             self._close_position(inst_id, current_price, "STOP_LOSS")
 
     def _check_smart_exit(self, inst_id, current_price):
-        if not self.config.use_smart_exit: return
+        if not self.use_smart_exit: return
         if inst_id not in self.positions_tracker: return
 
         cid = inst_id.value 
@@ -502,7 +582,7 @@ class PolymarketNautilusStrategy(Strategy):
         else: pnl_pct = (avg_price - current_price) / avg_price
 
         if pnl_pct > self.config.edge_threshold:
-            threshold = self.config.splash_threshold * self.config.smart_exit_ratio
+            threshold = self.splash_threshold * self.smart_exit_ratio
             is_long = net_qty > 0
             
             if is_long and current_signal < threshold:
@@ -952,6 +1032,9 @@ class FastBacktestEngine:
         from nautilus_trader.model.enums import OrderSide, TimeInForce, OmsType, AccountType, AggressorSide
         from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
         from decimal import Decimal
+        import numpy as np
+        import concurrent.futures
+        import os
 
         USDC = Currency.from_str("USDC")
         venue_id = Venue("POLY")
@@ -979,7 +1062,7 @@ class FastBacktestEngine:
         
         inst_map = {}
         ts_activation = int(start_time.value)
-        ts_expiration = int(end_time.value) + (365 * 24 * 60 * 60 * 1_000_000_000)
+        ts_expiration = int(end_time.value) + (365 * 3 * 24 * 60 * 60 * 1_000_000_000)
         for cid in unique_cids:
             inst_id = InstrumentId(Symbol(cid), venue_id)
             inst_map[cid] = inst_id
@@ -1004,100 +1087,65 @@ class FastBacktestEngine:
             engine.add_instrument(inst)
         
         # 4. FAST LOOP
-        for idx, row in enumerate(price_events.itertuples(index=True)):
-            ts_ns = int(row.ts_int)
-            cid = row.contract_id
-            if cid not in inst_map: continue
-                
-            inst_id = inst_map[cid]
-            price_float = float(row.p_market_all)
+        total_rows = len(price_events)
+        if total_rows > 0:
+            print(f"   Processing {total_rows} events with Parallel Execution...")
+            
+            # Use all available CPUs minus 2
+            max_workers = max(1, os.cpu_count() - 2)
+            chunks = np.array_split(price_events, max_workers)
+            
+            chunk_args = []
+            current_idx = 0
+            for chunk in chunks:
+                chunk_args.append((chunk, inst_map, current_idx, known_liquidity))
+                current_idx += len(chunk)
 
-            market_liq_score = float(known_liquidity.get(cid, 0))
-            real_size_val = getattr(row, 'size', 0.0)
-
-            if market_liq_score > 100.0:
-                # STRICT MODEL: Top-of-Book is ~1% of Total Liquidity
-                # This scales dynamically: A $1M market gives you $10k depth. A $1k market gives you $10.
-                # No magic caps. No arbitrary 5x multipliers.
-                simulated_depth = market_liq_score * 0.01
-            else:
-                # FALLBACK: If API data is missing/zero, we must assume the market 
-                # is at least as deep as the trade that just happened.
-                simulated_depth = real_size_val
-
-            # Ensure we don't have broken zero-depth quotes
-            simulated_depth = max(10.0, simulated_depth)
-            depth_str = f"{simulated_depth:.4f}"
+            nautilus_data = []
+            # local_wallet_lookup is already defined above
             
-            spread = max(0.005, price_float * 0.01)
-            bid_px = max(0.005, price_float - spread)
-            ask_px = min(0.995, price_float + spread)
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                for i, (result_list, chunk_lookup) in enumerate(executor.map(process_data_chunk, chunk_args)):
+                    # 1. Add the Ticks generated by the worker
+                    nautilus_data.extend(result_list)
+                    # 2. Add the Wallet IDs found by the worker
+                    local_wallet_lookup.update(chunk_lookup)
+                    
+                    print(f"   [Chunk {i+1}/{max_workers}] Processed {len(result_list)} ticks...", end='\r')
             
-            if bid_px >= ask_px:
-                diff = ask_px - bid_px
-                bid_px -= (diff / 2)
-                ask_px += (diff / 2)
-            
-            quote = QuoteTick(
-                instrument_id=inst_id,
-                bid_price=Price.from_str(f"{bid_px:.6f}"),
-                ask_price=Price.from_str(f"{ask_px:.6f}"),
-                bid_size=Quantity.from_str(depth_str),
-                ask_size=Quantity.from_str(depth_str),
-                ts_event=ts_ns - 1,
-                ts_init=ts_ns - 1
-            )
-            nautilus_data.append(quote)
-
-            raw_id = f"{ts_ns}_{idx}_{cid}"
-            tr_id_str = hashlib.md5(raw_id.encode('utf-8')).hexdigest()
-            local_wallet_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
-            
-            tick = TradeTick(
-                instrument_id=inst_id,
-                price=Price.from_str(f"{price_float:.6f}"),
-                size=Quantity.from_str(f"{row.trade_volume:.4f}"),
-                aggressor_side=AggressorSide.BUYER if not row.is_sell else AggressorSide.SELLER,
-                trade_id=TradeId(tr_id_str),
-                ts_event=ts_ns,
-                ts_init=ts_ns
-            )
-            nautilus_data.append(tick)
-        
-        if not nautilus_data:
-            return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'full_equity_curve': [], 'tracker_state': {}}
-            
-        nautilus_data.sort(key=lambda x: x.ts_event)
-        
-        engine.add_data(nautilus_data)
+            print(f"\n   ✅ Data Generation Complete. Sorting {len(nautilus_data)} ticks...")
+            nautilus_data.sort(key=lambda x: x.ts_event)
+            engine.add_data(nautilus_data)
+        else:
+             return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'full_equity_curve': [], 'tracker_state': {}}
 
         # 5. STRATEGY CONFIG
         base_inst_id = list(inst_map.values())[0]
         
-        strat_config = PolyStrategyConfig(
-            splash_threshold=float(config.get('splash_threshold', 1000.0)),
-            decay_factor=float(config.get('decay_factor', 0.95)),
-            wallet_scores=wallet_scores,
-            fw_slope=float(fw_slope),
-            fw_intercept=float(fw_intercept),
-            sizing_mode=str(config.get('sizing_mode', 'fixed')),
-            fixed_size=float(config.get('fixed_size', 10.0)),
-            kelly_fraction=float(config.get('kelly_fraction', 0.1)),
-            stop_loss=config.get('stop_loss'),
-            use_smart_exit=bool(config.get('use_smart_exit', False)),
-            smart_exit_ratio=float(config.get('smart_exit_ratio', 0.5)),
-            edge_threshold=float(config.get('edge_threshold', 0.05))
-        )
+        strat_config = PolyStrategyConfig()
         
         # 2. Create Strategy
         strategy = PolymarketNautilusStrategy(strat_config)
 
-        # 3. MANUAL INJECTION (The Fix)
-        # We attach the list directly to the instance, bypassing the strict Config struct
-        strategy.active_instrument_ids = list(inst_map.values())
-   
-        strategy.wallet_lookup = local_wallet_lookup
+        # 3. MANUAL INJECTION (The Real Logic)
+        strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
+        strategy.decay_factor = float(config.get('decay_factor', 0.95))
+        strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
+        strategy.wallet_scores = wallet_scores
+        strategy.fw_slope = float(fw_slope)
+        strategy.fw_intercept = float(fw_intercept)
+        strategy.sizing_mode = str(config.get('sizing_mode', 'fixed'))
+        strategy.fixed_size = float(config.get('fixed_size', 10.0))
+        strategy.kelly_fraction = float(config.get('kelly_fraction', 0.1))
+        strategy.stop_loss = config.get('stop_loss')
+        strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
+        strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
+        strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
         
+        # Inject the list of IDs
+        strategy.active_instrument_ids = list(inst_map.values())
+        
+        strategy.wallet_lookup = local_wallet_lookup
         if previous_tracker: 
             strategy.trackers = previous_tracker    
             
