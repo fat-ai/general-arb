@@ -171,19 +171,19 @@ def plot_performance(full_equity_curve, trades_count):
 def process_data_chunk(args):
     """
     Worker function to process a chunk of DataFrame rows into Nautilus objects.
-    restoring FULL FIDELITY to the original logic (Depth + Spread).
+    Returns: (List[Ticks], Dict[TradeId, WalletInfo])
     """
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
     from nautilus_trader.model.enums import AggressorSide
     
-    # NOW ACCEPTING: known_liquidity dict
+    # Unpack arguments
     df_chunk, inst_map, start_idx, known_liquidity = args
     
     results = []
+    chunk_lookup = {} 
     
-    # Use itertuples for speed
     for idx, row in enumerate(df_chunk.itertuples(index=True)):
         real_idx = start_idx + idx
         ts_ns = int(row.ts_int)
@@ -196,24 +196,17 @@ def process_data_chunk(args):
         price_float = float(row.p_market_all)
         
         # --- 1. Generate Quote (ORIGINAL LOGIC RESTORED) ---
-        
-        # A. Restore Depth Logic
-        # Your original code checked a 'known_liquidity' map to determine depth
         market_liq_score = float(known_liquidity.get(cid, 0))
         real_size_val = getattr(row, 'size', 0.0)
 
         if market_liq_score > 100.0:
-            # STRICT MODEL: Top-of-Book is ~1% of Total Liquidity
             simulated_depth = market_liq_score * 0.01
         else:
-            # FALLBACK
             simulated_depth = real_size_val
 
-        # Ensure we don't have broken zero-depth quotes
         simulated_depth = max(10.0, simulated_depth)
         depth_str = f"{simulated_depth:.4f}"
         
-        # B. Restore Spread Logic (This matches your original file exactly)
         spread = max(0.005, price_float * 0.01)
         bid_px = max(0.005, price_float - spread)
         ask_px = min(0.995, price_float + spread)
@@ -237,6 +230,8 @@ def process_data_chunk(args):
         # --- 2. Generate Trade ---
         tr_id_str = f"{ts_ns}-{real_idx}"
         
+        chunk_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
+
         is_sell = getattr(row, 'is_sell', False)
         trade_vol = getattr(row, 'trade_volume', 0.0)
         
@@ -251,7 +246,7 @@ def process_data_chunk(args):
         )
         results.append(tick)
         
-    return results
+    return results, chunk_lookup 
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
@@ -1486,8 +1481,8 @@ class TuningRunner:
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=1,
-            resources_per_trial={"cpu": 30},
+            max_concurrent_trials=3,
+            resources_per_trial={"cpu": 10},
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
