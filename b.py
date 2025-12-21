@@ -1034,6 +1034,7 @@ class FastBacktestEngine:
         import numpy as np
         import concurrent.futures
         import os
+        import gc
 
         USDC = Currency.from_str("USDC")
         venue_id = Venue("POLY")
@@ -1095,7 +1096,7 @@ class FastBacktestEngine:
             
             # OOM FIX 1: Create MORE chunks (smaller size per chunk)
             # 4 chunks per CPU ensures workers don't hold too much RAM at once
-            num_chunks = max(1, total_cpus * 4)
+            num_chunks = max(1, total_cpus * 10)
             chunks = np.array_split(price_events, num_chunks)
             
             chunk_args = []
@@ -1129,6 +1130,9 @@ class FastBacktestEngine:
                 
                 # Explicit cleanup
                 del ticks, chunk_lookup
+
+                if completed_count % 10 == 0:
+                    gc.collect()
                 
                 completed_count += 1
                 print(f"   [Chunk {completed_count}/{total_chunks}] Merged...", end='\r')
@@ -1506,8 +1510,8 @@ class TuningRunner:
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=2,
-            resources_per_trial={"cpu": 15},
+            max_concurrent_trials=1,
+            resources_per_trial={"cpu": 30},
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
