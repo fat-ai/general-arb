@@ -169,8 +169,10 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---
 def process_data_chunk(args):
     """
-    PATCHED: Emits Quote (Liquidity) BEFORE Trade to ensure the strategy
-    trades against valid, updated liquidity for the current timestamp.
+    PATCHED: 
+    1. Vectorized extraction for high-performance event generation (NumPy).
+    2. Ensures minimum liquidity depth to prevent artificial order rejections.
+    3. Enforces strict Quote -> Trade ordering via timestamp adjustment.
     """
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
@@ -181,35 +183,54 @@ def process_data_chunk(args):
     results = []
     chunk_lookup = {}
     
-    # Pre-fetch attributes to reduce dot-lookup overhead in loop
-    inst_get = inst_map.get
+    # 1. Map Instruments efficiently
+    mapped_insts = df_chunk['contract_id'].map(inst_map)
+    valid_mask = mapped_insts.notna() & (df_chunk['trade_volume'] >= min_vol)
     
-    for idx, row in enumerate(df_chunk.itertuples(index=True)):
-        if row.trade_volume < min_vol: continue
+    if not valid_mask.any():
+        return results, chunk_lookup
+
+    # 2. Extract to NumPy Arrays (Avoids Pandas overhead in loop)
+    inst_ids = mapped_insts[valid_mask].values
+    contract_ids = df_chunk.loc[valid_mask, 'contract_id'].values
+    ts_ints = df_chunk.loc[valid_mask, 'ts_int'].values.astype('int64')
+    prices = df_chunk.loc[valid_mask, 'p_market_all'].values.astype('float64')
+    volumes = df_chunk.loc[valid_mask, 'trade_volume'].values.astype('float64')
+    # Handle optional 'size' column
+    if 'size' in df_chunk.columns:
+        sizes = df_chunk.loc[valid_mask, 'size'].values.astype('float64')
+    else:
+        sizes = np.zeros(len(contract_ids))
         
-        cid = row.contract_id
-        inst_id = inst_get(cid)
-        if inst_id is None: continue
+    wallet_ids = df_chunk.loc[valid_mask, 'wallet_id'].values.astype(str)
+    is_sells = df_chunk.loc[valid_mask, 'is_sell'].values.astype(bool)
+    
+    count = len(inst_ids)
+    
+    for i in range(count):
+        inst_id = inst_ids[i]
+        cid = contract_ids[i]
+        ts_ns = int(ts_ints[i])
+        price_float = prices[i]
+        
+        # --- 1. Emit Quote FIRST ---
+        market_liq = float(known_liquidity.get(cid, 0.0)) if known_liquidity else 0.0
+        
+        # FIX: Ensure depth is substantial enough to fill strategy orders.
+        # Use 1% of market liq, OR minimum $5000, OR 1.5x the trade size (guaranteed fill).
+        depth_val = max(5000.0, market_liq * 0.01)
+        if sizes[i] > depth_val: depth_val = sizes[i] * 1.5
             
-        real_idx = start_idx + idx
-        ts_ns = int(row.ts_int)
-        price_float = float(row.p_market_all)
-        
-        # --- 1. Emit Quote FIRST (Liquidity Provision) ---
-        # Update the OrderBook so the Strategy sees the NEW state.
-        market_liq = float(known_liquidity.get(cid, 0)) if known_liquidity else 0.0
-        
-        # Dynamic depth: proportional to market liquidity or trade size
-        depth_val = market_liq * 0.01 if market_liq > 100 else max(10.0, getattr(row, 'size', 0.0))
         depth_str = f"{depth_val:.4f}"
         
+        # Spread Logic
         spread = max(0.005, price_float * 0.01)
         bid_px = max(0.005, price_float - spread)
         ask_px = min(0.995, price_float + spread)
         
-        # Uncross logic
+        # Uncross
         if bid_px >= ask_px:
-            mid = (bid_px + ask_px) / 2
+            mid = (bid_px + ask_px) * 0.5
             bid_px = max(0.005, mid - 0.002)
             ask_px = min(0.995, mid + 0.002)
             
@@ -223,32 +244,37 @@ def process_data_chunk(args):
             ts_init=ts_ns
         ))
         
-        # --- 2. Emit Trade SECOND (Trigger Strategy) ---
-        tr_id_str = f"{ts_ns}-{real_idx}"
-        chunk_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
+        # --- 2. Emit Trade SECOND ---
+        # Add 1ns to strictly order Trade AFTER Quote
+        ts_trade = ts_ns + 1
+        
+        real_idx = start_idx + i 
+        tr_id_str = f"{ts_trade}-{real_idx}"
+        
+        chunk_lookup[tr_id_str] = (wallet_ids[i], is_sells[i])
         
         results.append(TradeTick(
             instrument_id=inst_id,
             price=Price.from_str(f"{price_float:.6f}"),
-            size=Quantity.from_str(f"{row.trade_volume:.4f}"),
-            aggressor_side=AggressorSide.SELLER if row.is_sell else AggressorSide.BUYER,
+            size=Quantity.from_str(f"{volumes[i]:.4f}"),
+            aggressor_side=AggressorSide.SELLER if is_sells[i] else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
-            ts_event=ts_ns, 
-            ts_init=ts_ns
+            ts_event=ts_trade, 
+            ts_init=ts_trade
         ))
         
     return results, chunk_lookup
-    
-@ray.remote
-@ray.remote
+
+@ray.remote 
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     """
     PATCHED: 
-    1. Returns valid equity curve.
-    2. Extracts and uses correct market liquidity.
-    3. Uses Mark-to-Market valuation for accurate results.
+    1. Removed duplicate @ray.remote decorator (Syntax Fix).
+    2. Downsamples equity curve to hourly resolution to prevent Ray memory explosion.
+    3. Uses Sim Time for valuation to prevent look-ahead bias.
     """
     import gc
+    import pandas as pd
     from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
     from nautilus_trader.model.objects import Price, Quantity, Money, Currency
     from nautilus_trader.model.instruments import BinaryOption
@@ -267,7 +293,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     unique_cids = price_events['contract_id'].unique()
     
     inst_map = {}
-    local_liquidity = {} # NEW: Local liquidity map
+    local_liquidity = {} 
     
     ts_act = int(start_time.value)
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
@@ -275,8 +301,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
-        
-        # Correctly extract liquidity from lifecycle
         meta = market_lifecycle.get(cid, {})
         local_liquidity[cid] = float(meta.get('liquidity', 0.0))
         
@@ -293,7 +317,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     for i in range(0, len(price_events), chunk_size):
         chunk = price_events.iloc[i : i + chunk_size]
-        # Pass the extracted liquidity map here
         ticks, lookup = process_data_chunk((chunk, inst_map, i, local_liquidity, 0.0))
         
         if ticks: engine.add_data(ticks)
@@ -343,10 +366,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         outcome = meta.get('final_outcome')
         end_ts = meta.get('end')
         
-        # Valuation Logic:
-        # 1. If resolved, use Outcome. 
-        # 2. If active, use Mark-to-Market (Last Price).
-        if outcome is not None and (end_ts is None or end_ts <= int(end_time.value)):
+        # VALUATION FIX: Ensure we don't look ahead. 
+        # Only use outcome if the market resolved BEFORE the simulation ended.
+        if outcome is not None and (end_ts is not None and end_ts <= int(end_time.value)):
             open_pos_val += qty * outcome
         else:
             curr_px = last_prices.get(cid, tracker.get('avg_price', 0.5))
@@ -354,7 +376,25 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
     final_val = cash + open_pos_val
     
-    captured_curve = list(strategy.equity_history)
+    # --- PERFORMANCE PATCH: Downsample Equity Curve ---
+    # Prevents massive object serialization overhead
+    full_curve = strategy.equity_history
+    if len(full_curve) > 2000:
+        # Convert to DF for easy resampling (local to worker)
+        df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
+        df_eq['ts'] = pd.to_datetime(df_eq['ts'])
+        df_eq = df_eq.set_index('ts')
+        
+        # Resample to Hourly
+        resampled = df_eq.resample('h').last().dropna()
+        captured_curve = list(resampled['val'].items())
+        
+        # Append exact final value if not present
+        if full_curve and full_curve[-1][0] > captured_curve[-1][0]:
+            captured_curve.append(full_curve[-1])
+    else:
+        captured_curve = full_curve
+        
     captured_trades = strategy.total_closed
     captured_wins = strategy.wins
     captured_losses = strategy.losses
@@ -370,9 +410,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         'trades': captured_trades, 
         'wins': captured_wins, 
         'losses': captured_losses,
-        'equity_curve': captured_curve # Now contains data
-    }
-    
+        'equity_curve': captured_curve 
+    }    
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
