@@ -971,7 +971,7 @@ class FastBacktestEngine:
         valid.loc[short_mask, 'roi'] = (outcome_no - price_no) / price_no
         
         valid['roi'] = valid['roi'].clip(-1.0, 3.0)
-        valid['log_vol'] = math.log1p(valid['usdc_vol'])
+        valid['log_vol'] = np.log1p(valid['usdc_vol'])
 
         wallet_stats = valid.groupby('wallet_id').agg({
             'roi': 'mean',
