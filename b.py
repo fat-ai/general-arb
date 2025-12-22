@@ -977,14 +977,36 @@ class FastBacktestEngine:
         capital = 10000.0
         full_equity_curve = []
         
-        for res in results_store:
-            period_ret = res['return']
-            start_cap = capital
-            capital = capital * (1.0 + period_ret)
+        final_ret = (capital - 10000.0) / 10000.0
+        
+        total_trades = sum(r.get('trades', 0) for r in results_store)
+        total_wins = sum(r.get('wins', 0) for r in results_store)
+        total_losses = sum(r.get('losses', 0) for r in results_store)
+        
+        sharpe = 0.0
+        max_dd_pct = 0.0
+        
+        if full_equity_curve:
+            # Calculate metrics on the stitched curve
+            equity_values = [x[1] for x in full_equity_curve]
             
-            if res.get('equity_curve'):
-                for ts, val in res['equity_curve']:
-                    full_equity_curve.append((ts, start_cap * (val/10000.0)))
+            # Max Drawdown
+            try:
+                max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
+            except: 
+                max_dd_pct = 0.0
+            
+            # Sharpe (Approximate using daily samples from the curve)
+            try:
+                df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
+                df_eq['ts'] = pd.to_datetime(df_eq['ts'])
+                df_eq = df_eq.set_index('ts').sort_index()
+                # Resample to Daily to get standard Sharpe
+                daily_rets = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
+                sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=252, rf=0.02)
+            except:
+                sharpe = 0.0
+
         return {
             'total_return': final_ret,
             'sharpe_ratio': sharpe,
@@ -1063,56 +1085,26 @@ class FastBacktestEngine:
         # 4. FAST LOOP
         total_rows = len(price_events)
         if total_rows > 0:
-            print(f"   Processing {total_rows} events with Parallel Execution (Ray)...")
+            print(f"   Processing {total_rows} events (Sequential/Local)...")
             
-            # Resource detection
-            total_cpus = int(ray.available_resources().get("CPU", 1))
-            
-            num_chunks = max(1, total_cpus * 10)
+            # 1. Local Data Generation (No Ray overhead for single period)
             nautilus_data = []
             local_wallet_lookup = {}
             
             price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE'].sort_values('ts_int')
+            
             if not price_events.empty:
-                # Simply call the global local function
-                # process_data_chunk is now defined in global scope (Patch 2)
+                # Call the global function directly
                 ticks, lookup = process_data_chunk((price_events, inst_map, 0, known_liquidity, 0.0))
                 nautilus_data = ticks
                 local_wallet_lookup = lookup
                 
-                engine.add_data(nautilus_data)            
-                # OOM FIX 2: Iterative Processing
-                # Instead of ray.get(all), we wait for 1 at a time.
-                # This allows Ray to clear the Object Store memory for finished tasks.
-                total_chunks = len(pending_futures)
-                completed_count = 0
-                
-                while pending_futures:
-                    # Wait for the next 1 future to complete
-                    done_futures, pending_futures = ray.wait(pending_futures, num_returns=1)
-                    
-                # Get result for the finished chunk
-                ticks, chunk_lookup = ray.get(done_futures[0])
-                
-                # Merge immediately
-                nautilus_data.extend(ticks)
-                local_wallet_lookup.update(chunk_lookup)
-                
-                # Explicit cleanup
-                del ticks, chunk_lookup
-
-                if completed_count % 10 == 0:
-                    gc.collect()
-                
-                completed_count += 1
-                print(f"   [Chunk {completed_count}/{total_chunks}] Merged...", end='\r')
-                
-            print(f"\n   ✅ Data Generation Complete. Sorting {len(nautilus_data)} ticks...")
-            nautilus_data.sort(key=lambda x: x.ts_event)
-            engine.add_data(nautilus_data)
+                print(f"   ✅ Data Generation Complete. Sorting {len(nautilus_data)} ticks...")
+                nautilus_data.sort(key=lambda x: x.ts_event)
+                engine.add_data(nautilus_data)
         else:
              return {'final_value': 10000.0, 'total_return': 0.0, 'trades': 0, 'full_equity_curve': [], 'tracker_state': {}}
-
+            
         # 5. STRATEGY CONFIG
         base_inst_id = list(inst_map.values())[0]
         
