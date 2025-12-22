@@ -1636,7 +1636,7 @@ class TuningRunner:
             fail_fast=True, 
             max_failures=0,
             max_concurrent_trials=1,
-            resources_per_trial={"cpu": 30},
+            resources_per_trial=tune.PlacementGroupFactory([{'CPU': 1.0}] + [{'CPU': 1.0}] * 29),
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
