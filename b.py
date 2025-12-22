@@ -1068,33 +1068,29 @@ class FastBacktestEngine:
             # Resource detection
             total_cpus = int(ray.available_resources().get("CPU", 1))
             
-            # OOM FIX 1: Create MORE chunks (smaller size per chunk)
-            # 4 chunks per CPU ensures workers don't hold too much RAM at once
             num_chunks = max(1, total_cpus * 10)
-            chunks = np.array_split(price_events, num_chunks)
-            
-            chunk_args = []
-            current_idx = 0
-            for chunk in chunks:
-                chunk_args.append((chunk, inst_map, current_idx, known_liquidity))
-                current_idx += len(chunk)
-
             nautilus_data = []
+            local_wallet_lookup = {}
             
-            # --- EXECUTE WITH RAY (ITERATIVE) ---
-            # options(num_cpus=0) prevents deadlock
-            pending_futures = [process_data_chunk.options(num_cpus=0).remote(arg) for arg in chunk_args]
-            
-            # OOM FIX 2: Iterative Processing
-            # Instead of ray.get(all), we wait for 1 at a time.
-            # This allows Ray to clear the Object Store memory for finished tasks.
-            total_chunks = len(pending_futures)
-            completed_count = 0
-            
-            while pending_futures:
-                # Wait for the next 1 future to complete
-                done_futures, pending_futures = ray.wait(pending_futures, num_returns=1)
+            price_events = test_df[test_df['event_type'] == 'PRICE_UPDATE'].sort_values('ts_int')
+            if not price_events.empty:
+                # Simply call the global local function
+                # process_data_chunk is now defined in global scope (Patch 2)
+                ticks, lookup = process_data_chunk((price_events, inst_map, 0, known_liquidity, 0.0))
+                nautilus_data = ticks
+                local_wallet_lookup = lookup
                 
+                engine.add_data(nautilus_data)            
+                # OOM FIX 2: Iterative Processing
+                # Instead of ray.get(all), we wait for 1 at a time.
+                # This allows Ray to clear the Object Store memory for finished tasks.
+                total_chunks = len(pending_futures)
+                completed_count = 0
+                
+                while pending_futures:
+                    # Wait for the next 1 future to complete
+                    done_futures, pending_futures = ray.wait(pending_futures, num_returns=1)
+                    
                 # Get result for the finished chunk
                 ticks, chunk_lookup = ray.get(done_futures[0])
                 
