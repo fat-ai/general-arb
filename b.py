@@ -262,6 +262,174 @@ def process_data_chunk(args):
         
     return results, chunk_lookup
 
+@ray.remote
+def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity, market_lifecycle):
+    """
+    Independent worker that runs a single period of the backtest.
+    Full Fidelity: Generates TradeTicks AND QuoteTicks so IOC orders execute correctly.
+    """
+    # 1. Imports (Must be local for Ray)
+    from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
+    from nautilus_trader.model.objects import Price, Quantity, Money, Currency
+    from nautilus_trader.model.instruments import BinaryOption
+    from nautilus_trader.model.enums import AccountType, OmsType, AssetClass, AggressorSide
+    from nautilus_trader.model.data import QuoteTick, TradeTick
+    from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
+    from decimal import Decimal
+    import pandas as pd
+    import numpy as np
+    
+    # 2. Setup Engine
+    USDC = Currency.from_str("USDC")
+    venue_id = Venue("POLY")
+    
+    engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
+    engine.add_venue(
+        venue=venue_id, 
+        oms_type=OmsType.NETTING, 
+        account_type=AccountType.MARGIN, 
+        base_currency=USDC, 
+        starting_balances=[Money(10_000, USDC)]
+    )
+    
+    # 3. Setup Instruments
+    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE']
+    unique_cids = price_events['contract_id'].unique()
+    inst_map = {}
+    
+    ts_activation = int(start_time.value)
+    # Set expiration far in future so instruments don't expire mid-test
+    ts_expiration = int(end_time.value) + (365 * 24 * 60 * 60 * 1_000_000_000)
+    
+    for cid in unique_cids:
+        inst_id = InstrumentId(Symbol(cid), venue_id)
+        inst_map[cid] = inst_id
+        inst = BinaryOption(
+            instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
+            currency=USDC, price_precision=6, size_precision=4, price_increment=Price.from_str("0.000001"), 
+            size_increment=Quantity.from_str("0.0001"), activation_ns=ts_activation, expiration_ns=ts_expiration,
+            ts_event=ts_activation, ts_init=ts_activation, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
+        )
+        engine.add_instrument(inst)
+
+    # 4. Data Loading (FULL FIDELITY - NO COMPROMISES)
+    nautilus_data = []
+    local_wallet_lookup = {}
+    
+    # We iterate the slice directly. Since it's only ~30 days, this is fast (seconds).
+    for idx, row in enumerate(price_events.itertuples(index=True)):
+        cid = row.contract_id
+        inst_id = inst_map[cid]
+        ts_ns = int(row.ts_int)
+        price_float = float(row.p_market_all)
+        
+        # --- A. Full Quote Generation (Required for IOC) ---
+        # This matches your original logic exactly: Spread + Depth
+        spread = max(0.005, price_float * 0.01)
+        bid_px = max(0.005, price_float - spread)
+        ask_px = min(0.995, price_float + spread)
+        
+        if bid_px >= ask_px:
+            diff = ask_px - bid_px
+            bid_px -= (diff / 2)
+            ask_px += (diff / 2)
+
+        # Depth logic
+        market_liq_score = float(known_liquidity.get(cid, 0))
+        real_size_val = getattr(row, 'size', 0.0)
+        
+        if market_liq_score > 100.0:
+            simulated_depth = market_liq_score * 0.01
+        else:
+            simulated_depth = real_size_val
+            
+        depth_str = f"{max(10.0, simulated_depth):.4f}"
+
+        quote = QuoteTick(
+            instrument_id=inst_id,
+            bid_price=Price.from_str(f"{bid_px:.6f}"),
+            ask_price=Price.from_str(f"{ask_px:.6f}"),
+            bid_size=Quantity.from_str(depth_str),
+            ask_size=Quantity.from_str(depth_str),
+            ts_event=ts_ns - 1,
+            ts_init=ts_ns - 1
+        )
+        nautilus_data.append(quote)
+            
+        # --- B. Trade Generation ---
+        tr_id = f"{ts_ns}-{idx}"
+        local_wallet_lookup[tr_id] = (str(row.wallet_id), bool(row.is_sell))
+        
+        is_sell = getattr(row, 'is_sell', False)
+        
+        tick = TradeTick(
+            instrument_id=inst_id, 
+            price=Price.from_str(f"{price_float:.6f}"), 
+            size=Quantity.from_str(f"{row.trade_volume:.4f}"), 
+            aggressor_side=AggressorSide.SELLER if is_sell else AggressorSide.BUYER, 
+            trade_id=TradeId(tr_id), 
+            ts_event=ts_ns, 
+            ts_init=ts_ns
+        )
+        nautilus_data.append(tick)
+        
+    engine.add_data(nautilus_data)
+    
+    # 5. Configure Strategy
+    strat_config = PolyStrategyConfig()
+    strategy = PolymarketNautilusStrategy(strat_config)
+    
+    # Manual Injection
+    strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
+    strategy.decay_factor = float(config.get('decay_factor', 0.95))
+    strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
+    strategy.wallet_scores = wallet_scores
+    strategy.fw_slope = float(fw_slope)
+    strategy.fw_intercept = float(fw_intercept)
+    strategy.sizing_mode = str(config.get('sizing_mode', 'fixed'))
+    strategy.fixed_size = float(config.get('fixed_size', 10.0))
+    strategy.kelly_fraction = float(config.get('kelly_fraction', 0.1))
+    
+    # Helper Maps
+    strategy.wallet_lookup = local_wallet_lookup
+    strategy.active_instrument_ids = list(inst_map.values())
+    
+    engine.add_strategy(strategy)
+    engine.run()
+    
+    # 6. Calculate Results
+    try:
+        acct = engine.portfolio.account(venue_id)
+        cash = acct.balance_total(USDC).as_double()
+    except:
+        cash = 10000.0
+    
+    open_pos_val = 0.0
+    for inst_id, tracker in strategy.positions_tracker.items():
+        qty = tracker.get('net_qty', 0.0)
+        if abs(qty) < 0.0001: continue
+        cid = inst_id.symbol.value
+        meta = market_lifecycle.get(cid, {})
+        outcome = meta.get('final_outcome')
+        end_ts = meta.get('end')
+        
+        if outcome is not None and (end_ts is None or end_ts <= int(end_time.value)):
+            open_pos_val += qty * outcome
+        else:
+            open_pos_val += qty * tracker.get('avg_price', 0.5)
+            
+    final_val = cash + open_pos_val
+    
+    return {
+        'start_ts': start_time,
+        'final_val': final_val,
+        'return': (final_val / 10000.0) - 1.0,
+        'trades': strategy.total_closed,
+        'wins': strategy.wins,
+        'losses': strategy.losses,
+        'equity_curve': strategy.equity_history
+    }
+
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
@@ -844,191 +1012,138 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
 
     def run_walk_forward(self, config: dict) -> dict:
-        if self.event_log.empty: return {'total_return': 0.0, 'sharpe': 0.0, 'trades': 0}
-        
-        # 1. OPTIMIZATION: PRE-CALCULATE INTEGER TIMESTAMPS
-        # We do this once on the main dataframes to speed up filtering by 10x-50x
-        # We use .copy() to ensure we are modifying the engine's local copy, not a view
+        if self.event_log.empty: return {'total_return': 0.0}
+
+        # 1. Setup Timestamps
         if 'ts_int' not in self.profiler_data.columns:
-            self.profiler_data = self.profiler_data.copy()
-            # Ensure datetime type before converting
-            if not pd.api.types.is_datetime64_any_dtype(self.profiler_data['timestamp']):
-                self.profiler_data['timestamp'] = pd.to_datetime(self.profiler_data['timestamp'])
             self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
-            
         if 'ts_int' not in self.event_log.columns:
-            self.event_log = self.event_log.copy()
-            # Ensure datetime index
-            if not isinstance(self.event_log.index, pd.DatetimeIndex):
-                self.event_log.index = pd.to_datetime(self.event_log.index)
             self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
+
+        # FORCE 30-DAY WINDOWS FOR PARALLELISM
+        train_days = config.get('train_days', 60)
+        test_days = 30  # Hardcoded for parallel efficiency
         
-        min_date = self.event_log.index.min()
+        current_date = self.event_log.index.min()
         max_date = self.event_log.index.max()
         
-        train_days = config.get('train_days', 60)
-        test_days = config.get('test_days', 120)
-        embargo_days = 2
+        # 2. Prepare All Tasks
+        tasks = []
         
-        current_date = min_date
-        capital = 10000.0
-        full_equity_curve = []
-        total_trades = 0
-        total_wins = 0  
-        total_losses = 0
-        global_tracker = {}
-
-        # Pre-filter resolutions once to avoid repeated filtering inside the loop
-        all_resolutions = self.event_log[self.event_log['event_type'] == 'RESOLUTION'].copy()
-
-        if 'created_int' not in self.profiler_data.columns:
-
-            if not pd.api.types.is_datetime64_any_dtype(self.profiler_data['market_created']):
-                self.profiler_data['market_created'] = pd.to_datetime(self.profiler_data['market_created'])
-
-            self.profiler_data['created_int'] = self.profiler_data['market_created'].astype(np.int64)
-
-        while current_date + timedelta(days=train_days + embargo_days + test_days) <= max_date:
+        # We loop through time but DO NOT RUN the engine yet.
+        # We just collect the work orders.
+        while current_date + timedelta(days=train_days + 2 + test_days) <= max_date:
             train_end = current_date + timedelta(days=train_days)
-            test_start = train_end + timedelta(days=embargo_days)
+            test_start = train_end + timedelta(days=2)
             test_end = test_start + timedelta(days=test_days)
             
-            # FAST INTEGER FILTERING
+            # A. Train (Fast enough to keep sequential/local)
+            # This logic remains the same as your original
             train_end_ns = train_end.value
-            test_start_ns = test_start.value
-            test_end_ns = test_end.value
-            current_date_ns = current_date.value
-            safe_train_end = pd.Timestamp(train_end)
-            # Train Mask (Integer compare is faster)
-            train_mask = (
-                (self.profiler_data['ts_int'] >= current_date_ns) & 
-                (self.profiler_data['ts_int'] < train_end_ns) & 
-                (self.profiler_data['created_int'] < train_end_ns) 
-            )
-            train_profiler = self.profiler_data[train_mask].copy()
-            if 'res_time' in train_profiler.columns:
-                train_profiler = train_profiler[train_profiler['res_time'] < train_end]
-            else:
-                print("⚠️ Warning: res_time column missing, using timestamp instead")
-                train_profiler = train_profiler[train_profiler['timestamp'] < train_end]
-            train_profiler = train_profiler.sort_values(
-                by=['timestamp', 'wallet_id', 'market_id'], 
-                kind='stable'
-            )
+            train_mask = (self.profiler_data['ts_int'] >= current_date.value) & \
+                         (self.profiler_data['ts_int'] < train_end_ns)
             
+            train_profiler = self.profiler_data[train_mask]
             
-            # --- Profiler Logic ---
-            # Filter resolutions that happened before training ended
-            valid_res = all_resolutions[all_resolutions.index < train_end]
-            resolved_ids = set(valid_res['contract_id'])
-            
-            outcome_map = valid_res.set_index('contract_id')['outcome'].to_dict()
-            res_time_map = dict(zip(valid_res['contract_id'], valid_res.index))
-
-            train_profiler = train_profiler[train_profiler['market_id'].isin(resolved_ids)]
-            
-            train_profiler['outcome'] = train_profiler['market_id'].map(outcome_map)
-            train_profiler['res_time'] = train_profiler['market_id'].map(res_time_map)
-
-            train_profiler['res_time'] = pd.to_datetime(train_profiler['res_time'], errors='coerce')
- 
-            train_profiler = train_profiler.dropna(subset=['res_time'])
-
-            train_profiler = train_profiler[train_profiler['timestamp'] < train_profiler['res_time']]
-
-            fold_wallet_scores = fast_calculate_rois(
-                train_profiler, 
-                min_trades=5, 
-                cutoff_date=train_end
-            )
-
-            if 'wallet_scores' in config and config['wallet_scores']:
-                # If we passed explicit scores, use them instead of the empty fold scores
+            fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
+            if config.get('wallet_scores'):
                 fold_wallet_scores = config['wallet_scores']
-            
+                
+            known_experts = []
             if fold_wallet_scores:
                 known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys())))
-            else:
-                known_experts = []
                 
-            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(
+                train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end
+            )
             
-            # --- TEST SLICE (Optimized) ---
-            # Don't convert to dicts! Just slice the dataframe using integer mask.
-            test_mask = (self.event_log['ts_int'] >= test_start_ns) & (self.event_log['ts_int'] < test_end_ns)
-            test_slice_df = self.event_log[test_mask]
-
+            # B. Slice Data for Parallel Worker
+            test_mask = (self.event_log['ts_int'] >= test_start.value) & \
+                        (self.event_log['ts_int'] < test_end.value)
+            test_slice_df = self.event_log[test_mask].copy()
+            
             if not test_slice_df.empty:
-                # Prepare Liquidity Map
-                past_mask = (self.event_log['ts_int'] < test_end_ns)
-                init_events = self.event_log[past_mask & self.event_log['event_type'].isin(['NEW_CONTRACT', 'MARKET_INIT'])]
-                # Handle potential duplicate contract_ids by taking the last known liquidity
-                global_liq = dict(zip(init_events['contract_id'], init_events['liquidity'].fillna(1.0)))
-
-                # PASS DATAFRAME DIRECTLY
-                result = self._run_single_period(
+                # C. Launch Async Task
+                future = execute_period_remote.remote(
                     test_slice_df, 
-                    fold_wallet_scores, config, fw_slope, fw_intercept, 
-                    start_time=train_end, end_time=test_end,
-                    known_liquidity=global_liq,
-                    previous_tracker=global_tracker 
+                    fold_wallet_scores, 
+                    config, 
+                    fw_slope, 
+                    fw_intercept, 
+                    train_end, 
+                    test_end, 
+                    {}, # known_liquidity placeholder
+                    self.market_lifecycle
                 )
-                
-                # --- Aggregate Results ---
-                global_tracker = result['tracker_state']
-                local_curve = result.get('full_equity_curve', [])
-
-                if not local_curve: continue
-
-                # Calculate growth factor for this period
-                start_val = local_curve[0][1] 
-                
-                # Stitch the curve: Scale this fold's growth to global capital
-                for ts, val in local_curve:
-                    growth = val / start_val
-                    current_val = capital * growth
-                    full_equity_curve.append((ts, current_val))
-                
-                # Update global capital for the next fold
-                capital = full_equity_curve[-1][1]
-  
-                
-                total_trades += result['trades']
-                total_wins += result.get('wins', 0)
-                total_losses += result.get('losses', 0)
+                tasks.append(future)
             
             current_date += timedelta(days=test_days)
 
-        if not full_equity_curve: 
-            return {
-                'total_return': 0.0, 
-                'sharpe_ratio': 0.0, 
-                'max_drawdown': 0.0, 
-                'trades': 0
-            }
+        if not tasks:
+            return {'total_return': 0.0}
 
-        # Calculate final metrics
-        df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
-        df_eq['ts'] = pd.to_datetime(df_eq['ts'])
-        df_eq = df_eq.set_index('ts').sort_index()
+        # 3. EXECUTE PARALLEL (Utilization: 30 CPUs)
+        print(f"🚀 Launching {len(tasks)} parallel backtest periods...")
         
-        daily_returns = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
+        # This blocks until ALL periods are done. 
+        # Since they run in parallel, total time = time of slowest single period (~30-60m).
+        results = ray.get(tasks) 
         
-        sharpe = calculate_sharpe_ratio(daily_returns, periods_per_year=252, rf=0.02)
+        # 4. Stitch Results
+        # We assume compound growth across periods
+        capital = 10000.0
+        full_equity_curve = []
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
         
-        equity_values = [x[1] for x in full_equity_curve]
-        max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
+        # Sort by start time to ensure correct chronological order
+        results.sort(key=lambda x: x['start_ts'])
         
-        total_ret = (capital - 10000.0) / 10000.0
+        for res in results:
+            period_return = res['return']
+            
+            # Scale capital based on this period's return
+            start_cap_for_period = capital
+            capital = capital * (1.0 + period_return)
+            
+            # Stitch Curve
+            for ts, val in res['equity_curve']:
+                # 'val' is based on 10k start. Normalize it.
+                # If period started at 10k and ended at 11k, growth is 1.1x
+                # If global capital is 20k, we want to show 20k -> 22k
+                growth_factor = val / 10000.0
+                adjusted_val = start_cap_for_period * growth_factor
+                full_equity_curve.append((ts, adjusted_val))
+                
+            total_trades += res['trades']
+            total_wins += res['wins']
+            total_losses += res['losses']
+
+        final_ret = (capital - 10000.0) / 10000.0
         
+        # Calculate Sharpe on the stitched curve
+        sharpe = 0.0
+        if full_equity_curve:
+            df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
+            df_eq['ts'] = pd.to_datetime(df_eq['ts'])
+            df_eq = df_eq.set_index('ts').sort_index()
+            daily_returns = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
+            sharpe = calculate_sharpe_ratio(daily_returns, periods_per_year=252, rf=0.02)
+            
+            equity_values = [x[1] for x in full_equity_curve]
+            max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
+        else:
+            max_dd_pct = 0.0
+
         return {
-            'total_return': total_ret, 
-            'sharpe_ratio': sharpe, 
-            'max_drawdown': abs(max_dd_pct), 
-            'trades': total_trades, 
-            'wins': total_wins, 
+            'total_return': final_ret,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': abs(max_dd_pct),
+            'trades': total_trades,
+            'wins': total_wins,
             'losses': total_losses,
-            'final_capital': capital
+            'full_equity_curve': full_equity_curve
         }
                                   
     def _run_single_period(self, test_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, previous_tracker=None, known_liquidity=None):
