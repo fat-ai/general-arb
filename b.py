@@ -169,11 +169,12 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---
 def process_data_chunk(args):
     """
-    PATCHED: 
-    1. Vectorized extraction for high-performance event generation (NumPy).
-    2. Ensures minimum liquidity depth to prevent artificial order rejections.
-    3. Enforces strict Quote -> Trade ordering via timestamp adjustment.
+    OPTIMIZED:
+    1. Uses Vectorized NumPy math for scaling floats to integers.
+    2. Uses Price.from_int64 / Quantity.from_int64 (No string parsing).
+    3. Allocates memory efficiently.
     """
+    # Local imports for speed
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
@@ -190,64 +191,94 @@ def process_data_chunk(args):
     if not valid_mask.any():
         return results, chunk_lookup
 
-    # 2. Extract to NumPy Arrays (Avoids Pandas overhead in loop)
+    # 2. Extract and Scale to Int64 (Vectorized)
+    # PRECISION CONSTANTS (Must match execute_period_remote)
+    PRICE_PRECISION = 6
+    PRICE_SCALAR = 1_000_000
+    SIZE_PRECISION = 4
+    SIZE_SCALAR = 10_000
+
+    # Filter data subset
+    subset = df_chunk.loc[valid_mask]
+    
     inst_ids = mapped_insts[valid_mask].values
-    contract_ids = df_chunk.loc[valid_mask, 'contract_id'].values
-    ts_ints = df_chunk.loc[valid_mask, 'ts_int'].values.astype('int64')
-    prices = df_chunk.loc[valid_mask, 'p_market_all'].values.astype('float64')
-    volumes = df_chunk.loc[valid_mask, 'trade_volume'].values.astype('float64')
-    # Handle optional 'size' column
-    if 'size' in df_chunk.columns:
-        sizes = df_chunk.loc[valid_mask, 'size'].values.astype('float64')
+    contract_ids = subset['contract_id'].values
+    ts_ints = subset['ts_int'].values.astype('int64')
+    
+    # --- VECTORIZED SCALING ---
+    # Prices: Float -> Int64
+    raw_prices = subset['p_market_all'].values.astype('float64')
+    # Clip to ensure valid range [0.000001, 0.999999] before scaling
+    np.clip(raw_prices, 0.000001, 0.999999, out=raw_prices)
+    prices_int = np.rint(raw_prices * PRICE_SCALAR).astype(np.int64)
+    
+    # Volumes: Float -> Int64
+    raw_volumes = subset['trade_volume'].values.astype('float64')
+    volumes_int = np.rint(raw_volumes * SIZE_SCALAR).astype(np.int64)
+    
+    # Sizes (Liquidity Depth): Float -> Int64
+    if 'size' in subset.columns:
+        raw_sizes = subset['size'].values.astype('float64')
     else:
-        sizes = np.zeros(len(contract_ids))
-        
-    wallet_ids = df_chunk.loc[valid_mask, 'wallet_id'].values.astype(str)
-    is_sells = df_chunk.loc[valid_mask, 'is_sell'].values.astype(bool)
+        raw_sizes = np.zeros(len(contract_ids), dtype='float64')
+    
+    wallet_ids = subset['wallet_id'].values.astype(str)
+    is_sells = subset['is_sell'].values.astype(bool)
     
     count = len(inst_ids)
     
+    # Pre-calculate Spread Integers
+    # 0.5% spread = 0.005 * 1_000_000 = 5000 units
+    # 1.0% of price = price_int * 0.01
+    SPREAD_MIN_INT = 5000  # 0.005
+    spreads_int = np.maximum(SPREAD_MIN_INT, (prices_int * 0.01).astype(np.int64))
+    
     for i in range(count):
         inst_id = inst_ids[i]
-        cid = contract_ids[i]
         ts_ns = int(ts_ints[i])
-        price_float = prices[i]
+        px_int = prices_int[i]
+        vol_int = volumes_int[i]
         
         # --- 1. Emit Quote FIRST ---
+        # Calculate Depth
+        # Logic: Max(5000, 1% Liq, 1.5x Trade)
+        # We do this in float for logic simplicity, then cast to int for object creation
+        cid = contract_ids[i]
         market_liq = float(known_liquidity.get(cid, 0.0)) if known_liquidity else 0.0
         
-        # FIX: Ensure depth is substantial enough to fill strategy orders.
-        # Use 1% of market liq, OR minimum $5000, OR 1.5x the trade size (guaranteed fill).
         depth_val = max(5000.0, market_liq * 0.01)
-        if sizes[i] > depth_val: depth_val = sizes[i] * 1.5
+        if raw_sizes[i] > depth_val: 
+            depth_val = raw_sizes[i] * 1.5
             
-        depth_str = f"{depth_val:.4f}"
+        # Scale depth to int
+        depth_int = int(round(depth_val * SIZE_SCALAR))
         
-        # Spread Logic
-        spread = max(0.005, price_float * 0.01)
-        bid_px = max(0.005, price_float - spread)
-        ask_px = min(0.995, price_float + spread)
+        # Calculate Bid/Ask Integers
+        bid_int = px_int - spreads_int[i]
+        ask_int = px_int + spreads_int[i]
+        
+        # Clamp Logic (0.005 to 0.995) -> (5000 to 995000)
+        if bid_int < 5000: bid_int = 5000
+        if ask_int > 995000: ask_int = 995000
         
         # Uncross
-        if bid_px >= ask_px:
-            mid = (bid_px + ask_px) * 0.5
-            bid_px = max(0.005, mid - 0.002)
-            ask_px = min(0.995, mid + 0.002)
-            
+        if bid_int >= ask_int:
+            mid = (bid_int + ask_int) // 2
+            bid_int = max(5000, mid - 2000) # -0.002
+            ask_int = min(995000, mid + 2000) # +0.002
+
         results.append(QuoteTick(
             instrument_id=inst_id,
-            bid_price=Price.from_str(f"{bid_px:.6f}"),
-            ask_price=Price.from_str(f"{ask_px:.6f}"),
-            bid_size=Quantity.from_str(depth_str),
-            ask_size=Quantity.from_str(depth_str),
+            bid_price=Price.from_int64(bid_int, PRICE_PRECISION),
+            ask_price=Price.from_int64(ask_int, PRICE_PRECISION),
+            bid_size=Quantity.from_int64(depth_int, SIZE_PRECISION),
+            ask_size=Quantity.from_int64(depth_int, SIZE_PRECISION),
             ts_event=ts_ns, 
             ts_init=ts_ns
         ))
         
         # --- 2. Emit Trade SECOND ---
-        # Add 1ns to strictly order Trade AFTER Quote
         ts_trade = ts_ns + 1
-        
         real_idx = start_idx + i 
         tr_id_str = f"{ts_trade}-{real_idx}"
         
@@ -255,8 +286,8 @@ def process_data_chunk(args):
         
         results.append(TradeTick(
             instrument_id=inst_id,
-            price=Price.from_str(f"{price_float:.6f}"),
-            size=Quantity.from_str(f"{volumes[i]:.4f}"),
+            price=Price.from_int64(px_int, PRICE_PRECISION),
+            size=Quantity.from_int64(vol_int, SIZE_PRECISION),
             aggressor_side=AggressorSide.SELLER if is_sells[i] else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
             ts_event=ts_trade, 
@@ -264,7 +295,6 @@ def process_data_chunk(args):
         ))
         
     return results, chunk_lookup
-
 @ray.remote 
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     """
@@ -297,18 +327,30 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     ts_act = int(start_time.value)
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
-    
+
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
         meta = market_lifecycle.get(cid, {})
         local_liquidity[cid] = float(meta.get('liquidity', 0.0))
         
+        # UPDATED INSTRUMENT DEFINITION
         engine.add_instrument(BinaryOption(
-            instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
-            currency=USDC, price_precision=6, size_precision=4, price_increment=Price.from_str("0.000001"), 
-            size_increment=Quantity.from_str("0.0001"), activation_ns=ts_act, expiration_ns=ts_exp,
-            ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
+            instrument_id=inst_id, 
+            raw_symbol=Symbol(cid), 
+            asset_class=AssetClass.CRYPTOCURRENCY, 
+            currency=USDC, 
+            price_precision=6,  # Matches PRICE_SCALAR = 1,000,000
+            size_precision=4,   # Matches SIZE_SCALAR = 10,000
+            # Use int64 for increments too for speed/consistency
+            price_increment=Price.from_int64(1, 6),     # 0.000001
+            size_increment=Quantity.from_int64(1, 4),   # 0.0001
+            activation_ns=ts_act, 
+            expiration_ns=ts_exp,
+            ts_event=ts_act, 
+            ts_init=ts_act, 
+            maker_fee=Decimal("0.0"), 
+            taker_fee=Decimal("0.0")
         ))
 
     # Stream Processing
@@ -467,54 +509,98 @@ def calculate_max_drawdown(full_equity_curve):
     
     return max_dd, idx, equity[idx]
 
-def fast_calculate_rois(profiler_data: pd.DataFrame, min_trades: int = 20, cutoff_date=None):
+def fast_calculate_rois(profiler_data, min_trades: int = 20, cutoff_date=None):
     """
-    PATCHED: Returns Raw Average ROI per wallet.
-    No normalization, no mapping to Brier scores.
+    OPTIMIZED: Uses Polars for 10x speedup on grouping/aggregating massive datasets.
+    Falls back to Pandas if Polars is missing.
     """
-    if profiler_data.empty: return {}
-    
-    # Filter valid trades
-    valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']).copy()
-    
-    if cutoff_date is not None:
-        # Prefer resolution time for cutoff to ensure we only score 
-        # based on events fully resolved known before the cutoff.
-        time_col = 'res_time' if 'res_time' in valid.columns else 'timestamp'
-        valid = valid[valid[time_col] < cutoff_date]
+    # 1. Try Polars (Fast Path)
+    try:
+        import polars as pl
         
-    valid = valid[valid['bet_price'].between(0.01, 0.99)] 
-    
-    # 1. Calculate Raw ROI (Robust)
-    # LONG: (Outcome - Price) / Price
-    long_mask = valid['tokens'] > 0
-    valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
-    
-    # SHORT: (Outcome_No - Price_No) / Price_No
-    short_mask = valid['tokens'] < 0
-    price_no = 1.0 - valid.loc[short_mask, 'bet_price']
-    outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
-    price_no = price_no.clip(lower=0.01)
-    valid.loc[short_mask, 'raw_roi'] = (outcome_no - price_no) / price_no
-    
-    # 2. Outlier Clipping
-    # Clip single-trade ROI to range [-100%, +300%] to dampen variance
-    valid['raw_roi'] = valid['raw_roi'].clip(-1.0, 3.0)
-    
-    stats = valid.groupby(['wallet_id', 'entity_type'])['raw_roi'].agg(['mean', 'count'])
-    qualified = stats[stats['count'] >= min_trades]
-    
-    if qualified.empty: return {}
-
-    # Convert MultiIndex (Tuple) to String Key "wallet|type"
-    # This prevents "TypeError: keys must be str" during config serialization
-    result = {}
-    for (wallet, entity), row in qualified.iterrows():
-        key = f"{wallet}|{entity}"
-        result[key] = row['mean']
+        # Convert efficiently (zero-copy if possible)
+        df = pl.from_pandas(profiler_data)
         
-    return result
+        # Filter by Date
+        if cutoff_date:
+            # Ensure cutoff is compatible with Polars types
+            time_col = 'res_time' if 'res_time' in df.columns else 'timestamp'
+            df = df.filter(pl.col(time_col) < cutoff_date)
+            
+        # Filter Valid Trades
+        # Note: Polars `is_between` is inclusive by default
+        df = df.filter(
+            pl.col('outcome').is_not_null() &
+            pl.col('bet_price').is_between(0.01, 0.99)
+        )
+        
+        if df.height == 0:
+            return {}
 
+        # Vectorized ROI Calculation (Atomic)
+        # We calculate everything in one expression context for speed
+        stats = (
+            df.with_columns([
+                # Logic: Long vs Short ROI
+                pl.when(pl.col('tokens') > 0)
+                  .then((pl.col('outcome') - pl.col('bet_price')) / pl.col('bet_price'))
+                  .otherwise(
+                      # Short Logic: (Outcome_No - Price_No) / Price_No
+                      # Outcome_No = 1 - Outcome, Price_No = 1 - Price
+                      ((1.0 - pl.col('outcome')) - (1.0 - pl.col('bet_price'))) / 
+                      (1.0 - pl.col('bet_price')).clip(0.01, 1.0) 
+                  )
+                  .clip(-1.0, 3.0) # Clip outliers immediately
+                  .alias('roi')
+            ])
+            .group_by(['wallet_id', 'entity_type'])
+            .agg([
+                pl.col('roi').mean().alias('mean'),
+                pl.col('roi').len().alias('count') # .len() is fast count
+            ])
+            .filter(pl.col('count') >= min_trades)
+        )
+        
+        # Fast Dictionary Construction
+        # Iterating over rows in Polars is slower than Pandas, 
+        # so we convert the small result back to Pandas or use dict comprehension carefully.
+        # Ideally, zip is fastest here.
+        keys = (stats['wallet_id'] + "|" + stats['entity_type']).to_list()
+        vals = stats['mean'].to_list()
+        return dict(zip(keys, vals))
+
+    except ImportError:
+        # 2. Pandas Fallback (Slow Path - Original Logic)
+        if profiler_data.empty: return {}
+        
+        valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']).copy()
+        
+        if cutoff_date is not None:
+            time_col = 'res_time' if 'res_time' in valid.columns else 'timestamp'
+            valid = valid[valid[time_col] < cutoff_date]
+            
+        valid = valid[valid['bet_price'].between(0.01, 0.99)] 
+        
+        long_mask = valid['tokens'] > 0
+        valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
+        
+        short_mask = valid['tokens'] < 0
+        price_no = 1.0 - valid.loc[short_mask, 'bet_price']
+        outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
+        price_no = price_no.clip(lower=0.01)
+        valid.loc[short_mask, 'raw_roi'] = (outcome_no - price_no) / price_no
+        
+        valid['raw_roi'] = valid['raw_roi'].clip(-1.0, 3.0)
+        
+        stats = valid.groupby(['wallet_id', 'entity_type'])['raw_roi'].agg(['mean', 'count'])
+        qualified = stats[stats['count'] >= min_trades]
+        
+        result = {}
+        for (wallet, entity), row in qualified.iterrows():
+            result[f"{wallet}|{entity}"] = row['mean']
+            
+        return result
+        
 def persistent_disk_cache(func):
     """
     Thread-safe and Process-safe disk cache using FileLock.
@@ -669,11 +755,16 @@ class PolymarketNautilusStrategy(Strategy):
         
         tracker = self.trackers[cid]
         elapsed_seconds = (tick.ts_event - tracker['last_update_ts']) / 1e9
-        if elapsed_seconds < 0: elapsed_seconds = 0.0
-        
+    
         if elapsed_seconds > 0:
-            decay = self.decay_factor ** (elapsed_seconds / 60.0)
-        
+        # Optimization: Pre-check if decay is negligible
+            if elapsed_seconds < 0.1:
+                decay = 1.0
+            else:
+                decay = math.pow(self.decay_factor, elapsed_seconds / 60.0)
+            
+        # Apply decay
+            tracker['net_weight'] *= decay        
         tracker['last_update_ts'] = tick.ts_event
 
         # --- C. Signal Generation ---
