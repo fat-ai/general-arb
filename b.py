@@ -171,69 +171,79 @@ def plot_performance(full_equity_curve, trades_count):
 @ray.remote
 def process_data_chunk(args):
     """
-    Ray Worker function to process DataFrame chunks.
-    Uses Ray serialization to bypass standard multiprocessing pickle limits.
+    Ray Worker: Generates Trades AND Quotes, but compresses Quotes 
+    to only emit when price changes.
     """
-
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
     from nautilus_trader.model.enums import AggressorSide
     
     # Unpack arguments
-    df_chunk, inst_map, start_idx, known_liquidity = args
+    df_chunk, inst_map, start_idx, known_liquidity, min_vol = args
     
     results = []
     chunk_lookup = {}
     
-    # Use itertuples for speed
+    # Track last price to avoid duplicate quotes
+    last_price_map = {} 
+    
     for idx, row in enumerate(df_chunk.itertuples(index=True)):
+        # 1. Filter Dust
+        if getattr(row, 'trade_volume', 0.0) < min_vol:
+            continue
+
+        cid = row.contract_id
+        if cid not in inst_map: continue
+            
         real_idx = start_idx + idx
         ts_ns = int(row.ts_int)
-        cid = row.contract_id
-        
-        if cid not in inst_map:
-            continue
-            
         inst_id = inst_map[cid]
         price_float = float(row.p_market_all)
         
-        # --- 1. Generate Quote (Original Logic) ---
-        market_liq_score = float(known_liquidity.get(cid, 0))
-        real_size_val = getattr(row, 'size', 0.0)
-
-        if market_liq_score > 100.0:
-            simulated_depth = market_liq_score * 0.01
-        else:
-            simulated_depth = real_size_val
-
-        simulated_depth = max(10.0, simulated_depth)
-        depth_str = f"{simulated_depth:.4f}"
+        # --- SMART QUOTE GENERATION ---
+        # Only emit a new quote if the price has changed significantly
+        # or if it's the first time we see this market in this chunk.
+        last_px = last_price_map.get(cid, -1.0)
         
-        spread = max(0.005, price_float * 0.01)
-        bid_px = max(0.005, price_float - spread)
-        ask_px = min(0.995, price_float + spread)
-        
-        if bid_px >= ask_px:
-            diff = ask_px - bid_px
-            bid_px -= (diff / 2)
-            ask_px += (diff / 2)
-        
-        quote = QuoteTick(
-            instrument_id=inst_id,
-            bid_price=Price.from_str(f"{bid_px:.6f}"),
-            ask_price=Price.from_str(f"{ask_px:.6f}"),
-            bid_size=Quantity.from_str(depth_str),
-            ask_size=Quantity.from_str(depth_str),
-            ts_event=ts_ns - 1,
-            ts_init=ts_ns - 1
-        )
-        results.append(quote)
+        if abs(price_float - last_px) > 0.000001:
+            # Price changed! Generate a fresh Quote to update the Order Book
+            last_price_map[cid] = price_float
+            
+            market_liq_score = float(known_liquidity.get(cid, 0))
+            real_size_val = getattr(row, 'size', 0.0)
 
-        # --- 2. Generate Trade ---
+            if market_liq_score > 100.0:
+                simulated_depth = market_liq_score * 0.01
+            else:
+                simulated_depth = real_size_val
+
+            simulated_depth = max(10.0, simulated_depth)
+            depth_str = f"{simulated_depth:.4f}"
+            
+            spread = max(0.005, price_float * 0.01)
+            bid_px = max(0.005, price_float - spread)
+            ask_px = min(0.995, price_float + spread)
+            
+            if bid_px >= ask_px:
+                diff = ask_px - bid_px
+                bid_px -= (diff / 2)
+                ask_px += (diff / 2)
+            
+            # Create Quote Object
+            quote = QuoteTick(
+                instrument_id=inst_id,
+                bid_price=Price.from_str(f"{bid_px:.6f}"),
+                ask_price=Price.from_str(f"{ask_px:.6f}"),
+                bid_size=Quantity.from_str(depth_str),
+                ask_size=Quantity.from_str(depth_str),
+                ts_event=ts_ns - 1,
+                ts_init=ts_ns - 1
+            )
+            results.append(quote)
+
+        # --- TRADE GENERATION (Always emit trades) ---
         tr_id_str = f"{ts_ns}-{real_idx}"
-        
-        # Capture Wallet Info
         chunk_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
         
         is_sell = getattr(row, 'is_sell', False)
