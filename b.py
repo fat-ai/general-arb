@@ -539,11 +539,11 @@ class PolymarketNautilusStrategy(Strategy):
               roi_score = self.wallet_scores[wallet_key]
         else:
             # UPDATED: Use self.fw_intercept / slope
-            log_vol = np.log1p(usdc_vol)
+            log_vol = math.log1p(usdc_vol)
             roi_score = self.fw_intercept + self.fw_slope * log_vol
             
             raw_skill = max(0.0, roi_score)
-            weight = usdc_vol * (1.0 + min(np.log1p(raw_skill * 100) * 2.0, 10.0))
+            weight = usdc_vol * (1.0 + min(math.log1p(raw_skill * 100) * 2.0, 10.0))
             
             direction = -1.0 if is_sell else 1.0
             tracker['net_weight'] += (weight * direction)
@@ -803,7 +803,7 @@ class FastBacktestEngine:
         valid.loc[short_mask, 'roi'] = (outcome_no - price_no) / price_no
         
         valid['roi'] = valid['roi'].clip(-1.0, 3.0)
-        valid['log_vol'] = np.log1p(valid['usdc_vol'])
+        valid['log_vol'] = np.math(valid['usdc_vol'])
 
         wallet_stats = valid.groupby('wallet_id').agg({
             'roi': 'mean',
