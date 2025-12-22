@@ -167,11 +167,10 @@ def plot_performance(full_equity_curve, trades_count):
         print(f"Plotting failed: {e}")
 
 # --- HELPERS ---
-# [Target: Replace 'process_data_chunk' and 'execute_period_remote' completely]
-
 def process_data_chunk(args):
     """
-    Standard Function (Not Remote): Runs locally to avoid Ray scheduling overhead.
+    PATCHED: Emits Quote (Liquidity) BEFORE Trade to ensure the strategy
+    trades against valid, updated liquidity for the current timestamp.
     """
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
@@ -181,20 +180,50 @@ def process_data_chunk(args):
     df_chunk, inst_map, start_idx, known_liquidity, min_vol = args
     results = []
     chunk_lookup = {}
-    last_price_map = {} 
     
-    # Use itertuples for speed
+    # Pre-fetch attributes to reduce dot-lookup overhead in loop
+    inst_get = inst_map.get
+    
     for idx, row in enumerate(df_chunk.itertuples(index=True)):
         if row.trade_volume < min_vol: continue
+        
         cid = row.contract_id
-        if cid not in inst_map: continue
+        inst_id = inst_get(cid)
+        if inst_id is None: continue
             
         real_idx = start_idx + idx
         ts_ns = int(row.ts_int)
-        inst_id = inst_map[cid]
         price_float = float(row.p_market_all)
         
-        # 1. Emit Trade
+        # --- 1. Emit Quote FIRST (Liquidity Provision) ---
+        # Update the OrderBook so the Strategy sees the NEW state.
+        market_liq = float(known_liquidity.get(cid, 0)) if known_liquidity else 0.0
+        
+        # Dynamic depth: proportional to market liquidity or trade size
+        depth_val = market_liq * 0.01 if market_liq > 100 else max(10.0, getattr(row, 'size', 0.0))
+        depth_str = f"{depth_val:.4f}"
+        
+        spread = max(0.005, price_float * 0.01)
+        bid_px = max(0.005, price_float - spread)
+        ask_px = min(0.995, price_float + spread)
+        
+        # Uncross logic
+        if bid_px >= ask_px:
+            mid = (bid_px + ask_px) / 2
+            bid_px = max(0.005, mid - 0.002)
+            ask_px = min(0.995, mid + 0.002)
+            
+        results.append(QuoteTick(
+            instrument_id=inst_id,
+            bid_price=Price.from_str(f"{bid_px:.6f}"),
+            ask_price=Price.from_str(f"{ask_px:.6f}"),
+            bid_size=Quantity.from_str(depth_str),
+            ask_size=Quantity.from_str(depth_str),
+            ts_event=ts_ns, 
+            ts_init=ts_ns
+        ))
+        
+        # --- 2. Emit Trade SECOND (Trigger Strategy) ---
         tr_id_str = f"{ts_ns}-{real_idx}"
         chunk_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
         
@@ -204,38 +233,20 @@ def process_data_chunk(args):
             size=Quantity.from_str(f"{row.trade_volume:.4f}"),
             aggressor_side=AggressorSide.SELLER if row.is_sell else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
-            ts_event=ts_ns, ts_init=ts_ns
-        ))
-
-        # 2. Emit Quote (Refresh liquidity on every trade to prevent exhaustion)
-        market_liq = float(known_liquidity.get(cid, 0)) if known_liquidity else 0.0
-        depth_val = market_liq * 0.01 if market_liq > 100 else max(10.0, getattr(row, 'size', 0.0))
-        depth_str = f"{depth_val:.4f}"
-        
-        spread = max(0.005, price_float * 0.01)
-        bid_px = max(0.005, price_float - spread)
-        ask_px = min(0.995, price_float + spread)
-        
-        # Uncross
-        if bid_px >= ask_px:
-            mid = (bid_px + ask_px) / 2
-            bid_px, ask_px = mid - 0.002, mid + 0.002
-            
-        results.append(QuoteTick(
-            instrument_id=inst_id,
-            bid_price=Price.from_str(f"{bid_px:.6f}"),
-            ask_price=Price.from_str(f"{ask_px:.6f}"),
-            bid_size=Quantity.from_str(depth_str),
-            ask_size=Quantity.from_str(depth_str),
-            ts_event=ts_ns, ts_init=ts_ns
+            ts_event=ts_ns, 
+            ts_init=ts_ns
         ))
         
     return results, chunk_lookup
-
+    
 @ray.remote
-def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity, market_lifecycle):
+@ray.remote
+def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     """
-    Optimized Worker: Runs data processing locally and manages memory.
+    PATCHED: 
+    1. Returns valid equity curve.
+    2. Extracts and uses correct market liquidity.
+    3. Uses Mark-to-Market valuation for accurate results.
     """
     import gc
     from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
@@ -251,16 +262,24 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
     engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
     
-    # Setup Instruments
+    # Setup Instruments & Extract Liquidity
     price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE'].sort_values('ts_int')
     unique_cids = price_events['contract_id'].unique()
+    
     inst_map = {}
+    local_liquidity = {} # NEW: Local liquidity map
+    
     ts_act = int(start_time.value)
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
+        
+        # Correctly extract liquidity from lifecycle
+        meta = market_lifecycle.get(cid, {})
+        local_liquidity[cid] = float(meta.get('liquidity', 0.0))
+        
         engine.add_instrument(BinaryOption(
             instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
             currency=USDC, price_precision=6, size_precision=4, price_increment=Price.from_str("0.000001"), 
@@ -268,26 +287,23 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
-    # Local Chunk Processing (No Ray Overhead)
-    nautilus_data = []
+    # Stream Processing
     local_wallet_lookup = {}
     chunk_size = 50000
     
     for i in range(0, len(price_events), chunk_size):
         chunk = price_events.iloc[i : i + chunk_size]
-        # Call local function directly
-        ticks, lookup = process_data_chunk((chunk, inst_map, i, known_liquidity, 0.0))
-        nautilus_data.extend(ticks)
+        # Pass the extracted liquidity map here
+        ticks, lookup = process_data_chunk((chunk, inst_map, i, local_liquidity, 0.0))
+        
+        if ticks: engine.add_data(ticks)
         local_wallet_lookup.update(lookup)
+        del ticks, lookup, chunk
 
-    if nautilus_data:
-        engine.add_data(nautilus_data)
-    
-    # Free raw data memory
-    del nautilus_data, price_events
+    del price_events
     gc.collect()
 
-    # Strategy Execution
+    # Strategy Setup
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
     
@@ -312,11 +328,13 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine.add_strategy(strategy)
     engine.run()
     
-    # Results
+    # Results & Valuation
     try: cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     except: cash = 10000.0
     
     open_pos_val = 0.0
+    last_prices = getattr(strategy, 'last_known_prices', {})
+    
     for inst_id, tracker in strategy.positions_tracker.items():
         qty = tracker.get('net_qty', 0.0)
         if abs(qty) < 0.0001: continue
@@ -324,12 +342,23 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         meta = market_lifecycle.get(cid, {})
         outcome = meta.get('final_outcome')
         end_ts = meta.get('end')
+        
+        # Valuation Logic:
+        # 1. If resolved, use Outcome. 
+        # 2. If active, use Mark-to-Market (Last Price).
         if outcome is not None and (end_ts is None or end_ts <= int(end_time.value)):
             open_pos_val += qty * outcome
         else:
-            open_pos_val += qty * tracker.get('avg_price', 0.5)
+            curr_px = last_prices.get(cid, tracker.get('avg_price', 0.5))
+            open_pos_val += qty * curr_px
 
     final_val = cash + open_pos_val
+    
+    captured_curve = list(strategy.equity_history)
+    captured_trades = strategy.total_closed
+    captured_wins = strategy.wins
+    captured_losses = strategy.losses
+    
     engine.dispose()
     del engine, strategy
     gc.collect()
@@ -338,8 +367,10 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         'start_ts': start_time,
         'final_val': final_val,
         'return': (final_val / 10000.0) - 1.0,
-        'trades': 0, 'wins': 0, 'losses': 0,
-        'equity_curve': []
+        'trades': captured_trades, 
+        'wins': captured_wins, 
+        'losses': captured_losses,
+        'equity_curve': captured_curve # Now contains data
     }
     
 def normalize_contract_id(id_str):
@@ -555,29 +586,29 @@ class PolymarketNautilusStrategy(Strategy):
                 self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
     def _record_equity(self):
-        """Record equity with memory-safe growth limiting"""
+        """
+        PATCHED: Uses Simulation Time (Clock) instead of System Time.
+        """
         usdc = Currency.from_str("USDC")
-        # Safety check for portfolio access
+        # Safety check
         if not self.portfolio: return
 
         total_equity = 0.0
         if self.config.active_instrument_ids:
-            # Grab the venue from the first available instrument
+            # Use the first venue found (POLY)
             first_venue = self.config.active_instrument_ids[0].venue
             account = self.portfolio.account(first_venue)
             if account:
                 total_equity = account.balance_total(usdc).as_double()
         
-        if hasattr(self, 'clock') and self.clock is not None:
-            try:
-                now_ts = pd.Timestamp(self.clock.utc_now())
-            except:
-                now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
+        # CRITICAL FIX: Use internal clock, not system time
+        if self.clock:
+            now_ts = pd.Timestamp(self.clock.utc_now())
         else:
-            now_ts = pd.Timestamp.now(tz='UTC').tz_localize(None)
-        
-        self.equity_history.append((now_ts, total_equity))
+            now_ts = pd.Timestamp.now(tz='UTC')
 
+        self.equity_history.append((now_ts, total_equity))
+        
     def on_trade_tick(self, tick: TradeTick):
         # 1. Metadata Retrieval
         tid_val = tick.trade_id.value
@@ -945,7 +976,6 @@ class FastBacktestEngine:
             test_start = train_end + timedelta(days=2)
             test_end = test_start + timedelta(days=test_days)
             
-            # (Slice data code same as original...)
             train_mask = (self.profiler_data['ts_int'] >= current_date.value) & (self.profiler_data['ts_int'] < train_end.value)
             train_profiler = self.profiler_data[train_mask]
             
@@ -974,37 +1004,70 @@ class FastBacktestEngine:
 
         # Stitching Logic (Optimized)
         results_store.sort(key=lambda x: x['start_ts'])
-        capital = 10000.0
+        
         full_equity_curve = []
+        cumulative_compound = 1.0
+        STARTING_CAPITAL = 10000.0
         
-        final_ret = (capital - 10000.0) / 10000.0
+        total_trades = 0
+        total_wins = 0
+        total_losses = 0
         
-        total_trades = sum(r.get('trades', 0) for r in results_store)
-        total_wins = sum(r.get('wins', 0) for r in results_store)
-        total_losses = sum(r.get('losses', 0) for r in results_store)
+        # Stitching Logic
+        for res in results_store:
+            total_trades += res.get('trades', 0)
+            total_wins += res.get('wins', 0)
+            total_losses += res.get('losses', 0)
+            
+            period_curve = res.get('equity_curve', [])
+            if not period_curve:
+                continue
+                
+            # Normalize this period to a return multiplier
+            # We assume every period starts fresh at 10k in the simulation
+            # but in reality, we compound the capital.
+            period_start_val = 10000.0 
+            
+            for ts, val in period_curve:
+                # Calculate period growth factor
+                growth = val / period_start_val
+                
+                # Apply to global cumulative compound
+                real_equity = STARTING_CAPITAL * cumulative_compound * growth
+                full_equity_curve.append((ts, real_equity))
+            
+            # Update compound for the next period based on final value
+            final_period_return = res.get('return', 0.0)
+            cumulative_compound *= (1.0 + final_period_return)
+
+        # Final return based on compounding
+        final_ret = cumulative_compound - 1.0
         
         sharpe = 0.0
         max_dd_pct = 0.0
         
         if full_equity_curve:
-            # Calculate metrics on the stitched curve
+            # Calculate metrics
             equity_values = [x[1] for x in full_equity_curve]
-            
-            # Max Drawdown
             try:
                 max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
             except: 
                 max_dd_pct = 0.0
             
-            # Sharpe (Approximate using daily samples from the curve)
             try:
+                # Convert to Series for Sharpe
                 df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
                 df_eq['ts'] = pd.to_datetime(df_eq['ts'])
                 df_eq = df_eq.set_index('ts').sort_index()
-                # Resample to Daily to get standard Sharpe
-                daily_rets = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
-                sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=252, rf=0.02)
-            except:
+                
+                # Resample strictly to Daily
+                daily_vals = df_eq['equity'].resample('D').last().ffill()
+                daily_rets = daily_vals.pct_change().dropna()
+                
+                if len(daily_rets) > 1:
+                    sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=365, rf=0.02)
+            except Exception as e:
+                print(f"Sharpe calc error: {e}")
                 sharpe = 0.0
 
         return {
