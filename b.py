@@ -169,12 +169,9 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---
 def process_data_chunk(args):
     """
-    OPTIMIZED:
-    1. Uses Vectorized NumPy math for scaling floats to integers.
-    2. Uses Price.from_int64 / Quantity.from_int64 (No string parsing).
-    3. Allocates memory efficiently.
+    FIXED: Uses NumPy for math (fast) but Price.from_str for safety.
+    Removes from_int64 to avoid AttributeError.
     """
-    # Local imports for speed
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
@@ -184,110 +181,82 @@ def process_data_chunk(args):
     results = []
     chunk_lookup = {}
     
-    # 1. Map Instruments efficiently
+    # 1. Map Instruments
     mapped_insts = df_chunk['contract_id'].map(inst_map)
     valid_mask = mapped_insts.notna() & (df_chunk['trade_volume'] >= min_vol)
     
     if not valid_mask.any():
         return results, chunk_lookup
 
-    # 2. Extract and Scale to Int64 (Vectorized)
-    # PRECISION CONSTANTS (Must match execute_period_remote)
-    PRICE_PRECISION = 6
-    PRICE_SCALAR = 1_000_000
-    SIZE_PRECISION = 4
-    SIZE_SCALAR = 10_000
-
-    # Filter data subset
+    # 2. Extract Data (Vectorized Math)
     subset = df_chunk.loc[valid_mask]
-    
     inst_ids = mapped_insts[valid_mask].values
     contract_ids = subset['contract_id'].values
     ts_ints = subset['ts_int'].values.astype('int64')
     
-    # --- VECTORIZED SCALING ---
-    # Prices: Float -> Int64
-    raw_prices = subset['p_market_all'].values.astype('float64')
-    # Clip to ensure valid range [0.000001, 0.999999] before scaling
-    np.clip(raw_prices, 0.000001, 0.999999, out=raw_prices)
-    prices_int = np.rint(raw_prices * PRICE_SCALAR).astype(np.int64)
+    # Use floats for math (Fast)
+    prices = subset['p_market_all'].values.astype('float64')
+    volumes = subset['trade_volume'].values.astype('float64')
     
-    # Volumes: Float -> Int64
-    raw_volumes = subset['trade_volume'].values.astype('float64')
-    volumes_int = np.rint(raw_volumes * SIZE_SCALAR).astype(np.int64)
-    
-    # Sizes (Liquidity Depth): Float -> Int64
     if 'size' in subset.columns:
-        raw_sizes = subset['size'].values.astype('float64')
+        sizes = subset['size'].values.astype('float64')
     else:
-        raw_sizes = np.zeros(len(contract_ids), dtype='float64')
-    
+        sizes = np.zeros(len(contract_ids), dtype='float64')
+        
     wallet_ids = subset['wallet_id'].values.astype(str)
     is_sells = subset['is_sell'].values.astype(bool)
     
     count = len(inst_ids)
     
-    # Pre-calculate Spread Integers
-    # 0.5% spread = 0.005 * 1_000_000 = 5000 units
-    # 1.0% of price = price_int * 0.01
-    SPREAD_MIN_INT = 5000  # 0.005
-    spreads_int = np.maximum(SPREAD_MIN_INT, (prices_int * 0.01).astype(np.int64))
-    
     for i in range(count):
         inst_id = inst_ids[i]
         ts_ns = int(ts_ints[i])
-        px_int = prices_int[i]
-        vol_int = volumes_int[i]
+        price_float = prices[i]
+        vol_float = volumes[i]
         
-        # --- 1. Emit Quote FIRST ---
-        # Calculate Depth
-        # Logic: Max(5000, 1% Liq, 1.5x Trade)
-        # We do this in float for logic simplicity, then cast to int for object creation
+        # --- 1. Emit Quote ---
         cid = contract_ids[i]
         market_liq = float(known_liquidity.get(cid, 0.0)) if known_liquidity else 0.0
         
         depth_val = max(5000.0, market_liq * 0.01)
-        if raw_sizes[i] > depth_val: 
-            depth_val = raw_sizes[i] * 1.5
+        if sizes[i] > depth_val: depth_val = sizes[i] * 1.5
             
-        # Scale depth to int
-        depth_int = int(round(depth_val * SIZE_SCALAR))
+        depth_str = f"{depth_val:.4f}"
         
-        # Calculate Bid/Ask Integers
-        bid_int = px_int - spreads_int[i]
-        ask_int = px_int + spreads_int[i]
-        
-        # Clamp Logic (0.005 to 0.995) -> (5000 to 995000)
-        if bid_int < 5000: bid_int = 5000
-        if ask_int > 995000: ask_int = 995000
+        # Spread Logic (Float Math)
+        spread = max(0.005, price_float * 0.01)
+        bid_px = max(0.005, price_float - spread)
+        ask_px = min(0.995, price_float + spread)
         
         # Uncross
-        if bid_int >= ask_int:
-            mid = (bid_int + ask_int) // 2
-            bid_int = max(5000, mid - 2000) # -0.002
-            ask_int = min(995000, mid + 2000) # +0.002
-
+        if bid_px >= ask_px:
+            mid = (bid_px + ask_px) * 0.5
+            bid_px = max(0.005, mid - 0.002)
+            ask_px = min(0.995, mid + 0.002)
+            
+        # FIX: Reverted to from_str
         results.append(QuoteTick(
             instrument_id=inst_id,
-            bid_price=Price.from_int64(bid_int, PRICE_PRECISION),
-            ask_price=Price.from_int64(ask_int, PRICE_PRECISION),
-            bid_size=Quantity.from_int64(depth_int, SIZE_PRECISION),
-            ask_size=Quantity.from_int64(depth_int, SIZE_PRECISION),
+            bid_price=Price.from_str(f"{bid_px:.6f}"),
+            ask_price=Price.from_str(f"{ask_px:.6f}"),
+            bid_size=Quantity.from_str(depth_str),
+            ask_size=Quantity.from_str(depth_str),
             ts_event=ts_ns, 
             ts_init=ts_ns
         ))
         
-        # --- 2. Emit Trade SECOND ---
+        # --- 2. Emit Trade ---
         ts_trade = ts_ns + 1
         real_idx = start_idx + i 
         tr_id_str = f"{ts_trade}-{real_idx}"
         
         chunk_lookup[tr_id_str] = (wallet_ids[i], is_sells[i])
         
+        # FIX: Reverted to from_str
         results.append(TradeTick(
             instrument_id=inst_id,
-            price=Price.from_int64(px_int, PRICE_PRECISION),
-            size=Quantity.from_int64(vol_int, SIZE_PRECISION),
+            price=Price.from_str(f"{price_float:.6f}"),
+            size=Quantity.from_str(f"{vol_float:.4f}"),
             aggressor_side=AggressorSide.SELLER if is_sells[i] else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
             ts_event=ts_trade, 
@@ -295,14 +264,9 @@ def process_data_chunk(args):
         ))
         
     return results, chunk_lookup
+    
 @ray.remote 
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
-    """
-    PATCHED: 
-    1. Removed duplicate @ray.remote decorator (Syntax Fix).
-    2. Downsamples equity curve to hourly resolution to prevent Ray memory explosion.
-    3. Uses Sim Time for valuation to prevent look-ahead bias.
-    """
     import gc
     import pandas as pd
     from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
@@ -327,30 +291,21 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     ts_act = int(start_time.value)
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
-
+    
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
         meta = market_lifecycle.get(cid, {})
         local_liquidity[cid] = float(meta.get('liquidity', 0.0))
         
-        # UPDATED INSTRUMENT DEFINITION
+        # FIX: Reverted to from_str to prevent AttributeError
         engine.add_instrument(BinaryOption(
-            instrument_id=inst_id, 
-            raw_symbol=Symbol(cid), 
-            asset_class=AssetClass.CRYPTOCURRENCY, 
-            currency=USDC, 
-            price_precision=6,  # Matches PRICE_SCALAR = 1,000,000
-            size_precision=4,   # Matches SIZE_SCALAR = 10,000
-            # Use int64 for increments too for speed/consistency
-            price_increment=Price.from_int64(1, 6),     # 0.000001
-            size_increment=Quantity.from_int64(1, 4),   # 0.0001
-            activation_ns=ts_act, 
-            expiration_ns=ts_exp,
-            ts_event=ts_act, 
-            ts_init=ts_act, 
-            maker_fee=Decimal("0.0"), 
-            taker_fee=Decimal("0.0")
+            instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
+            currency=USDC, price_precision=6, size_precision=4, 
+            price_increment=Price.from_str("0.000001"), 
+            size_increment=Quantity.from_str("0.0001"), 
+            activation_ns=ts_act, expiration_ns=ts_exp,
+            ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
     # Stream Processing
@@ -359,6 +314,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     for i in range(0, len(price_events), chunk_size):
         chunk = price_events.iloc[i : i + chunk_size]
+        # Pass the safe string-based processor
         ticks, lookup = process_data_chunk((chunk, inst_map, i, local_liquidity, 0.0))
         
         if ticks: engine.add_data(ticks)
@@ -408,8 +364,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         outcome = meta.get('final_outcome')
         end_ts = meta.get('end')
         
-        # VALUATION FIX: Ensure we don't look ahead. 
-        # Only use outcome if the market resolved BEFORE the simulation ended.
         if outcome is not None and (end_ts is not None and end_ts <= int(end_time.value)):
             open_pos_val += qty * outcome
         else:
@@ -418,20 +372,14 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
     final_val = cash + open_pos_val
     
-    # --- PERFORMANCE PATCH: Downsample Equity Curve ---
-    # Prevents massive object serialization overhead
+    # Capture Equity Curve
     full_curve = strategy.equity_history
     if len(full_curve) > 2000:
-        # Convert to DF for easy resampling (local to worker)
         df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
         df_eq['ts'] = pd.to_datetime(df_eq['ts'])
         df_eq = df_eq.set_index('ts')
-        
-        # Resample to Hourly
         resampled = df_eq.resample('h').last().dropna()
         captured_curve = list(resampled['val'].items())
-        
-        # Append exact final value if not present
         if full_curve and full_curve[-1][0] > captured_curve[-1][0]:
             captured_curve.append(full_curve[-1])
     else:
@@ -453,7 +401,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         'wins': captured_wins, 
         'losses': captured_losses,
         'equity_curve': captured_curve 
-    }    
+    }
+
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
