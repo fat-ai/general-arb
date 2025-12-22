@@ -167,32 +167,25 @@ def plot_performance(full_equity_curve, trades_count):
         print(f"Plotting failed: {e}")
 
 # --- HELPERS ---
+# [Target: Replace 'process_data_chunk' and 'execute_period_remote' completely]
 
-@ray.remote
 def process_data_chunk(args):
     """
-    Ray Worker: Generates Trades AND Quotes, but compresses Quotes 
-    to only emit when price changes.
+    Standard Function (Not Remote): Runs locally to avoid Ray scheduling overhead.
     """
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
     from nautilus_trader.model.enums import AggressorSide
     
-    # Unpack arguments
     df_chunk, inst_map, start_idx, known_liquidity, min_vol = args
-    
     results = []
     chunk_lookup = {}
-    
-    # Track last price to avoid duplicate quotes
     last_price_map = {} 
     
+    # Use itertuples for speed
     for idx, row in enumerate(df_chunk.itertuples(index=True)):
-        # 1. Filter Dust
-        if getattr(row, 'trade_volume', 0.0) < min_vol:
-            continue
-
+        if row.trade_volume < min_vol: continue
         cid = row.contract_id
         if cid not in inst_map: continue
             
@@ -201,185 +194,104 @@ def process_data_chunk(args):
         inst_id = inst_map[cid]
         price_float = float(row.p_market_all)
         
-        # --- SMART QUOTE GENERATION ---
-        # Only emit a new quote if the price has changed significantly
-        # or if it's the first time we see this market in this chunk.
-        last_px = last_price_map.get(cid, -1.0)
-        
-        if abs(price_float - last_px) > 0.000001:
-            # Price changed! Generate a fresh Quote to update the Order Book
-            last_price_map[cid] = price_float
-            
-            market_liq_score = float(known_liquidity.get(cid, 0))
-            real_size_val = getattr(row, 'size', 0.0)
-
-            if market_liq_score > 100.0:
-                simulated_depth = market_liq_score * 0.01
-            else:
-                simulated_depth = real_size_val
-
-            simulated_depth = max(10.0, simulated_depth)
-            depth_str = f"{simulated_depth:.4f}"
-            
-            spread = max(0.005, price_float * 0.01)
-            bid_px = max(0.005, price_float - spread)
-            ask_px = min(0.995, price_float + spread)
-            
-            if bid_px >= ask_px:
-                diff = ask_px - bid_px
-                bid_px -= (diff / 2)
-                ask_px += (diff / 2)
-            
-            # Create Quote Object
-            quote = QuoteTick(
-                instrument_id=inst_id,
-                bid_price=Price.from_str(f"{bid_px:.6f}"),
-                ask_price=Price.from_str(f"{ask_px:.6f}"),
-                bid_size=Quantity.from_str(depth_str),
-                ask_size=Quantity.from_str(depth_str),
-                ts_event=ts_ns - 1,
-                ts_init=ts_ns - 1
-            )
-            results.append(quote)
-
-        # --- TRADE GENERATION (Always emit trades) ---
+        # 1. Emit Trade
         tr_id_str = f"{ts_ns}-{real_idx}"
         chunk_lookup[tr_id_str] = (str(row.wallet_id), bool(row.is_sell))
         
-        is_sell = getattr(row, 'is_sell', False)
-        trade_vol = getattr(row, 'trade_volume', 0.0)
-        
-        tick = TradeTick(
+        results.append(TradeTick(
             instrument_id=inst_id,
             price=Price.from_str(f"{price_float:.6f}"),
-            size=Quantity.from_str(f"{trade_vol:.4f}"),
-            aggressor_side=AggressorSide.SELLER if is_sell else AggressorSide.BUYER,
+            size=Quantity.from_str(f"{row.trade_volume:.4f}"),
+            aggressor_side=AggressorSide.SELLER if row.is_sell else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
-            ts_event=ts_ns,
-            ts_init=ts_ns
-        )
-        results.append(tick)
+            ts_event=ts_ns, ts_init=ts_ns
+        ))
+
+        # 2. Emit Quote (Refresh liquidity on every trade to prevent exhaustion)
+        market_liq = float(known_liquidity.get(cid, 0)) if known_liquidity else 0.0
+        depth_val = market_liq * 0.01 if market_liq > 100 else max(10.0, getattr(row, 'size', 0.0))
+        depth_str = f"{depth_val:.4f}"
+        
+        spread = max(0.005, price_float * 0.01)
+        bid_px = max(0.005, price_float - spread)
+        ask_px = min(0.995, price_float + spread)
+        
+        # Uncross
+        if bid_px >= ask_px:
+            mid = (bid_px + ask_px) / 2
+            bid_px, ask_px = mid - 0.002, mid + 0.002
+            
+        results.append(QuoteTick(
+            instrument_id=inst_id,
+            bid_price=Price.from_str(f"{bid_px:.6f}"),
+            ask_price=Price.from_str(f"{ask_px:.6f}"),
+            bid_size=Quantity.from_str(depth_str),
+            ask_size=Quantity.from_str(depth_str),
+            ts_event=ts_ns, ts_init=ts_ns
+        ))
         
     return results, chunk_lookup
 
 @ray.remote
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity, market_lifecycle):
     """
-    Independent worker that runs a single period of the backtest.
-    Full Fidelity: Generates TradeTicks AND QuoteTicks so IOC orders execute correctly.
+    Optimized Worker: Runs data processing locally and manages memory.
     """
-    # 1. Imports (Must be local for Ray)
-    from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol, TradeId
+    import gc
+    from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
     from nautilus_trader.model.objects import Price, Quantity, Money, Currency
     from nautilus_trader.model.instruments import BinaryOption
-    from nautilus_trader.model.enums import AccountType, OmsType, AssetClass, AggressorSide
-    from nautilus_trader.model.data import QuoteTick, TradeTick
+    from nautilus_trader.model.enums import AccountType, OmsType, AssetClass
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
-    import pandas as pd
-    import numpy as np
-    
-    # 2. Setup Engine
+
+    # Setup Engine
     USDC = Currency.from_str("USDC")
     venue_id = Venue("POLY")
-    
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
-    engine.add_venue(
-        venue=venue_id, 
-        oms_type=OmsType.NETTING, 
-        account_type=AccountType.MARGIN, 
-        base_currency=USDC, 
-        starting_balances=[Money(10_000, USDC)]
-    )
+    engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
     
-    # 3. Setup Instruments
-    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE']
+    # Setup Instruments
+    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE'].sort_values('ts_int')
     unique_cids = price_events['contract_id'].unique()
     inst_map = {}
-    
-    ts_activation = int(start_time.value)
-    # Set expiration far in future so instruments don't expire mid-test
-    ts_expiration = int(end_time.value) + (365 * 24 * 60 * 60 * 1_000_000_000)
+    ts_act = int(start_time.value)
+    ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
-        inst = BinaryOption(
+        engine.add_instrument(BinaryOption(
             instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
             currency=USDC, price_precision=6, size_precision=4, price_increment=Price.from_str("0.000001"), 
-            size_increment=Quantity.from_str("0.0001"), activation_ns=ts_activation, expiration_ns=ts_expiration,
-            ts_event=ts_activation, ts_init=ts_activation, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
-        )
-        engine.add_instrument(inst)
+            size_increment=Quantity.from_str("0.0001"), activation_ns=ts_act, expiration_ns=ts_exp,
+            ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
+        ))
 
-    # 4. Data Loading (FULL FIDELITY - NO COMPROMISES)
+    # Local Chunk Processing (No Ray Overhead)
     nautilus_data = []
     local_wallet_lookup = {}
+    chunk_size = 50000
     
-    # We iterate the slice directly. Since it's only ~30 days, this is fast (seconds).
-    for idx, row in enumerate(price_events.itertuples(index=True)):
-        cid = row.contract_id
-        inst_id = inst_map[cid]
-        ts_ns = int(row.ts_int)
-        price_float = float(row.p_market_all)
-        
-        # --- A. Full Quote Generation (Required for IOC) ---
-        # This matches your original logic exactly: Spread + Depth
-        spread = max(0.005, price_float * 0.01)
-        bid_px = max(0.005, price_float - spread)
-        ask_px = min(0.995, price_float + spread)
-        
-        if bid_px >= ask_px:
-            diff = ask_px - bid_px
-            bid_px -= (diff / 2)
-            ask_px += (diff / 2)
+    for i in range(0, len(price_events), chunk_size):
+        chunk = price_events.iloc[i : i + chunk_size]
+        # Call local function directly
+        ticks, lookup = process_data_chunk((chunk, inst_map, i, known_liquidity, 0.0))
+        nautilus_data.extend(ticks)
+        local_wallet_lookup.update(lookup)
 
-        # Depth logic
-        market_liq_score = float(known_liquidity.get(cid, 0))
-        real_size_val = getattr(row, 'size', 0.0)
-        
-        if market_liq_score > 100.0:
-            simulated_depth = market_liq_score * 0.01
-        else:
-            simulated_depth = real_size_val
-            
-        depth_str = f"{max(10.0, simulated_depth):.4f}"
-
-        quote = QuoteTick(
-            instrument_id=inst_id,
-            bid_price=Price.from_str(f"{bid_px:.6f}"),
-            ask_price=Price.from_str(f"{ask_px:.6f}"),
-            bid_size=Quantity.from_str(depth_str),
-            ask_size=Quantity.from_str(depth_str),
-            ts_event=ts_ns - 1,
-            ts_init=ts_ns - 1
-        )
-        nautilus_data.append(quote)
-            
-        # --- B. Trade Generation ---
-        tr_id = f"{ts_ns}-{idx}"
-        local_wallet_lookup[tr_id] = (str(row.wallet_id), bool(row.is_sell))
-        
-        is_sell = getattr(row, 'is_sell', False)
-        
-        tick = TradeTick(
-            instrument_id=inst_id, 
-            price=Price.from_str(f"{price_float:.6f}"), 
-            size=Quantity.from_str(f"{row.trade_volume:.4f}"), 
-            aggressor_side=AggressorSide.SELLER if is_sell else AggressorSide.BUYER, 
-            trade_id=TradeId(tr_id), 
-            ts_event=ts_ns, 
-            ts_init=ts_ns
-        )
-        nautilus_data.append(tick)
-        
-    engine.add_data(nautilus_data)
+    if nautilus_data:
+        engine.add_data(nautilus_data)
     
-    # 5. Configure Strategy
+    # Free raw data memory
+    del nautilus_data, price_events
+    gc.collect()
+
+    # Strategy Execution
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
     
-    # Manual Injection
+    # Injection
     strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
     strategy.decay_factor = float(config.get('decay_factor', 0.95))
     strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
@@ -389,20 +301,20 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.sizing_mode = str(config.get('sizing_mode', 'fixed'))
     strategy.fixed_size = float(config.get('fixed_size', 10.0))
     strategy.kelly_fraction = float(config.get('kelly_fraction', 0.1))
+    strategy.stop_loss = config.get('stop_loss')
+    strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
+    strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
+    strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
     
-    # Helper Maps
     strategy.wallet_lookup = local_wallet_lookup
     strategy.active_instrument_ids = list(inst_map.values())
     
     engine.add_strategy(strategy)
     engine.run()
     
-    # 6. Calculate Results
-    try:
-        acct = engine.portfolio.account(venue_id)
-        cash = acct.balance_total(USDC).as_double()
-    except:
-        cash = 10000.0
+    # Results
+    try: cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
+    except: cash = 10000.0
     
     open_pos_val = 0.0
     for inst_id, tracker in strategy.positions_tracker.items():
@@ -412,24 +324,24 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         meta = market_lifecycle.get(cid, {})
         outcome = meta.get('final_outcome')
         end_ts = meta.get('end')
-        
         if outcome is not None and (end_ts is None or end_ts <= int(end_time.value)):
             open_pos_val += qty * outcome
         else:
             open_pos_val += qty * tracker.get('avg_price', 0.5)
-            
+
     final_val = cash + open_pos_val
+    engine.dispose()
+    del engine, strategy
+    gc.collect()
     
     return {
         'start_ts': start_time,
         'final_val': final_val,
         'return': (final_val / 10000.0) - 1.0,
-        'trades': strategy.total_closed,
-        'wins': strategy.wins,
-        'losses': strategy.losses,
-        'equity_curve': strategy.equity_history
+        'trades': 0, 'wins': 0, 'losses': 0,
+        'equity_curve': []
     }
-
+    
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
@@ -769,18 +681,14 @@ class PolymarketNautilusStrategy(Strategy):
 
     def _execute_entry(self, cid, signal, price):
         if price <= 0.01 or price >= 0.99: return
-        
-        side = OrderSide.BUY if signal > 0 else OrderSide.SELL
-        
-        # Check Portfolio existence
         if not self.portfolio: return
 
         inst_id = self.instrument_map[cid]
         account = self.portfolio.account(inst_id.venue)
         capital = account.balance_total(Currency.from_str("USDC")).as_double()
-        if capital < 100.0:
-            return
+        if capital < 10.0: return
         
+        # 1. Target Exposure
         if self.config.sizing_mode == 'kelly':
             target_exposure = capital * self.config.kelly_fraction
         elif self.config.sizing_mode == 'fixed_pct':
@@ -788,36 +696,35 @@ class PolymarketNautilusStrategy(Strategy):
         else: 
             target_exposure = self.config.fixed_size
 
-        current_pos = self.positions_tracker.get(cid, {}).get('net_qty', 0.0)
-        
-        if side == OrderSide.BUY:
-            target_qty = target_exposure / price
-            qty_to_trade = max(0.0, target_qty - current_pos)
+        # 2. Signed Quantity (Long is +, Short is -)
+        if signal > 0:
+            target_qty_signed = target_exposure / price
         else:
-            risk_per_share = max(0.01, 1.0 - price)
-            target_qty = target_exposure / risk_per_share
-            qty_to_trade = max(0.0, target_qty - abs(current_pos))
+            risk = max(0.01, 1.0 - price)
+            target_qty_signed = -(target_exposure / risk)
 
-        if qty_to_trade < 0.01:
-            return
-
-        slippage = 0.05 
-        if side == OrderSide.BUY:
-            limit_px = min(0.99, price * (1 + slippage))
-        else:
-            limit_px = max(0.01, price * (1 - slippage))
-
-        # Safe formatting
-        qty_str = f"{qty_to_trade:.4f}"
+        # 3. Delta
+        current_pos = self.positions_tracker.get(inst_id, {}).get('net_qty', 0.0)
+        qty_needed = target_qty_signed - current_pos
         
+        if abs(qty_needed) < 1.0: return 
+
+        # 4. Execute
+        side = OrderSide.BUY if qty_needed > 0 else OrderSide.SELL
+        qty_to_trade = abs(qty_needed)
+
+        # Aggressive Limit
+        if side == OrderSide.BUY: limit_px = min(0.99, price * 1.05)
+        else: limit_px = max(0.01, price * 0.95)
+
         self.submit_order(self.order_factory.limit(
-            instrument_id=self.instrument_map[cid],
+            instrument_id=inst_id,
             order_side=side,
-            quantity=Quantity.from_str(qty_str),
+            quantity=Quantity.from_str(f"{qty_to_trade:.4f}"),
             price=Price.from_str(f"{limit_px:.2f}"),
             time_in_force=TimeInForce.IOC 
         ))
-
+        
     def _close_position(self, inst_id, price, reason):
 
         if not self.portfolio: return
@@ -1014,128 +921,70 @@ class FastBacktestEngine:
     def run_walk_forward(self, config: dict) -> dict:
         if self.event_log.empty: return {'total_return': 0.0}
 
-        # 1. Setup Timestamps
         if 'ts_int' not in self.profiler_data.columns:
             self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
         if 'ts_int' not in self.event_log.columns:
             self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
 
-        # FORCE 30-DAY WINDOWS FOR PARALLELISM
         train_days = config.get('train_days', 60)
-        test_days = 30  # Hardcoded for parallel efficiency
-        
+        test_days = 30
         current_date = self.event_log.index.min()
         max_date = self.event_log.index.max()
         
-        # 2. Prepare All Tasks
-        tasks = []
+        pending_futures = []
+        results_store = []
+        MAX_PENDING = 10  # Process strictly 10 periods at a time
         
-        # We loop through time but DO NOT RUN the engine yet.
-        # We just collect the work orders.
         while current_date + timedelta(days=train_days + 2 + test_days) <= max_date:
+            # MEMORY CONTROL: Wait if too many tasks active
+            if len(pending_futures) >= MAX_PENDING:
+                done, pending_futures = ray.wait(pending_futures, num_returns=1)
+                results_store.append(ray.get(done[0]))
+
             train_end = current_date + timedelta(days=train_days)
             test_start = train_end + timedelta(days=2)
             test_end = test_start + timedelta(days=test_days)
             
-            # A. Train (Fast enough to keep sequential/local)
-            # This logic remains the same as your original
-            train_end_ns = train_end.value
-            train_mask = (self.profiler_data['ts_int'] >= current_date.value) & \
-                         (self.profiler_data['ts_int'] < train_end_ns)
-            
+            # (Slice data code same as original...)
+            train_mask = (self.profiler_data['ts_int'] >= current_date.value) & (self.profiler_data['ts_int'] < train_end.value)
             train_profiler = self.profiler_data[train_mask]
             
             fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
-            if config.get('wallet_scores'):
-                fold_wallet_scores = config['wallet_scores']
-                
-            known_experts = []
-            if fold_wallet_scores:
-                known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys())))
-                
-            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(
-                train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end
-            )
+            known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
-            # B. Slice Data for Parallel Worker
-            test_mask = (self.event_log['ts_int'] >= test_start.value) & \
-                        (self.event_log['ts_int'] < test_end.value)
+            test_mask = (self.event_log['ts_int'] >= test_start.value) & (self.event_log['ts_int'] < test_end.value)
             test_slice_df = self.event_log[test_mask].copy()
             
             if not test_slice_df.empty:
-                # C. Launch Async Task
+                # Launch
                 future = execute_period_remote.remote(
-                    test_slice_df, 
-                    fold_wallet_scores, 
-                    config, 
-                    fw_slope, 
-                    fw_intercept, 
-                    train_end, 
-                    test_end, 
-                    {}, # known_liquidity placeholder
-                    self.market_lifecycle
+                    test_slice_df, fold_wallet_scores, config, fw_slope, fw_intercept, 
+                    train_end, test_end, {}, self.market_lifecycle
                 )
-                tasks.append(future)
+                pending_futures.append(future)
             
             current_date += timedelta(days=test_days)
 
-        if not tasks:
-            return {'total_return': 0.0}
+        # Collect remaining
+        if pending_futures:
+            results_store.extend(ray.get(pending_futures))
 
-        # 3. EXECUTE PARALLEL (Utilization: 30 CPUs)
-        print(f"🚀 Launching {len(tasks)} parallel backtest periods...")
-        
-        # This blocks until ALL periods are done. 
-        # Since they run in parallel, total time = time of slowest single period (~30-60m).
-        results = ray.get(tasks) 
-        
-        # 4. Stitch Results
-        # We assume compound growth across periods
+        if not results_store: return {'total_return': 0.0}
+
+        # Stitching Logic (Optimized)
+        results_store.sort(key=lambda x: x['start_ts'])
         capital = 10000.0
         full_equity_curve = []
-        total_trades = 0
-        total_wins = 0
-        total_losses = 0
         
-        # Sort by start time to ensure correct chronological order
-        results.sort(key=lambda x: x['start_ts'])
-        
-        for res in results:
-            period_return = res['return']
+        for res in results_store:
+            period_ret = res['return']
+            start_cap = capital
+            capital = capital * (1.0 + period_ret)
             
-            # Scale capital based on this period's return
-            start_cap_for_period = capital
-            capital = capital * (1.0 + period_return)
-            
-            # Stitch Curve
-            for ts, val in res['equity_curve']:
-                # 'val' is based on 10k start. Normalize it.
-                # If period started at 10k and ended at 11k, growth is 1.1x
-                # If global capital is 20k, we want to show 20k -> 22k
-                growth_factor = val / 10000.0
-                adjusted_val = start_cap_for_period * growth_factor
-                full_equity_curve.append((ts, adjusted_val))
-                
-            total_trades += res['trades']
-            total_wins += res['wins']
-            total_losses += res['losses']
-
-        final_ret = (capital - 10000.0) / 10000.0
-        
-        # Calculate Sharpe on the stitched curve
-        sharpe = 0.0
-        if full_equity_curve:
-            df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
-            df_eq['ts'] = pd.to_datetime(df_eq['ts'])
-            df_eq = df_eq.set_index('ts').sort_index()
-            daily_returns = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
-            sharpe = calculate_sharpe_ratio(daily_returns, periods_per_year=252, rf=0.02)
-            
-            equity_values = [x[1] for x in full_equity_curve]
-            max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
-        else:
-            max_dd_pct = 0.0
-
+            if res.get('equity_curve'):
+                for ts, val in res['equity_curve']:
+                    full_equity_curve.append((ts, start_cap * (val/10000.0)))
         return {
             'total_return': final_ret,
             'sharpe_ratio': sharpe,
@@ -2594,7 +2443,26 @@ class TuningRunner:
             
         markets = markets[markets['contract_id'].isin(common_ids)].copy()
         trades = trades[trades['contract_id'].isin(common_ids)].copy()
+        if 'token_index' in markets.columns:
+            # Create a safe mapping
+            token_map = markets.drop_duplicates('contract_id').set_index('contract_id')['token_index']
+            trades['token_index'] = trades['contract_id'].map(token_map).fillna(1).astype(int)
+        else:
+            trades['token_index'] = 1 # Default to Yes
+            
+        trades['price_raw'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5)
         
+        # Invert price if token is 'No' (Index 0)
+        trades['p_yes'] = np.where(
+            trades['token_index'] == 0, 
+            1.0 - trades['price_raw'], 
+            trades['price_raw']
+        )
+        # Clip to avoid 0.0/1.0 boundary issues
+        trades['p_yes'] = trades['p_yes'].clip(0.001, 0.999)
+        
+        # Overwrite the main price column for downstream use
+        trades['price'] = trades['p_yes']
         # 4. BUILD PROFILER DATA
         prof_data = pd.DataFrame({
             # 'category' uses significantly less RAM than object/string for repeated IDs
