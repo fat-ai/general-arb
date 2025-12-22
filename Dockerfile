@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir \
     hyperopt \
     dash \
     plotly \
-    pyarrow
+    pyarrow \
+    polars
 
 # 5. Set working directory
 WORKDIR /app
