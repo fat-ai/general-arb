@@ -255,8 +255,8 @@ def process_data_chunk(args):
         # FIX: Reverted to from_str
         results.append(TradeTick(
             instrument_id=inst_id,
-            price=Price.from_str(f"{price_float:.6f}"),
-            size=Quantity.from_str(f"{vol_float:.4f}"),
+            price=Price.from_raw(int(price_float * PRICE_PRECISION), 6),
+            size=Quantity.from_raw(int(vol_float * QTY_PRECISION), 4),
             aggressor_side=AggressorSide.SELLER if is_sells[i] else AggressorSide.BUYER,
             trade_id=TradeId(tr_id_str),
             ts_event=ts_trade, 
@@ -291,19 +291,21 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     ts_act = int(start_time.value)
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
-    
+    PRICE_INC = Price.from_raw(1, 6)
+    SIZE_INC = Quantity.from_raw(1, 4) 
+
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
         inst_map[cid] = inst_id
         meta = market_lifecycle.get(cid, {})
         local_liquidity[cid] = float(meta.get('liquidity', 0.0))
-        
+
         # FIX: Reverted to from_str to prevent AttributeError
         engine.add_instrument(BinaryOption(
             instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
             currency=USDC, price_precision=6, size_precision=4, 
-            price_increment=Price.from_str("0.000001"), 
-            size_increment=Quantity.from_str("0.0001"), 
+            price_increment=PRICE_INC, 
+            size_increment=SIZE_INC, 
             activation_ns=ts_act, expiration_ns=ts_exp,
             ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
