@@ -207,7 +207,8 @@ def process_data_chunk(args):
     is_sells = subset['is_sell'].values.astype(bool)
     
     count = len(inst_ids)
-    
+    PRICE_PRECISION = 1_000_000  # 10^6
+    QTY_PRECISION = 10_000  
     for i in range(count):
         inst_id = inst_ids[i]
         ts_ns = int(ts_ints[i])
