@@ -166,14 +166,13 @@ def plot_performance(full_equity_curve, trades_count):
     except Exception as e:
         print(f"Plotting failed: {e}")
 
-# --- HELPERS ---
+# --- HELPERS ---def process_data_chunk(args):
 def process_data_chunk(args):
     """
-    FINAL ROBUST VERSION: 
-    - Includes 'Whale Logic' (Heuristic Override).
-    - Includes 'Liquidity Penalty' (Accuracy Fix).
-    - Includes 'Economic Reality Filter' (Drops trades >$5M to prevent Fake Whales).
-    - Includes 'Crash Protection' (Drops Int64 Overflows).
+    FINAL ROBUST VERSION:
+    - [FIX] Casts contract_id to 'str' before mapping (Fixes 0 Events).
+    - [FIX] Clamps Quantity to prevent Engine Crashes (Fixes ValueError).
+    - [FIX] Filters unrealistic trade sizes ($5M+).
     """
     import math
     import numpy as np
@@ -185,34 +184,37 @@ def process_data_chunk(args):
     # Unpack args
     df_chunk, inst_map, start_idx, known_liquidity, min_vol, wallet_scores, fw_slope, fw_intercept = args
     
-    # 1. Filter Valid Data
-    mapped_insts = df_chunk['contract_id'].map(inst_map)
-    vols = df_chunk['trade_volume'].fillna(0) # USDC volume
+    # [CRITICAL FIX 1] Explicitly cast to string to ensure lookup works against inst_map
+    mapped_insts = df_chunk['contract_id'].astype(str).map(inst_map)
+    vols = df_chunk['trade_volume'].fillna(0)
+    
+    # Ensure min_vol is respected
     valid_mask = mapped_insts.notna() & (vols >= min_vol)
     
     if not valid_mask.any(): return [], {}
 
     subset = df_chunk.loc[valid_mask]
     
-    # 2. Setup Constants
+    # Setup Constants
     PRICE_SCALAR = 1_000_000.0
     SIZE_SCALAR = 10_000.0
-    
-    # [SAFETY LIMITS]
-    # Physics Limit: ~20 Trillion raw units (2 Billion tokens)
+    # [SAFETY] Cap raw int values to ~20 Trillion (Nautilus limit is ~34T)
     MAX_QTY_INT = 20_000_000_000_000  
-    # Economic Limit: $5 Million USD per trade (Prevents Decimal Errors/Fake Whales)
     MAX_USDC_PER_TRADE = 5_000_000.0  
 
     prices = subset['p_market_all'].values
-    volumes = subset['trade_volume'].values # USDC
-    sizes = subset['size'].values if 'size' in subset.columns else np.zeros(len(subset))
+    volumes = subset['trade_volume'].fillna(0).values 
     
-    # 3. Vectorized Spread & Liquidity Penalty
+    # Handle missing/NaN sizes
+    if 'size' in subset.columns:
+        sizes = subset['size'].fillna(0).values
+    else:
+        sizes = np.zeros(len(subset))
+    
+    # Spread & Liquidity Penalty
     cids = subset['contract_id'].values
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
     
-    # Penalty: Low Liquidity ($1k) -> Higher Spread
     liq_penalty = 20000.0 / (liq_values + 1000.0)
     calculated_spreads = 0.005 + (liq_penalty * 0.0001)
     spreads = np.minimum(0.20, calculated_spreads)
@@ -220,7 +222,7 @@ def process_data_chunk(args):
     bids = np.maximum(0.005, prices - spreads)
     asks = np.minimum(0.995, prices + spreads)
     
-    # Uncross logic
+    # Uncross
     mid_mask = bids >= asks
     mids = (bids + asks) * 0.5
     bids[mid_mask] = np.maximum(0.005, mids[mid_mask] - 0.002)
@@ -230,62 +232,51 @@ def process_data_chunk(args):
     ask_ints = (np.round(asks * PRICE_SCALAR)).astype(np.int64)
     price_ints = (np.round(prices * PRICE_SCALAR)).astype(np.int64)
     
-    # Depth Logic
+    # Depth Logic (Clamped)
     depth_vals = np.maximum(5000.0, liq_values * 0.01)
     large_size_mask = sizes > depth_vals
     depth_vals[large_size_mask] = sizes[large_size_mask] * 1.5
     
     depth_ints = (depth_vals * SIZE_SCALAR).astype(np.int64)
-    # [FIX] Clamp depth (It's synthetic background noise, so clamping is safe here)
+    # [CRITICAL FIX 2] Clamp depth to avoid crashing Nautilus
     depth_ints = np.minimum(depth_ints, MAX_QTY_INT)
     
-    # Trade Size Logic
     vol_ints = (sizes * SIZE_SCALAR).astype(np.int64)
 
-    # 4. Score Calculation (Whale Logic)
+    # Score Calculation
     wallet_ids = subset['wallet_id'].values.astype(str)
     precomputed_scores = []
     
     for i in range(len(wallet_ids)):
         usdc_vol = volumes[i]
-        
         if usdc_vol >= 1.0:
             key = f"{wallet_ids[i]}|default_topic"
             score = wallet_scores.get(key)
             if score is None:
                 log_vol = math.log1p(usdc_vol)
                 score = fw_intercept + (fw_slope * log_vol)
-                # Heuristic: Trust massive volume
                 if usdc_vol > 2000.0: score = max(score, 0.06) 
                 elif usdc_vol > 500.0: score = max(score, 0.02)
         else:
             score = 0.0
         precomputed_scores.append(score)
 
-    # 5. Object Creation with FILTERING
+    # Object Creation
     results = []
     chunk_lookup = {}
     inst_objs = mapped_insts[valid_mask].values
     ts_ints = subset['ts_int'].values.astype(np.int64)
     is_sells = subset['is_sell'].values.astype(bool)
     
-    # Detect safe constructor
     try:
         Price.from_int64(1000000, 6); use_from_int64 = True
     except AttributeError: use_from_int64 = False
 
     for i in range(len(inst_objs)):
-        # --- ROBUST FILTERING ---
-        
-        # 1. Physics Check: Would this crash the engine?
-        if vol_ints[i] > MAX_QTY_INT:
-            continue
-            
-        # 2. Economic Check: Is this trade worth > $5 Million? (Data Glitch)
-        if volumes[i] > MAX_USDC_PER_TRADE:
-            continue
-            
-        # ------------------------
+        # [CRITICAL FIX 3] Skip Garbage Trades that overflow physics engine
+        if vol_ints[i] > MAX_QTY_INT: continue
+        if volumes[i] > MAX_USDC_PER_TRADE: continue
+        if vol_ints[i] <= 0: continue 
 
         inst_id = inst_objs[i]
         ts_ns = int(ts_ints[i])
@@ -329,12 +320,17 @@ def process_data_chunk(args):
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     import gc
     import pandas as pd
+    import numpy as np
+    import logging
     from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
-    from nautilus_trader.model.objects import Price, Quantity, Money, Currency
+    from nautilus_trader.model.objects import Money, Currency, Price, Quantity
     from nautilus_trader.model.instruments import BinaryOption
     from nautilus_trader.model.enums import AccountType, OmsType, AssetClass
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
+
+    # [FIX] Silence Logger to speed up initialization (Fixes 5-hour hang)
+    logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
 
     # Setup Engine
     USDC = Currency.from_str("USDC")
@@ -342,18 +338,21 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
     engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
     
-    # Setup Instruments & Extract Liquidity
-    # We filter for PRICE_UPDATE events to get active contracts
-    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE'].sort_values('ts_int')
+    # [FIX] Force String Type for Mapping keys and sort chronologically
+    slice_df = slice_df.sort_values('ts_int').copy()
+    
+    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE'].copy()
+    price_events['contract_id'] = price_events['contract_id'].astype(str)
+    
     unique_cids = price_events['contract_id'].unique()
     
     inst_map = {}
     local_liquidity = {} 
     
     ts_act = int(start_time.value)
+    # Expiration: Set far in future to keep instruments active
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
-    # Pre-create increments to save time in loop
     PRICE_INC = Price.from_str("0.000001")
     SIZE_INC = Quantity.from_str("0.0001") 
 
@@ -372,21 +371,26 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
-    # --- OPTIMIZED DATA LOADING ---
+    # --- OPTIMIZED DATA LOADING WITH PROGRESS ---
     local_wallet_lookup = {}
-    chunk_size = 100000  # Increased chunk size for better throughput
+    chunk_size = 100000
     
-    # Filter valid instruments upfront to avoid repetitive map/drop inside the hot loop
-    price_events['inst_map_check'] = price_events['contract_id'].map(inst_map)
+    # [FIX] Cast to string so .map() matches the keys in inst_map
+    price_events['inst_map_check'] = price_events['contract_id'].astype(str).map(inst_map)
     price_events = price_events.dropna(subset=['inst_map_check'])
     
-    # DISABLE GC for the hot data loading loop to prevent stuttering
     gc.disable()
     
     try:
-        for i in range(0, len(price_events), chunk_size):
+        total_rows = len(price_events)
+        for i in range(0, total_rows, chunk_size):
+            # [PROGRESS] Print status every ~20% of the load
+            if i > 0 and i % (chunk_size * 2) == 0:
+                print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
+
             chunk = price_events.iloc[i : i + chunk_size]
-            # Pass new args: wallet_scores, slope, intercept
+            
+            # Pass new args including whale logic params
             ticks, lookup = process_data_chunk((
                 chunk, inst_map, i, local_liquidity, 0.0,
                 wallet_scores, float(fw_slope), float(fw_intercept)
@@ -395,10 +399,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             if ticks: engine.add_data(ticks)
             local_wallet_lookup.update(lookup)
             
-            # Manual fast cleanup since GC is off
             del ticks, lookup, chunk
     finally:
-        # ALWAYS re-enable GC after the heavy lifting
         gc.enable()
 
     del price_events
@@ -412,8 +414,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
     strategy.decay_factor = float(config.get('decay_factor', 0.95))
     strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
-    # Note: wallet_scores is no longer needed for lookup in the strategy, 
-    # but we keep it in case other logic depends on it.
     strategy.wallet_scores = wallet_scores
     strategy.fw_slope = float(fw_slope)
     strategy.fw_intercept = float(fw_intercept)
@@ -424,14 +424,20 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
     strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
     strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
+
+    strategy.sim_start_ns = start_time.value
+    strategy.sim_end_ns = end_time.value
     
     strategy.wallet_lookup = local_wallet_lookup
     strategy.active_instrument_ids = list(inst_map.values())
     
     engine.add_strategy(strategy)
+    
+    # [PROGRESS] Notify that simulation is beginning
+    print(f"   [Worker] Data Loaded. Starting Simulation...", flush=True)
     engine.run()
     
-    # Results & Valuation
+    # Results Calculation
     try: 
         cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     except: 
@@ -456,7 +462,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
     final_val = cash + open_pos_val
     
-    # Capture Equity Curve
+    # Curve Extraction
     full_curve = strategy.equity_history
     if len(full_curve) > 2000:
         df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
@@ -740,6 +746,28 @@ class PolymarketNautilusStrategy(Strategy):
     def on_timer(self, event):
         if event.name == "equity_heartbeat":
             self._record_equity()
+
+            # [PROGRESS TRACKING]
+            # Check if we injected the start/end times (as integer nanoseconds)
+            if hasattr(self, 'sim_start_ns') and hasattr(self, 'sim_end_ns'):
+                # Get current sim time in nanoseconds (safe integer math)
+                now_ns = pd.Timestamp(self.clock.utc_now()).value
+                
+                total = self.sim_end_ns - self.sim_start_ns
+                elapsed = now_ns - self.sim_start_ns
+                
+                if total > 0:
+                    pct = (elapsed / total) * 100.0
+                    
+                    # Lazy initialization of tracker variable
+                    if not hasattr(self, '_last_printed_pct'):
+                        self._last_printed_pct = 0.0
+                    
+                    # Only print every 5% increment (flush=True ensures Ray shows it instantly)
+                    if pct >= self._last_printed_pct + 5.0:
+                        print(f"   [Sim] Progress: {int(pct)}%", flush=True)
+                        self._last_printed_pct = pct
+
             if self.clock:
                 self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
 
