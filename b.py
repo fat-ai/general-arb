@@ -206,10 +206,11 @@ def process_data_chunk(args):
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
     
     # Calculate penalty: Low Liquidity = High Penalty
-    liq_penalty = 5000.0 / (liq_values + 500.0)
+    # e.g. $1k Liquidity -> ~2% spread penalty
+    liq_penalty = 20000.0 / (liq_values + 1000.0)
     
     # Base spread (0.5%) + Penalty (scaled)
-    calculated_spreads = 0.005 + (liq_penalty * 0.01)
+    calculated_spreads = 0.005 + (liq_penalty * 0.0001)
     spreads = np.minimum(0.20, calculated_spreads)
     bids = np.maximum(0.005, prices - spreads)
     asks = np.minimum(0.995, prices + spreads)
@@ -1014,36 +1015,32 @@ class FastBacktestEngine:
 
     def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
         """
-        PATCHED: Regresses Volume vs ROI (instead of Brier).
-        Returns (Slope, Intercept) to predict ROI for unknown wallets.
+        PATCHED: Uses Linear Regression (OLS) to correlate Volume with ROI.
+        CRITICAL FIX: Includes wallets with < 5 trades to capture 'One-Hit Wonder' whales.
         """
-        from scipy.stats import theilslopes
-        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 # Default to Neutral ROI (0%)
+        from scipy.stats import linregress
+        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 
         
         if 'outcome' not in profiler_data.columns or profiler_data.empty: 
             return SAFE_SLOPE, SAFE_INTERCEPT
             
         valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
-        
         valid = valid[valid['usdc_vol'] >= 1.0]
         
-        # Filter
         if cutoff_date:
             if 'res_time' in valid.columns and valid['res_time'].notna().any():
                 valid = valid[valid['res_time'] < cutoff_date]
             elif 'timestamp' in valid.columns:
                 valid = valid[valid['timestamp'] < cutoff_date]
             else:
-                # Fallback: filter by index if it's a DatetimeIndex
                 if isinstance(valid.index, pd.DatetimeIndex):
                     valid = valid[valid.index < cutoff_date]
                     
-        if known_wallet_ids: valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
-        if len(valid) < 50: return SAFE_SLOPE, SAFE_INTERCEPT
-        
+        if known_wallet_ids: 
+            valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
+            
         valid = valid.copy()
         
-        # Re-calculate ROI for regression
         long_mask = valid['tokens'] > 0
         valid.loc[long_mask, 'roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
         
@@ -1056,44 +1053,39 @@ class FastBacktestEngine:
         valid['roi'] = valid['roi'].clip(-1.0, 3.0)
         valid['log_vol'] = np.log1p(valid['usdc_vol'])
 
+        # Aggregate per wallet
         wallet_stats = valid.groupby('wallet_id').agg({
             'roi': 'mean',
             'log_vol': 'mean',
             'usdc_vol': 'count'
         }).rename(columns={'usdc_vol': 'trade_count'})
 
-        # Only learn from wallets that have a representative history (min 5 trades)
-        qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 5]
+        qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 1]
+        
         x = qualified_wallets['log_vol'].values
         y = qualified_wallets['roi'].values
-        # Ensure we have enough unique entities to form a regression
+        
         if len(qualified_wallets) < 10: 
             return SAFE_SLOPE, SAFE_INTERCEPT
 
         try:
-            # Regress Average Skill vs Average Volume
-            slope, intercept, low_slope, high_slope = theilslopes(y, x, alpha=0.90)
+          
+            slope, intercept, r_value, p_value, std_err = linregress(x, y)
             
-            # Validation: We only accept if High Volume correlates with Positive ROI
-            if low_slope <= 0 <= high_slope:
-                return SAFE_SLOPE, SAFE_INTERCEPT
-        
-                
             if not np.isfinite(slope) or not np.isfinite(intercept):
                 return SAFE_SLOPE, SAFE_INTERCEPT
             
-            # Damping: Reduce the slope confidence
-            final_slope = slope * 0.5
-            final_intercept = intercept * 0.5
+            if slope <= 0:
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # Clamp intercept to keep small bets neutral
+            final_intercept = max(-0.10, min(0.10, intercept))
             
-            # Safety Clamps for the Intercept (Base ROI)
-            # We don't want to assume fresh wallets are wildly profitable/unprofitable
-            final_intercept = max(-0.10, min(0.10, final_intercept))
+            return slope, final_intercept
             
-            return final_slope, final_intercept
         except: 
             return SAFE_SLOPE, SAFE_INTERCEPT
-
+            
     def run_walk_forward(self, config: dict) -> dict:
         if self.event_log.empty: return {'total_return': 0.0}
 
