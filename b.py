@@ -202,7 +202,15 @@ def process_data_chunk(args):
     sizes = subset['size'].values if 'size' in subset.columns else np.zeros(len(subset))
     
     # --- Vectorized Spread Logic ---
-    spreads = np.maximum(0.005, prices * 0.01)
+    cids = subset['contract_id'].values
+    liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
+    
+    # Calculate penalty: Low Liquidity = High Penalty
+    liq_penalty = 5000.0 / (liq_values + 500.0)
+    
+    # Base spread (0.5%) + Penalty (scaled)
+    calculated_spreads = 0.005 + (liq_penalty * 0.01)
+    spreads = np.minimum(0.20, calculated_spreads)
     bids = np.maximum(0.005, prices - spreads)
     asks = np.minimum(0.995, prices + spreads)
     
@@ -781,14 +789,14 @@ class PolymarketNautilusStrategy(Strategy):
 
         # --- C. Signal Generation ---
         vol = tick.size.as_double()
-        usdc_vol = vol * price
+        usdc_vol = vol
         
         if usdc_vol < self.min_signal_volume:
             return
 
         # Weight Logic using pre-calc score
         raw_skill = max(0.0, roi_score)
-        if raw_skill <= 0: return
+        if roi_score < 0: return
 
         # Simplified Weight Math
         weight = usdc_vol * (1.0 + min(math.log1p(raw_skill * 100) * 2.0, 10.0))
@@ -1114,9 +1122,16 @@ class FastBacktestEngine:
             test_end = test_start + timedelta(days=test_days)
             
             train_mask = (self.profiler_data['ts_int'] >= current_date.value) & (self.profiler_data['ts_int'] < train_end.value)
-            train_profiler = self.profiler_data[train_mask]
-            
+            raw_train = self.profiler_data[train_mask]
+
+            if 'res_time' in raw_train.columns:
+                 # Only learn from markets that have actually settled/resolved by now
+                 train_profiler = raw_train[raw_train['res_time'] <= train_end]
+            else:
+                 train_profiler = raw_train
+
             fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
+    
             known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
             
