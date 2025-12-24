@@ -169,13 +169,12 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---
 def process_data_chunk(args):
     """
-    OPTIMIZED: Vectorized Integer Math + Direct Object Creation.
-    FIXED: Includes local imports and safe Price constructors.
+    FINAL ROBUST VERSION: 
+    - Includes 'Whale Logic' (Heuristic Override).
+    - Includes 'Liquidity Penalty' (Accuracy Fix).
+    - Includes 'Economic Reality Filter' (Drops trades >$5M to prevent Fake Whales).
+    - Includes 'Crash Protection' (Drops Int64 Overflows).
     """
-    # Unpack updated arguments
-    df_chunk, inst_map, start_idx, known_liquidity, min_vol, wallet_scores, fw_slope, fw_intercept = args
-    
-    # 1. LOCAL IMPORTS (Crucial for Ray Workers)
     import math
     import numpy as np
     from nautilus_trader.model.data import QuoteTick, TradeTick
@@ -183,35 +182,41 @@ def process_data_chunk(args):
     from nautilus_trader.model.identifiers import TradeId
     from nautilus_trader.model.enums import AggressorSide
 
-    # 2. Filter Valid Data
+    # Unpack args
+    df_chunk, inst_map, start_idx, known_liquidity, min_vol, wallet_scores, fw_slope, fw_intercept = args
+    
+    # 1. Filter Valid Data
     mapped_insts = df_chunk['contract_id'].map(inst_map)
-    vols = df_chunk['trade_volume'].fillna(0)
+    vols = df_chunk['trade_volume'].fillna(0) # USDC volume
     valid_mask = mapped_insts.notna() & (vols >= min_vol)
     
-    if not valid_mask.any():
-        return [], {}
+    if not valid_mask.any(): return [], {}
 
     subset = df_chunk.loc[valid_mask]
     
-    # 3. Extract Vector Arrays (Float64 for math)
-    PRICE_SCALAR = 1_000_000.0  # Precision 6
-    SIZE_SCALAR = 10_000.0      # Precision 4
+    # 2. Setup Constants
+    PRICE_SCALAR = 1_000_000.0
+    SIZE_SCALAR = 10_000.0
     
+    # [SAFETY LIMITS]
+    # Physics Limit: ~20 Trillion raw units (2 Billion tokens)
+    MAX_QTY_INT = 20_000_000_000_000  
+    # Economic Limit: $5 Million USD per trade (Prevents Decimal Errors/Fake Whales)
+    MAX_USDC_PER_TRADE = 5_000_000.0  
+
     prices = subset['p_market_all'].values
-    volumes = subset['trade_volume'].values
+    volumes = subset['trade_volume'].values # USDC
     sizes = subset['size'].values if 'size' in subset.columns else np.zeros(len(subset))
     
-    # --- Vectorized Spread Logic ---
+    # 3. Vectorized Spread & Liquidity Penalty
     cids = subset['contract_id'].values
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
     
-    # Calculate penalty: Low Liquidity = High Penalty
-    # e.g. $1k Liquidity -> ~2% spread penalty
+    # Penalty: Low Liquidity ($1k) -> Higher Spread
     liq_penalty = 20000.0 / (liq_values + 1000.0)
-    
-    # Base spread (0.5%) + Penalty (scaled)
     calculated_spreads = 0.005 + (liq_penalty * 0.0001)
     spreads = np.minimum(0.20, calculated_spreads)
+    
     bids = np.maximum(0.005, prices - spreads)
     asks = np.minimum(0.995, prices + spreads)
     
@@ -221,29 +226,28 @@ def process_data_chunk(args):
     bids[mid_mask] = np.maximum(0.005, mids[mid_mask] - 0.002)
     asks[mid_mask] = np.minimum(0.995, mids[mid_mask] + 0.002)
 
-    # Convert to Int64 (Fast Path)
     bid_ints = (np.round(bids * PRICE_SCALAR)).astype(np.int64)
     ask_ints = (np.round(asks * PRICE_SCALAR)).astype(np.int64)
     price_ints = (np.round(prices * PRICE_SCALAR)).astype(np.int64)
     
-    # Depth logic
-    cids = subset['contract_id'].values
-    liq_values = np.array([known_liquidity.get(c, 0.0) for c in cids])
+    # Depth Logic
     depth_vals = np.maximum(5000.0, liq_values * 0.01)
     large_size_mask = sizes > depth_vals
     depth_vals[large_size_mask] = sizes[large_size_mask] * 1.5
     
     depth_ints = (depth_vals * SIZE_SCALAR).astype(np.int64)
-    vol_ints = (volumes * SIZE_SCALAR).astype(np.int64)
+    # [FIX] Clamp depth (It's synthetic background noise, so clamping is safe here)
+    depth_ints = np.minimum(depth_ints, MAX_QTY_INT)
+    
+    # Trade Size Logic
+    vol_ints = (sizes * SIZE_SCALAR).astype(np.int64)
 
-    # 4. Pre-Calculate Strategy Signals
+    # 4. Score Calculation (Whale Logic)
     wallet_ids = subset['wallet_id'].values.astype(str)
     precomputed_scores = []
     
     for i in range(len(wallet_ids)):
-        vol = volumes[i]
-        price = prices[i]
-        usdc_vol = vol * price
+        usdc_vol = volumes[i]
         
         if usdc_vol >= 1.0:
             key = f"{wallet_ids[i]}|default_topic"
@@ -251,29 +255,38 @@ def process_data_chunk(args):
             if score is None:
                 log_vol = math.log1p(usdc_vol)
                 score = fw_intercept + (fw_slope * log_vol)
+                # Heuristic: Trust massive volume
+                if usdc_vol > 2000.0: score = max(score, 0.06) 
+                elif usdc_vol > 500.0: score = max(score, 0.02)
         else:
             score = 0.0
         precomputed_scores.append(score)
 
-    # 5. Fast Loop for Object Creation
+    # 5. Object Creation with FILTERING
     results = []
     chunk_lookup = {}
     inst_objs = mapped_insts[valid_mask].values
     ts_ints = subset['ts_int'].values.astype(np.int64)
     is_sells = subset['is_sell'].values.astype(bool)
     
-    count = len(inst_objs)
-    
     # Detect safe constructor
     try:
-        # Try new API
-        Price.from_int64(1000000, 6)
-        use_from_int64 = True
-    except AttributeError:
-        # Fallback to older API or Constructor
-        use_from_int64 = False
+        Price.from_int64(1000000, 6); use_from_int64 = True
+    except AttributeError: use_from_int64 = False
 
-    for i in range(count):
+    for i in range(len(inst_objs)):
+        # --- ROBUST FILTERING ---
+        
+        # 1. Physics Check: Would this crash the engine?
+        if vol_ints[i] > MAX_QTY_INT:
+            continue
+            
+        # 2. Economic Check: Is this trade worth > $5 Million? (Data Glitch)
+        if volumes[i] > MAX_USDC_PER_TRADE:
+            continue
+            
+        # ------------------------
+
         inst_id = inst_objs[i]
         ts_ns = int(ts_ints[i])
         
@@ -284,7 +297,6 @@ def process_data_chunk(args):
             s_bid = Quantity.from_int64(depth_ints[i], 4)
             s_trd = Quantity.from_int64(vol_ints[i], 4)
         else:
-            # Fallback for older Nautilus versions (likely your case)
             p_bid = Price(bid_ints[i], 6)
             p_ask = Price(ask_ints[i], 6)
             p_trd = Price(price_ints[i], 6)
@@ -300,8 +312,6 @@ def process_data_chunk(args):
         
         ts_trade = ts_ns + 1
         tr_id_str = f"{ts_trade}-{start_idx + i}"
-        
-        # Store pre-calculated score instead of raw wallet_id
         chunk_lookup[tr_id_str] = (precomputed_scores[i], is_sells[i])
         
         results.append(TradeTick(
