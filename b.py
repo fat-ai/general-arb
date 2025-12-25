@@ -170,9 +170,9 @@ def plot_performance(full_equity_curve, trades_count):
 def process_data_chunk(args):
     """
     FINAL ROBUST VERSION:
-    - [FIX] Casts contract_id to 'str' before mapping (Fixes 0 Events).
-    - [FIX] Clamps Quantity to prevent Engine Crashes (Fixes ValueError).
-    - [FIX] Filters unrealistic trade sizes ($5M+).
+    - [FIX] REMOVED Timestamp Offset (+1) which caused "Time Backwards" engine lag.
+    - [FIX] Casts contract_id to 'str' before mapping.
+    - [FIX] Clamps Quantity to prevent Engine Crashes.
     """
     import math
     import numpy as np
@@ -184,37 +184,31 @@ def process_data_chunk(args):
     # Unpack args
     df_chunk, inst_map, start_idx, known_liquidity, min_vol, wallet_scores, fw_slope, fw_intercept = args
     
-    # [CRITICAL FIX 1] Explicitly cast to string to ensure lookup works against inst_map
+    # 1. Map IDs safely
     mapped_insts = df_chunk['contract_id'].astype(str).map(inst_map)
     vols = df_chunk['trade_volume'].fillna(0)
-    
-    # Ensure min_vol is respected
     valid_mask = mapped_insts.notna() & (vols >= min_vol)
     
     if not valid_mask.any(): return [], {}
 
     subset = df_chunk.loc[valid_mask]
     
-    # Setup Constants
+    # 2. Setup Constants
     PRICE_SCALAR = 1_000_000.0
     SIZE_SCALAR = 10_000.0
-    # [SAFETY] Cap raw int values to ~20 Trillion (Nautilus limit is ~34T)
     MAX_QTY_INT = 20_000_000_000_000  
     MAX_USDC_PER_TRADE = 5_000_000.0  
 
     prices = subset['p_market_all'].values
     volumes = subset['trade_volume'].fillna(0).values 
-    
-    # Handle missing/NaN sizes
     if 'size' in subset.columns:
         sizes = subset['size'].fillna(0).values
     else:
         sizes = np.zeros(len(subset))
     
-    # Spread & Liquidity Penalty
+    # 3. Spread & Liquidity Penalty
     cids = subset['contract_id'].values
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
-    
     liq_penalty = 20000.0 / (liq_values + 1000.0)
     calculated_spreads = 0.005 + (liq_penalty * 0.0001)
     spreads = np.minimum(0.20, calculated_spreads)
@@ -222,7 +216,6 @@ def process_data_chunk(args):
     bids = np.maximum(0.005, prices - spreads)
     asks = np.minimum(0.995, prices + spreads)
     
-    # Uncross
     mid_mask = bids >= asks
     mids = (bids + asks) * 0.5
     bids[mid_mask] = np.maximum(0.005, mids[mid_mask] - 0.002)
@@ -232,18 +225,17 @@ def process_data_chunk(args):
     ask_ints = (np.round(asks * PRICE_SCALAR)).astype(np.int64)
     price_ints = (np.round(prices * PRICE_SCALAR)).astype(np.int64)
     
-    # Depth Logic (Clamped)
+    # 4. Depth & Volume Logic
     depth_vals = np.maximum(5000.0, liq_values * 0.01)
     large_size_mask = sizes > depth_vals
     depth_vals[large_size_mask] = sizes[large_size_mask] * 1.5
     
     depth_ints = (depth_vals * SIZE_SCALAR).astype(np.int64)
-    # [CRITICAL FIX 2] Clamp depth to avoid crashing Nautilus
-    depth_ints = np.minimum(depth_ints, MAX_QTY_INT)
+    depth_ints = np.minimum(depth_ints, MAX_QTY_INT) # Clamp
     
     vol_ints = (sizes * SIZE_SCALAR).astype(np.int64)
 
-    # Score Calculation
+    # 5. Score Calculation
     wallet_ids = subset['wallet_id'].values.astype(str)
     precomputed_scores = []
     
@@ -261,7 +253,7 @@ def process_data_chunk(args):
             score = 0.0
         precomputed_scores.append(score)
 
-    # Object Creation
+    # 6. Object Creation
     results = []
     chunk_lookup = {}
     inst_objs = mapped_insts[valid_mask].values
@@ -273,7 +265,6 @@ def process_data_chunk(args):
     except AttributeError: use_from_int64 = False
 
     for i in range(len(inst_objs)):
-        # [CRITICAL FIX 3] Skip Garbage Trades that overflow physics engine
         if vol_ints[i] > MAX_QTY_INT: continue
         if volumes[i] > MAX_USDC_PER_TRADE: continue
         if vol_ints[i] <= 0: continue 
@@ -281,6 +272,10 @@ def process_data_chunk(args):
         inst_id = inst_objs[i]
         ts_ns = int(ts_ints[i])
         
+        # [CRITICAL SPEED FIX] 
+        # Do NOT add +1 to timestamp. It creates out-of-order data when rows have same TS.
+        ts_trade = ts_ns 
+
         if use_from_int64:
             p_bid = Price.from_int64(bid_ints[i], 6)
             p_ask = Price.from_int64(ask_ints[i], 6)
@@ -301,7 +296,6 @@ def process_data_chunk(args):
             ts_event=ts_ns, ts_init=ts_ns
         ))
         
-        ts_trade = ts_ns + 1
         tr_id_str = f"{ts_trade}-{start_idx + i}"
         chunk_lookup[tr_id_str] = (precomputed_scores[i], is_sells[i])
         
@@ -329,8 +323,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
 
-    # [FIX] Silence Logger to speed up initialization (Fixes 5-hour hang)
+    # [SPEED FIX] Silence Logger to speed up initialization (Fixes 11-hour hang)
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
+    logging.getLogger().setLevel(logging.ERROR) 
 
     # Setup Engine
     USDC = Currency.from_str("USDC")
@@ -340,8 +335,34 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     # [FIX] Force String Type for Mapping keys and sort chronologically
     slice_df = slice_df.sort_values('ts_int').copy()
+
+    # --- AUTO-SCALING LOGIC (Respects your existing data) ---
+    # Heuristic: If we see trade volumes > $1 Billion, it's definitely unscaled raw integers.
+    # Polymarket uses 6 decimals for USDC and often 18 for tokens.
     
-    price_events = slice_df[slice_df['event_type'] == 'PRICE_UPDATE'].copy()
+    # 1. Scale USDC Volume (likely 1e6 or 1e18)
+    if 'trade_volume' in slice_df.columns:
+        max_vol = slice_df['trade_volume'].max()
+        if max_vol > 1_000_000_000_000_000: # > 1 Quadrillion -> 1e18 scaling
+            print(f"   [Data] Auto-scaling USDC Volume (div by 1e18)...")
+            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000_000_000_000_000.0
+        elif max_vol > 1_000_000_000: # > 1 Billion -> 1e6 scaling
+            print(f"   [Data] Auto-scaling USDC Volume (div by 1e6)...")
+            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000.0
+
+    # 2. Scale Token Size (likely 1e18, sometimes 1e6)
+    if 'size' in slice_df.columns:
+        max_size = slice_df['size'].max()
+        if max_size > 1_000_000_000_000_000: # > 1 Quadrillion -> 1e18 scaling
+            print(f"   [Data] Auto-scaling Token Size (div by 1e18)...")
+            slice_df['size'] = slice_df['size'] / 1_000_000_000_000_000_000.0
+        elif max_size > 1_000_000_000: # > 1 Billion -> 1e6 scaling
+             print(f"   [Data] Auto-scaling Token Size (div by 1e6)...")
+             slice_df['size'] = slice_df['size'] / 1_000_000.0
+    # --------------------------------------------------------
+
+    # [CRITICAL FIX] Do NOT filter by 'PRICE_UPDATE'. Accept ALL rows that have a contract_id.
+    price_events = slice_df.dropna(subset=['contract_id']).copy()
     price_events['contract_id'] = price_events['contract_id'].astype(str)
     
     unique_cids = price_events['contract_id'].unique()
@@ -350,7 +371,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     local_liquidity = {} 
     
     ts_act = int(start_time.value)
-    # Expiration: Set far in future to keep instruments active
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
     PRICE_INC = Price.from_str("0.000001")
@@ -371,11 +391,11 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
-    # --- OPTIMIZED DATA LOADING WITH PROGRESS ---
+    # --- DATA LOADING ---
     local_wallet_lookup = {}
     chunk_size = 100000
     
-    # [FIX] Cast to string so .map() matches the keys in inst_map
+    # Map IDs
     price_events['inst_map_check'] = price_events['contract_id'].astype(str).map(inst_map)
     price_events = price_events.dropna(subset=['inst_map_check'])
     
@@ -390,9 +410,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
             chunk = price_events.iloc[i : i + chunk_size]
             
-            # Pass new args including whale logic params
+            # [FIX] Passed min_vol=0.000001. We rely on the scaler now, so 1.0 might be too high for small bets.
             ticks, lookup = process_data_chunk((
-                chunk, inst_map, i, local_liquidity, 0.0,
+                chunk, inst_map, i, local_liquidity, 0.000001,
                 wallet_scores, float(fw_slope), float(fw_intercept)
             ))
             
@@ -425,6 +445,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
     strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
 
+    # Timestamps for Progress Bar
     strategy.sim_start_ns = start_time.value
     strategy.sim_end_ns = end_time.value
     
@@ -433,7 +454,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     engine.add_strategy(strategy)
     
-    # [PROGRESS] Notify that simulation is beginning
     print(f"   [Worker] Data Loaded. Starting Simulation...", flush=True)
     engine.run()
     
@@ -462,7 +482,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
     final_val = cash + open_pos_val
     
-    # Curve Extraction
     full_curve = strategy.equity_history
     if len(full_curve) > 2000:
         df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
