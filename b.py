@@ -169,13 +169,13 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---def process_data_chunk(args):
 def process_data_chunk(args):
     """
-    FINAL ROBUST VERSION:
-    - [FIX] REMOVED Timestamp Offset (+1) which caused "Time Backwards" engine lag.
-    - [FIX] Casts contract_id to 'str' before mapping.
-    - [FIX] Clamps Quantity to prevent Engine Crashes.
+    FIXED VERSION:
+    1. COMPATIBILITY: Uses Price(float, precision) to avoid 'Huge Price' bug.
+    2. LOGIC: Implements 'Liquidity Snapping' so trades actually fill.
+    3. SPEED: Vectorized math + list iteration (avoids slow Pandas/NumPy loops).
     """
-    import math
     import numpy as np
+    import pandas as pd
     from nautilus_trader.model.data import QuoteTick, TradeTick
     from nautilus_trader.model.objects import Price, Quantity
     from nautilus_trader.model.identifiers import TradeId
@@ -184,129 +184,159 @@ def process_data_chunk(args):
     # Unpack args
     df_chunk, inst_map, start_idx, known_liquidity, min_vol, wallet_scores, fw_slope, fw_intercept = args
     
-    # 1. Map IDs safely
-    mapped_insts = df_chunk['contract_id'].astype(str).map(inst_map)
-    vols = df_chunk['trade_volume'].fillna(0)
-    valid_mask = mapped_insts.notna() & (vols >= min_vol)
+    # 1. Map IDs & Handle Missing Data
+    mapped_insts = df_chunk['contract_id'].map(inst_map)
     
+    # Fill NAs to allow vectorized math
+    prices = df_chunk['p_market_all'].fillna(0.0).values
+    vols = df_chunk['trade_volume'].fillna(0.0).values
+    
+    # Handle missing 'size' column by calculating it from Volume/Price
+    if 'size' in df_chunk.columns:
+        sizes = df_chunk['size'].fillna(0.0).values
+    else:
+        # Fallback: Size = Volume / Price (Avoid division by zero)
+        safe_prices = np.where(prices < 0.000001, 1.0, prices)
+        sizes = vols / safe_prices
+
+    # 2. Vectorized Filtering
+    MAX_USDC = 5_000_000.0  
+    
+    # Create Validity Mask
+    # We filter out invalid rows HERE to avoid processing them in the loop later
+    valid_mask = (
+        mapped_insts.notna() & 
+        (vols >= min_vol) & 
+        (vols <= MAX_USDC) & 
+        (sizes > 0)
+    )
+
     if not valid_mask.any(): return [], {}
 
-    subset = df_chunk.loc[valid_mask]
+    # Apply Mask (Work only on valid data subset)
+    subset_insts = mapped_insts[valid_mask].values
+    subset_prices = prices[valid_mask]
+    subset_sizes = sizes[valid_mask]
+    subset_vols = vols[valid_mask]
+    # Cast to python objects later for speed
+    subset_ts = df_chunk['ts_int'].values[valid_mask].astype(np.int64) 
+    subset_is_sell = df_chunk['is_sell'].values[valid_mask].astype(bool)
+    subset_wallet_ids = df_chunk['wallet_id'].values[valid_mask].astype(str)
+    subset_cids = df_chunk['contract_id'].values[valid_mask]
     
-    # 2. Setup Constants
-    PRICE_SCALAR = 1_000_000.0
-    SIZE_SCALAR = 10_000.0
-    MAX_QTY_INT = 20_000_000_000_000  
-    MAX_USDC_PER_TRADE = 5_000_000.0  
+    num_rows = len(subset_insts)
 
-    prices = subset['p_market_all'].values
-    volumes = subset['trade_volume'].fillna(0).values 
-    if 'size' in subset.columns:
-        sizes = subset['size'].fillna(0).values
-    else:
-        sizes = np.zeros(len(subset))
-    
-    # 3. Spread & Liquidity Penalty
-    cids = subset['contract_id'].values
-    liq_values = np.array([known_liquidity.get(c, 1000.0) for c in cids])
+    # 3. Vectorized Spread & Liquidity Snapping (The Execution Fix)
+    liq_values = np.array([known_liquidity.get(c, 1000.0) for c in subset_cids])
     liq_penalty = 20000.0 / (liq_values + 1000.0)
-    calculated_spreads = 0.005 + (liq_penalty * 0.0001)
-    spreads = np.minimum(0.20, calculated_spreads)
+    calculated_spreads = np.minimum(0.20, 0.005 + (liq_penalty * 0.0001))
     
-    bids = np.maximum(0.005, prices - spreads)
-    asks = np.minimum(0.995, prices + spreads)
+    # Initialize arrays
+    bids = np.zeros(num_rows, dtype=np.float64)
+    asks = np.zeros(num_rows, dtype=np.float64)
     
+    # --- LOGIC: Snap Bid/Ask to Trade Price based on Aggressor ---
+    # Case A: Aggressor SOLD. They hit the Bid. Bid must == Price.
+    bids[subset_is_sell] = subset_prices[subset_is_sell]
+    asks[subset_is_sell] = subset_prices[subset_is_sell] + calculated_spreads[subset_is_sell]
+    
+    # Case B: Aggressor BOUGHT. They lifted the Ask. Ask must == Price.
+    asks[~subset_is_sell] = subset_prices[~subset_is_sell]
+    bids[~subset_is_sell] = subset_prices[~subset_is_sell] - calculated_spreads[~subset_is_sell]
+
+    # Clamp prices (0.005 - 0.995)
+    bids = np.maximum(0.005, bids)
+    asks = np.minimum(0.995, asks)
+    
+    # Fix Crossed Books (Bid >= Ask)
     mid_mask = bids >= asks
-    mids = (bids + asks) * 0.5
-    bids[mid_mask] = np.maximum(0.005, mids[mid_mask] - 0.002)
-    asks[mid_mask] = np.minimum(0.995, mids[mid_mask] + 0.002)
+    if mid_mask.any():
+        mids = (bids[mid_mask] + asks[mid_mask]) * 0.5
+        bids[mid_mask] = np.maximum(0.005, mids - 0.002)
+        asks[mid_mask] = np.minimum(0.995, mids + 0.002)
 
-    bid_ints = (np.round(bids * PRICE_SCALAR)).astype(np.int64)
-    ask_ints = (np.round(asks * PRICE_SCALAR)).astype(np.int64)
-    price_ints = (np.round(prices * PRICE_SCALAR)).astype(np.int64)
-    
-    # 4. Depth & Volume Logic
+    # Round floats to correct precision (6 decimals) for the float constructor
+    bids = np.round(bids, 6)
+    asks = np.round(asks, 6)
+    subset_prices = np.round(subset_prices, 6)
+
+    # 4. Depth Logic
     depth_vals = np.maximum(5000.0, liq_values * 0.01)
-    large_size_mask = sizes > depth_vals
-    depth_vals[large_size_mask] = sizes[large_size_mask] * 1.5
+    large_size_mask = subset_sizes > depth_vals
+    depth_vals[large_size_mask] = subset_sizes[large_size_mask] * 1.5
     
-    depth_ints = (depth_vals * SIZE_SCALAR).astype(np.int64)
-    depth_ints = np.minimum(depth_ints, MAX_QTY_INT) # Clamp
+    # Round sizes (4 decimals)
+    depth_vals = np.round(depth_vals, 4)
+    subset_sizes = np.round(subset_sizes, 4)
     
-    vol_ints = (sizes * SIZE_SCALAR).astype(np.int64)
+    # 5. Vectorized Wallet Scoring
+    keys = pd.Series(subset_wallet_ids) + "|default_topic"
+    scores = keys.map(wallet_scores).values
+    
+    missing_mask = np.isnan(scores)
+    if missing_mask.any():
+        scores[missing_mask] = 0.0
+        # Logarithmic fallback calculation
+        calc_mask = missing_mask & (subset_vols >= 1.0)
+        if calc_mask.any():
+            log_vols = np.log1p(subset_vols[calc_mask])
+            calc_vals = fw_intercept + (fw_slope * log_vols)
+            # Cap scores based on volume
+            vols_m = subset_vols[calc_mask]
+            calc_vals = np.where(vols_m > 2000.0, np.maximum(calc_vals, 0.06),
+                        np.where(vols_m > 500.0, np.maximum(calc_vals, 0.02), calc_vals))
+            scores[calc_mask] = calc_vals
 
-    # 5. Score Calculation
-    wallet_ids = subset['wallet_id'].values.astype(str)
-    precomputed_scores = []
-    
-    for i in range(len(wallet_ids)):
-        usdc_vol = volumes[i]
-        if usdc_vol >= 1.0:
-            key = f"{wallet_ids[i]}|default_topic"
-            score = wallet_scores.get(key)
-            if score is None:
-                log_vol = math.log1p(usdc_vol)
-                score = fw_intercept + (fw_slope * log_vol)
-                if usdc_vol > 2000.0: score = max(score, 0.06) 
-                elif usdc_vol > 500.0: score = max(score, 0.02)
-        else:
-            score = 0.0
-        precomputed_scores.append(score)
-
-    # 6. Object Creation
+    # 6. Object Creation Loop
     results = []
     chunk_lookup = {}
-    inst_objs = mapped_insts[valid_mask].values
-    ts_ints = subset['ts_int'].values.astype(np.int64)
-    is_sells = subset['is_sell'].values.astype(bool)
     
-    try:
-        Price.from_int64(1000000, 6); use_from_int64 = True
-    except AttributeError: use_from_int64 = False
+    # Generate ID strings efficiently (List comprehension > Loop f-strings)
+    indices = np.arange(start_idx, start_idx + num_rows)
+    tr_id_strs = [f"{ts}-{i}" for ts, i in zip(subset_ts, indices)]
 
-    for i in range(len(inst_objs)):
-        if vol_ints[i] > MAX_QTY_INT: continue
-        if volumes[i] > MAX_USDC_PER_TRADE: continue
-        if vol_ints[i] <= 0: continue 
+    # Localize classes for speed
+    _Price = Price
+    _Quantity = Quantity
+    _QuoteTick = QuoteTick
+    _TradeTick = TradeTick
+    _TradeId = TradeId
+    _Agg_SELLER = AggressorSide.SELLER
+    _Agg_BUYER = AggressorSide.BUYER
 
-        inst_id = inst_objs[i]
-        ts_ns = int(ts_ints[i])
+    iterator = zip(
+        subset_insts, subset_ts.tolist(), 
+        bids.tolist(), asks.tolist(), subset_prices.tolist(), 
+        depth_vals.tolist(), subset_sizes.tolist(), 
+        subset_is_sell.tolist(), scores.tolist(), tr_id_strs
+    )
+
+    for inst, ts, bid_v, ask_v, trd_v, depth_v, size_v, is_sell, score, tr_id in iterator:
+    
+        p_bid = _Price(bid_v, 6)
+        p_ask = _Price(ask_v, 6)
+        p_trd = _Price(trd_v, 6)
         
-        # [CRITICAL SPEED FIX] 
-        # Do NOT add +1 to timestamp. It creates out-of-order data when rows have same TS.
-        ts_trade = ts_ns 
+        s_bid = _Quantity(depth_v, 4)
+        s_trd = _Quantity(size_v, 4)
 
-        if use_from_int64:
-            p_bid = Price.from_int64(bid_ints[i], 6)
-            p_ask = Price.from_int64(ask_ints[i], 6)
-            p_trd = Price.from_int64(price_ints[i], 6)
-            s_bid = Quantity.from_int64(depth_ints[i], 4)
-            s_trd = Quantity.from_int64(vol_ints[i], 4)
-        else:
-            p_bid = Price(bid_ints[i], 6)
-            p_ask = Price(ask_ints[i], 6)
-            p_trd = Price(price_ints[i], 6)
-            s_bid = Quantity(depth_ints[i], 4)
-            s_trd = Quantity(vol_ints[i], 4)
-
-        results.append(QuoteTick(
-            instrument_id=inst_id,
+        results.append(_QuoteTick(
+            instrument_id=inst,
             bid_price=p_bid, ask_price=p_ask,
             bid_size=s_bid, ask_size=s_bid,
-            ts_event=ts_ns, ts_init=ts_ns
+            ts_event=ts, ts_init=ts
         ))
-        
-        tr_id_str = f"{ts_trade}-{start_idx + i}"
-        chunk_lookup[tr_id_str] = (precomputed_scores[i], is_sells[i])
-        
-        results.append(TradeTick(
-            instrument_id=inst_id,
+
+        results.append(_TradeTick(
+            instrument_id=inst,
             price=p_trd,
             size=s_trd,
-            aggressor_side=AggressorSide.SELLER if is_sells[i] else AggressorSide.BUYER,
-            trade_id=TradeId(tr_id_str),
-            ts_event=ts_trade, ts_init=ts_trade
+            aggressor_side=_Agg_SELLER if is_sell else _Agg_BUYER,
+            trade_id=_TradeId(tr_id),
+            ts_event=ts, ts_init=ts
         ))
+        
+        chunk_lookup[tr_id] = (score, is_sell)
 
     return results, chunk_lookup
     
@@ -323,7 +353,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
 
-    # [SPEED FIX] Silence Logger to speed up initialization (Fixes 11-hour hang)
+    # [SPEED] Silence Logger to speed up initialization
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
     logging.getLogger().setLevel(logging.ERROR) 
 
@@ -333,48 +363,65 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
     engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
     
-    # [FIX] Force String Type for Mapping keys and sort chronologically
+    # [FIX] Sort by timestamp to ensure correct chronological processing
     slice_df = slice_df.sort_values('ts_int').copy()
 
-    # --- AUTO-SCALING LOGIC (Respects your existing data) ---
-    # Heuristic: If we see trade volumes > $1 Billion, it's definitely unscaled raw integers.
-    # Polymarket uses 6 decimals for USDC and often 18 for tokens.
+    # --- CRITICAL: AUTO-SCALING LOGIC ---
+    # This prepares the data for the new process_data_chunk.
+    # It detects if data is in raw Integers (Wei/Mwei) and converts to Float USDC.
+    # Without this, Price(550000) is created, breaking the strategy.
     
-    # 1. Scale USDC Volume (likely 1e6 or 1e18)
+    # 1. Scale USDC Volume (Detects 6 decimals or 18 decimals)
     if 'trade_volume' in slice_df.columns:
         max_vol = slice_df['trade_volume'].max()
-        if max_vol > 1_000_000_000_000_000: # > 1 Quadrillion -> 1e18 scaling
+        
+        # Threshold lowered to 10,000,000 (10 USDC) to catch smaller unscaled batches
+        if max_vol > 1_000_000_000_000_000: # > 1 Quadrillion -> Scaled by 1e18
             print(f"   [Data] Auto-scaling USDC Volume (div by 1e18)...")
             slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000_000_000_000_000.0
-        elif max_vol > 1_000_000_000: # > 1 Billion -> 1e6 scaling
+        elif max_vol > 10_000_000: # > 10 Million -> Scaled by 1e6
             print(f"   [Data] Auto-scaling USDC Volume (div by 1e6)...")
             slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000.0
 
-    # 2. Scale Token Size (likely 1e18, sometimes 1e6)
+    # 2. Scale Token Size (Detects 6 decimals or 18 decimals)
     if 'size' in slice_df.columns:
         max_size = slice_df['size'].max()
-        if max_size > 1_000_000_000_000_000: # > 1 Quadrillion -> 1e18 scaling
+        if max_size > 1_000_000_000_000_000:
             print(f"   [Data] Auto-scaling Token Size (div by 1e18)...")
             slice_df['size'] = slice_df['size'] / 1_000_000_000_000_000_000.0
-        elif max_size > 1_000_000_000: # > 1 Billion -> 1e6 scaling
+        elif max_size > 10_000_000:
              print(f"   [Data] Auto-scaling Token Size (div by 1e6)...")
              slice_df['size'] = slice_df['size'] / 1_000_000.0
+             
+    # [NEW] Scale Prices (p_market_all)
+    # The new process_data_chunk expects floats (0.0 to 1.0).
+    # If the CSV has "550000" instead of "0.55", we must fix it here.
+    if 'p_market_all' in slice_df.columns:
+        max_p = slice_df['p_market_all'].max()
+        if max_p > 1.1: # Buffer for slight overflow
+            print(f"   [Data] Auto-scaling Prices (div by 1e6)...")
+            slice_df['p_market_all'] = slice_df['p_market_all'] / 1_000_000.0
     # --------------------------------------------------------
 
-    # [CRITICAL FIX] Do NOT filter by 'PRICE_UPDATE'. Accept ALL rows that have a contract_id.
+    # Filter invalid rows before loop
     price_events = slice_df.dropna(subset=['contract_id']).copy()
     price_events['contract_id'] = price_events['contract_id'].astype(str)
     
     unique_cids = price_events['contract_id'].unique()
-    
     inst_map = {}
     local_liquidity = {} 
     
     ts_act = int(start_time.value)
+    # Add buffer to expiration
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
-    PRICE_INC = Price.from_str("0.000001")
-    SIZE_INC = Quantity.from_str("0.0001") 
+    # [COMPATIBILITY] Robust failover for older Nautilus versions
+    try:
+        PRICE_INC = Price.from_str("0.000001")
+        SIZE_INC = Quantity.from_str("0.0001") 
+    except AttributeError:
+        PRICE_INC = Price(0.000001, 6)
+        SIZE_INC = Quantity(0.0001, 4)
 
     for cid in unique_cids:
         inst_id = InstrumentId(Symbol(cid), venue_id)
@@ -391,46 +438,45 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
-    # --- DATA LOADING ---
+    # --- DATA LOADING LOOP ---
     local_wallet_lookup = {}
-    chunk_size = 100000
+    chunk_size = 100000 
     
-    # Map IDs
-    price_events['inst_map_check'] = price_events['contract_id'].astype(str).map(inst_map)
+    # Pre-calculate mapping check
+    price_events['inst_map_check'] = price_events['contract_id'].map(inst_map)
     price_events = price_events.dropna(subset=['inst_map_check'])
     
-    gc.disable()
+    # [MEMORY FIX] REMOVED gc.disable(). 
+    # Garbage collection is now handled manually per chunk to keep RAM low.
     
-    try:
-        total_rows = len(price_events)
-        for i in range(0, total_rows, chunk_size):
-            # [PROGRESS] Print status every ~20% of the load
-            if i > 0 and i % (chunk_size * 2) == 0:
-                print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
+    total_rows = len(price_events)
+    for i in range(0, total_rows, chunk_size):
+        if i > 0 and i % (chunk_size * 2) == 0:
+            print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
 
-            chunk = price_events.iloc[i : i + chunk_size]
-            
-            # [FIX] Passed min_vol=0.000001. We rely on the scaler now, so 1.0 might be too high for small bets.
-            ticks, lookup = process_data_chunk((
-                chunk, inst_map, i, local_liquidity, 0.000001,
-                wallet_scores, float(fw_slope), float(fw_intercept)
-            ))
-            
-            if ticks: engine.add_data(ticks)
-            local_wallet_lookup.update(lookup)
-            
-            del ticks, lookup, chunk
-    finally:
-        gc.enable()
+        chunk = price_events.iloc[i : i + chunk_size]
+        
+        # Call the new, vectorised process_data_chunk
+        # Note: min_vol is now 0.000001 because we normalized the data above
+        ticks, lookup = process_data_chunk((
+            chunk, inst_map, i, local_liquidity, 0.000001,
+            wallet_scores, float(fw_slope), float(fw_intercept)
+        ))
+        
+        if ticks: engine.add_data(ticks)
+        local_wallet_lookup.update(lookup)
+        
+        # [MEMORY FIX] Explicitly delete large objects and collect garbage
+        del ticks, lookup, chunk
+        gc.collect() 
 
     del price_events
     gc.collect()
 
-    # Strategy Setup
+    # --- STRATEGY INJECTION ---
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
     
-    # Injection
     strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
     strategy.decay_factor = float(config.get('decay_factor', 0.95))
     strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
@@ -445,10 +491,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
     strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
 
-    # Timestamps for Progress Bar
     strategy.sim_start_ns = start_time.value
     strategy.sim_end_ns = end_time.value
-    
     strategy.wallet_lookup = local_wallet_lookup
     strategy.active_instrument_ids = list(inst_map.values())
     
@@ -457,7 +501,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     print(f"   [Worker] Data Loaded. Starting Simulation...", flush=True)
     engine.run()
     
-    # Results Calculation
+    # --- RESULT CALCULATION ---
     try: 
         cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     except: 
