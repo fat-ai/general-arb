@@ -353,9 +353,59 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
 
-    # [SPEED] Silence Logger to speed up initialization
+    # 1. Silence Logger
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
     logging.getLogger().setLevel(logging.ERROR) 
+    
+    # A. Rename Columns (CSV Header -> Engine Header)
+    col_map = {
+        'timestamp': 'ts_str',        # Temporary name for processing
+        'tradeAmount': 'trade_volume',
+        'price': 'p_market_all',
+        'user': 'wallet_id',
+        'size': 'size',               
+        'contract_id': 'contract_id',
+        'side_mult': 'side_mult'
+    }
+    # Only rename columns that actually exist in the slice
+    slice_df = slice_df.rename(columns=col_map)
+
+    # B. Fix Timestamps (ISO String -> Nanosecond Int64)
+    # Evidence: "2025-12-08T00:25:21"
+    if 'ts_str' in slice_df.columns:
+        # Convert to UTC datetime, then to int64 nanoseconds
+        slice_df['ts_int'] = pd.to_datetime(slice_df['ts_str'], utc=True).astype(np.int64)
+    
+    # Sort Chronologically (Required by Engine)
+    slice_df = slice_df.sort_values('ts_int').copy()
+
+    # C. Map Side Logic (side_mult -> is_sell)
+    # Evidence: side_mult is -1 (Sell) or 1 (Buy)
+    if 'side_mult' in slice_df.columns:
+        slice_df['is_sell'] = slice_df['side_mult'] == -1
+    elif 'is_sell' not in slice_df.columns:
+        slice_df['is_sell'] = False # Fallback
+
+    # D. Correct Scaling (Based on your CSV evidence)
+    # - Price is ALREADY Float (0.01). DO NOT SCALE PRICE.
+    # - Volume/Size are Integers (333300.0). MUST SCALE BY 1e6.
+    
+    # We lower the detection threshold to > 100.0 to catch small trades (like $0.0001)
+    if 'trade_volume' in slice_df.columns:
+        if slice_df['trade_volume'].max() > 100.0:
+            print(f"   [Data] Scaling USDC Volume (div by 1e6)...")
+            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000.0
+
+    if 'size' in slice_df.columns:
+        if slice_df['size'].max() > 100.0:
+            print(f"   [Data] Scaling Token Size (div by 1e6)...")
+            slice_df['size'] = slice_df['size'] / 1_000_000.0
+
+    # Safety: Ensure Price is float
+    if 'p_market_all' in slice_df.columns:
+        slice_df['p_market_all'] = slice_df['p_market_all'].astype(float)
+
+    # --------------------------------------------------------
 
     # Setup Engine
     USDC = Currency.from_str("USDC")
@@ -363,47 +413,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
     engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
     
-    # [FIX] Sort by timestamp to ensure correct chronological processing
-    slice_df = slice_df.sort_values('ts_int').copy()
-
-    # --- CRITICAL: AUTO-SCALING LOGIC ---
-    # This prepares the data for the new process_data_chunk.
-    # It detects if data is in raw Integers (Wei/Mwei) and converts to Float USDC.
-    # Without this, Price(550000) is created, breaking the strategy.
-    
-    # 1. Scale USDC Volume (Detects 6 decimals or 18 decimals)
-    if 'trade_volume' in slice_df.columns:
-        max_vol = slice_df['trade_volume'].max()
-        
-        # Threshold lowered to 10,000,000 (10 USDC) to catch smaller unscaled batches
-        if max_vol > 1_000_000_000_000_000: # > 1 Quadrillion -> Scaled by 1e18
-            print(f"   [Data] Auto-scaling USDC Volume (div by 1e18)...")
-            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000_000_000_000_000.0
-        elif max_vol > 10_000_000: # > 10 Million -> Scaled by 1e6
-            print(f"   [Data] Auto-scaling USDC Volume (div by 1e6)...")
-            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000.0
-
-    # 2. Scale Token Size (Detects 6 decimals or 18 decimals)
-    if 'size' in slice_df.columns:
-        max_size = slice_df['size'].max()
-        if max_size > 1_000_000_000_000_000:
-            print(f"   [Data] Auto-scaling Token Size (div by 1e18)...")
-            slice_df['size'] = slice_df['size'] / 1_000_000_000_000_000_000.0
-        elif max_size > 10_000_000:
-             print(f"   [Data] Auto-scaling Token Size (div by 1e6)...")
-             slice_df['size'] = slice_df['size'] / 1_000_000.0
-             
-    # [NEW] Scale Prices (p_market_all)
-    # The new process_data_chunk expects floats (0.0 to 1.0).
-    # If the CSV has "550000" instead of "0.55", we must fix it here.
-    if 'p_market_all' in slice_df.columns:
-        max_p = slice_df['p_market_all'].max()
-        if max_p > 1.1: # Buffer for slight overflow
-            print(f"   [Data] Auto-scaling Prices (div by 1e6)...")
-            slice_df['p_market_all'] = slice_df['p_market_all'] / 1_000_000.0
-    # --------------------------------------------------------
-
-    # Filter invalid rows before loop
+    # Filter Invalid Rows
     price_events = slice_df.dropna(subset=['contract_id']).copy()
     price_events['contract_id'] = price_events['contract_id'].astype(str)
     
@@ -412,10 +422,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     local_liquidity = {} 
     
     ts_act = int(start_time.value)
-    # Add buffer to expiration
     ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
     
-    # [COMPATIBILITY] Robust failover for older Nautilus versions
+    # Compatibility
     try:
         PRICE_INC = Price.from_str("0.000001")
         SIZE_INC = Quantity.from_str("0.0001") 
@@ -442,22 +451,19 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     local_wallet_lookup = {}
     chunk_size = 100000 
     
-    # Pre-calculate mapping check
+    # Mapping Check
     price_events['inst_map_check'] = price_events['contract_id'].map(inst_map)
     price_events = price_events.dropna(subset=['inst_map_check'])
     
-    # [MEMORY FIX] REMOVED gc.disable(). 
-    # Garbage collection is now handled manually per chunk to keep RAM low.
-    
     total_rows = len(price_events)
+    # Manual GC loop to keep memory low
     for i in range(0, total_rows, chunk_size):
         if i > 0 and i % (chunk_size * 2) == 0:
             print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
 
         chunk = price_events.iloc[i : i + chunk_size]
         
-        # Call the new, vectorised process_data_chunk
-        # Note: min_vol is now 0.000001 because we normalized the data above
+        # NOTE: min_vol=0.000001 is safe now because we normalized the data above.
         ticks, lookup = process_data_chunk((
             chunk, inst_map, i, local_liquidity, 0.000001,
             wallet_scores, float(fw_slope), float(fw_intercept)
@@ -466,7 +472,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         if ticks: engine.add_data(ticks)
         local_wallet_lookup.update(lookup)
         
-        # [MEMORY FIX] Explicitly delete large objects and collect garbage
+        # Free memory
         del ticks, lookup, chunk
         gc.collect() 
 
@@ -477,6 +483,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
     
+    # Params
     strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
     strategy.decay_factor = float(config.get('decay_factor', 0.95))
     strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
@@ -501,7 +508,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     print(f"   [Worker] Data Loaded. Starting Simulation...", flush=True)
     engine.run()
     
-    # --- RESULT CALCULATION ---
+    # --- RESULT EXTRACTION ---
     try: 
         cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     except: 
