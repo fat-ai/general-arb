@@ -345,24 +345,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     # [CRITICAL FIX] DATA ADAPTER LAYER
     # --------------------------------------------------------
     
-    # 1. Rename Columns (Based on your CSV evidence)
-    col_map = {
-        'timestamp': 'ts_str',
-        'size': 'trade_volume',
-        'tradeAmount': 'usdc_vol',
-        'price': 'p_market_all',
-        'user': 'wallet_id',
-        'contract_id': 'contract_id',
-        'side_mult': 'side_mult'
-    }
-    
-    slice_df = slice_df.rename(columns=col_map)
-
     # 2. Parse Timestamps
     if 'ts_str' in slice_df.columns:
         slice_df['ts_int'] = pd.to_datetime(slice_df['ts_str'], utc=True).astype(np.int64)
-    
-    slice_df = slice_df.iloc[::-1].reset_index(drop=True)
 
     # 4. Map Side
     if 'side_mult' in slice_df.columns:
@@ -503,7 +488,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     engine.add_strategy(strategy)
     engine.run()
-    
+    print(f"\n   [DEBUG] Run Complete. Trades: {strategy.total_closed}", flush=True)
+    if strategy.total_closed == 0:
+        print(f"   [WARNING] 0 Trades! Max Volume in Data: {slice_df['trade_volume'].max() if 'trade_volume' in slice_df else 'N/A'}", flush=True)
     # --- RESULT ------#
             
     final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
@@ -2632,10 +2619,16 @@ class TuningRunner:
             'contract_id': markets['contract_id'],
             'event_type': 'NEW_CONTRACT',
             'liquidity': markets['liquidity'].fillna(1.0),
-            'condition_id': cond_ids,  # <--- FIXED
+            'condition_id': cond_ids,
             'token_outcome_label': markets['token_outcome_label'].fillna('Yes'),
             'end_date': markets['resolution_timestamp'],
-            'p_market_all': 0.5 
+            
+            # Match df_updates Schema:
+            'p_market_all': 0.5,        # Initial Price
+            'trade_volume': 0.0,        # No volume on creation
+            'usdc_vol': 0.0,            # No volume on creation
+            'is_sell': False,           # Not a sell
+            'wallet_id': "SYSTEM"       # Placeholder user
         })
             
         # B. RESOLUTION
@@ -2643,7 +2636,14 @@ class TuningRunner:
             'timestamp': markets['resolution_timestamp'],
             'contract_id': markets['contract_id'],
             'event_type': 'RESOLUTION',
-            'outcome': markets['outcome'].astype('float32')
+            'outcome': markets['outcome'].astype('float32'),
+            
+            # Match df_updates Schema (Fill with safe defaults):
+            'p_market_all': markets['outcome'].astype('float32'), # Price converges to outcome
+            'trade_volume': 0.0,
+            'usdc_vol': 0.0,
+            'is_sell': False,
+            'wallet_id': "SYSTEM"
         })
 
         # C. PRICE_UPDATE (Robust Logic)
@@ -2691,10 +2691,15 @@ class TuningRunner:
             'timestamp': trades['timestamp'],
             'contract_id': trades['contract_id'],
             'event_type': 'PRICE_UPDATE',
+            # 1. PRICE: Map to 'p_market_all'
             'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
-            'trade_volume': trades['tradeAmount'].astype('float32'),
-            'size': trades['size'].astype('float32'),  
-            'wallet_id': trades['user'].astype('category'),
+            # 2. VOLUME: Map 'size' (Shares) DIRECTLY to 'trade_volume'
+            'trade_volume': trades['size'].astype('float32'),
+            # 3. USDC: Map 'tradeAmount' to 'usdc_vol' (for reference/debugging)
+            'usdc_vol': trades['tradeAmount'].astype('float32'), 
+            # 4. USER: Map to 'wallet_id'
+            'wallet_id': trades['user'].astype('category'),  
+            # 5. SIDE: Pre-calculate 'is_sell' so worker doesn't have to
             'is_sell': (trades['outcomeTokensAmount'] < 0)
         })
 
