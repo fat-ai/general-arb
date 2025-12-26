@@ -233,8 +233,6 @@ def process_data_chunk(args):
     asks[~subset_is_sell] = subset_prices[~subset_is_sell]
     bids[~subset_is_sell] = subset_prices[~subset_is_sell] - calculated_spreads[~subset_is_sell]
 
-    # [CRITICAL FIX] Clamp to 0.0-1.0 (Not 0.005-0.995)
-    # This prevents Bids being > Asks when price is 0.999
     bids = np.maximum(0.0, bids)
     asks = np.minimum(1.0, asks)
     
@@ -350,23 +348,21 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     # 1. Rename Columns (Based on your CSV evidence)
     col_map = {
         'timestamp': 'ts_str',
-        'tradeAmount': 'trade_volume',
+        'size': 'trade_volume',
+        'tradeAmount': 'usdc_vol',
         'price': 'p_market_all',
         'user': 'wallet_id',
-        'size': 'size',               
         'contract_id': 'contract_id',
         'side_mult': 'side_mult'
     }
+    
     slice_df = slice_df.rename(columns=col_map)
 
     # 2. Parse Timestamps
     if 'ts_str' in slice_df.columns:
         slice_df['ts_int'] = pd.to_datetime(slice_df['ts_str'], utc=True).astype(np.int64)
     
-    # 3. [CRITICAL] SORT CHRONOLOGICALLY
-    # Your CSV is reverse order (Dec -> Oct). Nautilus requires Oldest -> Newest.
-    if 'ts_int' in slice_df.columns:
-        slice_df = slice_df.sort_values('ts_int')
+    slice_df = slice_df.iloc[::-1].reset_index(drop=True)
 
     # 4. Map Side
     if 'side_mult' in slice_df.columns:
@@ -375,8 +371,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         slice_df['is_sell'] = False 
 
     # 5. [CRITICAL] SMART SCALING FIX
-    # We lower threshold to 100.0 to catch Micro-USDC integers.
-    # $0.33 (333,300) and $964 (964,035,000) are both > 100.
+
     if 'trade_volume' in slice_df.columns:
         if slice_df['trade_volume'].max() > 100.0:
             print(f"   [Data] Scaling USDC Volume (div by 1e6)...")
@@ -509,32 +504,13 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     engine.add_strategy(strategy)
     engine.run()
     
-    # --- RESULT ---
-    try: 
-        cash = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
-    except: 
-        cash = 10000.0
-    
-    open_pos_val = 0.0
-    last_prices = getattr(strategy, 'last_known_prices', {})
-    
-    for inst_id, tracker in strategy.positions_tracker.items():
-        qty = tracker.get('net_qty', 0.0)
-        if abs(qty) < 0.0001: continue
-        cid = inst_id.symbol.value
-        meta = market_lifecycle.get(cid, {})
-        outcome = meta.get('final_outcome')
-        end_ts = meta.get('end')
-        
-        if outcome is not None and (end_ts is not None and end_ts <= int(end_time.value)):
-            open_pos_val += qty * outcome
-        else:
-            curr_px = last_prices.get(cid, tracker.get('avg_price', 0.5))
-            open_pos_val += qty * curr_px
-
-    final_val = cash + open_pos_val
+    # --- RESULT ------#
+            
+    final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     
     full_curve = strategy.equity_history
+    if not full_curve:
+        full_curve = [(start_time, 10000.0)]
     if len(full_curve) > 2000:
         df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
         df_eq['ts'] = pd.to_datetime(df_eq['ts'])
