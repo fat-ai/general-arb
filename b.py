@@ -921,51 +921,63 @@ class PolymarketNautilusStrategy(Strategy):
                 self._close_position(inst_id, current_price, "SMART_EXIT")
 
     def _execute_entry(self, cid, signal, price):
-        if price <= 0.01 or price >= 0.99: return
-        if not self.portfolio: return
+        # [DEBUG] Probe: See what the strategy sees
+        # print(f"[DEBUG] Entry Check: {cid} | Px: {price} | Sig: {signal}", flush=True)
 
-        # Fix: Handle missing instrument map gracefully
+        if price <= 0.01 or price >= 0.99: 
+            # print(f"[REJECT] Price bounds: {price}", flush=True)
+            return
+            
+        if not self.portfolio: 
+            return
+
+        # 1. Map Check (Common Point of Failure)
         if cid not in self.instrument_map:
+            # print(f"[REJECT] Unknown CID: {cid}", flush=True)
             return
             
         inst_id = self.instrument_map[cid]
         account = self.portfolio.account(inst_id.venue)
         capital = account.balance_total(Currency.from_str("USDC")).as_double()
-        if capital < 10.0: return
         
-        # ---------------------------------------------------
-        # [CRITICAL FIX] Use 'self.' instead of 'self.config.'
-        # ---------------------------------------------------
+        if capital < 10.0: 
+            # print(f"[REJECT] Insufficient Capital: {capital}", flush=True)
+            return
         
-        # 1. Target Exposure
-        # The parameters were injected into 'self' by the worker
-        if getattr(self, 'sizing_mode', 'fixed') == 'kelly':
+        # 2. Sizing Logic (Safe getattr)
+        sizing_mode = getattr(self, 'sizing_mode', 'fixed')
+        if sizing_mode == 'kelly':
             target_exposure = capital * getattr(self, 'kelly_fraction', 0.1)
-        elif getattr(self, 'sizing_mode', 'fixed') == 'fixed_pct':
+        elif sizing_mode == 'fixed_pct':
              target_exposure = capital * getattr(self, 'fixed_size', 0.1)
         else: 
             target_exposure = getattr(self, 'fixed_size', 10.0)
 
-        # 2. Signed Quantity (Long is +, Short is -)
+        # 3. Calculate Quantity
         if signal > 0:
             target_qty_signed = target_exposure / price
         else:
             risk = max(0.01, 1.0 - price)
             target_qty_signed = -(target_exposure / risk)
 
-        # 3. Delta
+        # 4. Delta Check (Most Likely Failure Point)
         current_pos = self.positions_tracker.get(inst_id, {}).get('net_qty', 0.0)
         qty_needed = target_qty_signed - current_pos
         
-        if abs(qty_needed) < 1.0: return 
+        # [CRITICAL DEBUG] Print why we are ignoring the trade
+        if abs(qty_needed) < 1.0: 
+            # Only print 1 in 1000 to avoid spam, or print ALL for a short test
+            print(f"[REJECT] Size too small. Needed: {qty_needed:.4f} (Target: {target_qty_signed:.4f} | Pos: {current_pos})", flush=True)
+            return 
 
-        # 4. Execute
+        # 5. Execute
         side = OrderSide.BUY if qty_needed > 0 else OrderSide.SELL
         qty_to_trade = abs(qty_needed)
 
-        # Aggressive Limit
         if side == OrderSide.BUY: limit_px = min(0.99, price * 1.05)
         else: limit_px = max(0.01, price * 0.95)
+
+        print(f"[TRADE] Submitting Order! {side} {qty_to_trade} @ {limit_px}", flush=True)
 
         self.submit_order(self.order_factory.limit(
             instrument_id=inst_id,
