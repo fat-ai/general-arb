@@ -924,18 +924,27 @@ class PolymarketNautilusStrategy(Strategy):
         if price <= 0.01 or price >= 0.99: return
         if not self.portfolio: return
 
+        # Fix: Handle missing instrument map gracefully
+        if cid not in self.instrument_map:
+            return
+            
         inst_id = self.instrument_map[cid]
         account = self.portfolio.account(inst_id.venue)
         capital = account.balance_total(Currency.from_str("USDC")).as_double()
         if capital < 10.0: return
         
+        # ---------------------------------------------------
+        # [CRITICAL FIX] Use 'self.' instead of 'self.config.'
+        # ---------------------------------------------------
+        
         # 1. Target Exposure
-        if self.config.sizing_mode == 'kelly':
-            target_exposure = capital * self.config.kelly_fraction
-        elif self.config.sizing_mode == 'fixed_pct':
-             target_exposure = capital * self.config.fixed_size 
+        # The parameters were injected into 'self' by the worker
+        if getattr(self, 'sizing_mode', 'fixed') == 'kelly':
+            target_exposure = capital * getattr(self, 'kelly_fraction', 0.1)
+        elif getattr(self, 'sizing_mode', 'fixed') == 'fixed_pct':
+             target_exposure = capital * getattr(self, 'fixed_size', 0.1)
         else: 
-            target_exposure = self.config.fixed_size
+            target_exposure = getattr(self, 'fixed_size', 10.0)
 
         # 2. Signed Quantity (Long is +, Short is -)
         if signal > 0:
