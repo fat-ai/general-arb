@@ -771,20 +771,16 @@ class PolymarketNautilusStrategy(Strategy):
         self.positions_tracker = {}
 
     def on_start(self):
-      
-        if self.active_instrument_ids:
-            for inst_id in self.active_instrument_ids:
-                if hasattr(inst_id, 'value'): 
-                    self.instrument_map[inst_id.value] = inst_id
+        loop_target = getattr(self, 'active_instrument_ids', [])
+        
+        if not loop_target:
+            print("[CRITICAL WARNING] No instruments found in active_instrument_ids!", flush=True)
 
-        if self.active_instrument_ids:
-            for inst_id in self.active_instrument_ids:
-                if isinstance(inst_id, InstrumentId):
-                    self.subscribe_trade_ticks(inst_id)
-                    self.subscribe_quote_ticks(instrument_id)
-                    
-        if self.clock:
-            self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
+        print(f"[STRATEGY] Subscribing to {len(loop_target)} instruments...", flush=True)
+
+        for instrument_id in loop_target:
+            self.subscribe_trade_ticks(instrument_id)
+            self.subscribe_quote_ticks(instrument_id)
             
     def on_quote_tick(self, tick: QuoteTick):
         # [DEBUG] Confirm life immediately
