@@ -351,8 +351,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     else:
         print("   [CRITICAL FAIL] 'trade_volume' column is MISSING.", flush=True)
 
-    
-        
     # Silence Logging
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
     logging.getLogger("POLY-BOT").setLevel(logging.WARNING)
@@ -451,16 +449,19 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
 
         chunk = price_events.iloc[i : i + chunk_size]
-        print(f"   [Chunk {i}] Generated {len(ticks)} ticks. (First Tick Type: {type(ticks[0]) if ticks else 'None'})", flush=True)
+        
         if i == 0 and not chunk.empty:
              print(f"   [Worker] Data Check | TS: {chunk.iloc[0].get('ts_int')} | Vol: {chunk.iloc[0].get('trade_volume')}", flush=True)
-        # min_vol=0.000001 is safe now (data is scaled)
+        
         ticks, lookup = process_data_chunk((
             chunk, inst_map, i, local_liquidity, 0.000001,
             wallet_scores, float(fw_slope), float(fw_intercept)
         ))
         
+        print(f"   [Chunk {i}] Generated {len(ticks)} ticks. (First Tick Type: {type(ticks[0]) if ticks else 'None'})", flush=True)
+
         if ticks: engine.add_data(ticks)
+            
         local_wallet_lookup.update(lookup)
         
         del ticks, lookup, chunk
@@ -487,22 +488,22 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
     strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
     strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
-
     strategy.sim_start_ns = start_ns
     strategy.sim_end_ns = end_ns
     strategy.wallet_lookup = local_wallet_lookup
     strategy.active_instrument_ids = list(inst_map.values())
-    
     engine.add_strategy(strategy)
     engine.run()
+    
     print(f"\n   [DEBUG] Run Complete. Trades: {strategy.total_closed}", flush=True)
+    
     if strategy.total_closed == 0:
         print(f"   [WARNING] 0 Trades! Max Volume in Data: {slice_df['trade_volume'].max() if 'trade_volume' in slice_df else 'N/A'}", flush=True)
-    # --- RESULT ------#
             
     final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
     
     full_curve = strategy.equity_history
+    
     if not full_curve:
         full_curve = [(start_time, 10000.0)]
     if len(full_curve) > 2000:
@@ -780,10 +781,21 @@ class PolymarketNautilusStrategy(Strategy):
             for inst_id in self.active_instrument_ids:
                 if isinstance(inst_id, InstrumentId):
                     self.subscribe_trade_ticks(inst_id)
-        
+                    self.subscribe_quote_ticks(instrument_id)
+                    
         if self.clock:
             self.clock.set_timer("equity_heartbeat", pd.Timedelta(minutes=5))
+            
+    def on_quote_tick(self, tick: QuoteTick):
+        # [DEBUG] Confirm life immediately
+        print(f"[QUOTE TICK] {tick.instrument_id}", flush=True)
 
+        # Calculate a Mid-Price to drive your strategy
+        mid_price = (tick.bid_price.as_double() + tick.ask_price.as_double()) / 2.0
+        
+        # Pass to your logic
+        self._execute_entry(tick.instrument_id.value, 0.0, mid_price)
+        
     def on_timer(self, event):
         if event.name == "equity_heartbeat":
             self._record_equity()
