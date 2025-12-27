@@ -922,10 +922,10 @@ class PolymarketNautilusStrategy(Strategy):
 
     def _execute_entry(self, cid, signal, price):
         # [DEBUG] Probe: See what the strategy sees
-        # print(f"[DEBUG] Entry Check: {cid} | Px: {price} | Sig: {signal}", flush=True)
+        print(f"[DEBUG] Entry Check: {cid} | Px: {price} | Sig: {signal}", flush=True)
 
         if price <= 0.01 or price >= 0.99: 
-            # print(f"[REJECT] Price bounds: {price}", flush=True)
+            print(f"[REJECT] Price bounds: {price}", flush=True)
             return
             
         if not self.portfolio: 
@@ -933,7 +933,7 @@ class PolymarketNautilusStrategy(Strategy):
 
         # 1. Map Check (Common Point of Failure)
         if cid not in self.instrument_map:
-            # print(f"[REJECT] Unknown CID: {cid}", flush=True)
+            print(f"[REJECT] Unknown CID: {cid}", flush=True)
             return
             
         inst_id = self.instrument_map[cid]
@@ -941,7 +941,7 @@ class PolymarketNautilusStrategy(Strategy):
         capital = account.balance_total(Currency.from_str("USDC")).as_double()
         
         if capital < 10.0: 
-            # print(f"[REJECT] Insufficient Capital: {capital}", flush=True)
+            print(f"[REJECT] Insufficient Capital: {capital}", flush=True)
             return
         
         # 2. Sizing Logic (Safe getattr)
