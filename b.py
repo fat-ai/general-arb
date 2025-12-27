@@ -338,6 +338,20 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
 
     if slice_df.index.name == 'timestamp':
         slice_df = slice_df.reset_index()
+
+    print(f"\n[DIAGNOSTIC REPORT]", flush=True)
+    if 'trade_volume' in slice_df.columns:
+        max_vol = slice_df['trade_volume'].max()
+        avg_vol = slice_df['trade_volume'].mean()
+        zeros = (slice_df['trade_volume'] == 0).sum()
+        print(f"   Max Vol: {max_vol} | Avg Vol: {avg_vol} | Zero Rows: {zeros}/{len(slice_df)}", flush=True)
+        
+        if max_vol == 0:
+            print("   [CRITICAL FAIL] ALL VOLUME IS ZERO. Scaling logic is wrong.", flush=True)
+    else:
+        print("   [CRITICAL FAIL] 'trade_volume' column is MISSING.", flush=True)
+
+    
         
     # Silence Logging
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
@@ -437,6 +451,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
 
         chunk = price_events.iloc[i : i + chunk_size]
+        print(f"   [Chunk {i}] Generated {len(ticks)} ticks. (First Tick Type: {type(ticks[0]) if ticks else 'None'})", flush=True)
         if i == 0 and not chunk.empty:
              print(f"   [Worker] Data Check | TS: {chunk.iloc[0].get('ts_int')} | Vol: {chunk.iloc[0].get('trade_volume')}", flush=True)
         # min_vol=0.000001 is safe now (data is scaled)
