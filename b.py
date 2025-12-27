@@ -2703,7 +2703,7 @@ class TuningRunner:
         df_updates = pd.DataFrame({
             'timestamp': trades['timestamp'],
             'contract_id': trades['contract_id'],
-            'event_type': 'PRICE_UPDATE',
+            'event_type': 'TRADE',
             # 1. PRICE: Map to 'p_market_all'
             'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
             # 2. VOLUME: Map 'size' (Shares) DIRECTLY to 'trade_volume'
