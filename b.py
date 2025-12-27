@@ -336,6 +336,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
     from decimal import Decimal
 
+    if slice_df.index.name == 'timestamp':
+        slice_df = slice_df.reset_index()
+        
     # Silence Logging
     logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
     logging.getLogger("POLY-BOT").setLevel(logging.WARNING)
@@ -346,26 +349,14 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     # --------------------------------------------------------
     
     # 2. Parse Timestamps
-    if 'ts_str' in slice_df.columns:
-        slice_df['ts_int'] = pd.to_datetime(slice_df['ts_str'], utc=True).astype(np.int64)
-
-    # 4. Map Side
-    if 'side_mult' in slice_df.columns:
-        slice_df['is_sell'] = slice_df['side_mult'] == -1
-    elif 'is_sell' not in slice_df.columns:
-        slice_df['is_sell'] = False 
-
-    # 5. [CRITICAL] SMART SCALING FIX
-
-    if 'trade_volume' in slice_df.columns:
-        if slice_df['trade_volume'].max() > 100.0:
-            print(f"   [Data] Scaling USDC Volume (div by 1e6)...")
-            slice_df['trade_volume'] = slice_df['trade_volume'] / 1_000_000.0
-
-    if 'size' in slice_df.columns:
-        if slice_df['size'].max() > 100.0:
-            print(f"   [Data] Scaling Token Size (div by 1e6)...")
-            slice_df['size'] = slice_df['size'] / 1_000_000.0
+    if 'timestamp' in slice_df.columns:
+        if not pd.api.types.is_numeric_dtype(slice_df['timestamp']):
+             slice_df['ts_int'] = pd.to_datetime(slice_df['timestamp'], utc=True).astype(np.int64)
+        else:
+             slice_df['ts_int'] = slice_df['timestamp'].astype(np.int64)
+    elif 'ts_str' in slice_df.columns:
+         slice_df['ts_int'] = pd.to_datetime(slice_df['ts_str'], utc=True).astype(np.int64)
+     
 
     # Ensure Price is float
     if 'p_market_all' in slice_df.columns:
@@ -446,7 +437,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
             print(f"   [Worker] Loading Data: {i / total_rows:.0%}", flush=True)
 
         chunk = price_events.iloc[i : i + chunk_size]
-        
+        if i == 0 and not chunk.empty:
+             print(f"   [Worker] Data Check | TS: {chunk.iloc[0].get('ts_int')} | Vol: {chunk.iloc[0].get('trade_volume')}", flush=True)
         # min_vol=0.000001 is safe now (data is scaled)
         ticks, lookup = process_data_chunk((
             chunk, inst_map, i, local_liquidity, 0.000001,
@@ -2694,9 +2686,9 @@ class TuningRunner:
             # 1. PRICE: Map to 'p_market_all'
             'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
             # 2. VOLUME: Map 'size' (Shares) DIRECTLY to 'trade_volume'
-            'trade_volume': trades['size'].astype('float32'),
+            'trade_volume': (trades['size'] / 1_000_000.0).astype('float32'),
             # 3. USDC: Map 'tradeAmount' to 'usdc_vol' (for reference/debugging)
-            'usdc_vol': trades['tradeAmount'].astype('float32'), 
+            'usdc_vol': (trades['tradeAmount'] / 1_000_000.0).astype('float32'),
             # 4. USER: Map to 'wallet_id'
             'wallet_id': trades['user'].astype('category'),  
             # 5. SIDE: Pre-calculate 'is_sell' so worker doesn't have to
