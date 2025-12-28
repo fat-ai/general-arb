@@ -1034,7 +1034,7 @@ class PolymarketNautilusStrategy(Strategy):
             instrument_id=inst_id,
             order_side=side,
             quantity=Quantity.from_str(f"{qty_to_trade:.4f}"),
-            price=Price.from_str(f"{limit_px:.2f}"),
+            price=Price.from_str(f"{limit_px:.6f}"),
             time_in_force=TimeInForce.IOC 
         ))
         
@@ -1062,7 +1062,7 @@ class PolymarketNautilusStrategy(Strategy):
             instrument_id=inst_id,
             order_side=side,
             quantity=Quantity.from_str(f"{qty:.4f}"),
-            price=Price.from_str(f"{limit_px:.2f}"),
+            price=Price.from_str(f"{limit_px:.6f}"),
             time_in_force=TimeInForce.IOC
         ))
 
