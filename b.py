@@ -761,7 +761,6 @@ class PolymarketNautilusStrategy(Strategy):
         self.use_smart_exit = False
         self.smart_exit_ratio = 0.5
         self.edge_threshold = 0.05
-        
         self.instrument_map = {}
         self.equity_history = []
         self.break_even = 0      
@@ -780,8 +779,12 @@ class PolymarketNautilusStrategy(Strategy):
         print(f"[STRATEGY] Subscribing to {len(loop_target)} instruments...", flush=True)
 
         for instrument_id in loop_target:
-            self.subscribe_trade_ticks(instrument_id)
+            raw_symbol = instrument_id.symbol.value
+            self.instrument_map[raw_symbol] = instrument_id
             self.subscribe_quote_ticks(instrument_id)
+            self.subscribe_trade_ticks(instrument_id)
+            
+        print("[STRATEGY] Map hydration complete.", flush=True)
             
     def on_quote_tick(self, tick: QuoteTick):
         # Capture the precise Bid/Ask calculated by the Data Loader
