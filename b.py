@@ -830,9 +830,9 @@ class PolymarketNautilusStrategy(Strategy):
         if not self.portfolio: return
 
         total_equity = 0.0
-        if self.config.active_instrument_ids:
+        if self.active_instrument_ids:
             # Use the first venue found (POLY)
-            first_venue = self.config.active_instrument_ids[0].venue
+            first_venue = self.active_instrument_ids[0].venue
             account = self.portfolio.account(first_venue)
             if account:
                 total_equity = account.balance_total(usdc).as_double()
@@ -922,7 +922,7 @@ class PolymarketNautilusStrategy(Strategy):
         else: 
             pnl_pct = (avg_price - current_price) / avg_price
 
-        if self.stop_loss and pnl_pct < -self.config.stop_loss:
+        if self.stop_loss and pnl_pct < -self.stop_loss:
             self._close_position(inst_id, current_price, "STOP_LOSS")
 
     def _check_smart_exit(self, inst_id, current_price):
@@ -943,7 +943,7 @@ class PolymarketNautilusStrategy(Strategy):
         if net_qty > 0: pnl_pct = (current_price - avg_price) / avg_price
         else: pnl_pct = (avg_price - current_price) / avg_price
 
-        if pnl_pct > self.config.edge_threshold:
+        if pnl_pct > self.edge_threshold:
             threshold = self.splash_threshold * self.smart_exit_ratio
             is_long = net_qty > 0
             
