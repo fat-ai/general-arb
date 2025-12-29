@@ -1044,7 +1044,7 @@ class PolymarketNautilusStrategy(Strategy):
 
         position = self.positions_tracker[inst_id]
         
-        if not position or position.is_flat: 
+        if not position: 
 
             if inst_id in self.positions_tracker:
 
@@ -1053,7 +1053,8 @@ class PolymarketNautilusStrategy(Strategy):
             return
         
         side = OrderSide.SELL if position.is_long else OrderSide.BUY
-        qty = position.quantity
+        
+        qty = position['net_qty']
         
         if side == OrderSide.BUY: limit_px = 0.99
             
