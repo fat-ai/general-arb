@@ -1053,7 +1053,7 @@ class PolymarketNautilusStrategy(Strategy):
             return
         
         side = OrderSide.SELL if position.is_long else OrderSide.BUY
-        qty = position.quantity.as_double()
+        qty = position.quantity
         
         if side == OrderSide.BUY: limit_px = 0.99
             
