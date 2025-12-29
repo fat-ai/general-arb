@@ -1040,9 +1040,9 @@ class PolymarketNautilusStrategy(Strategy):
         
     def _close_position(self, inst_id, price, reason):
 
-        if not self.portfolio: return
+        if not self.positions_tracker: return
 
-        position = self.portfolio.positions.get(inst_id)
+        position = self.positions_tracker[inst_id]
         
         if not position or position.is_flat: 
 
