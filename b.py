@@ -1042,20 +1042,21 @@ class PolymarketNautilusStrategy(Strategy):
 
         if not self.portfolio: return
 
-        account = self.portfolio.account(inst_id.venue)
-        position = account.position(inst_id)
+        position = self.portfolio.positions.get(inst_id)
         
         if not position or position.is_flat: 
 
             if inst_id in self.positions_tracker:
 
                 del self.positions_tracker[inst_id]
+                
             return
         
         side = OrderSide.SELL if position.is_long else OrderSide.BUY
         qty = position.quantity.as_double()
         
         if side == OrderSide.BUY: limit_px = 0.99
+            
         else: limit_px = 0.01
             
         self.submit_order(self.order_factory.limit(
