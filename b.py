@@ -1052,12 +1052,14 @@ class PolymarketNautilusStrategy(Strategy):
                 
             return
         
-        side = OrderSide.SELL if position.is_long else OrderSide.BUY
-        
         qty = position['net_qty']
+
+        is_long = qty > 0
+        
+        if is_long: side = OrderSide.BUY    
+        else: side = OrderSide.SELL
         
         if side == OrderSide.BUY: limit_px = 0.99
-            
         else: limit_px = 0.01
             
         self.submit_order(self.order_factory.limit(
