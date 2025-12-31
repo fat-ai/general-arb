@@ -217,9 +217,7 @@ def process_data_chunk(args):
     num_rows = len(subset_insts)
 
     # 4. Liquidity & Spread Logic
-    liq_values = np.array([known_liquidity.get(c, 1000.0) for c in subset_cids])
-    # Approximation: If $5k traded in this tick, liquidity is at least $5k.
-    dynamic_liquidity = np.maximum(liq_values * 0.1, subset_vols * 10.0)
+    dynamic_liquidity = np.maximum(liq_values * 0.1, subset_vols * 50.0)
     liq_penalty = 20000.0 / (dynamic_liquidity + 1000.0)
     calculated_spreads = np.minimum(0.20, 0.01 + (liq_penalty * 0.0025))
     
@@ -250,7 +248,7 @@ def process_data_chunk(args):
     subset_sizes = np.round(subset_sizes, 4)
 
     # Depth Logic
-    depth_vals = np.maximum(100.0, liq_values * 0.01)
+    depth_vals = np.maximum(100.0, subset_sizes * 2.0)
     large_size_mask = subset_sizes > depth_vals
     depth_vals[large_size_mask] = subset_sizes[large_size_mask] * 1.5
     depth_vals = np.round(depth_vals, 4)
