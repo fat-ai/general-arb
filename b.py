@@ -226,11 +226,11 @@ def process_data_chunk(args):
     
     # SNAP LOGIC: Align Bid/Ask exactly to the Trade Price to ensure fill
     # If Sell (-1) -> Hit Bid -> Bid = Price
-    bids[subset_is_sell] = subset_prices[subset_is_sell] - calculated_spreads[~subset_is_sell]
+    bids[subset_is_sell] = subset_prices[subset_is_sell] - calculated_spreads[subset_is_sell]
     asks[subset_is_sell] = subset_prices[subset_is_sell] 
     
     # If Buy (1) -> Lift Ask -> Ask = Price
-    asks[~subset_is_sell] = subset_prices[~subset_is_sell] + calculated_spreads[subset_is_sell]
+    asks[~subset_is_sell] = subset_prices[~subset_is_sell] + calculated_spreads[~subset_is_sell]
     bids[~subset_is_sell] = subset_prices[~subset_is_sell] 
 
     bids = np.maximum(0.0, bids)
