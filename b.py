@@ -218,7 +218,9 @@ def process_data_chunk(args):
 
     # 4. Liquidity & Spread Logic
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in subset_cids])
-    liq_penalty = 20000.0 / (liq_values + 1000.0)
+    # Approximation: If $5k traded in this tick, liquidity is at least $5k.
+    dynamic_liquidity = np.maximum(liq_values * 0.1, subset_vols * 10.0)
+    liq_penalty = 20000.0 / (dynamic_liquidity + 1000.0)
     calculated_spreads = np.minimum(0.20, 0.01 + (liq_penalty * 0.0025))
     
     bids = np.zeros(num_rows, dtype=np.float64)
@@ -248,7 +250,7 @@ def process_data_chunk(args):
     subset_sizes = np.round(subset_sizes, 4)
 
     # Depth Logic
-    depth_vals = np.maximum(5000.0, liq_values * 0.01)
+    depth_vals = np.maximum(100.0, liq_values * 0.01)
     large_size_mask = subset_sizes > depth_vals
     depth_vals[large_size_mask] = subset_sizes[large_size_mask] * 1.5
     depth_vals = np.round(depth_vals, 4)
@@ -256,7 +258,7 @@ def process_data_chunk(args):
     # 6. Wallet Scoring
     keys = pd.Series(subset_wallet_ids) + "|default_topic"
     scores = keys.map(wallet_scores).values
-    
+    scores[subset_wallet_ids == "SYSTEM"] = 0.0
     missing_mask = np.isnan(scores)
     if missing_mask.any():
         scores[missing_mask] = 0.0
@@ -2710,8 +2712,8 @@ class TuningRunner:
             
             # Match df_updates Schema (Fill with safe defaults):
             'p_market_all': markets['outcome'].astype('float32'), # Price converges to outcome
-            'trade_volume': 0.0,
-            'usdc_vol': 0.0,
+            'trade_volume': 0.0001,
+            'usdc_vol': 0.0001,
             'is_sell': False,
             'wallet_id': "SYSTEM"
         })
