@@ -297,13 +297,11 @@ def process_data_chunk(args):
 
     for inst, ts, bid_v, ask_v, trd_v, depth_v, size_v, is_sell, score, tr_id in iterator:
         
-        # [CRITICAL] Pass Standard Floats
-        # Price(0.01, 6) works in Nautilus. Price(10000, 6) creates $10,000.00.
-        p_bid = _Price(bid_v, 6)
-        p_ask = _Price(ask_v, 6)
-        p_trd = _Price(trd_v, 6)
-        s_bid = _Quantity(depth_v, 4)
-        s_trd = _Quantity(size_v, 4)
+        p_bid = _Price.from_str(f"{bid_v:.6f}")
+        p_ask = _Price.from_str(f"{ask_v:.6f}")
+        p_trd = _Price.from_str(f"{trd_v:.6f}")
+        s_bid = _Quantity.from_str(f"{depth_v:.4f}")
+        s_trd = _Quantity.from_str(f"{size_v:.4f}")
 
         results.append(_QuoteTick(
             instrument_id=inst,
@@ -1231,140 +1229,105 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
             
     def run_walk_forward(self, config: dict) -> dict:
+        """
+        REPLACEMENT: Continuous Simulation Mode.
+        Trains on the first 'train_days' (e.g., 60), then runs ONE uninterrupted 
+        backtest from that point to the end of the data. Preserves positions.
+        """
         if self.event_log.empty: return {'total_return': 0.0}
 
+        # 1. Setup Timestamps
         if 'ts_int' not in self.profiler_data.columns:
             self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
         if 'ts_int' not in self.event_log.columns:
             self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
 
+        # 2. Define Split Points
+        # Train on first X days, Test on the rest.
         train_days = config.get('train_days', 60)
-        test_days = 30
-        current_date = self.event_log.index.min()
+        
+        min_date = self.event_log.index.min()
         max_date = self.event_log.index.max()
         
-        pending_futures = []
-        results_store = []
-        MAX_PENDING = 30
+        # Train Window: Start -> Start + 60 Days
+        train_end = min_date + timedelta(days=train_days)
+        # Test Window: Train End + 2 Days -> End of Data
+        test_start = train_end + timedelta(days=2) 
         
-        while current_date + timedelta(days=train_days + 2 + test_days) <= max_date:
-            # MEMORY CONTROL: Wait if too many tasks active
-            if len(pending_futures) >= MAX_PENDING:
-                done, pending_futures = ray.wait(pending_futures, num_returns=1)
-                results_store.append(ray.get(done[0]))
+        print(f"\n[CONFIG] Continuous Block Mode")
+        print(f"   Training: {min_date.date()} -> {train_end.date()}")
+        print(f"   Testing:  {test_start.date()} -> {max_date.date()}")
 
-            train_end = current_date + timedelta(days=train_days)
-            test_start = train_end + timedelta(days=2)
-            test_end = test_start + timedelta(days=test_days)
-            
-            train_mask = (self.profiler_data['ts_int'] >= current_date.value) & (self.profiler_data['ts_int'] < train_end.value)
-            raw_train = self.profiler_data[train_mask]
+        if test_start >= max_date:
+            print("⚠️ Error: Not enough data for testing window.")
+            return {'total_return': 0.0}
 
-            if 'res_time' in raw_train.columns:
-                 # Only learn from markets that have actually settled/resolved by now
-                 train_profiler = raw_train[raw_train['res_time'] <= train_end]
-            else:
-                 train_profiler = raw_train
-
-            fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
-    
-            known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
-            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
-            
-            test_mask = (self.event_log['ts_int'] >= test_start.value) & (self.event_log['ts_int'] < test_end.value)
-            test_slice_df = self.event_log[test_mask].copy()
-            
-            if not test_slice_df.empty:
-                # Launch
-                future = execute_period_remote.remote(
-                    test_slice_df, fold_wallet_scores, config, fw_slope, fw_intercept, 
-                    train_end, test_end, {}, self.market_lifecycle
-                )
-                pending_futures.append(future)
-            
-            current_date += timedelta(days=test_days)
-
-        # Collect remaining
-        if pending_futures:
-            results_store.extend(ray.get(pending_futures))
-
-        if not results_store: return {'total_return': 0.0}
-
-        # Stitching Logic (Optimized)
-        results_store.sort(key=lambda x: x['start_ts'])
+        # 3. TRAIN (Once)
+        # Calculate scores using only the training window
+        train_mask = (self.profiler_data['ts_int'] < train_end.value)
+        train_profiler = self.profiler_data[train_mask]
         
-        full_equity_curve = []
-        cumulative_compound = 1.0
-        STARTING_CAPITAL = 10000.0
-        
-        total_trades = 0
-        total_wins = 0
-        total_losses = 0
-        
-        # Stitching Logic
-        for res in results_store:
-            total_trades += res.get('trades', 0)
-            total_wins += res.get('wins', 0)
-            total_losses += res.get('losses', 0)
-            
-            period_curve = res.get('equity_curve', [])
-            if not period_curve:
-                continue
-                
-            # Normalize this period to a return multiplier
-            # We assume every period starts fresh at 10k in the simulation
-            # but in reality, we compound the capital.
-            period_start_val = 10000.0 
-            
-            for ts, val in period_curve:
-                # Calculate period growth factor
-                growth = val / period_start_val
-                
-                # Apply to global cumulative compound
-                real_equity = STARTING_CAPITAL * cumulative_compound * growth
-                full_equity_curve.append((ts, real_equity))
-            
-            # Update compound for the next period based on final value
-            final_period_return = res.get('return', 0.0)
-            cumulative_compound *= (1.0 + final_period_return)
+        # Only learn from markets resolved during training
+        if 'res_time' in train_profiler.columns:
+            train_profiler = train_profiler[train_profiler['res_time'] <= train_end]
 
-        # Final return based on compounding
-        final_ret = cumulative_compound - 1.0
+        print(f"   Training on {len(train_profiler)} historical trades...")
+        fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
+        
+        known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
+        fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
+
+        # 4. PREPARE TEST DATA (All remaining data)
+        test_mask = (self.event_log['ts_int'] >= test_start.value)
+        test_slice_df = self.event_log[test_mask].copy()
+
+        if test_slice_df.empty:
+            return {'total_return': 0.0}
+
+        # 5. EXECUTE (Single Long Job)
+        # We run one remote task for the entire remaining duration.
+        # This keeps the engine alive, so positions are held until resolution.
+        try:
+            result = ray.get(execute_period_remote.remote(
+                test_slice_df, fold_wallet_scores, config, fw_slope, fw_intercept, 
+                train_end, max_date, {}, self.market_lifecycle
+            ))
+        except Exception as e:
+            print(f"❌ Simulation execution failed: {e}")
+            traceback.print_exc()
+            return {'total_return': 0.0}
+
+        # 6. RETURN RESULTS DIRECTLY
+        # No stitching needed because we have a single equity curve
+        final_ret = result.get('return', 0.0)
+        full_equity_curve = result.get('equity_curve', [])
         
         sharpe = 0.0
         max_dd_pct = 0.0
         
         if full_equity_curve:
-            # Calculate metrics
             equity_values = [x[1] for x in full_equity_curve]
             try:
                 max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
-            except: 
-                max_dd_pct = 0.0
-            
-            try:
-                # Convert to Series for Sharpe
+                
+                # Sharpe Calculation
                 df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
                 df_eq['ts'] = pd.to_datetime(df_eq['ts'])
                 df_eq = df_eq.set_index('ts').sort_index()
-                
-                # Resample strictly to Daily
-                daily_vals = df_eq['equity'].resample('D').last().ffill()
-                daily_rets = daily_vals.pct_change().dropna()
-                
+                # Resample strictly to daily for standard Sharpe
+                daily_rets = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
                 if len(daily_rets) > 1:
                     sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=365, rf=0.02)
-            except Exception as e:
-                print(f"Sharpe calc error: {e}")
-                sharpe = 0.0
+            except Exception: 
+                pass
 
         return {
             'total_return': final_ret,
             'sharpe_ratio': sharpe,
             'max_drawdown': abs(max_dd_pct),
-            'trades': total_trades,
-            'wins': total_wins,
-            'losses': total_losses,
+            'trades': result.get('trades', 0),
+            'wins': result.get('wins', 0),
+            'losses': result.get('losses', 0),
             'full_equity_curve': full_equity_curve
         }
                                                                                                  
