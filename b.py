@@ -219,19 +219,19 @@ def process_data_chunk(args):
     # 4. Liquidity & Spread Logic
     liq_values = np.array([known_liquidity.get(c, 1000.0) for c in subset_cids])
     liq_penalty = 20000.0 / (liq_values + 1000.0)
-    calculated_spreads = np.minimum(0.20, 0.005 + (liq_penalty * 0.0001))
+    calculated_spreads = np.minimum(0.20, 0.01 + (liq_penalty * 0.0025))
     
     bids = np.zeros(num_rows, dtype=np.float64)
     asks = np.zeros(num_rows, dtype=np.float64)
     
     # SNAP LOGIC: Align Bid/Ask exactly to the Trade Price to ensure fill
     # If Sell (-1) -> Hit Bid -> Bid = Price
-    bids[subset_is_sell] = subset_prices[subset_is_sell]
-    asks[subset_is_sell] = subset_prices[subset_is_sell] + calculated_spreads[subset_is_sell]
+    bids[subset_is_sell] = subset_prices[subset_is_sell] - calculated_spreads[~subset_is_sell]
+    asks[subset_is_sell] = subset_prices[subset_is_sell] 
     
     # If Buy (1) -> Lift Ask -> Ask = Price
-    asks[~subset_is_sell] = subset_prices[~subset_is_sell]
-    bids[~subset_is_sell] = subset_prices[~subset_is_sell] - calculated_spreads[~subset_is_sell]
+    asks[~subset_is_sell] = subset_prices[~subset_is_sell] + calculated_spreads[subset_is_sell]
+    bids[~subset_is_sell] = subset_prices[~subset_is_sell] 
 
     bids = np.maximum(0.0, bids)
     asks = np.minimum(1.0, asks)
