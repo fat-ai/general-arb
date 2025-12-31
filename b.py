@@ -217,7 +217,7 @@ def process_data_chunk(args):
     num_rows = len(subset_insts)
 
     # 4. Liquidity & Spread Logic
-    dynamic_liquidity = np.maximum(liq_values * 0.1, subset_vols * 50.0)
+    dynamic_liquidity = np.maximum(1000.0, subset_vols * 50.0)
     liq_penalty = 20000.0 / (dynamic_liquidity + 1000.0)
     calculated_spreads = np.minimum(0.20, 0.01 + (liq_penalty * 0.0025))
     
@@ -1326,6 +1326,7 @@ class FastBacktestEngine:
             'trades': result.get('trades', 0),
             'wins': result.get('wins', 0),
             'losses': result.get('losses', 0),
+            'win_loss_ratio': result.get('wins', 0) / max(1, result.get('losses', 0)),
             'full_equity_curve': full_equity_curve
         }
                                                                                                  
