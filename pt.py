@@ -358,38 +358,58 @@ class ModelTrainer:
         return pd.DataFrame()
 
     def _build_outcome_map(self):
-        log.info("   Fetching resolved market outcomes...")
-        
+
+        market_cache = CACHE_DIR / "gamma_markets.json"
         all_rows = []
-        offset = 0
-        
-        # ADDED: Retry logic for initial market fetch
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        session.mount('https://', HTTPAdapter(max_retries=retries))
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-        
-        while True:
-            params = {"limit": 500, "offset": offset, "closed": "true"}
+
+        # 1. Try Loading from Cache
+        if market_cache.exists():
+            log.info(f"   Loading markets from cache: {market_cache.name}")
             try:
-                r = session.get(GAMMA_API_URL, params=params, timeout=15)
-                if r.status_code != 200: break
-                batch = r.json()
-                if not batch: break
-                all_rows.extend(batch)
-                offset += len(batch)
-                print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
-                if len(batch) < 500: break
-            except: break
-        print("")
-        
+                with open(market_cache, 'r') as f:
+                    all_rows = json.load(f)
+            except Exception as e:
+                log.warning(f"   Cache read failed ({e}), re-downloading...")
+
+        # 2. Download if Cache is Missing/Empty
+        if not all_rows:
+            log.info("   Fetching resolved market outcomes from API...")
+            offset = 0
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
+            session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            
+            while True:
+                params = {"limit": 500, "offset": offset, "closed": "true"}
+                try:
+                    r = session.get(GAMMA_API_URL, params=params, timeout=15)
+                    if r.status_code != 200: break
+                    batch = r.json()
+                    if not batch: break
+                    all_rows.extend(batch)
+                    offset += len(batch)
+                    print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
+                    if len(batch) < 500: break
+                except: break
+            print("")
+            
+            # 3. Save to Cache
+            if all_rows:
+                try:
+                    with open(market_cache, 'w') as f:
+                        json.dump(all_rows, f)
+                    log.info(f"   Cached {len(all_rows)} markets to disk.")
+                except Exception as e:
+                    log.error(f"   Failed to write cache: {e}")
+
+        # --- Standard Processing (No changes below this line) ---
         if not all_rows: return set(), set()
 
         df = pd.DataFrame(all_rows)
         
         def extract_tokens(row):
-            raw = row.get('clobTokenIds')
-            if not raw: raw = row.get('tokens')
+            raw = row.get('clobTokenIds') or row.get('tokens')
             if isinstance(raw, list): return ",".join([str(t).strip() for t in raw])
             if isinstance(raw, str):
                 try: return ",".join([str(t).strip() for t in json.loads(raw)])
@@ -430,7 +450,7 @@ class ModelTrainer:
         
         log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
         return winners, losers
-
+        
     def _fetch_history_parallel(self, token_ids, days_back=365):
         cache_file = CACHE_DIR / "gamma_trades_stream.csv"
         ledger_file = CACHE_DIR / "gamma_completed.txt"
