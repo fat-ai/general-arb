@@ -6,11 +6,16 @@ import logging
 import asyncio
 import signal
 import requests
+import pandas as pd
+import numpy as np 
 from pathlib import Path
 from typing import Dict, List, Set, Any
 from concurrent.futures import ThreadPoolExecutor
 import websockets
-import pandas as pd
+import concurrent.futures
+import csv
+import threading
+from requests.adapters import HTTPAdapter, Retry
 
 # --- CONFIGURATION ---
 CACHE_DIR = Path("live_paper_cache")
@@ -18,13 +23,10 @@ STATE_FILE = Path("paper_state.json")
 AUDIT_FILE = Path("trades_audit.jsonl")
 LOG_LEVEL = logging.INFO
 
-# 1. UPDATED ENDPOINTS
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-# SWITCHED TO ORDERBOOK SUBGRAPH (CLOB)
 SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# POLYGON USDC ADDRESS (To identify the collateral leg of a trade)
 USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
 CONFIG = {
@@ -105,12 +107,531 @@ class PersistenceManager:
         pos_val = sum(p['qty'] * p['avg_price'] for p in self.state['positions'].values())
         return self.state['cash'] + pos_val
 
-# --- DATA ---
+# --- DATA & MODELING ---
+
+class ModelTrainer:
+    """
+    Identifies 'Smart Wallets' by fetching full market history in parallel.
+    - Uses ThreadPoolExecutor to fetch trades for specific tokens.
+    - Caches results to CSV to allow resuming interrupted downloads.
+    """
+    def __init__(self):
+        self.scores_file = Path("wallet_scores.json")
+        self.min_trades = 5
+        self.min_volume = 100.0
+
+    def train_if_needed(self):
+        if self.scores_file.exists():
+            if time.time() - self.scores_file.stat().st_mtime < 86400:
+                log.info("🧠 Model is fresh. Loading from cache.")
+                with open(self.scores_file, "r") as f:
+                    return json.load(f)
+        
+        log.info(f"🧠 Training model on full history...")
+        return self._run_training()
+
+    def _run_training(self):
+        # 1. Fetch Resolved Markets & Identify Winning Tokens
+        winning_tokens, losing_tokens = self._build_outcome_map()
+        if not winning_tokens:
+            log.error("❌ No winning tokens identified. Aborting training.")
+            return {}
+
+        # 2. Fetch Trades (Parallel)
+        all_tokens = list(winning_tokens | losing_tokens)
+        df = self._fetch_history_parallel(all_tokens)
+        
+        if df.empty:
+            log.warning("⚠️ No trade history fetched.")
+            return {}
+
+        # 3. Calculate ROI Scores
+        log.info(f"   Calculating ROI from {len(df)} trades...")
+        wallet_stats = {} 
+        winners = set(winning_tokens)
+        losers = set(losing_tokens)
+
+        for row in df.itertuples():
+            # Columns: timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult
+            user = str(row.user)
+            token = str(row.contract_id)
+            usdc_val = float(row.tradeAmount) 
+            size = float(row.size)
+            side = int(row.side_mult) # 1 = Buy, -1 = Sell
+            
+            if user not in wallet_stats: 
+                wallet_stats[user] = {'invested': 0.0, 'returned': 0.0, 'count': 0}
+            
+            stats = wallet_stats[user]
+            stats['count'] += 1
+            
+            if token in winners:
+                if side == 1: # Buy
+                    stats['invested'] += usdc_val
+                    stats['returned'] += size 
+                else: # Sell
+                    stats['returned'] += usdc_val
+            elif token in losers:
+                if side == 1: # Buy
+                    stats['invested'] += usdc_val
+                else: # Sell
+                    stats['returned'] += usdc_val
+
+        # 4. Final Scoring
+        final_scores = {}
+        for user, stats in wallet_stats.items():
+            if stats['count'] < self.min_trades: continue
+            if stats['invested'] < self.min_volume: continue
+            
+            roi = (stats['returned'] - stats['invested']) / stats['invested']
+            if roi > 0.05: 
+                final_scores[user] = min(roi * 5.0, 5.0)
+        
+        with open(self.scores_file, "w") as f:
+            json.dump(final_scores, f)
+        
+        log.info(f"✅ Training Complete. Identified {len(final_scores)} Smart Wallets.")
+        return final_scores
+
+    def _fetch_history_parallel(self, token_ids, days_back=365):
+        cache_file = CACHE_DIR / "gamma_trades_stream.csv"
+        ledger_file = CACHE_DIR / "gamma_completed.txt"
+        
+        completed_tokens = set()
+        if ledger_file.exists():
+            try:
+                with open(ledger_file, 'r') as f:
+                    completed_tokens = set(line.strip() for line in f if line.strip())
+            except Exception: pass
+        
+        pending_tokens = [t for t in token_ids if t not in completed_tokens]
+        log.info(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
+        
+        if not pending_tokens and cache_file.exists():
+             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+
+        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
+                      'contract_id', 'price', 'size', 'side_mult']
+        
+        csv_lock = threading.Lock()
+        ledger_lock = threading.Lock()
+        
+        limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+        CUTOFF_TS = limit_date.timestamp()
+        
+        def worker(token_str, writer):
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
+            
+            last_ts = 2147483647 
+            
+            while True:
+                try:
+                    query = """
+                    query($token: String!, $max_ts: Int!) {
+                      asMaker: orderFilledEvents(
+                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        where: { makerAssetId: $token, timestamp_lt: $max_ts }
+                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                      asTaker: orderFilledEvents(
+                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
+                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                    }
+                    """
+                    resp = session.post(SUBGRAPH_URL, json={"query": query, "variables": {"token": token_str, "max_ts": int(last_ts)}}, timeout=30)
+                    if resp.status_code != 200: 
+                        time.sleep(2)
+                        continue
+                        
+                    data = resp.json().get('data', {})
+                    if not data: break
+                    
+                    batch = []
+                    for r in data.get('asMaker', []): batch.append((r, 'maker'))
+                    for r in data.get('asTaker', []): batch.append((r, 'taker'))
+                    
+                    if not batch: break
+                    batch.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
+                    
+                    rows = []
+                    min_ts = last_ts
+                    stop = False
+                    
+                    for r, role in batch:
+                        ts = float(r['timestamp'])
+                        min_ts = min(min_ts, ts)
+                        if ts < CUTOFF_TS: 
+                            stop = True
+                            continue
+                            
+                        if role == 'maker':
+                            size = float(r['makerAmountFilled']) / 1e18
+                            usdc = float(r['takerAmountFilled']) / 1e6
+                            user = r['taker']
+                            side = 1 
+                        else:
+                            size = float(r['takerAmountFilled']) / 1e18
+                            usdc = float(r['makerAmountFilled']) / 1e6
+                            user = r['taker']
+                            side = -1 
+                            
+                        if size <= 0 or usdc <= 0: continue
+                        price = usdc / size
+                        if not (0.01 <= price <= 0.99): continue
+                        
+                        rows.append({
+                            'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
+                            'tradeAmount': usdc,
+                            'outcomeTokensAmount': size * side,
+                            'user': user,
+                            'contract_id': token_str,
+                            'price': price,
+                            'size': size,
+                            'side_mult': side
+                        })
+                    
+                    if rows:
+                        with csv_lock:
+                            writer.writerows(rows)
+                    
+                    if stop: break
+                    
+                    if int(min_ts) >= int(last_ts): last_ts = int(min_ts) - 1
+                    else: last_ts = min_ts
+                    
+                    if min_ts < CUTOFF_TS: break
+                    
+                except Exception:
+                    break
+
+            with ledger_lock:
+                with open(ledger_file, "a") as f: f.write(f"{token_str}\n")
+
+        target = cache_file if cache_file.exists() else cache_file.with_suffix(f".tmp.{os.getpid()}")
+        mode = 'a' if cache_file.exists() else 'w'
+        
+        try:
+            with open(target, mode, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+                if mode == 'w': writer.writeheader()
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(worker, t, writer) for t in pending_tokens]
+                    done = 0
+                    for _ in concurrent.futures.as_completed(futures):
+                        done += 1
+                        print(f"   Fetching history: {done}/{len(pending_tokens)} tokens...", end='\r')
+            
+            if not cache_file.exists() and os.path.exists(target):
+                os.replace(target, cache_file)
+                
+        except Exception as e:
+            log.error(f"Parallel fetch failed: {e}")
+            if os.path.exists(target) and target != cache_file: os.remove(target)
+            
+        print("")
+        if cache_file.exists():
+            return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        return pd.DataFrame()
+
+    def _build_outcome_map(self):
+        log.info("   Fetching resolved market outcomes...")
+        
+        all_rows = []
+        offset = 0
+        
+        # ADDED: Retry logic for initial market fetch
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        
+        while True:
+            params = {"limit": 500, "offset": offset, "closed": "true"}
+            try:
+                r = session.get(GAMMA_API_URL, params=params, timeout=15)
+                if r.status_code != 200: break
+                batch = r.json()
+                if not batch: break
+                all_rows.extend(batch)
+                offset += len(batch)
+                print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
+                if len(batch) < 500: break
+            except: break
+        print("")
+        
+        if not all_rows: return set(), set()
+
+        df = pd.DataFrame(all_rows)
+        
+        def extract_tokens(row):
+            raw = row.get('clobTokenIds')
+            if not raw: raw = row.get('tokens')
+            if isinstance(raw, list): return ",".join([str(t).strip() for t in raw])
+            if isinstance(raw, str):
+                try: return ",".join([str(t).strip() for t in json.loads(raw)])
+                except: return str(raw)
+            return None
+
+        df['contract_id'] = df.apply(extract_tokens, axis=1)
+        df = df.dropna(subset=['contract_id'])
+        
+        def derive_outcome(row):
+            val = row.get('outcome')
+            if pd.notna(val):
+                try:
+                    f = float(val)
+                    if f in [0.0, 1.0]: return f
+                except: pass
+            return np.nan 
+
+        df['outcome'] = df.apply(derive_outcome, axis=1)
+        df = df.dropna(subset=['outcome'])
+        
+        if df.empty: return set(), set()
+
+        df['contract_id_list'] = df['contract_id'].str.split(',')
+        df = df.explode('contract_id_list')
+        df['token_id'] = df['contract_id_list'].str.strip()
+        df['token_index'] = df.groupby(level=0).cumcount()
+        df = df.reset_index(drop=True)
+        
+        def final_token_payout(row):
+            winning_idx = int(round(row['outcome']))
+            return 1.0 if row['token_index'] == winning_idx else 0.0
+
+        df['token_payout'] = df.apply(final_token_payout, axis=1)
+        
+        winners = set(df[df['token_payout'] == 1.0]['token_id'].unique())
+        losers = set(df[df['token_payout'] == 0.0]['token_id'].unique())
+        
+        log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
+        return winners, losers
+
+    def _fetch_history_parallel(self, token_ids, days_back=365):
+        cache_file = CACHE_DIR / "gamma_trades_stream.csv"
+        ledger_file = CACHE_DIR / "gamma_completed.txt"
+        
+        # Filter completed tokens using ledger
+        completed_tokens = set()
+        if ledger_file.exists():
+            try:
+                with open(ledger_file, 'r') as f:
+                    completed_tokens = set(line.strip() for line in f if line.strip())
+            except Exception: pass
+        
+        pending_tokens = [t for t in token_ids if t not in completed_tokens]
+        log.info(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
+        
+        # Return immediately if everything is done
+        if not pending_tokens and cache_file.exists():
+             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+
+        # Setup CSV and Worker
+        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
+                      'contract_id', 'price', 'size', 'side_mult']
+        
+        csv_lock = threading.Lock()
+        ledger_lock = threading.Lock()
+        
+        limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+        CUTOFF_TS = limit_date.timestamp()
+        
+        def worker(token_str, writer):
+            session = requests.Session()
+            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            session.mount('https://', HTTPAdapter(max_retries=retries))
+            
+            last_ts = 2147483647 # Max Int32
+            
+            while True:
+                try:
+                    # Dual query for Maker and Taker roles
+                    query = """
+                    query($token: String!, $max_ts: Int!) {
+                      asMaker: orderFilledEvents(
+                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        where: { makerAssetId: $token, timestamp_lt: $max_ts }
+                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                      asTaker: orderFilledEvents(
+                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
+                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                    }
+                    """
+                    resp = session.post(SUBGRAPH_URL, json={"query": query, "variables": {"token": token_str, "max_ts": int(last_ts)}}, timeout=30)
+                    if resp.status_code != 200: 
+                        time.sleep(2)
+                        continue
+                        
+                    data = resp.json().get('data', {})
+                    if not data: break
+                    
+                    batch = []
+                    for r in data.get('asMaker', []): batch.append((r, 'maker'))
+                    for r in data.get('asTaker', []): batch.append((r, 'taker'))
+                    
+                    if not batch: break
+                    batch.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
+                    
+                    rows = []
+                    min_ts = last_ts
+                    stop = False
+                    
+                    for r, role in batch:
+                        ts = float(r['timestamp'])
+                        min_ts = min(min_ts, ts)
+                        if ts < CUTOFF_TS: 
+                            stop = True
+                            continue
+                            
+                        # Normalize columns (USDC is always 1e6, Token is 1e18)
+                        if role == 'maker':
+                            size = float(r['makerAmountFilled']) / 1e18
+                            usdc = float(r['takerAmountFilled']) / 1e6
+                            user = r['taker']
+                            side = 1 # Taker bought
+                        else:
+                            size = float(r['takerAmountFilled']) / 1e18
+                            usdc = float(r['makerAmountFilled']) / 1e6
+                            user = r['taker']
+                            side = -1 # Taker sold
+                            
+                        if size <= 0 or usdc <= 0: continue
+                        price = usdc / size
+                        if not (0.01 <= price <= 0.99): continue
+                        
+                        rows.append({
+                            'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
+                            'tradeAmount': usdc,
+                            'outcomeTokensAmount': size * side,
+                            'user': user,
+                            'contract_id': token_str,
+                            'price': price,
+                            'size': size,
+                            'side_mult': side
+                        })
+                    
+                    if rows:
+                        with csv_lock:
+                            writer.writerows(rows)
+                    
+                    if stop: break
+                    
+                    if int(min_ts) >= int(last_ts): last_ts = int(min_ts) - 1
+                    else: last_ts = min_ts
+                    
+                    if min_ts < CUTOFF_TS: break
+                    
+                except Exception:
+                    break
+
+            # Mark token as complete
+            with ledger_lock:
+                with open(ledger_file, "a") as f: f.write(f"{token_str}\n")
+
+        # Execute Parallel Workers
+        target = cache_file if cache_file.exists() else cache_file.with_suffix(f".tmp.{os.getpid()}")
+        mode = 'a' if cache_file.exists() else 'w'
+        
+        try:
+            with open(target, mode, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+                if mode == 'w': writer.writeheader()
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = [executor.submit(worker, t, writer) for t in pending_tokens]
+                    done = 0
+                    for _ in concurrent.futures.as_completed(futures):
+                        done += 1
+                        print(f"   Fetching history: {done}/{len(pending_tokens)} tokens...", end='\r')
+            
+            if not cache_file.exists() and os.path.exists(target):
+                os.replace(target, cache_file)
+                
+        except Exception as e:
+            log.error(f"Parallel fetch failed: {e}")
+            if os.path.exists(target) and target != cache_file: os.remove(target)
+            
+        print("")
+        if cache_file.exists():
+            return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        return pd.DataFrame()
+
+    def _build_outcome_map(self):
+        log.info("   Fetching resolved market outcomes...")
+        
+        all_rows = []
+        offset = 0
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+        
+        while True:
+            params = {"limit": 500, "offset": offset, "closed": "true"}
+            try:
+                r = session.get(GAMMA_API_URL, params=params, timeout=15)
+                if r.status_code != 200: break
+                batch = r.json()
+                if not batch: break
+                all_rows.extend(batch)
+                offset += len(batch)
+                print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
+                if len(batch) < 500: break
+            except: break
+        print("")
+        
+        if not all_rows: return set(), set()
+
+        df = pd.DataFrame(all_rows)
+        
+        def extract_tokens(row):
+            raw = row.get('clobTokenIds') or row.get('tokens')
+            if isinstance(raw, list): return ",".join([str(t).strip() for t in raw])
+            if isinstance(raw, str):
+                try: return ",".join([str(t).strip() for t in json.loads(raw)])
+                except: return str(raw)
+            return None
+
+        df['contract_id'] = df.apply(extract_tokens, axis=1)
+        df = df.dropna(subset=['contract_id'])
+        
+        def derive_outcome(row):
+            val = row.get('outcome')
+            if pd.notna(val):
+                try:
+                    f = float(val)
+                    if f in [0.0, 1.0]: return f
+                except: pass
+            return np.nan 
+
+        df['outcome'] = df.apply(derive_outcome, axis=1)
+        df = df.dropna(subset=['outcome'])
+        
+        if df.empty: return set(), set()
+
+        df['contract_id_list'] = df['contract_id'].str.split(',')
+        df = df.explode('contract_id_list')
+        df['token_id'] = df['contract_id_list'].str.strip()
+        df['token_index'] = df.groupby(level=0).cumcount()
+        df = df.reset_index(drop=True)
+        
+        def final_token_payout(row):
+            winning_idx = int(round(row['outcome']))
+            return 1.0 if row['token_index'] == winning_idx else 0.0
+
+        df['token_payout'] = df.apply(final_token_payout, axis=1)
+        
+        winners = set(df[df['token_payout'] == 1.0]['token_id'].unique())
+        losers = set(df[df['token_payout'] == 0.0]['token_id'].unique())
+        
+        log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
+        return winners, losers
 
 class MarketMetadata:
     def __init__(self):
         self.fpmm_to_tokens: Dict[str, List[str]] = {}
-        # New: Map Token ID to FPMM for reverse lookup
         self.token_to_fpmm: Dict[str, str] = {}
 
     async def refresh(self):
@@ -118,70 +639,45 @@ class MarketMetadata:
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(None, self._fetch_all_pages)
-            
-            # Debug: Check if data is empty
             if not data:
-                log.error("⚠️ Gamma API returned NO data. Check API availability.")
+                log.error("⚠️ Gamma API returned NO data.")
                 return
 
             count = 0
             for m in data:
-                # 1. Extract FPMM (Condition ID or Market Address)
-                # For CLOB, we key by 'conditionId' or 'questionID' usually, 
-                # but 'fpmm' field is still often used as the grouper ID.
-                # However, the Subgraph gives us Asset IDs. 
-                # We need to map Asset ID -> Market Group.
-                
                 fpmm = m.get('fpmm', '')
-                if not fpmm: 
-                    # Fallback to conditionId if fpmm is missing (common in new markets)
-                    fpmm = m.get('conditionId', '')
-                
+                if not fpmm: fpmm = m.get('conditionId', '')
                 fpmm = fpmm.lower()
                 if not fpmm: continue
 
-                # 2. Extract Tokens
                 raw_tokens = m.get('clobTokenIds') or m.get('tokens')
                 tokens = []
-                
-                # Robust Parsing for stringified lists
                 if isinstance(raw_tokens, str):
-                    try: 
-                        # Try loading as JSON
-                        tokens = json.loads(raw_tokens)
-                    except:
-                        # Fallback: simple string split if not JSON
-                        tokens = [t.strip().replace('"','').replace("'", "") for t in raw_tokens.strip("[]").split(",")]
+                    try: tokens = json.loads(raw_tokens)
+                    except: pass
                 elif isinstance(raw_tokens, list):
                     tokens = raw_tokens
                 
                 if not tokens or len(tokens) != 2: continue
                 
-                # 3. Store
-                clean_tokens = [str(t) for t in tokens]
-                self.fpmm_to_tokens[fpmm] = clean_tokens
-                for t in clean_tokens:
-                    self.token_to_fpmm[t] = fpmm
-                    
+                clean = [str(t) for t in tokens]
+                self.fpmm_to_tokens[fpmm] = clean
+                for t in clean: self.token_to_fpmm[t] = fpmm
                 count += 1
 
-            if count == 0:
-                log.warning(f"⚠️ 0 Markets indexed! Raw Data Sample: {json.dumps(data[0]) if data else 'None'}")
-            else:
-                log.info(f"✅ Metadata Updated. {count} Markets Indexed.")
+            log.info(f"✅ Metadata Updated. {count} Markets Indexed.")
                 
         except Exception as e:
             log.error(f"Metadata refresh failed: {e}")
 
     def _fetch_all_pages(self):
         results = []
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         params = {"closed": "false", "limit": 1000, "offset": 0}
         try:
             while True:
-                resp = requests.get(GAMMA_API_URL, params=params, timeout=10)
-                if resp.status_code != 200: 
-                    log.error(f"Gamma API Error: {resp.status_code}")
-                    break
+                resp = requests.get(GAMMA_API_URL, params=params, headers=headers, timeout=10)
+                if resp.status_code != 200: break
                 chunk = resp.json()
                 if not chunk: break
                 results.extend(chunk)
@@ -190,256 +686,27 @@ class MarketMetadata:
         except Exception as e:
             log.error(f"Gamma Fetch Error: {e}")
         return results
-        
-class ModelTrainer:
-    """
-    Downloads historical data (365 days) to identify 'Smart Wallets'.
-    Uses parallel processing and pagination to handle the larger dataset.
-    """
-    def __init__(self):
-        self.scores_file = Path("wallet_scores.json")
-        self.lookback_days = 365  # <--- UPDATED TO 365
-        self.min_trades = 10      # Increased threshold for statistical significance
 
-    def train_if_needed(self):
-        if self.scores_file.exists():
-            # Check if fresh (less than 24 hours old)
-            if time.time() - self.scores_file.stat().st_mtime < 86400:
-                log.info("🧠 Model is fresh. Loading from cache.")
-                with open(self.scores_file, "r") as f:
-                    return json.load(f)
-        
-        log.info(f"🧠 Training model on {self.lookback_days} days of data (this will take a few minutes)...")
-        return self._run_training()
-
-    def _run_training(self):
-        # 1. Fetch Resolved Markets (Paginated)
-        resolved_markets = self._fetch_resolved_markets()
-        if not resolved_markets: return {}
-
-        log.info(f"   Analyzing {len(resolved_markets)} historical markets in parallel...")
-
-        # 2. Process Markets in Parallel (Fast)
-        wallet_stats = {} # {user: {'invested': 0, 'returned': 0}}
-        
-        # We use a ThreadPool to download trade histories concurrently
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            # Map markets to the processor function
-            results = list(executor.map(self._process_market_history, resolved_markets))
-        
-        # 3. Aggregate Results
-        for market_pnl in results:
-            for user, pnl in market_pnl.items():
-                if user not in wallet_stats:
-                    wallet_stats[user] = {'profit': 0.0, 'turnover': 0.0, 'wins': 0, 'count': 0}
-                
-                wallet_stats[user]['profit'] += pnl['net_profit']
-                wallet_stats[user]['turnover'] += pnl['total_volume']
-                wallet_stats[user]['count'] += 1
-                if pnl['net_profit'] > 0:
-                    wallet_stats[user]['wins'] += 1
-
-        # 4. Calculate Final Scores (ROI)
-        final_scores = {}
-        for user, stats in wallet_stats.items():
-            if stats['count'] < self.min_trades: continue
-            if stats['turnover'] < 100.0: continue # Ignore dust
-            
-            # Simple ROI: Net Profit / Total Volume Traded
-            roi = stats['profit'] / stats['turnover']
-            
-            # We only want consistent winners
-            if roi > 0.05: 
-                # Cap score to avoid outliers breaking the weight logic
-                final_scores[user] = min(roi * 5.0, 5.0) 
-        
-        # 5. Save
-        with open(self.scores_file, "w") as f:
-            json.dump(final_scores, f)
-        
-        log.info(f"✅ Training Complete. Identified {len(final_scores)} Smart Wallets.")
-        return final_scores
-
-    def _fetch_resolved_markets(self):
-        """
-        Logic ported directly from b.py: _fetch_gamma_markets.
-        Simple, robust pagination without unsupported sort parameters.
-        """
-        all_markets = []
-        offset = 0
-        
-        # Use a session for connection pooling (like b.py)
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(max_retries=3)
-        session.mount('https://', adapter)
-
-        cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
-        log.info(f"   Fetching markets resolved after {cutoff_date.date()}...")
-
-        while True:
-            try:
-                # Exact params from b.py (no 'order' param that breaks the API)
-                params = {"limit": 500, "offset": offset, "closed": "true"}
-                
-                resp = session.get(GAMMA_API_URL, params=params, timeout=30)
-                if resp.status_code != 200: 
-                    log.error(f"Gamma API Error {resp.status_code}")
-                    break
-                
-                batch = resp.json()
-                if not batch: break
-                
-                valid_batch = []
-                # We fetch everything but stop processing if we drift too far back in time
-                # Note: Gamma default sort is not strictly guaranteed, but usually roughly time-based.
-                # Since b.py fetched all and filtered, we do the same but add a break check.
-                
-                finished = False
-                for m in batch:
-                    # Date Check
-                    r_date_str = m.get('resolutionDate') or m.get('endDate')
-                    if not r_date_str: continue
-                    
-                    try:
-                        r_date = pd.Timestamp(r_date_str)
-                        if r_date.tz is None: r_date = r_date.tz_localize('UTC')
-                        
-                        # Optimization: If we see data older than cutoff, we might be done.
-                        # However, since API isn't strictly sorted, we just filter here.
-                        if r_date < cutoff_date:
-                            continue 
-
-                        if m.get('clobTokenIds') or m.get('tokens'):
-                            valid_batch.append(m)
-                    except:
-                        continue
-
-                all_markets.extend(valid_batch)
-                print(f"   Fetched {len(all_markets)} markets...", end='\r')
-                
-                offset += len(batch)
-                if len(batch) < 500: break # End of pages
-                
-            except Exception as e:
-                log.error(f"Fetch loop error: {e}")
-                break
-        
-        print("")
-        if len(all_markets) == 0:
-            log.warning("⚠️ No resolved markets found.")
-            
-        return all_markets
-        
-    def _process_market_history(self, market):
-        """Reconstructs PnL for a single market using Orderbook Subgraph."""
-        market_pnl = {} # {user: {'net_profit': float, 'total_volume': float}}
-        
-        # Parse Winner
-        outcome_str = market.get('outcome', '')
-        if outcome_str not in ['0', '1']: return {}
-        winner_idx = int(outcome_str)
-        
-        # Parse Tokens
-        raw_tokens = market.get('clobTokenIds') or market.get('tokens')
-        if not raw_tokens: return {}
-        if isinstance(raw_tokens, str):
-            try: tokens = json.loads(raw_tokens)
-            except: return {}
-        else: tokens = raw_tokens
-        
-        if len(tokens) != 2: return {}
-        token_yes = str(tokens[1])
-        token_no = str(tokens[0])
-        winning_token = token_yes if winner_idx == 1 else token_no
-
-        # Fetch ALL Trades for these tokens
-        # We query by makerAsset/takerAsset to catch all CLOB activity
-        query = f"""
-        {{
-          asMaker: orderFilledEvents(first: 1000, where: {{ makerAssetId_in: ["{token_yes}", "{token_no}"] }}) {{
-            taker, makerAssetId, makerAmountFilled, takerAmountFilled
-          }}
-          asTaker: orderFilledEvents(first: 1000, where: {{ takerAssetId_in: ["{token_yes}", "{token_no}"] }}) {{
-            taker, takerAssetId, makerAmountFilled, takerAmountFilled
-          }}
-        }}
-        """
-        
-        try:
-            r = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
-            data = r.json().get('data', {})
-            
-            # We track the TAKER (Aggressor) PnL
-            user_positions = {} # {user: {'cash_flow': 0.0, 'shares': 0.0}}
-            
-            # Helper to update position
-            def update_pos(u, cash_change, share_change):
-                if u not in user_positions: user_positions[u] = {'cf': 0.0, 'vol': 0.0, 'shares': 0.0}
-                user_positions[u]['cf'] += cash_change
-                user_positions[u]['shares'] += share_change
-                user_positions[u]['vol'] += abs(cash_change)
-
-            # Process "As Maker" (User was Taker, they BOUGHT Token)
-            # Maker gave Token (makerAsset), Taker gave USDC (takerAsset)
-            for t in data.get('asMaker', []):
-                user = t['taker'].lower()
-                shares = float(t['makerAmountFilled'])
-                usdc = float(t['takerAmountFilled']) / 1e6
-                
-                # Check if they bought the WINNER
-                is_winner = (t['makerAssetId'] == winning_token)
-                
-                # Logic: Spent USDC (-), Gained Shares (+)
-                # We normalize everything to "Winning Shares" for simplicity
-                # If they bought the loser, shares = 0 value eventually.
-                
-                update_pos(user, -usdc, shares if is_winner else 0)
-
-            # Process "As Taker" (User was Taker, they SOLD Token)
-            # Taker gave Token (takerAsset), Maker gave USDC (makerAsset)
-            for t in data.get('asTaker', []):
-                user = t['taker'].lower()
-                shares = float(t['takerAmountFilled'])
-                usdc = float(t['makerAmountFilled']) / 1e6
-                
-                is_winner = (t['takerAssetId'] == winning_token)
-                
-                # Logic: Gained USDC (+), Lost Shares (-)
-                update_pos(user, usdc, -shares if is_winner else 0)
-
-            # Calculate Final PnL
-            for u, pos in user_positions.items():
-                # Final Value = Shares Held * $1.00
-                final_val = max(0, pos['shares']) * 1.0
-                net_profit = pos['cf'] + final_val
-                
-                market_pnl[u] = {
-                    'net_profit': net_profit,
-                    'total_volume': pos['vol']
-                }
-
-        except Exception:
-            return {}
-
-        return market_pnl
-        
 class AnalyticsEngine:
     def __init__(self):
         self.wallet_scores: Dict[str, float] = {}
         self.fw_slope = 0.05
         self.fw_intercept = 0.01
         self.metadata = MarketMetadata()
-        self.trainer = ModelTrainer() # <--- NEW
+        self.trainer = ModelTrainer()
 
     async def initialize(self):
         await self.metadata.refresh()
-        
-        # Load or Train the Model (Blocking, runs once on startup)
         loop = asyncio.get_running_loop()
         self.wallet_scores = await loop.run_in_executor(None, self.trainer.train_if_needed)
-        
         if not self.wallet_scores:
-            log.warning("⚠️ No wallet scores found! Running in Fallback Mode (High Risk).")
+            log.warning("⚠️ No wallet scores found! Fallback Mode.")
+
+    def get_score(self, wallet_id: str, volume: float) -> float:
+        score = self.wallet_scores.get(wallet_id, 0.0)
+        if score == 0.0 and volume > 10.0:
+            score = self.fw_intercept + (self.fw_slope * math.log1p(volume))
+        return score
 
 # --- EXECUTION ---
 
@@ -497,10 +764,7 @@ class PaperBroker:
                 "fpmm": fpmm_id
             }
             audit_log.info(json.dumps(audit_record))
-            
-            if equity > state.get("highest_equity", 0):
-                state["highest_equity"] = equity
-
+            if equity > state.get("highest_equity", 0): state["highest_equity"] = equity
             await self.pm.save_async()
             return True
 
@@ -531,7 +795,6 @@ class SubscriptionManager:
             if slots_left > 0:
                 final_list.extend(list(self.speculative_subs)[:slots_left])
             
-            # Corrected Payload
             payload = {"type": "Market", "assets_ids": final_list}
             try:
                 await websocket.send(json.dumps(payload))
@@ -548,16 +811,14 @@ class LiveTrader:
         self.analytics = AnalyticsEngine()
         self.sub_manager = SubscriptionManager()
         self.trackers: Dict[str, Dict] = {}
-        
         self.ws_prices: Dict[str, float] = {}
         self.ws_queue = asyncio.Queue()
-        
         self.running = True
         self.seen_trade_ids = set()
         self.reconnect_delay = 1 
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER V6 (CLOB Enabled)")
+        print("\n🚀 STARTING LIVE PAPER TRADER V10 (Final Fix)")
         validate_config()
         
         loop = asyncio.get_running_loop()
@@ -631,16 +892,12 @@ class LiveTrader:
                 self.ws_queue.task_done()
 
     async def _signal_loop(self):
-        """CLOB Orderbook Subgraph Poller."""
         last_ts = int(time.time()) - 60
-        
         while self.running:
             try:
                 current_batch_ts = last_ts
                 has_more = True
-                
                 while has_more:
-                    # UPDATED QUERY FOR CLOB TRADES
                     query = f"""
                     {{
                       orderFilledEvents(
@@ -652,7 +909,6 @@ class LiveTrader:
                       }}
                     }}
                     """
-                    
                     loop = asyncio.get_running_loop()
                     resp = await loop.run_in_executor(None, lambda: requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10))
                     
@@ -668,53 +924,39 @@ class LiveTrader:
                             for t in new_trades: self.seen_trade_ids.add(t['id'])
                             if len(self.seen_trade_ids) > 10000:
                                 self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
-                        
                         last_ts_in_batch = int(data[-1]['timestamp'])
                         if len(data) < 1000:
                             has_more = False
                             last_ts = last_ts_in_batch
                         else:
                             current_batch_ts = last_ts_in_batch
-
             except Exception as e:
                 log.error(f"Signal Error: {e}")
-            
             await asyncio.sleep(5)
 
     async def _process_batch(self, trades):
         for t in trades:
-            # 1. Determine which asset is the OUTCOME TOKEN
-            # The trade involves Outcome Token <-> USDC
-            # USDC ID: 0x2791...
-            
             maker_asset = t['makerAssetId']
             taker_asset = t['takerAssetId']
-            
-            # Logic: Identify the Token ID and the Volume in USDC
             token_id = None
             usdc_vol = 0.0
-            wallet = t['taker'] # The aggressor
+            wallet = t['taker'] 
+            direction = 0
             
             if maker_asset == USDC_ADDRESS:
-                # Taker SOLD Token (Taker gave Token, Maker gave USDC)
-                # ERROR CHECK: Wait, if Maker gave USDC, Taker received USDC. So Taker SOLD Token?
-                # Let's verify: TakerAssetId = Token. Taker gives TakerAsset. Yes.
                 token_id = taker_asset
-                usdc_vol = float(t['makerAmountFilled']) / 1e6 # USDC is 6 decimals
-                direction = -1.0 # Sell
+                usdc_vol = float(t['makerAmountFilled']) / 1e6 
+                direction = -1.0 
             elif taker_asset == USDC_ADDRESS:
-                # Taker BOUGHT Token (Taker gave USDC, Maker gave Token)
                 token_id = maker_asset
                 usdc_vol = float(t['takerAmountFilled']) / 1e6
-                direction = 1.0 # Buy
+                direction = 1.0 
             else:
-                continue # Token <-> Token trade (rare/ignore)
+                continue 
 
-            # 2. Reverse Lookup FPMM
             fpmm = self.analytics.metadata.token_to_fpmm.get(str(token_id))
-            if not fpmm: continue # Unknown token
+            if not fpmm: continue 
             
-            # 3. Strategy Logic
             score = self.analytics.get_score(wallet, usdc_vol)
             if score <= 0: continue
             
@@ -727,41 +969,27 @@ class LiveTrader:
                 tracker['weight'] *= math.pow(CONFIG['decay_factor'], elapsed / 60.0)
             tracker['last_ts'] = time.time()
             
-            # Determine Token Index (Yes=1, No=0)
             tokens = self.analytics.metadata.fpmm_to_tokens.get(fpmm)
             if not tokens: continue
             
-            # If buying YES (Index 1) -> Positive Impact
-            # If buying NO (Index 0)  -> Negative Impact
-            # If selling YES -> Negative Impact
-            # If selling NO -> Positive Impact
-            
             is_yes_token = (str(token_id) == tokens[1])
-            
             raw_impact = usdc_vol * score
-            
-            if is_yes_token:
-                final_impact = raw_impact * direction
-            else:
-                final_impact = raw_impact * -direction # Buying NO is like Selling YES
+            final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction 
                 
             tracker['weight'] += final_impact
-            
-            # 4. Trigger
             abs_w = abs(tracker['weight'])
+            
             if abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
                 self.sub_manager.add_speculative(tokens)
             
             if abs_w > CONFIG['splash_threshold']:
                 tracker['weight'] = 0.0
-                # If weight > 0 (Bullish), buy YES (tokens[1]). Else buy NO (tokens[0])
                 target = tokens[1] if tracker['weight'] > 0 else tokens[0]
                 await self._attempt_exec(target, fpmm)
 
     async def _attempt_exec(self, token_id, fpmm):
         price = self.ws_prices.get(token_id)
         if not price or not (0.02 < price < 0.98): return
-        
         success = await self.broker.execute_market_order(token_id, "BUY", price, CONFIG['fixed_size'], fpmm)
         if success:
             open_pos = list(self.persistence.state["positions"].keys())
@@ -772,7 +1000,6 @@ class LiveTrader:
         if not pos: return
         avg = pos['avg_price']
         pnl = (price - avg) / avg
-        
         if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
             log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
             success = await self.broker.execute_market_order(token_id, "SELL", price, 0, pos['market_fpmm'])
@@ -784,10 +1011,8 @@ class LiveTrader:
         while self.running:
             await asyncio.sleep(3600)
             await self.analytics.metadata.refresh()
-            
             active = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
             self.ws_prices = {k: v for k, v in self.ws_prices.items() if k in active}
-            
             now = time.time()
             self.trackers = {k: v for k, v in self.trackers.items() if now - v['last_ts'] < 300}
 
