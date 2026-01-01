@@ -261,22 +261,37 @@ class ModelTrainer:
         return final_scores
 
     def _fetch_resolved_markets(self):
-        """Paginates backwards through Gamma until we hit the 365-day cutoff."""
         all_markets = []
         offset = 0
-        cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
+        # Headers to prevent 403 Forbidden errors
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json"
+        }
         
+        try:
+            cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
+        except Exception as e:
+            log.error(f"Date Calculation Error: {e}")
+            return []
+
+        log.info(f"   Fetching markets resolved after {cutoff_date.date()}...")
+
         while True:
             params = {
                 "closed": "true", 
-                "limit": 1000, 
+                "limit": 500, # Reduced from 1000 to be safer
                 "offset": offset, 
                 "order": "resolutionDate", 
                 "ascending": "false"
             }
             try:
-                resp = requests.get(GAMMA_API_URL, params=params, timeout=10)
-                if resp.status_code != 200: break
+                resp = requests.get(GAMMA_API_URL, params=params, headers=headers, timeout=15)
+                
+                # --- NEW: Explicit Error Logging ---
+                if resp.status_code != 200: 
+                    log.error(f"❌ API Error {resp.status_code}: {resp.text[:200]}")
+                    break
                 
                 batch = resp.json()
                 if not batch: break
@@ -285,33 +300,37 @@ class ModelTrainer:
                 finished = False
                 
                 for m in batch:
-                    # Check date
                     r_date_str = m.get('resolutionDate')
                     if not r_date_str: continue
-                    r_date = pd.Timestamp(r_date_str)
-                    if r_date.tz is None: r_date = r_date.tz_localize('UTC')
-                    
-                    if r_date < cutoff_date:
-                        finished = True
-                        break
-                    
-                    # Must have tokens
-                    if m.get('clobTokenIds') or m.get('tokens'):
-                        valid_batch.append(m)
+                    try:
+                        r_date = pd.Timestamp(r_date_str)
+                        if r_date.tz is None: r_date = r_date.tz_localize('UTC')
+                        
+                        if r_date < cutoff_date:
+                            finished = True
+                            break
+                        
+                        if m.get('clobTokenIds') or m.get('tokens'):
+                            valid_batch.append(m)
+                    except:
+                        continue
                 
                 all_markets.extend(valid_batch)
                 print(f"   Fetched {len(all_markets)} markets...", end='\r')
                 
-                if finished or len(batch) < 1000: break
-                offset += 1000
+                if finished or len(batch) < 500: break
+                offset += 500
                 
             except Exception as e:
-                log.error(f"Market fetch error: {e}")
+                log.error(f"Market fetch exception: {e}")
                 break
         
         print("") # Newline
+        if len(all_markets) == 0:
+            log.warning("⚠️ No resolved markets found. Check your internet or API access.")
+            
         return all_markets
-
+        
     def _process_market_history(self, market):
         """Reconstructs PnL for a single market using Orderbook Subgraph."""
         market_pnl = {} # {user: {'net_profit': float, 'total_volume': float}}
