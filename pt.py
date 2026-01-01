@@ -197,6 +197,17 @@ class ModelTrainer:
         cache_file = CACHE_DIR / "gamma_trades_stream.csv"
         ledger_file = CACHE_DIR / "gamma_completed.txt"
         
+        # [PATCH 1] Expand & Sanitize Token IDs
+        all_tokens_expanded = []
+        for mid_str in token_ids:
+            parts = str(mid_str).split(',')
+            for p in parts:
+                if len(p) > 5: all_tokens_expanded.append(p.strip())
+        
+        # Use the sanitized list for the rest of the logic
+        token_ids = list(set(all_tokens_expanded))
+
+        # Filter completed tokens using ledger
         completed_tokens = set()
         if ledger_file.exists():
             try:
@@ -439,12 +450,15 @@ class ModelTrainer:
         limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
         CUTOFF_TS = limit_date.timestamp()
         
-        def worker(token_str, writer):
+        def worker(token_str, writer, f_handle):
             session = requests.Session()
             retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
             
-            last_ts = 2147483647 # Max Int32
+            # [PATCH 2] Add numeric validation
+            if not token_str.isdigit(): return False
+            
+            last_ts = 2147483647 
             
             while True:
                 try:
@@ -542,7 +556,9 @@ class ModelTrainer:
                 if mode == 'w': writer.writeheader()
                 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = [executor.submit(worker, t, writer) for t in pending_tokens]
+                    # [PATCH 4] Pass 'f' as the third argument
+                    futures = [executor.submit(worker, t, writer, f) for t in pending_tokens]
+                    
                     done = 0
                     for _ in concurrent.futures.as_completed(futures):
                         done += 1
