@@ -271,37 +271,47 @@ class ModelTrainer:
                     stop = False
                     
                     for r, role in batch:
-                        ts = float(r['timestamp'])
-                        min_ts = min(min_ts, ts)
-                        if ts < CUTOFF_TS: 
-                            stop = True
+                    
+                        try:
+            
+                            ts = float(r.get('timestamp', 0))
+                            min_ts = min(min_ts, ts)
+                            
+                            if ts < CUTOFF_TS: 
+                                stop = True
+                                continue
+                            
+                            if role == 'maker':
+                                size = float(r.get('makerAmountFilled') or 0.0) / 1e18
+                                usdc = float(r.get('takerAmountFilled') or 0.0) / 1e6
+                                user = str(r.get('taker') or 'unknown')
+                                side = 1 
+                            else:
+                                size = float(r.get('takerAmountFilled') or 0.0) / 1e18
+                                usdc = float(r.get('makerAmountFilled') or 0.0) / 1e6
+                                user = str(r.get('taker') or 'unknown')
+                                side = -1 
+                                
+                            if size <= 0 or usdc <= 0: continue
+                            
+                            price = usdc / size
+                            if not (0.01 <= price <= 0.99): continue
+                            
+                            rows.append({
+                                'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
+                                'tradeAmount': usdc,
+                                'outcomeTokensAmount': size * side,
+                                'user': user,
+                                'contract_id': token_str,
+                                'price': price,
+                                'size': size,
+                                'side_mult': side
+                            })
+                            
+                        except Exception:
+            
                             continue
                             
-                        if role == 'maker':
-                            size = float(r['makerAmountFilled']) / 1e18
-                            usdc = float(r['takerAmountFilled']) / 1e6
-                            user = r['taker']
-                            side = 1 
-                        else:
-                            size = float(r['takerAmountFilled']) / 1e18
-                            usdc = float(r['makerAmountFilled']) / 1e6
-                            user = r['taker']
-                            side = -1 
-                            
-                        if size <= 0 or usdc <= 0: continue
-                        price = usdc / size
-                        if not (0.01 <= price <= 0.99): continue
-                        
-                        rows.append({
-                            'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
-                            'tradeAmount': usdc,
-                            'outcomeTokensAmount': size * side,
-                            'user': user,
-                            'contract_id': token_str,
-                            'price': price,
-                            'size': size,
-                            'side_mult': side
-                        })
                     
                     if rows:
                         with csv_lock:
