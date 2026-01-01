@@ -1523,7 +1523,7 @@ class TuningRunner:
     
         # Execute Tuning
         if 'ts_int' not in event_log.columns:
-        event_log['ts_int'] = event_log.index.astype(np.int64)
+            event_log['ts_int'] = event_log.index.astype(np.int64)
         if 'ts_int' not in profiler_data.columns:
             profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
     
