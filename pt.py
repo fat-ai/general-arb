@@ -189,22 +189,143 @@ class MarketMetadata:
         except Exception as e:
             log.error(f"Gamma Fetch Error: {e}")
         return results
+class ModelTrainer:
+    """
+    Downloads historical data to identify 'Smart Wallets' (High ROI).
+    Run this once on startup or periodically.
+    """
+    def __init__(self):
+        self.scores_file = Path("wallet_scores.json")
+        self.lookback_days = 90
+        self.min_trades = 5
 
+    def train_if_needed(self):
+        if self.scores_file.exists():
+            # Check if stale (> 24 hours)
+            mtime = self.scores_file.stat().st_mtime
+            if time.time() - mtime < 86400:
+                log.info("🧠 Model is fresh. Loading from cache.")
+                with open(self.scores_file, "r") as f:
+                    return json.load(f)
+        
+        log.info("🧠 Training new model (this may take 2-3 minutes)...")
+        return self._run_training()
+
+    def _run_training(self):
+        # 1. Fetch Resolved Markets (to know who won)
+        resolved_markets = self._fetch_resolved_markets()
+        if not resolved_markets: return {}
+
+        # 2. Fetch Trades for those markets
+        wallet_pnl = {} # {wallet: {'invested': 0.0, 'returned': 0.0}}
+        
+        # We fetch via Subgraph for speed
+        log.info(f"   Analyzing {len(resolved_markets)} resolved markets...")
+        
+        # (Simplified fetch for brevity - Production would use the parallel fetcher)
+        # For this patch, we iterate the top 100 recent resolved markets to populate the list
+        for market in resolved_markets[:200]: 
+            self._process_market_history(market, wallet_pnl)
+            
+        # 3. Calculate ROI
+        final_scores = {}
+        for w, data in wallet_pnl.items():
+            if data['count'] < self.min_trades: continue
+            
+            roi = (data['returned'] - data['invested']) / data['invested'] if data['invested'] > 0 else 0
+            if roi > 0.10: # Only keep winners > 10% ROI
+                final_scores[w] = min(roi, 3.0) # Cap at 300%
+        
+        # 4. Save
+        with open(self.scores_file, "w") as f:
+            json.dump(final_scores, f)
+        
+        log.info(f"✅ Training Complete. Identified {len(final_scores)} Smart Wallets.")
+        return final_scores
+
+    def _fetch_resolved_markets(self):
+        # Fetch markets that closed in the last 90 days
+        url = "https://gamma-api.polymarket.com/markets"
+        params = {
+            "closed": "true", 
+            "limit": 500, 
+            "order": "resolutionDate", 
+            "ascending": "false"
+        }
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            return resp.json()
+        except Exception:
+            return []
+
+    def _process_market_history(self, market, wallet_pnl):
+        # We need the FPMM address to query the subgraph
+        fpmm = market.get('fpmm', '').lower()
+        if not fpmm: return
+        
+        # Winning Token Index (0 or 1) based on resolution
+        # Gamma output: "1" usually means "Yes" (Index 1), "0" means "No" (Index 0)
+        # This is a heuristic; production needs strict mapping
+        outcome_str = market.get('outcome', '')
+        if outcome_str not in ['0', '1']: return
+        winner_idx = int(outcome_str)
+        
+        # Fetch trades for this specific market from Subgraph
+        query = f"""
+        {{
+            fpmmTransactions(first: 1000, where: {{ market: "{fpmm}" }}) {{
+                user {{ id }}
+                tradeAmount
+                outcomeTokensAmount
+            }}
+        }}
+        """
+        try:
+            r = requests.post(SUBGRAPH_URL, json={'query': query})
+            trades = r.json().get('data', {}).get('fpmmTransactions', [])
+            
+            for t in trades:
+                user = t['user']['id'].lower()
+                invested = float(t['tradeAmount'])
+                
+                # Did they buy the winner?
+                # outcomeTokensAmount > 0 means they bought YES (Index 1)
+                # outcomeTokensAmount < 0 means they bought NO (Index 0)
+                # (Simplified logic for binary markets)
+                tokens_bought = float(t['outcomeTokensAmount'])
+                
+                bought_index = 1 if tokens_bought > 0 else 0
+                
+                if user not in wallet_pnl: wallet_pnl[user] = {'invested': 0.0, 'returned': 0.0, 'count': 0}
+                
+                wallet_pnl[user]['invested'] += invested
+                wallet_pnl[user]['count'] += 1
+                
+                # If they held the winner, they got paid $1.00 per share
+                if bought_index == winner_idx:
+                    # Payout = Shares * $1.00
+                    wallet_pnl[user]['returned'] += abs(tokens_bought)
+                    
+        except Exception:
+            pass
+            
 class AnalyticsEngine:
     def __init__(self):
         self.wallet_scores: Dict[str, float] = {}
         self.fw_slope = 0.05
         self.fw_intercept = 0.01
         self.metadata = MarketMetadata()
+        self.trainer = ModelTrainer() # <--- NEW
 
     async def initialize(self):
         await self.metadata.refresh()
-
-    def get_score(self, wallet_id: str, volume: float) -> float:
-        score = self.wallet_scores.get(wallet_id, 0.0)
-        if score == 0.0 and volume > 10.0:
-            score = self.fw_intercept + (self.fw_slope * math.log1p(volume))
-        return score
+        
+        # Load or Train the Model (Blocking, runs once on startup)
+        loop = asyncio.get_running_loop()
+        self.wallet_scores = await loop.run_in_executor(None, self.trainer.train_if_needed)
+        
+        if not self.wallet_scores:
+            log.warning("⚠️ No wallet scores found! Running in Fallback Mode (High Risk).")
 
 # --- EXECUTION ---
 
