@@ -189,54 +189,70 @@ class MarketMetadata:
         except Exception as e:
             log.error(f"Gamma Fetch Error: {e}")
         return results
+        
 class ModelTrainer:
     """
-    Downloads historical data to identify 'Smart Wallets' (High ROI).
-    Run this once on startup or periodically.
+    Downloads historical data (365 days) to identify 'Smart Wallets'.
+    Uses parallel processing and pagination to handle the larger dataset.
     """
     def __init__(self):
         self.scores_file = Path("wallet_scores.json")
-        self.lookback_days = 90
-        self.min_trades = 5
+        self.lookback_days = 365  # <--- UPDATED TO 365
+        self.min_trades = 10      # Increased threshold for statistical significance
 
     def train_if_needed(self):
         if self.scores_file.exists():
-            # Check if stale (> 24 hours)
-            mtime = self.scores_file.stat().st_mtime
-            if time.time() - mtime < 86400:
+            # Check if fresh (less than 24 hours old)
+            if time.time() - self.scores_file.stat().st_mtime < 86400:
                 log.info("🧠 Model is fresh. Loading from cache.")
                 with open(self.scores_file, "r") as f:
                     return json.load(f)
         
-        log.info("🧠 Training new model (this may take 2-3 minutes)...")
+        log.info(f"🧠 Training model on {self.lookback_days} days of data (this will take a few minutes)...")
         return self._run_training()
 
     def _run_training(self):
-        # 1. Fetch Resolved Markets (to know who won)
+        # 1. Fetch Resolved Markets (Paginated)
         resolved_markets = self._fetch_resolved_markets()
         if not resolved_markets: return {}
 
-        # 2. Fetch Trades for those markets
-        wallet_pnl = {} # {wallet: {'invested': 0.0, 'returned': 0.0}}
+        log.info(f"   Analyzing {len(resolved_markets)} historical markets in parallel...")
+
+        # 2. Process Markets in Parallel (Fast)
+        wallet_stats = {} # {user: {'invested': 0, 'returned': 0}}
         
-        # We fetch via Subgraph for speed
-        log.info(f"   Analyzing {len(resolved_markets)} resolved markets...")
+        # We use a ThreadPool to download trade histories concurrently
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            # Map markets to the processor function
+            results = list(executor.map(self._process_market_history, resolved_markets))
         
-        # (Simplified fetch for brevity - Production would use the parallel fetcher)
-        # For this patch, we iterate the top 100 recent resolved markets to populate the list
-        for market in resolved_markets[:200]: 
-            self._process_market_history(market, wallet_pnl)
-            
-        # 3. Calculate ROI
+        # 3. Aggregate Results
+        for market_pnl in results:
+            for user, pnl in market_pnl.items():
+                if user not in wallet_stats:
+                    wallet_stats[user] = {'profit': 0.0, 'turnover': 0.0, 'wins': 0, 'count': 0}
+                
+                wallet_stats[user]['profit'] += pnl['net_profit']
+                wallet_stats[user]['turnover'] += pnl['total_volume']
+                wallet_stats[user]['count'] += 1
+                if pnl['net_profit'] > 0:
+                    wallet_stats[user]['wins'] += 1
+
+        # 4. Calculate Final Scores (ROI)
         final_scores = {}
-        for w, data in wallet_pnl.items():
-            if data['count'] < self.min_trades: continue
+        for user, stats in wallet_stats.items():
+            if stats['count'] < self.min_trades: continue
+            if stats['turnover'] < 100.0: continue # Ignore dust
             
-            roi = (data['returned'] - data['invested']) / data['invested'] if data['invested'] > 0 else 0
-            if roi > 0.10: # Only keep winners > 10% ROI
-                final_scores[w] = min(roi, 3.0) # Cap at 300%
+            # Simple ROI: Net Profit / Total Volume Traded
+            roi = stats['profit'] / stats['turnover']
+            
+            # We only want consistent winners
+            if roi > 0.05: 
+                # Cap score to avoid outliers breaking the weight logic
+                final_scores[user] = min(roi * 5.0, 5.0) 
         
-        # 4. Save
+        # 5. Save
         with open(self.scores_file, "w") as f:
             json.dump(final_scores, f)
         
@@ -244,71 +260,150 @@ class ModelTrainer:
         return final_scores
 
     def _fetch_resolved_markets(self):
-        # Fetch markets that closed in the last 90 days
-        url = "https://gamma-api.polymarket.com/markets"
-        params = {
-            "closed": "true", 
-            "limit": 500, 
-            "order": "resolutionDate", 
-            "ascending": "false"
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-            return resp.json()
-        except Exception:
-            return []
-
-    def _process_market_history(self, market, wallet_pnl):
-        # We need the FPMM address to query the subgraph
-        fpmm = market.get('fpmm', '').lower()
-        if not fpmm: return
+        """Paginates backwards through Gamma until we hit the 365-day cutoff."""
+        all_markets = []
+        offset = 0
+        cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
         
-        # Winning Token Index (0 or 1) based on resolution
-        # Gamma output: "1" usually means "Yes" (Index 1), "0" means "No" (Index 0)
-        # This is a heuristic; production needs strict mapping
+        while True:
+            params = {
+                "closed": "true", 
+                "limit": 1000, 
+                "offset": offset, 
+                "order": "resolutionDate", 
+                "ascending": "false"
+            }
+            try:
+                resp = requests.get(GAMMA_API_URL, params=params, timeout=10)
+                if resp.status_code != 200: break
+                
+                batch = resp.json()
+                if not batch: break
+                
+                valid_batch = []
+                finished = False
+                
+                for m in batch:
+                    # Check date
+                    r_date_str = m.get('resolutionDate')
+                    if not r_date_str: continue
+                    r_date = pd.Timestamp(r_date_str)
+                    if r_date.tz is None: r_date = r_date.tz_localize('UTC')
+                    
+                    if r_date < cutoff_date:
+                        finished = True
+                        break
+                    
+                    # Must have tokens
+                    if m.get('clobTokenIds') or m.get('tokens'):
+                        valid_batch.append(m)
+                
+                all_markets.extend(valid_batch)
+                print(f"   Fetched {len(all_markets)} markets...", end='\r')
+                
+                if finished or len(batch) < 1000: break
+                offset += 1000
+                
+            except Exception as e:
+                log.error(f"Market fetch error: {e}")
+                break
+        
+        print("") # Newline
+        return all_markets
+
+    def _process_market_history(self, market):
+        """Reconstructs PnL for a single market using Orderbook Subgraph."""
+        market_pnl = {} # {user: {'net_profit': float, 'total_volume': float}}
+        
+        # Parse Winner
         outcome_str = market.get('outcome', '')
-        if outcome_str not in ['0', '1']: return
+        if outcome_str not in ['0', '1']: return {}
         winner_idx = int(outcome_str)
         
-        # Fetch trades for this specific market from Subgraph
+        # Parse Tokens
+        raw_tokens = market.get('clobTokenIds') or market.get('tokens')
+        if not raw_tokens: return {}
+        if isinstance(raw_tokens, str):
+            try: tokens = json.loads(raw_tokens)
+            except: return {}
+        else: tokens = raw_tokens
+        
+        if len(tokens) != 2: return {}
+        token_yes = str(tokens[1])
+        token_no = str(tokens[0])
+        winning_token = token_yes if winner_idx == 1 else token_no
+
+        # Fetch ALL Trades for these tokens
+        # We query by makerAsset/takerAsset to catch all CLOB activity
         query = f"""
         {{
-            fpmmTransactions(first: 1000, where: {{ market: "{fpmm}" }}) {{
-                user {{ id }}
-                tradeAmount
-                outcomeTokensAmount
-            }}
+          asMaker: orderFilledEvents(first: 1000, where: {{ makerAssetId_in: ["{token_yes}", "{token_no}"] }}) {{
+            taker, makerAssetId, makerAmountFilled, takerAmountFilled
+          }}
+          asTaker: orderFilledEvents(first: 1000, where: {{ takerAssetId_in: ["{token_yes}", "{token_no}"] }}) {{
+            taker, takerAssetId, makerAmountFilled, takerAmountFilled
+          }}
         }}
         """
+        
         try:
-            r = requests.post(SUBGRAPH_URL, json={'query': query})
-            trades = r.json().get('data', {}).get('fpmmTransactions', [])
+            r = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
+            data = r.json().get('data', {})
             
-            for t in trades:
-                user = t['user']['id'].lower()
-                invested = float(t['tradeAmount'])
+            # We track the TAKER (Aggressor) PnL
+            user_positions = {} # {user: {'cash_flow': 0.0, 'shares': 0.0}}
+            
+            # Helper to update position
+            def update_pos(u, cash_change, share_change):
+                if u not in user_positions: user_positions[u] = {'cf': 0.0, 'vol': 0.0, 'shares': 0.0}
+                user_positions[u]['cf'] += cash_change
+                user_positions[u]['shares'] += share_change
+                user_positions[u]['vol'] += abs(cash_change)
+
+            # Process "As Maker" (User was Taker, they BOUGHT Token)
+            # Maker gave Token (makerAsset), Taker gave USDC (takerAsset)
+            for t in data.get('asMaker', []):
+                user = t['taker'].lower()
+                shares = float(t['makerAmountFilled'])
+                usdc = float(t['takerAmountFilled']) / 1e6
                 
-                # Did they buy the winner?
-                # outcomeTokensAmount > 0 means they bought YES (Index 1)
-                # outcomeTokensAmount < 0 means they bought NO (Index 0)
-                # (Simplified logic for binary markets)
-                tokens_bought = float(t['outcomeTokensAmount'])
+                # Check if they bought the WINNER
+                is_winner = (t['makerAssetId'] == winning_token)
                 
-                bought_index = 1 if tokens_bought > 0 else 0
+                # Logic: Spent USDC (-), Gained Shares (+)
+                # We normalize everything to "Winning Shares" for simplicity
+                # If they bought the loser, shares = 0 value eventually.
                 
-                if user not in wallet_pnl: wallet_pnl[user] = {'invested': 0.0, 'returned': 0.0, 'count': 0}
+                update_pos(user, -usdc, shares if is_winner else 0)
+
+            # Process "As Taker" (User was Taker, they SOLD Token)
+            # Taker gave Token (takerAsset), Maker gave USDC (makerAsset)
+            for t in data.get('asTaker', []):
+                user = t['taker'].lower()
+                shares = float(t['takerAmountFilled'])
+                usdc = float(t['makerAmountFilled']) / 1e6
                 
-                wallet_pnl[user]['invested'] += invested
-                wallet_pnl[user]['count'] += 1
+                is_winner = (t['takerAssetId'] == winning_token)
                 
-                # If they held the winner, they got paid $1.00 per share
-                if bought_index == winner_idx:
-                    # Payout = Shares * $1.00
-                    wallet_pnl[user]['returned'] += abs(tokens_bought)
-                    
+                # Logic: Gained USDC (+), Lost Shares (-)
+                update_pos(user, usdc, -shares if is_winner else 0)
+
+            # Calculate Final PnL
+            for u, pos in user_positions.items():
+                # Final Value = Shares Held * $1.00
+                final_val = max(0, pos['shares']) * 1.0
+                net_profit = pos['cf'] + final_val
+                
+                market_pnl[u] = {
+                    'net_profit': net_profit,
+                    'total_volume': pos['vol']
+                }
+
         except Exception:
-            pass
-            
+            return {}
+
+        return market_pnl
+        
 class AnalyticsEngine:
     def __init__(self):
         self.wallet_scores: Dict[str, float] = {}
