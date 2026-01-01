@@ -17,9 +17,14 @@ STATE_FILE = Path("paper_state.json")
 AUDIT_FILE = Path("trades_audit.jsonl")
 LOG_LEVEL = logging.INFO
 
+# 1. UPDATED ENDPOINTS
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
+# SWITCHED TO ORDERBOOK SUBGRAPH (CLOB)
+SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# POLYGON USDC ADDRESS (To identify the collateral leg of a trade)
+USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
 CONFIG = {
     "splash_threshold": 1000.0,
@@ -30,15 +35,12 @@ CONFIG = {
     "take_profit": 0.50,
     "preheat_threshold": 0.5,
     "max_ws_subs": 500,
-    
-    # NEW: Risk Controls
-    "max_positions": 20,       # Hard limit on concurrent bets
-    "max_drawdown": 0.50,      # Kill switch at 50% equity loss
-    "initial_capital": 10000.0 # Reference for drawdown calc
+    "max_positions": 20,
+    "max_drawdown": 0.50,
+    "initial_capital": 10000.0
 }
 
-# --- LOGGING SETUP ---
-# Main Application Log
+# --- LOGGING ---
 logging.basicConfig(
     level=LOG_LEVEL,
     format='%(asctime)s - [PaperGold] - %(levelname)s - %(message)s',
@@ -46,27 +48,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("PaperGold")
 
-# Audit Log (Machine readable, separate file)
 audit_log = logging.getLogger("TradeAudit")
 audit_log.setLevel(logging.INFO)
-audit_log.propagate = False # Don't print to console
+audit_log.propagate = False
 audit_handler = logging.FileHandler(AUDIT_FILE)
 audit_handler.setFormatter(logging.Formatter('%(message)s'))
 audit_log.addHandler(audit_handler)
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- VALIDATION ---
-def validate_config():
-    """Fail fast if config is dangerous."""
-    assert CONFIG['stop_loss'] < 1.0, "Stop loss > 100%"
-    assert CONFIG['take_profit'] > 0.0, "Take profit must be positive"
-    assert 0 < CONFIG['fixed_size'] < CONFIG['initial_capital'], "Bet size > Capital"
-    assert CONFIG['splash_threshold'] > 0, "Threshold must be positive"
-    assert CONFIG['max_positions'] > 0, "Max positions must be > 0"
-    log.info("✅ Configuration Validated")
-
 # --- UTILS ---
+
+def validate_config():
+    assert CONFIG['stop_loss'] < 1.0
+    assert CONFIG['take_profit'] > 0.0
+    assert 0 < CONFIG['fixed_size'] < CONFIG['initial_capital']
+    assert CONFIG['splash_threshold'] > 0
+    assert CONFIG['max_positions'] > 0
 
 class PersistenceManager:
     def __init__(self):
@@ -74,7 +72,7 @@ class PersistenceManager:
             "cash": CONFIG['initial_capital'],
             "positions": {},
             "start_time": time.time(),
-            "highest_equity": CONFIG['initial_capital'] # For Drawdown tracking
+            "highest_equity": CONFIG['initial_capital']
         }
         self._executor = ThreadPoolExecutor(max_workers=1)
         self.load()
@@ -85,11 +83,7 @@ class PersistenceManager:
                 with open(STATE_FILE, "r") as f:
                     data = json.load(f)
                     self.state.update(data)
-                eq = self.calculate_equity()
-                log.info(f"💾 State loaded. Equity: ${eq:.2f}")
-                # Update high-water mark if needed
-                if eq > self.state.get("highest_equity", 0):
-                    self.state["highest_equity"] = eq
+                log.info(f"💾 State loaded. Equity: ${self.calculate_equity():.2f}")
             except Exception as e:
                 log.error(f"State load error: {e}")
 
@@ -115,37 +109,85 @@ class PersistenceManager:
 class MarketMetadata:
     def __init__(self):
         self.fpmm_to_tokens: Dict[str, List[str]] = {}
+        # New: Map Token ID to FPMM for reverse lookup
+        self.token_to_fpmm: Dict[str, str] = {}
 
     async def refresh(self):
         log.info("🌍 Refreshing Market Metadata...")
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(None, self._fetch_all_pages)
+            
+            # Debug: Check if data is empty
+            if not data:
+                log.error("⚠️ Gamma API returned NO data. Check API availability.")
+                return
+
+            count = 0
             for m in data:
-                fpmm = m.get('fpmm', '').lower()
+                # 1. Extract FPMM (Condition ID or Market Address)
+                # For CLOB, we key by 'conditionId' or 'questionID' usually, 
+                # but 'fpmm' field is still often used as the grouper ID.
+                # However, the Subgraph gives us Asset IDs. 
+                # We need to map Asset ID -> Market Group.
+                
+                fpmm = m.get('fpmm', '')
+                if not fpmm: 
+                    # Fallback to conditionId if fpmm is missing (common in new markets)
+                    fpmm = m.get('conditionId', '')
+                
+                fpmm = fpmm.lower()
                 if not fpmm: continue
-                raw_tokens = m.get('clobTokenIds')
+
+                # 2. Extract Tokens
+                raw_tokens = m.get('clobTokenIds') or m.get('tokens')
+                tokens = []
+                
+                # Robust Parsing for stringified lists
                 if isinstance(raw_tokens, str):
-                    try: tokens = json.loads(raw_tokens)
-                    except: continue
-                else: tokens = raw_tokens
+                    try: 
+                        # Try loading as JSON
+                        tokens = json.loads(raw_tokens)
+                    except:
+                        # Fallback: simple string split if not JSON
+                        tokens = [t.strip().replace('"','').replace("'", "") for t in raw_tokens.strip("[]").split(",")]
+                elif isinstance(raw_tokens, list):
+                    tokens = raw_tokens
+                
                 if not tokens or len(tokens) != 2: continue
-                self.fpmm_to_tokens[fpmm] = [str(t) for t in tokens]
-            log.info(f"✅ Metadata Updated. {len(self.fpmm_to_tokens)} Markets.")
+                
+                # 3. Store
+                clean_tokens = [str(t) for t in tokens]
+                self.fpmm_to_tokens[fpmm] = clean_tokens
+                for t in clean_tokens:
+                    self.token_to_fpmm[t] = fpmm
+                    
+                count += 1
+
+            if count == 0:
+                log.warning(f"⚠️ 0 Markets indexed! Raw Data Sample: {json.dumps(data[0]) if data else 'None'}")
+            else:
+                log.info(f"✅ Metadata Updated. {count} Markets Indexed.")
+                
         except Exception as e:
             log.error(f"Metadata refresh failed: {e}")
 
     def _fetch_all_pages(self):
         results = []
         params = {"closed": "false", "limit": 1000, "offset": 0}
-        while True:
-            resp = requests.get(GAMMA_API_URL, params=params, timeout=10)
-            if resp.status_code != 200: break
-            chunk = resp.json()
-            if not chunk: break
-            results.extend(chunk)
-            if len(chunk) < 1000: break
-            params['offset'] += 1000
+        try:
+            while True:
+                resp = requests.get(GAMMA_API_URL, params=params, timeout=10)
+                if resp.status_code != 200: 
+                    log.error(f"Gamma API Error: {resp.status_code}")
+                    break
+                chunk = resp.json()
+                if not chunk: break
+                results.extend(chunk)
+                if len(chunk) < 1000: break
+                params['offset'] += 1000
+        except Exception as e:
+            log.error(f"Gamma Fetch Error: {e}")
         return results
 
 class AnalyticsEngine:
@@ -175,10 +217,9 @@ class PaperBroker:
         async with self.lock:
             state = self.pm.state
             
-            # --- NEW: Position Limit Check ---
             if side == "BUY":
                 if token_id not in state["positions"] and len(state["positions"]) >= CONFIG["max_positions"]:
-                    log.warning(f"🚫 REJECTED {token_id}: Max positions ({CONFIG['max_positions']}) reached.")
+                    log.warning(f"🚫 REJECTED {token_id}: Max positions reached.")
                     return False
                     
                 qty = usdc_amount / price
@@ -208,9 +249,8 @@ class PaperBroker:
                 del state["positions"][token_id]
                 
                 log.info(f"🔴 SELL {qty_to_sell:.2f} {token_id} @ {price:.3f} | PnL: ${pnl:.2f}")
-                qty = qty_to_sell # For audit log
+                qty = qty_to_sell
 
-            # --- NEW: Audit Logging ---
             equity = self.pm.calculate_equity()
             audit_record = {
                 "ts": time.time(),
@@ -223,7 +263,6 @@ class PaperBroker:
             }
             audit_log.info(json.dumps(audit_record))
             
-            # Update High Water Mark
             if equity > state.get("highest_equity", 0):
                 state["highest_equity"] = equity
 
@@ -233,55 +272,37 @@ class PaperBroker:
 # --- WS MANAGEMENT ---
 
 class SubscriptionManager:
-    """Prioritized Subscription Management."""
     def __init__(self):
-        self.mandatory_subs: Set[str] = set() # Open positions (High Priority)
-        self.speculative_subs: Set[str] = set() # Pre-heated signals (Low Priority)
+        self.mandatory_subs: Set[str] = set()
+        self.speculative_subs: Set[str] = set()
         self.lock = asyncio.Lock()
         self.dirty = False
 
     def set_mandatory(self, asset_ids: List[str]):
-        """Call this when positions change."""
         self.mandatory_subs = set(asset_ids)
         self.dirty = True
 
     def add_speculative(self, asset_ids: List[str]):
-        """Call this when signals heat up."""
         for a in asset_ids:
             if a not in self.speculative_subs and a not in self.mandatory_subs:
                 self.speculative_subs.add(a)
                 self.dirty = True
 
-    def remove_speculative(self, asset_ids: List[str]):
-        for a in asset_ids:
-            if a in self.speculative_subs:
-                self.speculative_subs.remove(a)
-                self.dirty = True
-
     async def sync(self, websocket):
         if not self.dirty or not websocket: return
         async with self.lock:
-            # 1. Priority Logic
             final_list = list(self.mandatory_subs)
-            
-            # 2. Fill remainder
             slots_left = CONFIG['max_ws_subs'] - len(final_list)
             if slots_left > 0:
                 final_list.extend(list(self.speculative_subs)[:slots_left])
             
-            # 3. FIX: Correct Payload Structure per Docs
-            payload = {
-                "type": "Market", 
-                "assets_ids": final_list 
-            }
-            
+            # Corrected Payload
+            payload = {"type": "Market", "assets_ids": final_list}
             try:
                 await websocket.send(json.dumps(payload))
                 self.dirty = False
-                # Optional: Log the sync for debugging
-                # log.debug(f"Synced {len(final_list)} assets")
-            except Exception as e:
-                log.error(f"WS Sync Error: {e}")
+            except Exception:
+                pass
 
 # --- MAIN TRADER ---
 
@@ -298,10 +319,10 @@ class LiveTrader:
         
         self.running = True
         self.seen_trade_ids = set()
-        self.reconnect_delay = 1 # Start with 1s backoff
+        self.reconnect_delay = 1 
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER V5 (Production)")
+        print("\n🚀 STARTING LIVE PAPER TRADER V6 (CLOB Enabled)")
         validate_config()
         
         loop = asyncio.get_running_loop()
@@ -315,7 +336,7 @@ class LiveTrader:
             self._ws_processor_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
-            self._risk_monitor_loop() # NEW: Risk Monitor
+            self._risk_monitor_loop()
         )
 
     async def shutdown(self):
@@ -324,55 +345,39 @@ class LiveTrader:
         await self.persistence.save_async()
         asyncio.get_running_loop().stop()
 
-    # --- NEW: Risk Monitor ---
     async def _risk_monitor_loop(self):
-        """Global Portfolio Risk Supervisor."""
         while self.running:
-            state = self.persistence.state
+            high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             equity = self.persistence.calculate_equity()
-            high_water = state.get("highest_equity", CONFIG['initial_capital'])
-            
-            # Drawdown Calculation
             if high_water > 0:
                 drawdown = (high_water - equity) / high_water
                 if drawdown > CONFIG['max_drawdown']:
-                    log.critical(f"💀 CRITICAL: Max Drawdown Exceeded ({drawdown:.1%}). HALTING BOT.")
+                    log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%}")
                     self.running = False
-                    # Optional: Close all positions logic could go here
                     return 
-
             await asyncio.sleep(60)
 
     async def _ws_ingestion_loop(self):
         while self.running:
             try:
-                # 4. FIX: Use the Correct URL
                 async with websockets.connect(WS_URL) as websocket:
-                    log.info(f"⚡ Websocket Connected to {WS_URL}")
-                    self.reconnect_delay = 1 
+                    log.info(f"⚡ Websocket Connected.")
+                    self.reconnect_delay = 1
                     self.sub_manager.dirty = True
-                    
                     while self.running:
                         await self.sub_manager.sync(websocket)
                         try:
-                            # 5. FIX: Handle Pings (The docs recommend sending pings every 5s)
-                            # 'websockets' library handles low-level pings automatically, 
-                            # but we must ensure we don't timeout.
                             msg = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                             await self.ws_queue.put(msg)
                         except asyncio.TimeoutError:
-                            # Send a "pong" or just continue to keep loop alive
-                            # The server might close if we are silent, but usually 
-                            # re-syncing/checking connection is enough.
                             continue
                         except websockets.ConnectionClosed:
-                            log.warning("WS Connection Closed by Server")
                             break 
             except Exception as e:
                 log.error(f"WS Error: {e}")
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
-                
+
     async def _ws_processor_loop(self):
         while self.running:
             msg = await self.ws_queue.get()
@@ -391,29 +396,33 @@ class LiveTrader:
                 self.ws_queue.task_done()
 
     async def _signal_loop(self):
+        """CLOB Orderbook Subgraph Poller."""
         last_ts = int(time.time()) - 60
         
         while self.running:
             try:
                 current_batch_ts = last_ts
                 has_more = True
+                
                 while has_more:
+                    # UPDATED QUERY FOR CLOB TRADES
                     query = f"""
                     {{
-                      fpmmTransactions(
+                      orderFilledEvents(
                         first: 1000, 
                         orderBy: timestamp, orderDirection: asc, 
                         where: {{ timestamp_gte: "{current_batch_ts}" }}
                       ) {{
-                        id, timestamp, tradeAmount, outcomeTokensAmount, user {{ id }}, market {{ id }}
+                        id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
                       }}
                     }}
                     """
+                    
                     loop = asyncio.get_running_loop()
                     resp = await loop.run_in_executor(None, lambda: requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10))
                     
                     if resp.status_code != 200: break
-                    data = resp.json().get('data', {}).get('fpmmTransactions', [])
+                    data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
                     if not data:
                         has_more = False
@@ -439,11 +448,39 @@ class LiveTrader:
 
     async def _process_batch(self, trades):
         for t in trades:
-            fpmm = t['market']['id'].lower()
-            wallet = t['user']['id'].lower()
-            vol = float(t['tradeAmount'])
+            # 1. Determine which asset is the OUTCOME TOKEN
+            # The trade involves Outcome Token <-> USDC
+            # USDC ID: 0x2791...
             
-            score = self.analytics.get_score(wallet, vol)
+            maker_asset = t['makerAssetId']
+            taker_asset = t['takerAssetId']
+            
+            # Logic: Identify the Token ID and the Volume in USDC
+            token_id = None
+            usdc_vol = 0.0
+            wallet = t['taker'] # The aggressor
+            
+            if maker_asset == USDC_ADDRESS:
+                # Taker SOLD Token (Taker gave Token, Maker gave USDC)
+                # ERROR CHECK: Wait, if Maker gave USDC, Taker received USDC. So Taker SOLD Token?
+                # Let's verify: TakerAssetId = Token. Taker gives TakerAsset. Yes.
+                token_id = taker_asset
+                usdc_vol = float(t['makerAmountFilled']) / 1e6 # USDC is 6 decimals
+                direction = -1.0 # Sell
+            elif taker_asset == USDC_ADDRESS:
+                # Taker BOUGHT Token (Taker gave USDC, Maker gave Token)
+                token_id = maker_asset
+                usdc_vol = float(t['takerAmountFilled']) / 1e6
+                direction = 1.0 # Buy
+            else:
+                continue # Token <-> Token trade (rare/ignore)
+
+            # 2. Reverse Lookup FPMM
+            fpmm = self.analytics.metadata.token_to_fpmm.get(str(token_id))
+            if not fpmm: continue # Unknown token
+            
+            # 3. Strategy Logic
+            score = self.analytics.get_score(wallet, usdc_vol)
             if score <= 0: continue
             
             if fpmm not in self.trackers:
@@ -455,20 +492,36 @@ class LiveTrader:
                 tracker['weight'] *= math.pow(CONFIG['decay_factor'], elapsed / 60.0)
             tracker['last_ts'] = time.time()
             
-            direction = 1.0 if float(t['outcomeTokensAmount']) > 0 else -1.0
-            impact = vol * score * direction
-            tracker['weight'] += impact
-            
-            abs_w = abs(tracker['weight'])
+            # Determine Token Index (Yes=1, No=0)
             tokens = self.analytics.metadata.fpmm_to_tokens.get(fpmm)
+            if not tokens: continue
             
-            if tokens:
-                if abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
-                    self.sub_manager.add_speculative(tokens)
-                if abs_w > CONFIG['splash_threshold']:
-                    tracker['weight'] = 0.0
-                    target = tokens[1] if impact > 0 else tokens[0]
-                    await self._attempt_exec(target, fpmm)
+            # If buying YES (Index 1) -> Positive Impact
+            # If buying NO (Index 0)  -> Negative Impact
+            # If selling YES -> Negative Impact
+            # If selling NO -> Positive Impact
+            
+            is_yes_token = (str(token_id) == tokens[1])
+            
+            raw_impact = usdc_vol * score
+            
+            if is_yes_token:
+                final_impact = raw_impact * direction
+            else:
+                final_impact = raw_impact * -direction # Buying NO is like Selling YES
+                
+            tracker['weight'] += final_impact
+            
+            # 4. Trigger
+            abs_w = abs(tracker['weight'])
+            if abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
+                self.sub_manager.add_speculative(tokens)
+            
+            if abs_w > CONFIG['splash_threshold']:
+                tracker['weight'] = 0.0
+                # If weight > 0 (Bullish), buy YES (tokens[1]). Else buy NO (tokens[0])
+                target = tokens[1] if tracker['weight'] > 0 else tokens[0]
+                await self._attempt_exec(target, fpmm)
 
     async def _attempt_exec(self, token_id, fpmm):
         price = self.ws_prices.get(token_id)
@@ -476,14 +529,12 @@ class LiveTrader:
         
         success = await self.broker.execute_market_order(token_id, "BUY", price, CONFIG['fixed_size'], fpmm)
         if success:
-            # Sync Mandatory Subs immediately
             open_pos = list(self.persistence.state["positions"].keys())
             self.sub_manager.set_mandatory(open_pos)
 
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
         if not pos: return
-        
         avg = pos['avg_price']
         pnl = (price - avg) / avg
         
@@ -491,7 +542,6 @@ class LiveTrader:
             log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
             success = await self.broker.execute_market_order(token_id, "SELL", price, 0, pos['market_fpmm'])
             if success:
-                # Update mandatory subs
                 open_pos = list(self.persistence.state["positions"].keys())
                 self.sub_manager.set_mandatory(open_pos)
 
@@ -500,9 +550,8 @@ class LiveTrader:
             await asyncio.sleep(3600)
             await self.analytics.metadata.refresh()
             
-            # Prune Memory
-            active_assets = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
-            self.ws_prices = {k: v for k, v in self.ws_prices.items() if k in active_assets}
+            active = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
+            self.ws_prices = {k: v for k, v in self.ws_prices.items() if k in active}
             
             now = time.time()
             self.trackers = {k: v for k, v in self.trackers.items() if now - v['last_ts'] < 300}
