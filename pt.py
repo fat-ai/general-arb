@@ -261,73 +261,72 @@ class ModelTrainer:
         return final_scores
 
     def _fetch_resolved_markets(self):
+        """
+        Logic ported directly from b.py: _fetch_gamma_markets.
+        Simple, robust pagination without unsupported sort parameters.
+        """
         all_markets = []
         offset = 0
-        # Headers to prevent 403 Forbidden errors
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json"
-        }
         
-        try:
-            cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
-        except Exception as e:
-            log.error(f"Date Calculation Error: {e}")
-            return []
+        # Use a session for connection pooling (like b.py)
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(max_retries=3)
+        session.mount('https://', adapter)
 
+        cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=self.lookback_days)
         log.info(f"   Fetching markets resolved after {cutoff_date.date()}...")
 
         while True:
-            params = {
-                "closed": "true", 
-                "limit": 500, # Reduced from 1000 to be safer
-                "offset": offset, 
-                "order": "resolutionDate", 
-                "ascending": "false"
-            }
             try:
-                resp = requests.get(GAMMA_API_URL, params=params, headers=headers, timeout=15)
+                # Exact params from b.py (no 'order' param that breaks the API)
+                params = {"limit": 500, "offset": offset, "closed": "true"}
                 
-                # --- NEW: Explicit Error Logging ---
+                resp = session.get(GAMMA_API_URL, params=params, timeout=30)
                 if resp.status_code != 200: 
-                    log.error(f"❌ API Error {resp.status_code}: {resp.text[:200]}")
+                    log.error(f"Gamma API Error {resp.status_code}")
                     break
                 
                 batch = resp.json()
                 if not batch: break
                 
                 valid_batch = []
-                finished = False
+                # We fetch everything but stop processing if we drift too far back in time
+                # Note: Gamma default sort is not strictly guaranteed, but usually roughly time-based.
+                # Since b.py fetched all and filtered, we do the same but add a break check.
                 
+                finished = False
                 for m in batch:
-                    r_date_str = m.get('resolutionDate')
+                    # Date Check
+                    r_date_str = m.get('resolutionDate') or m.get('endDate')
                     if not r_date_str: continue
+                    
                     try:
                         r_date = pd.Timestamp(r_date_str)
                         if r_date.tz is None: r_date = r_date.tz_localize('UTC')
                         
+                        # Optimization: If we see data older than cutoff, we might be done.
+                        # However, since API isn't strictly sorted, we just filter here.
                         if r_date < cutoff_date:
-                            finished = True
-                            break
-                        
+                            continue 
+
                         if m.get('clobTokenIds') or m.get('tokens'):
                             valid_batch.append(m)
                     except:
                         continue
-                
+
                 all_markets.extend(valid_batch)
                 print(f"   Fetched {len(all_markets)} markets...", end='\r')
                 
-                if finished or len(batch) < 500: break
-                offset += 500
+                offset += len(batch)
+                if len(batch) < 500: break # End of pages
                 
             except Exception as e:
-                log.error(f"Market fetch exception: {e}")
+                log.error(f"Fetch loop error: {e}")
                 break
         
-        print("") # Newline
+        print("")
         if len(all_markets) == 0:
-            log.warning("⚠️ No resolved markets found. Check your internet or API access.")
+            log.warning("⚠️ No resolved markets found.")
             
         return all_markets
         
