@@ -286,20 +286,33 @@ def process_data_chunk(args):
     _Agg_SELLER = AggressorSide.SELLER
     _Agg_BUYER = AggressorSide.BUYER
 
+    PRICE_MULT = 1_000_000.0
+    SIZE_MULT = 10_000.0
+
+    bids_int = np.round(bids * PRICE_MULT).astype(np.int64)
+    asks_int = np.round(asks * PRICE_MULT).astype(np.int64)
+    trds_int = np.round(subset_prices * PRICE_MULT).astype(np.int64)
+    depth_int = np.round(depth_vals * SIZE_MULT).astype(np.int64)
+    sizes_int = np.round(subset_sizes * SIZE_MULT).astype(np.int64)
+
+    # Iterator
+    indices = np.arange(start_idx, start_idx + num_rows)
+    
+    # Loop over standard Python lists (faster than iterating numpy arrays directly)
     iterator = zip(
         subset_insts, subset_ts.tolist(), 
-        bids.tolist(), asks.tolist(), subset_prices.tolist(), 
-        depth_vals.tolist(), subset_sizes.tolist(), 
-        subset_is_sell.tolist(), scores.tolist(), tr_id_strs
+        bids_int.tolist(), asks_int.tolist(), trds_int.tolist(), 
+        depth_int.tolist(), sizes_int.tolist(), 
+        subset_is_sell.tolist(), scores.tolist(), indices.tolist()
     )
 
     for inst, ts, bid_v, ask_v, trd_v, depth_v, size_v, is_sell, score, tr_id in iterator:
         
-        p_bid = _Price(int(round(bid_v * 1_000_000)), 6)
-        p_ask = _Price(int(round(ask_v * 1_000_000)), 6)
-        p_trd = _Price(int(round(trd_v * 1_000_000)), 6)
-        s_bid = _Quantity(int(round(depth_v * 10_000)), 4)
-        s_trd = _Quantity(int(round(size_v * 10_000)), 4)
+        p_bid = _Price(bid_i, 6)
+        p_ask = _Price(ask_i, 6)
+        p_trd = _Price(trd_i, 6)
+        s_depth = _Quantity(depth_i, 4)
+        s_trd = _Quantity(size_i, 4)
 
         results.append(_QuoteTick(
             instrument_id=inst,
