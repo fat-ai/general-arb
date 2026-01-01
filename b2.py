@@ -200,7 +200,7 @@ def process_data_chunk(args):
 
     # 3. Filter Valid Rows
     # We check for valid maps and positive sizes
-    valid_mask = (mapped_insts.notna()) & (sizes > 0)
+    valid_mask = (mapped_insts.notna()) & (sizes > 0) & (vols >= 1.0)
     
     if not valid_mask.any(): return [], {}
 
@@ -295,11 +295,11 @@ def process_data_chunk(args):
 
     for inst, ts, bid_v, ask_v, trd_v, depth_v, size_v, is_sell, score, tr_id in iterator:
         
-        p_bid = _Price.from_str(f"{bid_v:.6f}")
-        p_ask = _Price.from_str(f"{ask_v:.6f}")
-        p_trd = _Price.from_str(f"{trd_v:.6f}")
-        s_bid = _Quantity.from_str(f"{depth_v:.4f}")
-        s_trd = _Quantity.from_str(f"{size_v:.4f}")
+        p_bid = _Price(int(round(bid_v * 1_000_000)), 6)
+        p_ask = _Price(int(round(ask_v * 1_000_000)), 6)
+        p_trd = _Price(int(round(trd_v * 1_000_000)), 6)
+        s_bid = _Quantity(int(round(depth_v * 10_000)), 4)
+        s_trd = _Quantity(int(round(size_v * 10_000)), 4)
 
         results.append(_QuoteTick(
             instrument_id=inst,
@@ -463,10 +463,9 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         local_wallet_lookup.update(lookup)
         
         del ticks, lookup, chunk
-        gc.collect() 
+        
 
     del price_events
-    gc.collect()
 
     # --- STRATEGY ---
     strat_config = PolyStrategyConfig()
@@ -521,7 +520,6 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     engine.dispose()
     del engine, strategy
-    gc.collect()
     
     return {
         'start_ts': start_time,
@@ -1363,85 +1361,29 @@ class TuningRunner:
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
                 
     def _fast_load_trades(self, csv_path, start_date, end_date):
-
+        import polars as pl
         import pandas as pd
-        import os
-        import gc
-        import glob
         
-        # 1. Check for Cached Parquet (Instant Load)
-        # Hash based on file size and date window to ensure freshness
-        file_hash = f"{os.path.getsize(csv_path)}_{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
-        cache_path = self.cache_dir / f"trades_opt_{file_hash}.parquet"
+        # Check for the optimized file
+        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        if cache_path.exists():
-            print(f"⚡ FAST LOAD: Using cached parquet: {cache_path.name}")
-            return pd.read_parquet(cache_path)
-
-        print(f"🐢 SLOW LOAD: Processing Trades CSV in chunks (One-time op)...")
-        
-        # 2. Setup for String Filtering (Faster than Date Parsing)
-        # We assume the CSV contains ISO format dates (e.g. 2024-01-01T...) which sort lexicographically.
-        start_str = start_date.isoformat()
-        end_str = end_date.isoformat()
-        
-        # Only load necessary columns with efficient types
-        use_cols = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult']
-        dtypes = {
-            'tradeAmount': 'float32', 'outcomeTokensAmount': 'float32',
-            'price': 'float32', 'size': 'float32', 'side_mult': 'float32',
-            'contract_id': 'string', 'user': 'string'
-        }
-        
-        chunks = []
-        chunk_size = 2_000_000 # 2M rows per chunk (~200MB RAM)
-
-        temp_dir = self.cache_dir / f"temp_chunks_{file_hash}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        for f in temp_dir.glob("*.parquet"): os.remove(f)
-
-        chunk_count = 0
+        if parquet_path.exists():
+            print(f"⚡ FAST LOAD: Scanning optimized parquet...")
             
-        try:
-            with pd.read_csv(csv_path, usecols=use_cols, dtype=dtypes, chunksize=chunk_size) as reader:
-                for i, chunk in enumerate(reader):
-     
-                    mask = (chunk['timestamp'] >= start_str) & (chunk['timestamp'] <= end_str)
-                    filtered = chunk[mask].copy()
-                    
-                    if not filtered.empty:
-     
-                        filtered['timestamp'] = pd.to_datetime(filtered['timestamp'], utc=True).dt.tz_localize(None)
-                        
-                        temp_file = temp_dir / f"chunk_{i:05d}.parquet"
-                        filtered.to_parquet(temp_file, compression='snappy')
-                        chunk_count += 1
-                        
-                    if i % 5 == 0:
-                        print(f"   Processed {(i+1)*2}M+ lines...", end='\r')
-                        gc.collect() 
-                        
-        except Exception as e:
-            print(f"\n❌ Error reading chunks: {e}")
+            # Polars Scan -> Filter -> Collect (Ram Efficient)
+            # We convert start/end to datetime for comparison if they are timestamps
+            df = pl.scan_parquet(parquet_path).filter(
+                (pl.col("timestamp") >= start_date) & 
+                (pl.col("timestamp") <= end_date)
+            ).collect()
+            
+            # Convert to Pandas for compatibility with your existing code
+            pdf = df.to_pandas()
+            return pdf
+            
+        else:
+            print("⚠️ Parquet not found. Please run convert_data.py first.")
             return pd.DataFrame()
-
-        print("\n   Merging filtered chunks...")
-        
-        all_files = sorted(list(temp_dir.glob("*.parquet")))
-        
-        if not all_files:
-             return pd.DataFrame(columns=use_cols)
-
-        df = pd.read_parquet(all_files)
-        
-        import shutil
-        shutil.rmtree(temp_dir)
-        
-        print(f"   Caching {len(df)} rows to {cache_path.name}...")
-        df.to_parquet(cache_path, compression='snappy')
-        
-        return df
         
     def run_tuning_job(self):
 
@@ -1544,24 +1486,8 @@ class TuningRunner:
             
         log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
     
-        import gc
         del df_markets, df_trades
-        gc.collect()
-    
-        log.info("Uploading data to Ray Object Store...")
-        event_log_ref = ray.put(event_log)
-        profiler_ref = ray.put(profiler_data)
 
-        # Create empty placeholders for the unused refs to satisfy signature
-        nlp_cache_ref = ray.put(None)
-        priors_ref = ray.put({})
-
-        print("🗑️ Freeing local memory for tuning...")
-        del event_log
-        del profiler_data
-        import gc
-        gc.collect()
-        
         # === FIXED SEARCH SPACE ===
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
@@ -1579,22 +1505,54 @@ class TuningRunner:
         }
     
         # Execute Tuning
+        if 'ts_int' not in event_log.columns:
+        event_log['ts_int'] = event_log.index.astype(np.int64)
+        if 'ts_int' not in profiler_data.columns:
+            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
+    
+        # Upload to Object Store
+        log.info("Uploading data to Ray Object Store...")
+        event_log_ref = ray.put(event_log)
+        profiler_ref = ray.put(profiler_data)
+        # Create empty placeholders for the unused refs to satisfy signature
+        nlp_cache_ref = ray.put(None)
+        priors_ref = ray.put({})
+    
+        # 2. Calculate Max Parallelism based on RAM (Safety Check)
+        import psutil
+        # Assume ~4GB RAM overhead per worker for safety
+        worker_est_ram = 4 
+        total_ram_gb = psutil.virtual_memory().total / (1024**3)
+        safe_slots = int(total_ram_gb / worker_est_ram)
+        
+        # Use the lower of: Available CPUs OR Safe RAM slots
+        cpu_count = os.cpu_count()
+        max_parallel = max(1, min(safe_slots, cpu_count - 1))
+
+        print("🗑️ Freeing local memory for tuning...")
+        del event_log
+        del profiler_data
+    
+        print(f"🚀 Launching {max_parallel} parallel trials (1 CPU each)...")
+    
         analysis = tune.run(
             tune.with_parameters(
                 ray_backtest_wrapper,
-                event_log=event_log_ref,      # maps to 'event_log' arg
-                profiler_data=profiler_ref,   # maps to 'profiler_data' arg
-        #        nlp_cache=nlp_cache_ref,      # maps to 'nlp_cache' arg
-        #        priors=priors_ref             # maps to 'priors' arg
-
+                event_log=event_log_ref,
+                profiler_data=profiler_ref,
+                # nlp_cache=nlp_cache_ref,
+                # priors=priors_ref
             ),
             config=search_space,
             metric="smart_score",
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=1,
-            resources_per_trial=tune.PlacementGroupFactory([{'CPU': 1.0}] + [{'CPU': 1.0}] * 26),
+            
+            # --- CRITICAL FIXES ---
+            max_concurrent_trials=max_parallel,
+            resources_per_trial={"cpu": 1},
+            # ----------------------
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
@@ -1620,6 +1578,7 @@ class TuningRunner:
                 -t.config.get('splash_threshold', 0),
                 t.trial_id
             )
+            
         sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
         best_trial = sorted_trials[0]
         best_config = best_trial.config
@@ -1767,7 +1726,7 @@ class TuningRunner:
             # Initial fetch (creates the CSV)
             # We assign to _ and delete to ensure we don't hold the raw data in RAM
             _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
-            import gc; gc.collect()
+            
         
         # CALL THE NEW OPTIMIZED LOADER
         # This handles Chunking -> Filtering -> Caching automatically
@@ -2738,13 +2697,11 @@ class TuningRunner:
         })
 
         del trades
-        gc.collect()
         
         # 6. FINAL SORT
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
-        gc.collect()
         
         df_ev['event_type'] = df_ev['event_type'].astype('category')
         
@@ -2794,19 +2751,11 @@ class TuningRunner:
         return df_ev, prof_data
       
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
-    """
-    Production-ready wrapper that correctly unpacks Ray search space parameters
-    into a flat configuration dictionary compatible with PolyStrategyConfig.
-    """
+    
     if isinstance(event_log, ray.ObjectRef):
         event_log = ray.get(event_log)
     if isinstance(profiler_data, ray.ObjectRef):
         profiler_data = ray.get(profiler_data)
-
-    if event_log is not None:
-        event_log = event_log.copy()
-    if profiler_data is not None:
-        profiler_data = profiler_data.copy()
         
     if isinstance(nlp_cache, ray.ObjectRef):
         nlp_cache = ray.get(nlp_cache)
@@ -2900,8 +2849,6 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         
         # Cleanup to prevent RAM explosion in Ray
         del engine
-        import gc
-        gc.collect()
         
         return results
         
