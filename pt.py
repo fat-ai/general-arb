@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Set, Any
 from concurrent.futures import ThreadPoolExecutor
 import websockets
+import pandas as pd
 
 # --- CONFIGURATION ---
 CACHE_DIR = Path("live_paper_cache")
