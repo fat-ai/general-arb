@@ -358,7 +358,6 @@ class ModelTrainer:
         return pd.DataFrame()
 
     def _build_outcome_map(self):
-
         market_cache = CACHE_DIR / "gamma_markets.json"
         all_rows = []
 
@@ -403,29 +402,58 @@ class ModelTrainer:
                 except Exception as e:
                     log.error(f"   Failed to write cache: {e}")
 
-        # --- Standard Processing (No changes below this line) ---
         if not all_rows: return set(), set()
 
         df = pd.DataFrame(all_rows)
         
+        # [PATCH] Robust Token Extraction (Handles strings, lists, and dicts)
         def extract_tokens(row):
             raw = row.get('clobTokenIds') or row.get('tokens')
-            if isinstance(raw, list): return ",".join([str(t).strip() for t in raw])
             if isinstance(raw, str):
-                try: return ",".join([str(t).strip() for t in json.loads(raw)])
-                except: return str(raw)
+                try: raw = json.loads(raw)
+                except: pass
+            
+            if isinstance(raw, list):
+                clean_tokens = []
+                for t in raw:
+                    if isinstance(t, dict):
+                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
+                        if tid: clean_tokens.append(str(tid).strip())
+                    else:
+                        clean_tokens.append(str(t).strip())
+                
+                if len(clean_tokens) >= 2:
+                    return ",".join(clean_tokens)
             return None
 
         df['contract_id'] = df.apply(extract_tokens, axis=1)
         df = df.dropna(subset=['contract_id'])
         
+        # [PATCH] Robust Outcome Derivation (Fallback to outcomePrices)
         def derive_outcome(row):
+            # 1. Try explicit 'outcome' field (Legacy)
             val = row.get('outcome')
             if pd.notna(val):
                 try:
                     f = float(val)
                     if f in [0.0, 1.0]: return f
                 except: pass
+            
+            # 2. Fallback: Infer winner from 'outcomePrices'
+            # Resolved markets settle to prices like ["1", "0"] or ["0", "1"]
+            prices = row.get('outcomePrices')
+            if prices:
+                try:
+                    if isinstance(prices, str):
+                        prices = json.loads(prices)
+                    
+                    if isinstance(prices, list):
+                        p_floats = [float(p) for p in prices]
+                        # Find the index with price >= 0.95 (Winning outcome)
+                        for i, p in enumerate(p_floats):
+                            if p >= 0.95: return float(i)
+                except: pass
+            
             return np.nan 
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
