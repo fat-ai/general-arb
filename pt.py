@@ -606,75 +606,7 @@ class ModelTrainer:
             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         return pd.DataFrame()
 
-    def _build_outcome_map(self):
-        log.info("   Fetching resolved market outcomes...")
-        
-        all_rows = []
-        offset = 0
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-        
-        while True:
-            params = {"limit": 500, "offset": offset, "closed": "true"}
-            try:
-                r = session.get(GAMMA_API_URL, params=params, timeout=15)
-                if r.status_code != 200: break
-                batch = r.json()
-                if not batch: break
-                all_rows.extend(batch)
-                offset += len(batch)
-                print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
-                if len(batch) < 500: break
-            except: break
-        print("")
-        
-        if not all_rows: return set(), set()
-
-        df = pd.DataFrame(all_rows)
-        
-        def extract_tokens(row):
-            raw = row.get('clobTokenIds') or row.get('tokens')
-            if isinstance(raw, list): return ",".join([str(t).strip() for t in raw])
-            if isinstance(raw, str):
-                try: return ",".join([str(t).strip() for t in json.loads(raw)])
-                except: return str(raw)
-            return None
-
-        df['contract_id'] = df.apply(extract_tokens, axis=1)
-        df = df.dropna(subset=['contract_id'])
-        
-        def derive_outcome(row):
-            val = row.get('outcome')
-            if pd.notna(val):
-                try:
-                    f = float(val)
-                    if f in [0.0, 1.0]: return f
-                except: pass
-            return np.nan 
-
-        df['outcome'] = df.apply(derive_outcome, axis=1)
-        df = df.dropna(subset=['outcome'])
-        
-        if df.empty: return set(), set()
-
-        df['contract_id_list'] = df['contract_id'].str.split(',')
-        df = df.explode('contract_id_list')
-        df['token_id'] = df['contract_id_list'].str.strip()
-        df['token_index'] = df.groupby(level=0).cumcount()
-        df = df.reset_index(drop=True)
-        
-        def final_token_payout(row):
-            winning_idx = int(round(row['outcome']))
-            return 1.0 if row['token_index'] == winning_idx else 0.0
-
-        df['token_payout'] = df.apply(final_token_payout, axis=1)
-        
-        winners = set(df[df['token_payout'] == 1.0]['token_id'].unique())
-        losers = set(df[df['token_payout'] == 0.0]['token_id'].unique())
-        
-        log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
-        return winners, losers
-
+    
 class MarketMetadata:
     def __init__(self):
         self.fpmm_to_tokens: Dict[str, List[str]] = {}
