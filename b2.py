@@ -479,7 +479,8 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
         
 
     del price_events
-
+    import gc
+    gc.collect()
     # --- STRATEGY ---
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
@@ -533,6 +534,7 @@ def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercep
     
     engine.dispose()
     del engine, strategy
+    gc.collect()
     
     return {
         'start_ts': start_time,
@@ -1500,7 +1502,9 @@ class TuningRunner:
         log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
     
         del df_markets, df_trades
-
+        import gc
+        gc.collect()
+        
         # === FIXED SEARCH SPACE ===
         search_space = {
             # Grid Search: Ray will strictly iterate these combinations
@@ -1545,7 +1549,9 @@ class TuningRunner:
         print("🗑️ Freeing local memory for tuning...")
         del event_log
         del profiler_data
-    
+        import gc
+        gc.collect()
+        
         print(f"🚀 Launching {max_parallel} parallel trials (1 CPU each)...")
     
         analysis = tune.run(
@@ -1739,7 +1745,8 @@ class TuningRunner:
             # Initial fetch (creates the CSV)
             # We assign to _ and delete to ensure we don't hold the raw data in RAM
             _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
-            
+            import gc
+            gc.collect()
         
         # CALL THE NEW OPTIMIZED LOADER
         # This handles Chunking -> Filtering -> Caching automatically
@@ -2710,11 +2717,15 @@ class TuningRunner:
         })
 
         del trades
+        import gc
+        gc.collect()
         
         # 6. FINAL SORT
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
+        import gc
+        gc.collect()
         
         df_ev['event_type'] = df_ev['event_type'].astype('category')
         
@@ -2862,6 +2873,8 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         
         # Cleanup to prevent RAM explosion in Ray
         del engine
+        import gc
+        gc.collect()
         
         return results
         
