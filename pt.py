@@ -19,7 +19,7 @@ LOG_LEVEL = logging.INFO
 
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
-WS_URL = "wss://ws-fidelity.polymarket.com"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 CONFIG = {
     "splash_threshold": 1000.0,
@@ -261,21 +261,27 @@ class SubscriptionManager:
     async def sync(self, websocket):
         if not self.dirty or not websocket: return
         async with self.lock:
-            # --- NEW: Priority Logic ---
-            # 1. Always include mandatory (Open Positions)
+            # 1. Priority Logic
             final_list = list(self.mandatory_subs)
             
-            # 2. Fill remainder with speculative
+            # 2. Fill remainder
             slots_left = CONFIG['max_ws_subs'] - len(final_list)
             if slots_left > 0:
                 final_list.extend(list(self.speculative_subs)[:slots_left])
             
-            payload = {"type": "market", "assets": final_list}
+            # 3. FIX: Correct Payload Structure per Docs
+            payload = {
+                "type": "Market", 
+                "assets_ids": final_list 
+            }
+            
             try:
                 await websocket.send(json.dumps(payload))
                 self.dirty = False
-            except Exception:
-                pass
+                # Optional: Log the sync for debugging
+                # log.debug(f"Synced {len(final_list)} assets")
+            except Exception as e:
+                log.error(f"WS Sync Error: {e}")
 
 # --- MAIN TRADER ---
 
@@ -340,26 +346,33 @@ class LiveTrader:
     async def _ws_ingestion_loop(self):
         while self.running:
             try:
+                # 4. FIX: Use the Correct URL
                 async with websockets.connect(WS_URL) as websocket:
-                    log.info("⚡ Websocket Connected.")
-                    self.reconnect_delay = 1 # Reset on success
+                    log.info(f"⚡ Websocket Connected to {WS_URL}")
+                    self.reconnect_delay = 1 
                     self.sub_manager.dirty = True
                     
                     while self.running:
                         await self.sub_manager.sync(websocket)
                         try:
-                            msg = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                            # 5. FIX: Handle Pings (The docs recommend sending pings every 5s)
+                            # 'websockets' library handles low-level pings automatically, 
+                            # but we must ensure we don't timeout.
+                            msg = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                             await self.ws_queue.put(msg)
                         except asyncio.TimeoutError:
+                            # Send a "pong" or just continue to keep loop alive
+                            # The server might close if we are silent, but usually 
+                            # re-syncing/checking connection is enough.
                             continue
                         except websockets.ConnectionClosed:
-                            raise 
+                            log.warning("WS Connection Closed by Server")
+                            break 
             except Exception as e:
                 log.error(f"WS Error: {e}")
-                # --- NEW: Exponential Backoff ---
                 await asyncio.sleep(self.reconnect_delay)
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
-
+                
     async def _ws_processor_loop(self):
         while self.running:
             msg = await self.ws_queue.get()
