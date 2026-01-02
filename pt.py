@@ -116,7 +116,8 @@ class ModelTrainer:
     - Caches results to CSV to allow resuming interrupted downloads.
     """
     def __init__(self):
-        self.scores_file = Path("wallet_scores.json")
+        self.scores_file = Path("wallet_scores.json
+        self.cache_dir = CACHE_DIR
         self.min_trades = 5
         self.min_volume = 100.0
 
@@ -479,161 +480,229 @@ class ModelTrainer:
         log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
         return winners, losers
         
-    def _fetch_history_parallel(self, token_ids, days_back=365):
-        cache_file = CACHE_DIR / "gamma_trades_stream.csv"
-        ledger_file = CACHE_DIR / "gamma_completed.txt"
+    def _fetch_history_parallel(self, market_ids_raw, days_back=200):
+        # [Logic Source: User Provided Correct Function]
+        import concurrent.futures 
+        import csv
+        import threading
+        import requests
+        import os
+        import time
+        from requests.adapters import HTTPAdapter, Retry
         
-        # Filter completed tokens using ledger
+        cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        ledger_file = self.cache_dir / "gamma_completed.txt"
+        
+        # Expand Market IDs to Token IDs
+        all_tokens = []
+        for mid_str in market_ids_raw:
+            parts = str(mid_str).split(',')
+            for p in parts:
+                if len(p) > 5: all_tokens.append(p.strip())
+                    
+        all_tokens = list(set(all_tokens))
+
         completed_tokens = set()
         if ledger_file.exists():
             try:
                 with open(ledger_file, 'r') as f:
-                    completed_tokens = set(line.strip() for line in f if line.strip())
-            except Exception: pass
+                     completed_tokens = set(line.strip() for line in f if line.strip())
+            except Exception as e:
+                print(f"⚠️ Could not read ledger: {e}")
         
-        pending_tokens = [t for t in token_ids if t not in completed_tokens]
-        log.info(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
+        pending_tokens = [t for t in all_tokens if t not in completed_tokens]
+        print(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
         
-        # Return immediately if everything is done
         if not pending_tokens and cache_file.exists():
+             print("✅ All tokens previously fetched.")
              return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        
+        # Use 'pending_tokens' for the actual work
+        all_tokens = pending_tokens
+            
+        print(f"Stream-fetching {len(all_tokens)} tokens via SUBGRAPH...")
+        print(f"Constraint: STRICT {days_back} DAY HISTORY LIMIT.")
+        
+        GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
-        # Setup CSV and Worker
         FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
+        # add id
         
+        # Append if file exists, write new if not
+        write_mode = 'a' if cache_file.exists() else 'w'
         csv_lock = threading.Lock()
         ledger_lock = threading.Lock()
+        self.first_success = False
         
+        # CALCULATE THE HARD TIME LIMIT
         limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
         CUTOFF_TS = limit_date.timestamp()
         
-        def worker(token_str, writer, f_handle):
+        def fetch_and_write_worker(token_str, writer, f_handle):
             session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
-            
-            # [PATCH 2] Add numeric validation
             if not token_str.isdigit(): return False
-            
-            last_ts = 2147483647 
+            last_ts = 2147483647 # Int32 Max
             
             while True:
                 try:
-                    # Dual query for Maker and Taker roles
+                    # DUAL QUERY: Fetches trades where the token was either the Maker Asset or Taker Asset
                     query = """
                     query($token: String!, $max_ts: Int!) {
                       asMaker: orderFilledEvents(
-                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        first: 1000
+                        orderBy: timestamp
+                        orderDirection: desc
                         where: { makerAssetId: $token, timestamp_lt: $max_ts }
-                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                      ) {
+                        id
+                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
+                      }
                       asTaker: orderFilledEvents(
-                        first: 1000, orderBy: timestamp, orderDirection: desc, 
+                        first: 1000
+                        orderBy: timestamp, orderDirection: desc
                         where: { takerAssetId: $token, timestamp_lt: $max_ts }
-                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
+                      ) {
+                        id
+                        timestamp, makerAmountFilled, takerAmountFilled, maker, taker
+                      }
                     }
                     """
-                    resp = session.post(SUBGRAPH_URL, json={"query": query, "variables": {"token": token_str, "max_ts": int(last_ts)}}, timeout=30)
-                    if resp.status_code != 200: 
+                    variables = {"token": token_str, "max_ts": int(last_ts)}
+                    
+                    resp = session.post(GRAPH_URL, json={"query": query, "variables": variables}, timeout=45)
+                    
+                    if resp.status_code == 200:
+                        r_json = resp.json()
+                        if 'errors' in r_json: break 
+                        
+                        batch_maker = r_json.get('data', {}).get('asMaker', [])
+                        batch_taker = r_json.get('data', {}).get('asTaker', [])
+                        
+                        # Tag them explicitly to identify flow source
+                        tagged_rows = [(r, 'maker') for r in batch_maker] + [(r, 'taker') for r in batch_taker]
+                        if not tagged_rows: break 
+                        
+                        tagged_rows.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
+                        
+                        rows = []
+                        min_batch_ts = last_ts
+                        stop_signal = False
+                        
+                        for row, source in tagged_rows:
+                            ts_val = float(row['timestamp'])
+                            min_batch_ts = min(min_batch_ts, ts_val)
+                            
+                            if ts_val < CUTOFF_TS:
+                                stop_signal = True
+                                continue
+                            
+                            try:
+                                # Scale amounts based on asset type (USDC: 10**6, Tokens: 10**18)
+                                if source == 'maker':
+                                    size = float(row.get('makerAmountFilled') or 0.0) / 1e18  # Token amount
+                                    usdc = float(row.get('takerAmountFilled') or 0.0) / 1e6   # USDC amount
+                                    user = str(row.get('taker') or 'unknown')                # Aggressor: Taker buys token
+                                    side_mult = 1  # Buy (long)
+                                else:
+                                    size = float(row.get('takerAmountFilled') or 0.0) / 1e18  # Token amount
+                                    usdc = float(row.get('makerAmountFilled') or 0.0) / 1e6   # USDC amount
+                                    user = str(row.get('taker') or 'unknown')                # Aggressor: Taker sells token
+                                    side_mult = -1 # Sell (short)
+                            
+                                if size <= 0 or usdc <= 0: continue  # Skip invalid trades
+                            
+                                price = usdc / size
+                                if not (0.01 <= price <= 0.99): continue  # Skip extreme prices (data errors)
+                            
+                                ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
+                            
+                                rows.append({
+                                #     'id': row.get('id'),
+                                    'timestamp': ts_str,
+                                    'tradeAmount': usdc,
+                                    'outcomeTokensAmount': size * side_mult,  # Signed, scaled correctly (no *1e18)
+                                    'user': user,
+                                    'contract_id': token_str,
+                                    'price': price,
+                                    'size': size,  # Absolute size
+                                    'side_mult': side_mult
+                                })
+                            except:
+                                continue
+                        
+                        if rows:
+                            with csv_lock:
+                                writer.writerows(rows)
+                        
+                        if stop_signal: break
+                        
+                        if int(min_batch_ts) >= int(last_ts): last_ts = int(min_batch_ts) - 1
+                        else: last_ts = min_batch_ts
+                        
+                        if min_batch_ts < CUTOFF_TS: break
+                        
+                    else:
+                        # Basic backoff for non-200 responses inside the loop
                         time.sleep(2)
                         continue
-                        
-                    data = resp.json().get('data', {})
-                    if not data: break
-                    
-                    batch = []
-                    for r in data.get('asMaker', []): batch.append((r, 'maker'))
-                    for r in data.get('asTaker', []): batch.append((r, 'taker'))
-                    
-                    if not batch: break
-                    batch.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
-                    
-                    rows = []
-                    min_ts = last_ts
-                    stop = False
-                    
-                    for r, role in batch:
-                        ts = float(r['timestamp'])
-                        min_ts = min(min_ts, ts)
-                        if ts < CUTOFF_TS: 
-                            stop = True
-                            continue
-                            
-                        # Normalize columns (USDC is always 1e6, Token is 1e18)
-                        if role == 'maker':
-                            size = float(r['makerAmountFilled']) / 1e18
-                            usdc = float(r['takerAmountFilled']) / 1e6
-                            user = r['taker']
-                            side = 1 # Taker bought
-                        else:
-                            size = float(r['takerAmountFilled']) / 1e18
-                            usdc = float(r['makerAmountFilled']) / 1e6
-                            user = r['taker']
-                            side = -1 # Taker sold
-                            
-                        if size <= 0 or usdc <= 0: continue
-                        price = usdc / size
-                        if not (0.01 <= price <= 0.99): continue
-                        
-                        rows.append({
-                            'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
-                            'tradeAmount': usdc,
-                            'outcomeTokensAmount': size * side,
-                            'user': user,
-                            'contract_id': token_str,
-                            'price': price,
-                            'size': size,
-                            'side_mult': side
-                        })
-                    
-                    if rows:
-                        with csv_lock:
-                            writer.writerows(rows)
-                    
-                    if stop: break
-                    
-                    if int(min_ts) >= int(last_ts): last_ts = int(min_ts) - 1
-                    else: last_ts = min_ts
-                    
-                    if min_ts < CUTOFF_TS: break
-                    
-                except Exception:
-                    break
-
-            # Mark token as complete
-            with ledger_lock:
-                with open(ledger_file, "a") as f: f.write(f"{token_str}\n")
-
-        # Execute Parallel Workers
-        target = cache_file if cache_file.exists() else cache_file.with_suffix(f".tmp.{os.getpid()}")
-        mode = 'a' if cache_file.exists() else 'w'
         
+                except Exception:
+                    break 
+            
+            with ledger_lock:
+                with open(ledger_file, "a") as lf: lf.write(f"{token_str}\n")
+            return True
+
+        is_resume = cache_file.exists()
+        if is_resume:
+            target_path = cache_file
+            mode = 'a'
+        else:
+            target_path = cache_file.with_suffix(f".tmp.{os.getpid()}")
+            mode = 'w'
+
         try:
-            with open(target, mode, newline='') as f:
+            with open(target_path, mode=mode, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
                 if mode == 'w': writer.writeheader()
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    # [PATCH 4] Pass 'f' as the third argument
-                    futures = [executor.submit(worker, t, writer, f) for t in pending_tokens]
-                    
-                    done = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = [executor.submit(fetch_and_write_worker, mid, writer, f) for mid in all_tokens]
+                    completed = 0
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            # This raises if the worker thread crashed
+                            future.result()
+                        except Exception as e:
+                            # Log error but allow other workers to continue
+                            print(f"\n⚠️ Worker Error: {e}")
+                            
+                        completed += 1
+                        if completed % 100 == 0: 
+                            print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
+                            
                     for _ in concurrent.futures.as_completed(futures):
-                        done += 1
-                        print(f"   Fetching history: {done}/{len(pending_tokens)} tokens...", end='\r')
+                        completed += 1
+                        if completed % 100 == 0: print(f" Progress: {completed}/{len(all_tokens)} checked...", end="\r")
             
-            if not cache_file.exists() and os.path.exists(target):
-                os.replace(target, cache_file)
+            # ATOMIC SWAP (Only for fresh fetches)
+            if not is_resume:
+                os.replace(target_path, cache_file)
+                print(f"\n✅ Fetch complete. Saved atomically to {cache_file.name}")
                 
         except Exception as e:
-            log.error(f"Parallel fetch failed: {e}")
-            if os.path.exists(target) and target != cache_file: os.remove(target)
-            
-        print("")
-        if cache_file.exists():
-            return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-        return pd.DataFrame()
+            # Cleanup temp file on crash
+            if not is_resume and target_path.exists():
+                os.remove(target_path)
+            raise e
 
+        print("\n✅ Fetch complete.")
+        try: df = pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+        except: return pd.DataFrame()
+        return df
     
 class MarketMetadata:
     def __init__(self):
