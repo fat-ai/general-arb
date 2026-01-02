@@ -1356,8 +1356,15 @@ class TuningRunner:
         
         if ray.is_initialized(): ray.shutdown()
         
+        # In b.py -> TuningRunner -> __init__
+        
         try:
+            import psutil
+            num_cpus = psutil.cpu_count(logical=False) or 8
+            
             ray.init(
+                num_cpus=num_cpus,
+                object_store_memory=2 * 1024 * 1024 * 1024,
                 _system_config={
                     "object_spilling_config": json.dumps({
                         "type": "filesystem",
@@ -1366,8 +1373,9 @@ class TuningRunner:
                         }
                     })
                 },
+                ignore_reinit_error=True
             )
-            print(f"✅ Ray initialized. Heavy data will spill to: {self.spill_dir}")
+            print(f"✅ Ray initialized (Limited to 2GB RAM). Heavy data will spill to: {self.spill_dir}")
             
         except Exception as e:
             log.warning(f"Ray init warning: {e}")
@@ -1378,53 +1386,62 @@ class TuningRunner:
     def _fast_load_trades(self, csv_path, start_date, end_date):
         import polars as pl
         import pandas as pd
+        import gc
         
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
         if parquet_path.exists():
-            print(f"⚡ FAST LOAD: Scanning optimized parquet...")
-            
+            print(f"⚡ LOW-RAM LOAD: Scanning parquet...")
             try:
-                # 1. Debug Scan
                 lf = pl.scan_parquet(parquet_path)
                 
-                # Check file bounds before filtering
-                bounds = lf.select([
-                    pl.col("timestamp").min().alias("min"), 
-                    pl.col("timestamp").max().alias("max")
-                ]).collect()
-                
-                print(f"   [DEBUG] File Range: {bounds['min'][0]} to {bounds['max'][0]}")
-                print(f"   [DEBUG] Requesting: {start_date} to {end_date}")
-
-                # 2. Filter
-                df = lf.filter(
+                # 1. Filter Dates
+                lf = lf.filter(
                     (pl.col("timestamp") >= start_date) & 
                     (pl.col("timestamp") <= end_date)
-                ).collect()
-                
-                print(f"   [DEBUG] Rows Loaded: {df.height}")
+                )
 
+                # 2. CLEAN & OPTIMIZE IN POLARS (Saves ~10GB RAM)
+                # We cast strings to Categorical immediately
+                # We cast floats to Float32 (50% smaller)
+                df = lf.select([
+                    pl.col("timestamp"),
+                    
+                    # Clean Contract ID here (so we don't do it in Pandas)
+                    pl.col("contract_id").cast(pl.String)
+                      .str.strip_chars().str.to_lowercase().str.replace("^0x", "")
+                      .cast(pl.Categorical),
+                      
+                    # Clean User
+                    pl.col("user").cast(pl.String).str.strip_chars().cast(pl.Categorical),
+                    
+                    pl.col("tradeAmount").cast(pl.Float32),
+                    pl.col("price").cast(pl.Float32),
+                    pl.col("size").cast(pl.Float32),
+                    pl.col("outcomeTokensAmount").cast(pl.Float32)
+                ]).collect()
+                
                 if df.height == 0:
-                    print("⚠️ WARNING: Loaded 0 trades! Check your dates.")
+                    print("⚠️ WARNING: Loaded 0 trades.")
                     return pd.DataFrame()
 
-                # 3. Convert to Pandas
-                pdf = df.to_pandas()
+                print(f"   [DEBUG] Converting {df.height} rows to Pandas...")
                 
-                # CRITICAL FIX: Ensure IDs are Strings (matches Market Data)
-                # Polars 'Categorical' converts to Pandas 'category', but we need 'object/string' for merging
-                if 'contract_id' in pdf.columns:
-                    pdf['contract_id'] = pdf['contract_id'].astype(str)
-                if 'user' in pdf.columns:
-                    pdf['user'] = pdf['user'].astype(str)
-                    
+                # 3. Convert using PyArrow (prevents string duplication)
+                try:
+                    pdf = df.to_pandas(use_pyarrow_extension_array=True)
+                except TypeError:
+                    pdf = df.to_pandas()
+                
+                del df
+                gc.collect()
                 return pdf
 
             except Exception as e:
                 print(f"❌ Loader Error: {e}")
+                import traceback
+                traceback.print_exc()
                 return pd.DataFrame()
-            
         else:
             print("⚠️ Parquet not found. Please run convert_data.py.")
             return pd.DataFrame()
@@ -1460,12 +1477,16 @@ class TuningRunner:
             df_trades[c] = pd.to_numeric(df_trades[c], downcast='float')
         
         # Use categorical for repeated strings
-        df_trades['contract_id'] = df_trades['contract_id'].astype('category')
+       # df_trades['contract_id'] = df_trades['contract_id'].astype('category')
 
-        df_trades['contract_id'] = df_trades['contract_id'].apply(normalize_contract_id)
+       # df_trades['contract_id'] = df_trades['contract_id'].apply(normalize_contract_id)
 
-        df_trades['user'] = df_trades['user'].astype('category')
-        
+       # df_trades['user'] = df_trades['user'].astype('category')
+        float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
+        for c in float_cols:
+            if c in df_trades.columns:
+                df_trades[c] = df_trades[c].astype('float32')
+                
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
             return None
@@ -1598,7 +1619,8 @@ class TuningRunner:
             max_failures=0,
             
             # --- CRITICAL FIXES ---
-            max_concurrent_trials=max_parallel,
+            #max_concurrent_trials=max_parallel,
+            max_concurrent_trials=4,
             resources_per_trial={"cpu": 1},
             # ----------------------
         )
