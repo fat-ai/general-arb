@@ -1379,27 +1379,56 @@ class TuningRunner:
         import polars as pl
         import pandas as pd
         
-        # Check for the optimized file
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
         if parquet_path.exists():
             print(f"⚡ FAST LOAD: Scanning optimized parquet...")
             
-            # Polars Scan -> Filter -> Collect (Ram Efficient)
-            # We convert start/end to datetime for comparison if they are timestamps
-            df = pl.scan_parquet(parquet_path).filter(
-                (pl.col("timestamp") >= start_date) & 
-                (pl.col("timestamp") <= end_date)
-            ).collect()
-            
-            # Convert to Pandas for compatibility with your existing code
-            pdf = df.to_pandas()
-            return pdf
+            try:
+                # 1. Debug Scan
+                lf = pl.scan_parquet(parquet_path)
+                
+                # Check file bounds before filtering
+                bounds = lf.select([
+                    pl.col("timestamp").min().alias("min"), 
+                    pl.col("timestamp").max().alias("max")
+                ]).collect()
+                
+                print(f"   [DEBUG] File Range: {bounds['min'][0]} to {bounds['max'][0]}")
+                print(f"   [DEBUG] Requesting: {start_date} to {end_date}")
+
+                # 2. Filter
+                df = lf.filter(
+                    (pl.col("timestamp") >= start_date) & 
+                    (pl.col("timestamp") <= end_date)
+                ).collect()
+                
+                print(f"   [DEBUG] Rows Loaded: {df.height}")
+
+                if df.height == 0:
+                    print("⚠️ WARNING: Loaded 0 trades! Check your dates.")
+                    return pd.DataFrame()
+
+                # 3. Convert to Pandas
+                pdf = df.to_pandas()
+                
+                # CRITICAL FIX: Ensure IDs are Strings (matches Market Data)
+                # Polars 'Categorical' converts to Pandas 'category', but we need 'object/string' for merging
+                if 'contract_id' in pdf.columns:
+                    pdf['contract_id'] = pdf['contract_id'].astype(str)
+                if 'user' in pdf.columns:
+                    pdf['user'] = pdf['user'].astype(str)
+                    
+                return pdf
+
+            except Exception as e:
+                print(f"❌ Loader Error: {e}")
+                return pd.DataFrame()
             
         else:
-            print("⚠️ Parquet not found. Please run convert_data.py first.")
+            print("⚠️ Parquet not found. Please run convert_data.py.")
             return pd.DataFrame()
-        
+            
     def run_tuning_job(self):
 
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
