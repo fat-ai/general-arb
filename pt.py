@@ -116,7 +116,7 @@ class ModelTrainer:
     - Caches results to CSV to allow resuming interrupted downloads.
     """
     def __init__(self):
-        self.scores_file = Path("wallet_scores.json)
+        self.scores_file = Path("wallet_scores.json")
         self.cache_dir = CACHE_DIR
         self.min_trades = 5
         self.min_volume = 100.0
