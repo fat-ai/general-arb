@@ -1994,24 +1994,39 @@ class TuningRunner:
         
         # --- EXTRACT ALL TOKEN IDS ---
         def extract_all_tokens(row):
+            # Strategy 1: Try clobTokenIds (CLOB markets)
             try:
                 raw = row.get('clobTokenIds')
-                if not raw: return None
-                
-                if isinstance(raw, str):
-                    try: tokens = json.loads(raw)
-                    except: return None
-                else: tokens = raw
-                
-                if isinstance(tokens, list) and len(tokens) > 0:
-                    clean_ids = []
-                    for t in tokens:
-                        if isinstance(t, (int, float)):
-                            clean_ids.append(str(t))
-                        else:
-                            clean_ids.append(str(t).strip())
-                    return ",".join(clean_ids)
-                return None
+                if raw:
+                    if isinstance(raw, str):
+                        try: tokens = json.loads(raw)
+                        except: tokens = None
+                    else:
+                        tokens = raw
+                    
+                    if isinstance(tokens, list) and len(tokens) > 0:
+                        clean_ids = []
+                        for t in tokens:
+                            if isinstance(t, (int, float)): clean_ids.append(str(t))
+                            else: clean_ids.append(str(t).strip())
+                        return ",".join(clean_ids)
+            except: pass
+
+            # Strategy 2: Try 'tokens' list (Standard/older markets)
+            # Structure: [{'tokenId': '0x123...'}, {'tokenId': '0x456...'}]
+            try:
+                raw_tokens = row.get('tokens')
+                if isinstance(raw_tokens, list) and raw_tokens:
+                    ids = []
+                    for t in raw_tokens:
+                        if isinstance(t, dict):
+                            tid = t.get('tokenId')
+                            if tid: ids.append(str(tid).strip())
+                    if ids:
+                        return ",".join(ids)
+            except: pass
+            
+            return None
             except: return None
 
         df['contract_id'] = df.apply(extract_all_tokens, axis=1)
