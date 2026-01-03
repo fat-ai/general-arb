@@ -1406,6 +1406,7 @@ class TuningRunner:
                 # 2. OPTIMIZE TYPES IN POLARS
                 # Clean strings here. Doing this in Pandas later would crash the VM.
                 df = lf.select([
+                    pl.col("id").cast(pl.String),
                     pl.col("timestamp"),
                     
                     # Normalize Contract ID: Lowercase, remove 0x, strip -> Categorical
@@ -2179,7 +2180,7 @@ class TuningRunner:
         
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
-        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
+        FINAL_COLS = ['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         # add id
         
@@ -2275,7 +2276,7 @@ class TuningRunner:
                                 ts_str = pd.to_datetime(ts_val, unit='s').isoformat()
                             
                                 rows.append({
-                                #     'id': row.get('id'),
+                                    'id': row.get('id'),
                                     'timestamp': ts_str,
                                     'tradeAmount': usdc,
                                     'outcomeTokensAmount': size * side_mult,  # Signed, scaled correctly (no *1e18)
