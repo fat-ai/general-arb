@@ -1382,7 +1382,73 @@ class TuningRunner:
             # Fallback if the custom config fails
             if not ray.is_initialized():
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
+    def _convert_csv_to_parquet(self):
+        """
+        Integrated robust CSV -> Parquet conversion.
+        Checks if conversion is needed (if Parquet is missing or older than CSV).
+        """
+        import polars as pl
+        
+        csv_path = self.cache_dir / "gamma_trades_stream.csv"
+        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
+        
+        if not csv_path.exists():
+            print(f"❌ Cannot convert: Input CSV not found at {csv_path}")
+            return
+
+        # Smart Check: Only convert if CSV is newer than Parquet
+        if parquet_path.exists():
+            if csv_path.stat().st_mtime <= parquet_path.stat().st_mtime:
+                # Parquet is up to date, no action needed
+                return
+            print(f"🔄 CSV has changed. Updating Parquet...")
+        else:
+            print(f"🚀 Generating initial Parquet file from CSV...")
+
+        # Remove old file to ensure clean write
+        if parquet_path.exists():
+            try: os.remove(parquet_path)
+            except: pass
+
+        # 1. EXPLICIT SCHEMA (Prevents Type Inference Errors)
+        # matches b2.py data generation + your convert.py logic
+        dtypes = {
+            "id": pl.String, # Included per your previous fix
+            "contract_id": pl.String,
+            "user": pl.String,
+            "tradeAmount": pl.Float32,
+            "price": pl.Float32,
+            "size": pl.Float32,
+            "outcomeTokensAmount": pl.Float32,
+            "timestamp": pl.String,
+            "side_mult": pl.Float32
+        }
+        
+        try:
+            # 2. Scan CSV
+            q = pl.scan_csv(str(csv_path), schema_overrides=dtypes, ignore_errors=True)
+            
+            # 3. Transform & Parse Dates
+            q = q.with_columns([
+                # strict=False turns parsing errors into Nulls instead of crashing
+                pl.col("timestamp").str.to_datetime(strict=False).dt.replace_time_zone(None),
                 
+                # Optimize memory usage
+                pl.col("contract_id").cast(pl.Categorical),
+                pl.col("user").cast(pl.Categorical),
+            ])
+
+            # 4. Filter out bad rows
+            q = q.filter(pl.col("timestamp").is_not_null())
+
+            print(f"💾 Converting robustly to Parquet...")
+            q.sink_parquet(str(parquet_path), compression="snappy", row_group_size=100_000)
+            print(f"✅ Success! Saved optimized data to {parquet_path.name}")
+            
+        except Exception as e:
+            print(f"⚠️ Parquet Conversion Failed: {e}")
+            # Do not crash; _fast_load_trades handles missing file gracefully
+    
     def _fast_load_trades(self, csv_path, start_date, end_date):
         import polars as pl
         import pandas as pd
@@ -1804,8 +1870,10 @@ class TuningRunner:
         
         # CALL THE NEW OPTIMIZED LOADER
         # This handles Chunking -> Filtering -> Caching automatically
+        self._convert_csv_to_parquet()
+        
         trades = self._fast_load_trades(trades_file, FIXED_START_DATE, FIXED_END_DATE)
-
+        
         if trades.empty:
             print("❌ Critical: No trade data available.")
             return pd.DataFrame(), pd.DataFrame()
