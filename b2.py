@@ -2015,7 +2015,10 @@ class TuningRunner:
             # Fallback for weird data shapes
             return "Yes" if idx == 1 else "No"
 
-        df['token_outcome_label'] = df.apply(map_label, axis=1)
+        df['token_outcome_label'] = [
+            str(outcomes[i]) if isinstance(outcomes, list) and i < len(outcomes) else ("Yes" if i == 1 else "No")
+            for outcomes, i in zip(df['outcomes_clean'], df['token_index'])
+        ]
         
         # 4. Invert Outcome Logic
         # If token_outcome_label is the "Winner" (matches market outcome), payout is 1.0
