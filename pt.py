@@ -16,6 +16,7 @@ import concurrent.futures
 import csv
 import threading
 from requests.adapters import HTTPAdapter, Retry
+import math
 
 # --- CONFIGURATION ---
 CACHE_DIR = Path("live_paper_cache")
@@ -892,6 +893,49 @@ class LiveTrader:
         self.seen_trade_ids = set()
         self.reconnect_delay = 1 
 
+    async def _check_smart_exit_adapter(self, token_id, current_price, fpmm_id):
+        # 1. Retrieve Signal
+        if fpmm_id not in self.trackers: return
+        current_signal = self.trackers[fpmm_id].get('weight', 0.0)
+        
+        # 2. Retrieve Position Data
+        pos = self.persistence.state["positions"].get(token_id)
+        if not pos: return
+        
+        avg_price = pos['avg_price']
+        qty = pos['qty']
+        
+        # 3. Calculate PnL % (Mirroring b2.py logic)
+        # Note: pt.py positions are always long tokens, so qty is positive.
+        pnl_pct = (current_price - avg_price) / avg_price
+
+        # 4. Smart Exit Check
+        # Config references: CONFIG['splash_threshold'], CONFIG['smart_exit_ratio'], CONFIG['edge_threshold']
+        # You might need to add 'smart_exit_ratio' and 'edge_threshold' to your CONFIG dict in pt.py first.
+        
+        if pnl_pct > CONFIG.get('edge_threshold', 0.05):
+            threshold = CONFIG['splash_threshold'] * CONFIG.get('smart_exit_ratio', 0.5)
+            
+            # Logic: If we are holding the "YES" token (positive signal expected),
+            # but signal drops below threshold -> EXIT.
+            # In pt.py, we need to know if token_id is YES or NO to correlate with signal direction.
+            tokens = self.analytics.metadata.fpmm_to_tokens.get(fpmm_id)
+            if not tokens: return
+            
+            is_yes_token = (str(token_id) == tokens[1])
+            
+            should_exit = False
+            if is_yes_token:
+                if current_signal < threshold: should_exit = True
+            else:
+                # Holding NO token (Short YES), so we expect negative signal.
+                # If signal rises above -threshold (becomes bullish or neutral), exit.
+                if current_signal > -threshold: should_exit = True
+                
+            if should_exit:
+                log.info(f"🧠 SMART EXIT {token_id} @ {current_price:.3f} | Sig: {current_signal:.1f}")
+                await self.broker.execute_market_order(token_id, "SELL", current_price, 0, fpmm_id)
+
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER V10 (Final Fix)")
         validate_config()
@@ -1048,10 +1092,27 @@ class LiveTrader:
             if not tokens: continue
             
             is_yes_token = (str(token_id) == tokens[1])
-            raw_impact = usdc_vol * score
+          
+            raw_skill = max(0.0, score / 5.0) # Normalize score back to ROI if needed
+            raw_impact = usdc_vol * (1.0 + min(math.log1p(raw_skill * 100) * 2.0, 10.0))
             final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction 
                 
             tracker['weight'] += final_impact
+            
+            if self.analytics.config['use_smart_exit']:
+                # Filter positions that belong to this specific market (FPMM)
+                relevant_positions = [
+                    (tid, p) for tid, p in self.persistence.state["positions"].items() 
+                    if p.get("market_fpmm") == fpmm
+                ]
+                
+                for pos_token, pos_data in relevant_positions:
+                    # Get latest price from WS (essential for PnL calc)
+                    current_price = self.ws_prices.get(pos_token)
+                    if current_price:
+                        # Call your copied function (ensure it is async or wrapped)
+                        await self._check_smart_exit_adapter(pos_token, current_price, fpmm)
+                        
             abs_w = abs(tracker['weight'])
             
             if abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
