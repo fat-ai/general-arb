@@ -1391,28 +1391,29 @@ class TuningRunner:
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
         if parquet_path.exists():
-            print(f"⚡ LOW-RAM LOAD: Scanning parquet...")
+            print(f"⚡ FAST LOAD: Scanning parquet...")
             try:
                 lf = pl.scan_parquet(parquet_path)
                 
-                # 1. Filter Dates
+                # 1. Filter Dates AND Volume (Crucial for RAM)
+                # Dropping trades < $1.00 usually reduces row count by ~70%
                 lf = lf.filter(
                     (pl.col("timestamp") >= start_date) & 
-                    (pl.col("timestamp") <= end_date)
+                    (pl.col("timestamp") <= end_date) &
+                    (pl.col("tradeAmount") >= 1.0)
                 )
 
-                # 2. CLEAN & OPTIMIZE IN POLARS (Saves ~10GB RAM)
-                # We cast strings to Categorical immediately
-                # We cast floats to Float32 (50% smaller)
+                # 2. OPTIMIZE TYPES IN POLARS
+                # Clean strings here. Doing this in Pandas later would crash the VM.
                 df = lf.select([
                     pl.col("timestamp"),
                     
-                    # Clean Contract ID here (so we don't do it in Pandas)
+                    # Normalize Contract ID: Lowercase, remove 0x, strip -> Categorical
                     pl.col("contract_id").cast(pl.String)
                       .str.strip_chars().str.to_lowercase().str.replace("^0x", "")
                       .cast(pl.Categorical),
                       
-                    # Clean User
+                    # Normalize User
                     pl.col("user").cast(pl.String).str.strip_chars().cast(pl.Categorical),
                     
                     pl.col("tradeAmount").cast(pl.Float32),
@@ -1421,20 +1422,21 @@ class TuningRunner:
                     pl.col("outcomeTokensAmount").cast(pl.Float32)
                 ]).collect()
                 
-                if df.height == 0:
-                    print("⚠️ WARNING: Loaded 0 trades.")
+                rows = df.height
+                print(f"   [DEBUG] Rows Loaded (Volume >= $1.0): {rows}")
+
+                if rows == 0:
+                    print("⚠️ WARNING: Loaded 0 trades. Check filters/dates.")
                     return pd.DataFrame()
 
-                print(f"   [DEBUG] Converting {df.height} rows to Pandas...")
-                
-                # 3. Convert using PyArrow (prevents string duplication)
+                # 3. Convert to Pandas safely
                 try:
                     pdf = df.to_pandas(use_pyarrow_extension_array=True)
                 except TypeError:
                     pdf = df.to_pandas()
                 
                 del df
-                gc.collect()
+                gc.collect() 
                 return pdf
 
             except Exception as e:
@@ -1482,10 +1484,10 @@ class TuningRunner:
        # df_trades['contract_id'] = df_trades['contract_id'].apply(normalize_contract_id)
 
        # df_trades['user'] = df_trades['user'].astype('category')
-        float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
-        for c in float_cols:
-            if c in df_trades.columns:
-                df_trades[c] = df_trades[c].astype('float32')
+       # float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
+       # for c in float_cols:
+       #     if c in df_trades.columns:
+       #         df_trades[c] = df_trades[c].astype('float32')
                 
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
@@ -2565,9 +2567,9 @@ class TuningRunner:
 
         markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
         
-        trades['contract_id'] = clean_id(trades['contract_id'])
+        #trades['contract_id'] = clean_id(trades['contract_id'])
 
-        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
+        #trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
             
         # 3. FILTER TO COMMON IDs
         common_ids_set = set(markets['contract_id']).intersection(set(trades['contract_id']))
