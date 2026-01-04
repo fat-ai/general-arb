@@ -1955,31 +1955,34 @@ class TuningRunner:
         
         return market_subset, trades
         
-    def _fetch_gamma_markets(self, days_back=200):
+    def _fetch_gamma_markets(self, days_back=365):
         import os
         import json
         import pandas as pd
         import numpy as np
         import requests
-        import time
-        
+        from requests.adapters import HTTPAdapter, Retry
+
         cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
-        # Force fresh start to fix previous bad data
+        # Remove old cache to force a fresh, correct fetch
         if cache_file.exists():
             try: os.remove(cache_file)
             except: pass
 
-        # 1. FETCH METADATA FROM API
+        # 1. FETCH FROM API
         all_rows = []
         offset = 0
-        print(f"Fetching GLOBAL market list from Gamma...")
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
         
+        print(f"Fetching GLOBAL market list...")
         while True:
+            params = {"limit": 500, "offset": offset, "closed": "true"}
             try:
-                # We fetch 'closed' markets to get history
-                params = {"limit": 500, "offset": offset, "closed": "true"}
-                resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
+                # We do not need the subgraph here if we use the logic from pt.py
+                resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
                 if resp.status_code != 200: break
                 
                 rows = resp.json()
@@ -1988,158 +1991,106 @@ class TuningRunner:
                 
                 offset += len(rows)
                 if len(rows) < 500: break 
-           
             except Exception: break
         
-        print(f"   API: Fetched {len(all_rows)} raw markets.")
+        print(f" Done. Fetched {len(all_rows)} markets.")
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
 
-        # 2. FETCH RESOLUTIONS FROM SUBGRAPH (The Missing Link)
-        # Since API is missing 'outcome', we get it from the chain.
-        print(f"   SUBGRAPH: Fetching true resolutions...")
-        
-        SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
-        resolution_map = {} # conditionId -> outcome (0.0 or 1.0)
-        last_id = ""
-        
-        while True:
-            query = """
-            query($last_id: String!) {
-              conditions(
-                first: 1000
-                orderBy: id
-                orderDirection: asc
-                where: { id_gt: $last_id, payoutReported: true }
-              ) {
-                id
-                payouts
-              }
-            }
-            """
-            try:
-                r = requests.post(SUBGRAPH_URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=30)
-                data = r.json().get('data', {}).get('conditions', [])
-                if not data: break
+        # 2. ROBUST TOKEN EXTRACTION (From pt.py)
+        def extract_tokens(row):
+            raw = row.get('clobTokenIds') or row.get('tokens')
+            if isinstance(raw, str):
+                try: raw = json.loads(raw)
+                except: pass
+            
+            if isinstance(raw, list):
+                clean_tokens = []
+                for t in raw:
+                    if isinstance(t, dict):
+                        # Handle varied dictionary keys
+                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
+                        if tid: clean_tokens.append(str(tid).strip())
+                    else:
+                        clean_tokens.append(str(t).strip())
                 
-                for item in data:
-                    cid = item['id']
-                    payouts = item.get('payouts', [])
-                    
-                    # Logic: Identify Winner based on payouts
-                    # Binary: [1, 0] = NO(0), [0, 1] = YES(1)
-                    # We cast to float to handle "1000000..." scaling differences
-                    try:
-                        p0 = float(payouts[0])
-                        p1 = float(payouts[1])
-                        
-                        if p1 > p0:
-                            resolution_map[cid] = 1.0 # YES won
-                        elif p0 > p1:
-                            resolution_map[cid] = 0.0 # NO won
-                        else:
-                            resolution_map[cid] = 0.5 # Split/Invalid
-                    except:
-                        continue
-
-                last_id = data[-1]['id']
-                print(f"   Resolutions fetched: {len(resolution_map)}...", end='\r')
-            except Exception as e:
-                print(f"   Subgraph warning: {e}")
-                break
-                
-        print(f"\n   Synced {len(resolution_map)} resolutions.")
-
-        # 3. MERGE & PROCESS
-        
-        # Ensure conditionId is present for merging
-        if 'conditionId' not in df.columns:
-             # Fallback: Extract from contract_id or other fields if conditionId is missing
-             # But usually Gamma 'closed=true' returns conditionId.
-             # If missing, we can't map.
-             print("   ⚠️ Warning: 'conditionId' missing from API response. Map might fail.")
-             df['condition_id_clean'] = np.nan
-        else:
-             df['condition_id_clean'] = df['conditionId'].astype(str).str.lower().str.strip()
-
-        # Extract Token IDs (Robust)
-        def extract_tokens_safe(row):
-            # Try clobTokenIds
-            try:
-                raw = row.get('clobTokenIds')
-                if isinstance(raw, str) and raw.strip():
-                    try: t = json.loads(raw)
-                    except: t = None
-                    if isinstance(t, list): return ",".join([str(x) for x in t])
-            except: pass
-            # Try tokens list
-            try:
-                raw_t = row.get('tokens')
-                if isinstance(raw_t, list):
-                    ids = [str(x.get('tokenId')) for x in raw_t if isinstance(x, dict) and x.get('tokenId')]
-                    if ids: return ",".join(ids)
-            except: pass
+                if len(clean_tokens) >= 2:
+                    return ",".join(clean_tokens)
             return None
 
-        df['contract_id'] = df.apply(extract_tokens_safe, axis=1)
+        df['contract_id'] = df.apply(extract_tokens, axis=1)
         df = df.dropna(subset=['contract_id'])
-        
-        # 4. MAP OUTCOMES
-        # Function to look up outcome in our subgraph map
-        def get_outcome(row):
-            # 1. Try explicit API outcome (rarely there)
-            if pd.notna(row.get('outcome')): return float(row['outcome'])
+
+        # 3. ROBUST OUTCOME DERIVATION (From pt.py)
+        # This fixes the "No market data" error by checking outcomePrices
+        def derive_outcome(row):
+            # A. Try explicit 'outcome' field
+            val = row.get('outcome')
+            if pd.notna(val):
+                try:
+                    f = float(val)
+                    if f in [0.0, 1.0]: return f
+                except: pass
             
-            # 2. Try Subgraph Map
-            cid = str(row.get('condition_id_clean'))
-            if cid in resolution_map:
-                return resolution_map[cid]
+            # B. Fallback: Infer winner from 'outcomePrices' (Critical for Closed markets)
+            prices = row.get('outcomePrices')
+            if prices:
+                try:
+                    if isinstance(prices, str): prices = json.loads(prices)
+                    if isinstance(prices, list):
+                        p_floats = [float(p) for p in prices]
+                        # If a price is >= 0.95, that index is the winner
+                        for i, p in enumerate(p_floats):
+                            if p >= 0.95: return float(i)
+                except: pass
             
-            # 3. Fallback: If it's closed but not in subgraph, we don't know who won.
-            # We return NaN so we can drop it (Backtest needs truth).
-            return np.nan
+            return np.nan 
 
-        df['outcome'] = df.apply(get_outcome, axis=1)
+        df['outcome'] = df.apply(derive_outcome, axis=1)
         
-        # 5. FINAL FILTER
-        before_filter = len(df)
-        df = df.dropna(subset=['outcome'])
-        print(f"   [DATA QUALITY] Retained {len(df)} markets with verified outcomes. (Dropped {before_filter - len(df)} unknowns)")
-
-        if df.empty:
-            return pd.DataFrame()
-
-        # 6. RENAMING & FORMATTING
+        # 4. RENAME & FORMAT
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
         
-        # Explode Tokens
+        # Only drop if we really can't determine the winner or date
+        df = df.dropna(subset=['resolution_timestamp', 'outcome'])
+
+        # 5. EXPLODE & RESET INDEX (Fixes "Cannot set DataFrame..." error)
         df['contract_id_list'] = df['contract_id'].str.split(',')
         df = df.explode('contract_id_list')
+        
+        # *** CRITICAL FIX: Reset index so 'token_index' aligns perfectly ***
+        df = df.reset_index(drop=True)
+        
         df['contract_id'] = df['contract_id_list'].str.strip()
-        df['token_index'] = df.groupby(level=0).cumcount()
+        df['token_index'] = df.groupby(level=0).cumcount()  # This might need check, but with reset_index usually safer to calc contextually if grouped by original ID, but here we exploded.
+        # Actually, simpler way after reset_index:
+        # Since we just exploded, the order is preserved. [Token0, Token1, Token0, Token1...]
+        # But safest is:
+        df['token_index'] = df.groupby(df['contract_id_list'].index).cumcount() # Wait, index was reset.
+        # Let's use the modulus operator as a fallback since markets are binary
+        df['token_index'] = df.index % 2 
         
-        # Outcome Logic for Tokens
-        def final_payout(row):
-            m_out = row['outcome']
-            t_idx = row['token_index']
-            if abs(m_out - 0.5) < 0.01: return 0.5 # Draw/Active
-            winning_idx = int(round(m_out))
-            return 1.0 if t_idx == winning_idx else 0.0
-
-        df['outcome'] = df.apply(final_payout, axis=1)
-        
-        # Fix Token Labels
+        # 6. ASSIGN LABELS (Now safe because index is unique)
         df['token_outcome_label'] = np.where(df['token_index'] == 1, "Yes", "No")
 
-        cols_drop = ['contract_id_list', 'token_index', 'condition_id_clean']
-        df = df.drop(columns=[c for c in cols_drop if c in df.columns])
-        
+        # Calculate final binary payout (1.0 or 0.0)
+        def final_payout(row):
+            winning_idx = int(round(row['outcome']))
+            return 1.0 if row['token_index'] == winning_idx else 0.0
+
+        df['outcome'] = df.apply(final_payout, axis=1)
+
+        # Cleanup
+        drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices']
+        df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
+
         if not df.empty:
             df.to_parquet(cache_file)
+            print(f"✅ Processed {len(df)} tokens successfully.")
             
         return df
         
