@@ -1959,9 +1959,11 @@ class TuningRunner:
         import os
         import json
         import pandas as pd
+        import numpy as np  # Ensure numpy is available
         
         cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
+        # Remove cache to force fresh processing with new logic
         if cache_file.exists():
             try: os.remove(cache_file)
             except: pass
@@ -1973,7 +1975,6 @@ class TuningRunner:
         
         while True:
             try:
-                # Gamma API
                 params = {"limit": 500, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
@@ -1983,7 +1984,7 @@ class TuningRunner:
                 all_rows.extend(rows)
                 
                 offset += len(rows)
-                if len(rows) < 500: break # Optimization: Stop if partial page
+                if len(rows) < 500: break 
            
             except Exception: break
         
@@ -1991,40 +1992,27 @@ class TuningRunner:
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
-        
-        # --- EXTRACT ALL TOKEN IDS ---
+        print(f" [DEBUG] Raw columns found: {list(df.columns)[:10]}")
+
+        # --- EXTRACT ALL TOKEN IDS (ROBUST & LOGGED) ---
         def extract_all_tokens(row):
-            import json  # Safety import to prevent NameError
-            
-            # Strategy 1: Try clobTokenIds (CLOB markets)
+            # Strategy 1: Check clobTokenIds (Newer Markets)
             try:
                 raw = row.get('clobTokenIds')
                 tokens = None
-
                 if raw is not None:
-                    if isinstance(raw, str):
-                        if raw.strip():  # Check for non-empty string
-                            try:
-                                tokens = json.loads(raw)
-                            except Exception:
-                                tokens = None
+                    if isinstance(raw, str) and raw.strip():
+                        try: tokens = json.loads(raw)
+                        except: tokens = None
                     else:
                         tokens = raw
                     
                     if isinstance(tokens, list) and len(tokens) > 0:
-                        clean_ids = []
-                        for t in tokens:
-                            if isinstance(t, (int, float)):
-                                clean_ids.append(str(t))
-                            elif isinstance(t, str):
-                                clean_ids.append(t.strip())
-                        
-                        if clean_ids:
-                            return ",".join(clean_ids)
-            except Exception:
-                pass
+                        clean_ids = [str(t).strip() for t in tokens if t is not None]
+                        if clean_ids: return ",".join(clean_ids)
+            except: pass
 
-            # Strategy 2: Try 'tokens' list (Standard/older markets)
+            # Strategy 2: Check tokens list (Older/Legacy Markets)
             try:
                 raw_tokens = row.get('tokens')
                 if isinstance(raw_tokens, list) and len(raw_tokens) > 0:
@@ -2032,123 +2020,102 @@ class TuningRunner:
                     for t in raw_tokens:
                         if isinstance(t, dict):
                             tid = t.get('tokenId')
-                            if tid:
-                                ids.append(str(tid).strip())
-                    
-                    if ids:
-                        return ",".join(ids)
-            except Exception:
-                pass
+                            if tid: ids.append(str(tid).strip())
+                    if ids: return ",".join(ids)
+            except: pass
             
             return None
 
+        # Apply Extraction
         df['contract_id'] = df.apply(extract_all_tokens, axis=1)
         
-        # Filter
+        # Filter & Debug
+        before_count = len(df)
         df = df.dropna(subset=['contract_id'])
+        print(f" [DEBUG] After ID extraction: {len(df)} rows (Dropped {before_count - len(df)})")
+        
+        if df.empty:
+            print(" [DIAGNOSTIC] First 3 raw rows failed to extract IDs:")
+            print(all_rows[:3])
+            return pd.DataFrame()
+
         df['contract_id'] = df['contract_id'].astype(str)
 
         # --- PATCH: PREPARE OUTCOME LABELS ---
-        # Ensure 'outcomes' column is parsed correctly (str -> list)
-        def parse_outcomes(val):
-            if isinstance(val, list): return val
-            if isinstance(val, str):
-                try: return json.loads(val)
-                except: pass
-            return ["No", "Yes"] # Default fallback
-            
-        df['outcomes_clean'] = df['outcomes'].apply(parse_outcomes)
+        # Vectorized safe parsing
+        df['outcomes_clean'] = [
+            x if isinstance(x, list) else (json.loads(x) if isinstance(x, str) else ["No", "Yes"])
+            for x in df['outcomes'].fillna('["No", "Yes"]')
+        ]
 
         # Normalization
         def derive_outcome(row):
             # 1. Trust explicit outcome
             outcome_val = row.get('outcome')
             if pd.notna(outcome_val):
-                val = float(outcome_val)
-                if val in [0.0, 1.0]:
-                    return val
+                try:
+                    # Handle "0", "1", 0.0, 1.0, "0.5"
+                    val = float(outcome_val)
+                    if 0.0 <= val <= 1.0: return val
+                except: pass
             
             # 2. Check resolution status
             is_resolved = row.get('closed', False) or row.get('resolved', False)
-            
-            # 3. If resolved but missing outcome, mark as INVALID (filter later)
             if is_resolved and pd.isna(outcome_val):
-                return np.nan  # Mark for deletion
+                return np.nan  # Resolved but no outcome = Junk
             
-            # 4. Active markets
+            # 3. Active markets
             end_date_str = row.get('endDate')
             if end_date_str:
-                end_ts = pd.to_datetime(end_date_str, utc=True)
-                if end_ts > pd.Timestamp.now(tz='UTC'):
-                    return 0.5
+                try:
+                    end_ts = pd.to_datetime(end_date_str, utc=True)
+                    if end_ts > pd.Timestamp.now(tz='UTC'):
+                        return 0.5
+                except: pass
             
             return np.nan
 
         df['outcome'] = df.apply(derive_outcome, axis=1)
+        
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
+        # Filter Outcomes & Debug
+        before_outcome = len(df)
         df = df.dropna(subset=['resolution_timestamp', 'outcome'])
+        print(f" [DEBUG] After Outcome filter: {len(df)} rows (Dropped {before_outcome - len(df)})")
+        
         df['outcome'] = pd.to_numeric(df['outcome'])
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
         
-        # 1. Split contract_id into list
+        # Explode logic (Vectorized Fix applied here automatically)
         df['contract_id_list'] = df['contract_id'].str.split(',')
-        
-        # 2. Explode to create one row per token
         df = df.explode('contract_id_list')
         df['contract_id'] = df['contract_id_list'].str.strip()
-        
-        # 3. Assign Token Index (0, 1, ...)
         df['token_index'] = df.groupby(level=0).cumcount()
         
-        # --- PATCH: MAP INDEX TO ACTUAL LABEL ---
-        def map_label(row):
-            idx = row['token_index']
-            labels = row['outcomes_clean']
-            if idx < len(labels):
-                return str(labels[idx])
-            # Fallback for weird data shapes
-            return "Yes" if idx == 1 else "No"
-
+        # --- VECTORIZED MAP LABEL FIX (Prevents "Multiple columns" error) ---
         df['token_outcome_label'] = [
             str(outcomes[i]) if isinstance(outcomes, list) and i < len(outcomes) else ("Yes" if i == 1 else "No")
             for outcomes, i in zip(df['outcomes_clean'], df['token_index'])
         ]
         
-        # 4. Invert Outcome Logic
-        # If token_outcome_label is the "Winner" (matches market outcome), payout is 1.0
-        # If market is Active (0.5), everyone is 0.5
-        # Note: Gamma 'outcome' is typically "1" (Index 1 wins) or "0" (Index 0 wins) for binary
-        # But we normalized it to a 0.0-1.0 float in derive_outcome.
-        
-        # Simplified Logic using text matching to be safe:
-        # If Market Outcome was "0.0" -> That means Index 0 won.
-        # If Market Outcome was "1.0" -> That means Index 1 won.
-        
-        # We need to map the Market Outcome (float) to the Winning Index (int)
-        # Usually: 0.0 -> Index 0 Wins. 1.0 -> Index 1 Wins.
-        
         def final_token_payout(row):
-            """Calculate token payout based on market outcome"""
-            m_out = row['outcome']  # Market-level outcome
-            t_idx = row['token_index']  # This token's index (0 or 1)
-            
-            # Active markets
-            if pd.isna(m_out) or abs(m_out - 0.5) < 0.01:
-                return 0.5
-            
-            # Resolved markets: outcome is the WINNING index (0.0 or 1.0)
-            # Convert to integer for exact comparison
+            m_out = row['outcome']
+            t_idx = row['token_index']
+            if pd.isna(m_out) or abs(m_out - 0.5) < 0.01: return 0.5
             winning_idx = int(round(m_out))
-            
             return 1.0 if t_idx == winning_idx else 0.0
 
         df['outcome'] = df.apply(final_token_payout, axis=1)
 
         # Cleanup
         df = df.drop(columns=['contract_id_list', 'token_index', 'outcomes_clean'])
-        if not df.empty: df.to_parquet(cache_file)
+        
+        if not df.empty: 
+            print(f" [DEBUG] Saving {len(df)} rows to {cache_file}")
+            df.to_parquet(cache_file)
+            
         return df
         
     def _fetch_single_market_trades(self, market_id):
