@@ -1959,22 +1959,25 @@ class TuningRunner:
         import os
         import json
         import pandas as pd
-        import numpy as np  # Ensure numpy is available
+        import numpy as np
+        import requests
+        import time
         
         cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
-        # Remove cache to force fresh processing with new logic
+        # Force fresh start to fix previous bad data
         if cache_file.exists():
             try: os.remove(cache_file)
             except: pass
 
+        # 1. FETCH METADATA FROM API
         all_rows = []
         offset = 0
-        
-        print(f"Fetching GLOBAL market list...")
+        print(f"Fetching GLOBAL market list from Gamma...")
         
         while True:
             try:
+                # We fetch 'closed' markets to get history
                 params = {"limit": 500, "offset": offset, "closed": "true"}
                 resp = self.session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
                 if resp.status_code != 200: break
@@ -1988,132 +1991,154 @@ class TuningRunner:
            
             except Exception: break
         
-        print(f" Done. Fetched {len(all_rows)} markets.")
+        print(f"   API: Fetched {len(all_rows)} raw markets.")
         if not all_rows: return pd.DataFrame()
 
         df = pd.DataFrame(all_rows)
-        print(f" [DEBUG] Raw columns found: {list(df.columns)[:10]}")
 
-        # --- EXTRACT ALL TOKEN IDS (ROBUST & LOGGED) ---
-        def extract_all_tokens(row):
-            # Strategy 1: Check clobTokenIds (Newer Markets)
+        # 2. FETCH RESOLUTIONS FROM SUBGRAPH (The Missing Link)
+        # Since API is missing 'outcome', we get it from the chain.
+        print(f"   SUBGRAPH: Fetching true resolutions...")
+        
+        SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
+        resolution_map = {} # conditionId -> outcome (0.0 or 1.0)
+        last_id = ""
+        
+        while True:
+            query = """
+            query($last_id: String!) {
+              conditions(
+                first: 1000
+                orderBy: id
+                orderDirection: asc
+                where: { id_gt: $last_id, payoutReported: true }
+              ) {
+                id
+                payouts
+              }
+            }
+            """
+            try:
+                r = requests.post(SUBGRAPH_URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=30)
+                data = r.json().get('data', {}).get('conditions', [])
+                if not data: break
+                
+                for item in data:
+                    cid = item['id']
+                    payouts = item.get('payouts', [])
+                    
+                    # Logic: Identify Winner based on payouts
+                    # Binary: [1, 0] = NO(0), [0, 1] = YES(1)
+                    # We cast to float to handle "1000000..." scaling differences
+                    try:
+                        p0 = float(payouts[0])
+                        p1 = float(payouts[1])
+                        
+                        if p1 > p0:
+                            resolution_map[cid] = 1.0 # YES won
+                        elif p0 > p1:
+                            resolution_map[cid] = 0.0 # NO won
+                        else:
+                            resolution_map[cid] = 0.5 # Split/Invalid
+                    except:
+                        continue
+
+                last_id = data[-1]['id']
+                print(f"   Resolutions fetched: {len(resolution_map)}...", end='\r')
+            except Exception as e:
+                print(f"   Subgraph warning: {e}")
+                break
+                
+        print(f"\n   Synced {len(resolution_map)} resolutions.")
+
+        # 3. MERGE & PROCESS
+        
+        # Ensure conditionId is present for merging
+        if 'conditionId' not in df.columns:
+             # Fallback: Extract from contract_id or other fields if conditionId is missing
+             # But usually Gamma 'closed=true' returns conditionId.
+             # If missing, we can't map.
+             print("   ⚠️ Warning: 'conditionId' missing from API response. Map might fail.")
+             df['condition_id_clean'] = np.nan
+        else:
+             df['condition_id_clean'] = df['conditionId'].astype(str).str.lower().str.strip()
+
+        # Extract Token IDs (Robust)
+        def extract_tokens_safe(row):
+            # Try clobTokenIds
             try:
                 raw = row.get('clobTokenIds')
-                tokens = None
-                if raw is not None:
-                    if isinstance(raw, str) and raw.strip():
-                        try: tokens = json.loads(raw)
-                        except: tokens = None
-                    else:
-                        tokens = raw
-                    
-                    if isinstance(tokens, list) and len(tokens) > 0:
-                        clean_ids = [str(t).strip() for t in tokens if t is not None]
-                        if clean_ids: return ",".join(clean_ids)
+                if isinstance(raw, str) and raw.strip():
+                    try: t = json.loads(raw)
+                    except: t = None
+                    if isinstance(t, list): return ",".join([str(x) for x in t])
             except: pass
-
-            # Strategy 2: Check tokens list (Older/Legacy Markets)
+            # Try tokens list
             try:
-                raw_tokens = row.get('tokens')
-                if isinstance(raw_tokens, list) and len(raw_tokens) > 0:
-                    ids = []
-                    for t in raw_tokens:
-                        if isinstance(t, dict):
-                            tid = t.get('tokenId')
-                            if tid: ids.append(str(tid).strip())
+                raw_t = row.get('tokens')
+                if isinstance(raw_t, list):
+                    ids = [str(x.get('tokenId')) for x in raw_t if isinstance(x, dict) and x.get('tokenId')]
                     if ids: return ",".join(ids)
             except: pass
-            
             return None
 
-        # Apply Extraction
-        df['contract_id'] = df.apply(extract_all_tokens, axis=1)
-        
-        # Filter & Debug
-        before_count = len(df)
+        df['contract_id'] = df.apply(extract_tokens_safe, axis=1)
         df = df.dropna(subset=['contract_id'])
-        print(f" [DEBUG] After ID extraction: {len(df)} rows (Dropped {before_count - len(df)})")
         
-        if df.empty:
-            print(" [DIAGNOSTIC] First 3 raw rows failed to extract IDs:")
-            print(all_rows[:3])
-            return pd.DataFrame()
-
-        df['contract_id'] = df['contract_id'].astype(str)
-
-        # --- PATCH: PREPARE OUTCOME LABELS ---
-        # Vectorized safe parsing
-        df['outcomes_clean'] = [
-            x if isinstance(x, list) else (json.loads(x) if isinstance(x, str) else ["No", "Yes"])
-            for x in df['outcomes'].fillna('["No", "Yes"]')
-        ]
-
-        # Normalization
-        def derive_outcome(row):
-            # 1. Trust explicit outcome
-            outcome_val = row.get('outcome')
-            if pd.notna(outcome_val):
-                try:
-                    # Handle "0", "1", 0.0, 1.0, "0.5"
-                    val = float(outcome_val)
-                    if 0.0 <= val <= 1.0: return val
-                except: pass
+        # 4. MAP OUTCOMES
+        # Function to look up outcome in our subgraph map
+        def get_outcome(row):
+            # 1. Try explicit API outcome (rarely there)
+            if pd.notna(row.get('outcome')): return float(row['outcome'])
             
-            # 2. Check resolution status
-            is_resolved = row.get('closed', False) or row.get('resolved', False)
-            if is_resolved and pd.isna(outcome_val):
-                return np.nan  # Resolved but no outcome = Junk
+            # 2. Try Subgraph Map
+            cid = str(row.get('condition_id_clean'))
+            if cid in resolution_map:
+                return resolution_map[cid]
             
-            # 3. Active markets
-            end_date_str = row.get('endDate')
-            if end_date_str:
-                try:
-                    end_ts = pd.to_datetime(end_date_str, utc=True)
-                    if end_ts > pd.Timestamp.now(tz='UTC'):
-                        return 0.5
-                except: pass
-            
+            # 3. Fallback: If it's closed but not in subgraph, we don't know who won.
+            # We return NaN so we can drop it (Backtest needs truth).
             return np.nan
 
-        df['outcome'] = df.apply(derive_outcome, axis=1)
+        df['outcome'] = df.apply(get_outcome, axis=1)
         
+        # 5. FINAL FILTER
+        before_filter = len(df)
+        df = df.dropna(subset=['outcome'])
+        print(f"   [DATA QUALITY] Retained {len(df)} markets with verified outcomes. (Dropped {before_filter - len(df)} unknowns)")
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # 6. RENAMING & FORMATTING
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume'}
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
-        # Filter Outcomes & Debug
-        before_outcome = len(df)
-        df = df.dropna(subset=['resolution_timestamp', 'outcome'])
-        print(f" [DEBUG] After Outcome filter: {len(df)} rows (Dropped {before_outcome - len(df)})")
+        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
         
-        df['outcome'] = pd.to_numeric(df['outcome'])
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', format='mixed', utc=True).dt.tz_localize(None)
-        
-        # Explode logic (Vectorized Fix applied here automatically)
+        # Explode Tokens
         df['contract_id_list'] = df['contract_id'].str.split(',')
         df = df.explode('contract_id_list')
         df['contract_id'] = df['contract_id_list'].str.strip()
         df['token_index'] = df.groupby(level=0).cumcount()
         
-        # --- VECTORIZED MAP LABEL FIX (Prevents "Multiple columns" error) ---
-        df['token_outcome_label'] = [
-            str(outcomes[i]) if isinstance(outcomes, list) and i < len(outcomes) else ("Yes" if i == 1 else "No")
-            for outcomes, i in zip(df['outcomes_clean'], df['token_index'])
-        ]
-        
-        def final_token_payout(row):
+        # Outcome Logic for Tokens
+        def final_payout(row):
             m_out = row['outcome']
             t_idx = row['token_index']
-            if pd.isna(m_out) or abs(m_out - 0.5) < 0.01: return 0.5
+            if abs(m_out - 0.5) < 0.01: return 0.5 # Draw/Active
             winning_idx = int(round(m_out))
             return 1.0 if t_idx == winning_idx else 0.0
 
-        df['outcome'] = df.apply(final_token_payout, axis=1)
-
-        # Cleanup
-        df = df.drop(columns=['contract_id_list', 'token_index', 'outcomes_clean'])
+        df['outcome'] = df.apply(final_payout, axis=1)
         
-        if not df.empty: 
-            print(f" [DEBUG] Saving {len(df)} rows to {cache_file}")
+        # Fix Token Labels
+        df['token_outcome_label'] = np.where(df['token_index'] == 1, "Yes", "No")
+
+        cols_drop = ['contract_id_list', 'token_index', 'condition_id_clean']
+        df = df.drop(columns=[c for c in cols_drop if c in df.columns])
+        
+        if not df.empty:
             df.to_parquet(cache_file)
             
         return df
