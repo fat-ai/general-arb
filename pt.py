@@ -111,375 +111,154 @@ class PersistenceManager:
 # --- DATA & MODELING ---
 
 class ModelTrainer:
-    """
-    Identifies 'Smart Wallets' by fetching full market history in parallel.
-    - Uses ThreadPoolExecutor to fetch trades for specific tokens.
-    - Caches results to CSV to allow resuming interrupted downloads.
-    """
     def __init__(self):
         self.scores_file = Path("wallet_scores.json")
+        self.params_file = Path("model_params.json") # New file for slope/intercept
         self.cache_dir = CACHE_DIR
         self.min_trades = 5
         self.min_volume = 100.0
 
     def train_if_needed(self):
-        if self.scores_file.exists():
+        # Load cached if fresh (< 24h)
+        if self.scores_file.exists() and self.params_file.exists():
             if time.time() - self.scores_file.stat().st_mtime < 86400:
                 log.info("🧠 Model is fresh. Loading from cache.")
                 with open(self.scores_file, "r") as f:
-                    return json.load(f)
+                    scores = json.load(f)
+                with open(self.params_file, "r") as f:
+                    params = json.load(f)
+                return scores, params.get("slope", 0.0), params.get("intercept", 0.0)
         
         log.info(f"🧠 Training model on full history...")
         return self._run_training()
 
     def _run_training(self):
-        # 1. Fetch Resolved Markets & Identify Winning Tokens
+        # 1. Fetch Resolved Markets
         winning_tokens, losing_tokens = self._build_outcome_map()
         if not winning_tokens:
-            log.error("❌ No winning tokens identified. Aborting training.")
-            return {}
+            return {}, 0.0, 0.0
 
-        # 2. Fetch Trades (Parallel)
+        # 2. Fetch Trades
         all_tokens = list(winning_tokens | losing_tokens)
         df = self._fetch_history_parallel(all_tokens)
-        
-        if df.empty:
-            log.warning("⚠️ No trade history fetched.")
-            return {}
+        if df.empty: return {}, 0.0, 0.0
 
-        # 3. Calculate ROI Scores
-        log.info(f"   Calculating ROI from {len(df)} trades...")
-        wallet_stats = {} 
+        # 3. Calculate Stats & Prepare Regression Data
+        wallet_stats = {}
         winners = set(winning_tokens)
         losers = set(losing_tokens)
+        
+        # Regression Data Arrays
+        reg_x = [] # Log Volume
+        reg_y = [] # ROI
 
+        # Pre-calc sets for speed
         for row in df.itertuples():
-            # Columns: timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult
             user = str(row.user)
             token = str(row.contract_id)
-            usdc_val = float(row.tradeAmount) 
+            usdc_val = float(row.tradeAmount)
             size = float(row.size)
-            side = int(row.side_mult) # 1 = Buy, -1 = Sell
+            side = int(row.side_mult)
             
-            if user not in wallet_stats: 
-                wallet_stats[user] = {'invested': 0.0, 'returned': 0.0, 'count': 0}
+            if user not in wallet_stats:
+                wallet_stats[user] = {'invested': 0.0, 'returned': 0.0, 'count': 0, 'log_vol_sum': 0.0}
             
             stats = wallet_stats[user]
             stats['count'] += 1
+            stats['invested'] += usdc_val
+            
+            # Track log volume for regression (b2.py uses sum of log1p per trade? 
+            # Actually b2.py aggregates per wallet: mean(log_vol) vs mean(roi))
+            # Let's mirror b2.py 'calibrate_fresh_wallet_model' exactly:
+            # It takes ALL trades, calculates ROI per trade, and aggregates by wallet.
+            
+            # Calculate Trade ROI (Mirroring b2.py fast_calculate_rois logic)
+            trade_roi = 0.0
+            pnl = 0.0
             
             if token in winners:
-                if side == 1: # Buy
-                    stats['invested'] += usdc_val
-                    stats['returned'] += size 
-                else: # Sell
-                    stats['returned'] += usdc_val
-            elif token in losers:
-                if side == 1: # Buy
-                    stats['invested'] += usdc_val
-                else: # Sell
-                    stats['returned'] += usdc_val
+                if side == 1: # Long Winner
+                    pnl = size - usdc_val
+                else: # Short Winner (Lost money)
+                    pnl = -usdc_val # You sold, but it won. You essentially paid to lose? 
+                    # Simpler: Invested is cost. Returned is payoff.
+                    # If you Buy Winner: Invest X, Return Size.
+                    # If you Sell Winner: Invest 0? No, selling is closing or shorting.
+                    # pt.py simplified logic:
+                    pass
+            
+            # RE-DOING ROI CALC TO MATCH B2.PY EXACTLY
+            # b2.py calculates ROI per trade row, then averages per wallet.
+            # ROI = (Outcome - Price) / Price
+            
+            price = row.price
+            outcome = 1.0 if token in winners else 0.0
+            
+            if side == 1: # Buy (Long)
+                if price > 0:
+                    trade_roi = (outcome - price) / price
+            else: # Sell (Short)
+                # Short ROI: (Outcome_No - Price_No) / Price_No
+                # Outcome_No = 1 - outcome, Price_No = 1 - price
+                price_no = max(0.01, 1.0 - price)
+                outcome_no = 1.0 - outcome
+                trade_roi = (outcome_no - price_no) / price_no
+            
+            # Clip outliers (b2.py line 784)
+            trade_roi = max(-1.0, min(3.0, trade_roi))
+            
+            # Store accumulators
+            stats['roi_sum'] = stats.get('roi_sum', 0.0) + trade_roi
+            stats['log_vol_sum'] = stats.get('log_vol_sum', 0.0) + math.log1p(usdc_val)
 
-        # 4. Final Scoring
+        # 4. Final Scoring & Regression
         final_scores = {}
+        
+        # Prepare lists for linregress
+        x_vals = []
+        y_vals = []
+        
         for user, stats in wallet_stats.items():
+            if stats['count'] < 1: continue
+            
+            avg_roi = stats['roi_sum'] / stats['count']
+            avg_log_vol = stats['log_vol_sum'] / stats['count']
+            
+            # Populate Regression Data (Wallets with at least 1 trade, per b2.py)
+            x_vals.append(avg_log_vol)
+            y_vals.append(avg_roi)
+            
+            # Filter for "Smart Wallet" list
             if stats['count'] < self.min_trades: continue
             if stats['invested'] < self.min_volume: continue
             
-            roi = (stats['returned'] - stats['invested']) / stats['invested']
-            if roi > 0.05: 
-                final_scores[user] = min(roi * 5.0, 5.0)
-        
-        with open(self.scores_file, "w") as f:
-            json.dump(final_scores, f)
-        
-        log.info(f"✅ Training Complete. Identified {len(final_scores)} Smart Wallets.")
-        return final_scores
+            # Calculate final ROI for scoring
+            roi_total = (stats.get('returned', 0) - stats['invested']) / stats['invested'] if stats['invested'] > 0 else 0
+            # Use the average ROI we calculated for consistency with regression? 
+            # b2.py uses the average ROI for the score map.
+            if avg_roi > 0.05:
+                final_scores[user] = min(avg_roi * 5.0, 5.0)
 
-    def _fetch_history_parallel(self, token_ids, days_back=365):
-        cache_file = CACHE_DIR / "gamma_trades_stream.csv"
-        ledger_file = CACHE_DIR / "gamma_completed.txt"
-        
-        # [PATCH 1] Expand & Sanitize Token IDs
-        all_tokens_expanded = []
-        for mid_str in token_ids:
-            parts = str(mid_str).split(',')
-            for p in parts:
-                if len(p) > 5: all_tokens_expanded.append(p.strip())
-        
-        # Use the sanitized list for the rest of the logic
-        token_ids = list(set(all_tokens_expanded))
-
-        # Filter completed tokens using ledger
-        completed_tokens = set()
-        if ledger_file.exists():
+        # 5. Run Regression (Scipy)
+        slope, intercept = 0.0, 0.0
+        if len(x_vals) > 10:
             try:
-                with open(ledger_file, 'r') as f:
-                    completed_tokens = set(line.strip() for line in f if line.strip())
-            except Exception: pass
-        
-        pending_tokens = [t for t in token_ids if t not in completed_tokens]
-        log.info(f"RESUME STATUS: {len(completed_tokens)} done, {len(pending_tokens)} pending.")
-        
-        if not pending_tokens and cache_file.exists():
-             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-
-        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
-                      'contract_id', 'price', 'size', 'side_mult']
-        
-        csv_lock = threading.Lock()
-        ledger_lock = threading.Lock()
-        
-        limit_date = pd.Timestamp.now() - pd.Timedelta(days=days_back)
-        CUTOFF_TS = limit_date.timestamp()
-        
-        def worker(token_str, writer):
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(max_retries=retries))
-            
-            last_ts = 2147483647 
-            
-            while True:
-                try:
-                    query = """
-                    query($token: String!, $max_ts: Int!) {
-                      asMaker: orderFilledEvents(
-                        first: 1000, orderBy: timestamp, orderDirection: desc, 
-                        where: { makerAssetId: $token, timestamp_lt: $max_ts }
-                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
-                      asTaker: orderFilledEvents(
-                        first: 1000, orderBy: timestamp, orderDirection: desc, 
-                        where: { takerAssetId: $token, timestamp_lt: $max_ts }
-                      ) { timestamp, makerAmountFilled, takerAmountFilled, maker, taker }
-                    }
-                    """
-                    resp = session.post(SUBGRAPH_URL, json={"query": query, "variables": {"token": token_str, "max_ts": int(last_ts)}}, timeout=30)
-                    if resp.status_code != 200: 
-                        time.sleep(2)
-                        continue
-                        
-                    data = resp.json().get('data', {})
-                    if not data: break
-                    
-                    batch = []
-                    for r in data.get('asMaker', []): batch.append((r, 'maker'))
-                    for r in data.get('asTaker', []): batch.append((r, 'taker'))
-                    
-                    if not batch: break
-                    batch.sort(key=lambda x: float(x[0]['timestamp']), reverse=True)
-                    
-                    rows = []
-                    min_ts = last_ts
-                    stop = False
-                    
-                    for r, role in batch:
-                    
-                        try:
-            
-                            ts = float(r.get('timestamp', 0))
-                            min_ts = min(min_ts, ts)
-                            
-                            if ts < CUTOFF_TS: 
-                                stop = True
-                                continue
-                            
-                            if role == 'maker':
-                                size = float(r.get('makerAmountFilled') or 0.0) / 1e18
-                                usdc = float(r.get('takerAmountFilled') or 0.0) / 1e6
-                                user = str(r.get('taker') or 'unknown')
-                                side = 1 
-                            else:
-                                size = float(r.get('takerAmountFilled') or 0.0) / 1e18
-                                usdc = float(r.get('makerAmountFilled') or 0.0) / 1e6
-                                user = str(r.get('taker') or 'unknown')
-                                side = -1 
-                                
-                            if size <= 0 or usdc <= 0: continue
-                            
-                            price = usdc / size
-                            if not (0.01 <= price <= 0.99): continue
-                            
-                            rows.append({
-                                'timestamp': pd.to_datetime(ts, unit='s').isoformat(),
-                                'tradeAmount': usdc,
-                                'outcomeTokensAmount': size * side,
-                                'user': user,
-                                'contract_id': token_str,
-                                'price': price,
-                                'size': size,
-                                'side_mult': side
-                            })
-                            
-                        except Exception:
-            
-                            continue
-                            
-                    
-                    if rows:
-                        with csv_lock:
-                            writer.writerows(rows)
-                    
-                    if stop: break
-                    
-                    if int(min_ts) >= int(last_ts): last_ts = int(min_ts) - 1
-                    else: last_ts = min_ts
-                    
-                    if min_ts < CUTOFF_TS: break
-                    
-                except Exception:
-                    break
-
-            with ledger_lock:
-                with open(ledger_file, "a") as f: f.write(f"{token_str}\n")
-
-        target = cache_file if cache_file.exists() else cache_file.with_suffix(f".tmp.{os.getpid()}")
-        mode = 'a' if cache_file.exists() else 'w'
-        
-        try:
-            with open(target, mode, newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
-                if mode == 'w': writer.writeheader()
+                # b2.py Line 1150
+                slope, intercept, _, _, _ = linregress(x_vals, y_vals)
                 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                    futures = [executor.submit(worker, t, writer) for t in pending_tokens]
-                    done = 0
-                    for _ in concurrent.futures.as_completed(futures):
-                        done += 1
-                        print(f"   Fetching history: {done}/{len(pending_tokens)} tokens...", end='\r')
-            
-            if not cache_file.exists() and os.path.exists(target):
-                os.replace(target, cache_file)
+                # b2.py Safety Clamps
+                if slope <= 0: slope, intercept = 0.0, 0.0
+                intercept = max(-0.10, min(0.10, intercept))
                 
-        except Exception as e:
-            log.error(f"Parallel fetch failed: {e}")
-            if os.path.exists(target) and target != cache_file: os.remove(target)
-            
-        print("")
-        if cache_file.exists():
-            return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-        return pd.DataFrame()
-
-    def _build_outcome_map(self):
-        market_cache = CACHE_DIR / "gamma_markets.json"
-        all_rows = []
-
-        # 1. Try Loading from Cache
-        if market_cache.exists():
-            log.info(f"   Loading markets from cache: {market_cache.name}")
-            try:
-                with open(market_cache, 'r') as f:
-                    all_rows = json.load(f)
+                log.info(f"📉 Calibration: Slope={slope:.4f}, Intercept={intercept:.4f} (N={len(x_vals)})")
             except Exception as e:
-                log.warning(f"   Cache read failed ({e}), re-downloading...")
+                log.error(f"Regression failed: {e}")
 
-        # 2. Download if Cache is Missing/Empty
-        if not all_rows:
-            log.info("   Fetching resolved market outcomes from API...")
-            offset = 0
-            session = requests.Session()
-            retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-            session.mount('https://', HTTPAdapter(max_retries=retries))
-            session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
-            
-            while True:
-                params = {"limit": 500, "offset": offset, "closed": "true"}
-                try:
-                    r = session.get(GAMMA_API_URL, params=params, timeout=15)
-                    if r.status_code != 200: break
-                    batch = r.json()
-                    if not batch: break
-                    all_rows.extend(batch)
-                    offset += len(batch)
-                    print(f"   Downloaded {len(all_rows)} raw markets...", end='\r')
-                    if len(batch) < 500: break
-                except: break
-            print("")
-            
-            # 3. Save to Cache
-            if all_rows:
-                try:
-                    with open(market_cache, 'w') as f:
-                        json.dump(all_rows, f)
-                    log.info(f"   Cached {len(all_rows)} markets to disk.")
-                except Exception as e:
-                    log.error(f"   Failed to write cache: {e}")
+        # Save params
+        with open(self.scores_file, "w") as f: json.dump(final_scores, f)
+        with open(self.params_file, "w") as f: json.dump({"slope": slope, "intercept": intercept}, f)
 
-        if not all_rows: return set(), set()
-
-        df = pd.DataFrame(all_rows)
-        
-        # [PATCH] Robust Token Extraction (Handles strings, lists, and dicts)
-        def extract_tokens(row):
-            raw = row.get('clobTokenIds') or row.get('tokens')
-            if isinstance(raw, str):
-                try: raw = json.loads(raw)
-                except: pass
-            
-            if isinstance(raw, list):
-                clean_tokens = []
-                for t in raw:
-                    if isinstance(t, dict):
-                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                        if tid: clean_tokens.append(str(tid).strip())
-                    else:
-                        clean_tokens.append(str(t).strip())
-                
-                if len(clean_tokens) >= 2:
-                    return ",".join(clean_tokens)
-            return None
-
-        df['contract_id'] = df.apply(extract_tokens, axis=1)
-        df = df.dropna(subset=['contract_id'])
-        
-        # [PATCH] Robust Outcome Derivation (Fallback to outcomePrices)
-        def derive_outcome(row):
-            # 1. Try explicit 'outcome' field (Legacy)
-            val = row.get('outcome')
-            if pd.notna(val):
-                try:
-                    f = float(val)
-                    if f in [0.0, 1.0]: return f
-                except: pass
-            
-            # 2. Fallback: Infer winner from 'outcomePrices'
-            # Resolved markets settle to prices like ["1", "0"] or ["0", "1"]
-            prices = row.get('outcomePrices')
-            if prices:
-                try:
-                    if isinstance(prices, str):
-                        prices = json.loads(prices)
-                    
-                    if isinstance(prices, list):
-                        p_floats = [float(p) for p in prices]
-                        # Find the index with price >= 0.95 (Winning outcome)
-                        for i, p in enumerate(p_floats):
-                            if p >= 0.95: return float(i)
-                except: pass
-            
-            return np.nan 
-
-        df['outcome'] = df.apply(derive_outcome, axis=1)
-        df = df.dropna(subset=['outcome'])
-        
-        if df.empty: return set(), set()
-
-        df['contract_id_list'] = df['contract_id'].str.split(',')
-        df = df.explode('contract_id_list')
-        df['token_id'] = df['contract_id_list'].str.strip()
-        df['token_index'] = df.groupby(level=0).cumcount()
-        df = df.reset_index(drop=True)
-        
-        def final_token_payout(row):
-            winning_idx = int(round(row['outcome']))
-            return 1.0 if row['token_index'] == winning_idx else 0.0
-
-        df['token_payout'] = df.apply(final_token_payout, axis=1)
-        
-        winners = set(df[df['token_payout'] == 1.0]['token_id'].unique())
-        losers = set(df[df['token_payout'] == 0.0]['token_id'].unique())
-        
-        log.info(f"   Indexed {len(winners)} winning tokens from {len(df)//2} markets.")
-        return winners, losers
+        return final_scores, slope, intercept
         
     def _fetch_history_parallel(self, market_ids_raw, days_back=200):
         # [Logic Source: User Provided Correct Function]
@@ -526,7 +305,7 @@ class ModelTrainer:
         
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 
-        FINAL_COLS = ['timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
+        FINAL_COLS = ['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
                       'contract_id', 'price', 'size', 'side_mult']
         # add id
         
