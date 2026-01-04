@@ -2817,9 +2817,9 @@ class TuningRunner:
             # 1. PRICE: Map to 'p_market_all'
             'p_market_all': pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32'),
             # 2. VOLUME: Map 'size' (Shares) DIRECTLY to 'trade_volume'
-            'trade_volume': (trades['size'] / 1_000_000.0).astype('float32'),
+            'trade_volume': trades['size'].astype('float32'),
             # 3. USDC: Map 'tradeAmount' to 'usdc_vol' (for reference/debugging)
-            'usdc_vol': (trades['tradeAmount'] / 1_000_000.0).astype('float32'),
+            'usdc_vol': trades['tradeAmount'].astype('float32'),
             # 4. USER: Map to 'wallet_id'
             'wallet_id': trades['user'].astype('category'),  
             # 5. SIDE: Pre-calculate 'is_sell' so worker doesn't have to
