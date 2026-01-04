@@ -1840,11 +1840,11 @@ class TuningRunner:
             markets['contract_id'] = markets['contract_id'].astype(str)
             df_stats['contract_id'] = df_stats['contract_id'].astype(str)
             markets = markets.merge(df_stats, on='contract_id', how='left')
-            markets['total_volume'] = markets['total_volume'].fillna(0.0)
+            markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
             markets['total_trades'] = markets['total_trades'].fillna(0)
-            print(f"Merged stats. High Vol Markets (>10k): {len(markets[markets['total_volume'] > 10000])}")
+            print(f"Merged stats. High Vol Markets (>10k): {len(markets[markets['volume'] > 10000])}")
         else:
-            markets['total_volume'] = 0.0
+            markets['volume'] = 0.0
             markets['total_trades'] = 0
 
         # ---------------------------------------------------------
@@ -1854,13 +1854,27 @@ class TuningRunner:
         
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
-            # Collect tokens from markets
+            
+            # [FIX] Filter for High Volume Markets ONLY
+            # We use the 'volume' column from the API (Total Volume)
+            # Threshold: $5,000 lifetime volume to be safe
+            vol_threshold = 10000.0
+            
+            # Ensure volume is numeric and fill NaNs
+            markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
+            
+            high_vol_markets = markets[markets['volume'] > vol_threshold]
+            print(f"   📉 Filtering: Keeping {len(high_vol_markets)} markets (Vol > ${vol_threshold}) out of {len(markets)}")
+            
+            # Collect tokens ONLY from high-volume markets
             all_tokens = []
-            for raw_ids in markets['contract_id']:
+            for raw_ids in high_vol_markets['contract_id']:
                 parts = str(raw_ids).split(',')
                 for p in parts:
                     if len(p.strip()) > 2: all_tokens.append(p.strip())
+            
             target_tokens = list(set(all_tokens))
+            print(f"   🎯 Targeted Tokens: {len(target_tokens)} (was {len(markets)*2})")
             
             # Initial fetch (creates the CSV)
             # We assign to _ and delete to ensure we don't hold the raw data in RAM
