@@ -2142,29 +2142,33 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         import requests
         import csv
         import time
         from datetime import datetime
+        from decimal import Decimal, InvalidOperation # Import Decimal for precision
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
-        # --- 1. PREPARE TARGETS AS INTEGERS ---
+        # --- 1. PREPARE TARGETS AS INTEGERS (SAFE) ---
         valid_token_ints = set()
         for t in target_token_ids:
             try:
                 s = str(t).strip().lower()
-                if s == "0" or s == "null" or s == "none": continue
+                if s in ["0", "null", "none"]: continue
                 
-                # Robust parsing
-                if s.startswith("0x"): valid_token_ints.add(int(s, 16))
-                else: valid_token_ints.add(int(s))
+                # Use Decimal to handle ANY numeric string safely, then cast to int
+                # This handles "1.23e+20" AND "123" without precision loss
+                if s.startswith("0x"): 
+                    val = int(s, 16)
+                else:
+                    val = int(Decimal(s))
+                valid_token_ints.add(val)
             except: continue
 
         print(f"   🎯 Global Fetcher configured with {len(valid_token_ints)} numeric targets.")
         if len(valid_token_ints) == 0:
-            print("   ⚠️ WARNING: Target list is empty!")
             return pd.DataFrame()
 
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
@@ -2179,7 +2183,7 @@ class TuningRunner:
         temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
         total_scanned = 0
-        error_count = 0
+        debug_mismatches = 0 # Counter for debugging
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
@@ -2216,28 +2220,21 @@ class TuningRunner:
                         min_ts_in_batch = min(min_ts_in_batch, ts_val)
                         if ts_val < start_ts: continue
 
-                        # [CRITICAL] EXPLICIT PARSING BLOCK (NO BROAD EXCEPT)
+                        # [CRITICAL] SAFE PARSING
                         try:
-                            # Force string conversion first
                             m_raw = str(row['makerAssetId']).strip().lower()
                             t_raw = str(row['takerAssetId']).strip().lower()
                             
-                            # Safe Integer Conversion
-                            # 1. Handle Hex
+                            # Parse Maker
                             if m_raw.startswith("0x"): m_int = int(m_raw, 16)
-                            # 2. Handle Float strings (e.g. "1.23e+20")
-                            elif "e" in m_raw or "." in m_raw: m_int = int(float(m_raw))
-                            # 3. Handle Standard Ints
-                            else: m_int = int(m_raw)
+                            else: m_int = int(Decimal(m_raw)) # PRECISION SAFE
 
+                            # Parse Taker
                             if t_raw.startswith("0x"): t_int = int(t_raw, 16)
-                            elif "e" in t_raw or "." in t_raw: t_int = int(float(t_raw))
-                            else: t_int = int(t_raw)
+                            else: t_int = int(Decimal(t_raw)) # PRECISION SAFE
                         
                         except Exception as e:
-                            error_count += 1
-                            if error_count < 5:
-                                print(f"   ⚠️ Parse Error on row {row.get('id')}: {e}")
+                            # Skip bad rows silently
                             continue
 
                         token_id_int = None
@@ -2258,7 +2255,16 @@ class TuningRunner:
                             side_mult = -1
                         
                         else:
-                            # No match - skip silently
+                            # DEBUG: If no match found, print WHY for the first few failures
+                            # This removes the guessing.
+                            if debug_mismatches < 3 and m_int != 0 and t_int != 0:
+                                print(f"\n   [DEBUG MISMATCH] TS: {datetime.utcfromtimestamp(ts_val)}")
+                                print(f"      Maker ID: {m_int} (Type: {type(m_int)})")
+                                print(f"      Taker ID: {t_int} (Type: {type(t_int)})")
+                                # Check if it's close to a whitelist item (formatting check)
+                                sample = list(valid_token_ints)[0]
+                                print(f"      Whitelist Sample: {sample} (Type: {type(sample)})")
+                                debug_mismatches += 1
                             continue
 
                         if size_val > 0 and usdc_val > 0:
@@ -2302,7 +2308,7 @@ class TuningRunner:
             os.rename(temp_file, cache_file)
             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         
-        return pd.DataFrame()        
+        return pd.DataFrame()
         
     def _fetch_subgraph_trades(self, days_back=365):
         import time
