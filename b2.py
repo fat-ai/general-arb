@@ -2150,46 +2150,52 @@ class TuningRunner:
         from decimal import Decimal
         from collections import defaultdict
         
+        # 1. SETUP CACHE
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        temp_file = cache_file.with_suffix(".tmp.csv")
         
-        # 1. PARSE TARGETS SAFELY
+        # 2. PARSE TARGETS
         valid_token_ints = set()
         for t in target_token_ids:
             try:
                 s = str(t).strip().lower()
-                if s in ["0", "null", "none", "nan"]: continue
                 if s.startswith("0x"): val = int(s, 16)
                 else: val = int(Decimal(s))
                 valid_token_ints.add(val)
             except: continue
-
+            
         print(f"   🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
         if not valid_token_ints: return pd.DataFrame()
 
-        # 2. SETUP SESSION
+        # 3. SETUP SESSION
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
         session = requests.Session()
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
 
-        # 3. PAGINATION STATE
-        current_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+        # 4. INITIALIZE CURSOR (Direct Access)
+        # We access FIXED_END_DATE directly from the module scope.
+        # If it's missing, we crash intentionally rather than guessing.
+        try:
+            current_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+            print(f"   ⏱️  CURSOR LOCKED: {FIXED_END_DATE} (Int: {current_cursor})")
+        except NameError:
+            print("   ⚠️  FIXED_END_DATE not found in scope. Using 'Now'.")
+            current_cursor = int(time.time())
+
         stop_ts = current_cursor - (days_back * 86400)
-        
-        temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
         total_scanned = 0
-        
-        # Helper: Process a list of raw rows and write to CSV
+
+        # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
             out_rows = []
             for r in rows_in:
                 try:
                     m_raw = str(r['makerAssetId']).strip()
-                    t_raw = str(r['takerAssetId']).strip()
-                    
                     if m_raw.startswith("0x"): m_int = int(m_raw, 16)
                     else: m_int = int(Decimal(m_raw))
 
+                    t_raw = str(r['takerAssetId']).strip()
                     if t_raw.startswith("0x"): t_int = int(t_raw, 16)
                     else: t_int = int(Decimal(t_raw))
 
@@ -2218,9 +2224,7 @@ class TuningRunner:
                                 'side_mult': mult
                             })
                 except: continue
-            
-            if out_rows:
-                writer_obj.writerows(out_rows)
+            if out_rows: writer_obj.writerows(out_rows)
             return len(out_rows)
 
         with open(temp_file, 'w', newline='') as f:
@@ -2228,77 +2232,79 @@ class TuningRunner:
             writer.writeheader()
             
             while current_cursor > stop_ts:
-                # A. FETCH PAGE (Desc)
-                query = """query($max_ts: Int!) { orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: { timestamp_lt: $max_ts }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
+                # 5. EXECUTE QUERY (String Injection - Proven to work)
+                # We do NOT use variables to avoid any parsing mismatch.
+                query = f"""
+                query {{
+                    orderFilledEvents(
+                        first: 1000, 
+                        orderBy: timestamp, 
+                        orderDirection: desc, 
+                        where: {{ timestamp_lt: {current_cursor} }}
+                    ) {{
+                        id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+                    }}
+                }}
+                """
                 
                 try:
-                    resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': current_cursor}}, timeout=15)
+                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=15)
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
+                    # 6. HANDLE EMPTY ZONES (Gap Jumping)
                     if not data:
-                        current_cursor -= 100 # Skip gap
+                        # Probe for the next valid timestamp to teleport
+                        probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
+                        try:
+                            p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
+                            p_data = p_resp.json().get('data', {}).get('orderFilledEvents', [])
+                            if p_data:
+                                next_ts = int(p_data[0]['timestamp'])
+                                jump_diff = current_cursor - next_ts
+                                print(f"   🚀 Jumping gap ({jump_diff}s) -> {datetime.utcfromtimestamp(next_ts)}")
+                                current_cursor = next_ts + 1 # +1 to include it in next 'lt' query
+                            else:
+                                print("   ✅ History exhausted.")
+                                break
+                        except:
+                            current_cursor -= 1000 # Fallback
                         continue
 
-                    # B. ANALYZE BATCH
-                    # Group rows by timestamp to handle the "Partial Second" problem
+                    # 7. PROCESS BATCH
                     by_ts = defaultdict(list)
                     for row in data:
                         ts = int(row['timestamp'])
                         by_ts[ts].append(row)
                     
-                    sorted_ts = sorted(by_ts.keys(), reverse=True) # Newest -> Oldest
+                    sorted_ts = sorted(by_ts.keys(), reverse=True)
                     oldest_ts = sorted_ts[-1]
                     is_full_batch = (len(data) >= 1000)
                     
-                    # C. PROCESS "SAFE" ROWS (Newer than the oldest second)
-                    # These are guaranteed complete because we sort Descending.
                     for ts in sorted_ts:
-                        if is_full_batch and ts == oldest_ts:
-                            continue # Don't process the cutoff second yet
-                        
+                        if is_full_batch and ts == oldest_ts: continue
                         count = process_and_write(by_ts[ts], writer)
                         total_captured += count
 
                     total_scanned += len(data)
                     
-                    # D. HANDLE THE CUTOFF SECOND (Oldest TS)
+                    # 8. HANDLE DENSE BLOCK
                     if is_full_batch:
-                        # The batch was full, so 'oldest_ts' might be incomplete.
-                        # We must "Drain" it specifically using ID pagination.
-                        # We start from the ID of the last row we saw for this timestamp.
+                        last_id = by_ts[oldest_ts][-1]['id']
+                        process_and_write(by_ts[oldest_ts], writer)
                         
-                        last_id_seen = by_ts[oldest_ts][-1]['id']
-                        
-                        # Process the partial chunk we already have
-                        count = process_and_write(by_ts[oldest_ts], writer)
-                        total_captured += count
-                        
-                        # Now fetch the REST of that second
                         while True:
-                            dq = """query($ts: Int!, $lid: String!) { orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: { timestamp: $ts, id_lt: $lid }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
-                            
-                            dresp = session.post(GRAPH_URL, json={'query': dq, 'variables': {'ts': oldest_ts, 'lid': last_id_seen}}, timeout=15)
+                            dq = f"""query {{ orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp: {oldest_ts}, id_lt: "{last_id}" }}) {{ id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled }} }}"""
+                            dresp = session.post(GRAPH_URL, json={'query': dq}, timeout=15)
                             ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
                             
-                            if not ddata: break # Drained!
+                            if not ddata: break
                             
                             process_and_write(ddata, writer)
                             total_captured += len(ddata)
                             total_scanned += len(ddata)
-                            last_id_seen = ddata[-1]['id']
-                            
-                            if total_scanned % 5000 == 0:
-                                print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned}", end='\r')
+                            last_id = ddata[-1]['id']
+                            print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned}", end='\r')
 
-                    else:
-                        # Batch wasn't full, so even 'oldest_ts' is complete.
-                        count = process_and_write(by_ts[oldest_ts], writer)
-                        total_captured += count
-
-                    # E. ADVANCE CURSOR
-                    # We have fully processed 'oldest_ts' (either naturally or via drain).
-                    # So we can safely set the cursor to it. 
-                    # The next query uses 'timestamp_lt', so it will start at (oldest_ts - 1).
                     current_cursor = oldest_ts
                     
                     if total_scanned % 5000 == 0:
