@@ -2231,10 +2231,16 @@ class TuningRunner:
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
-        # Convert target tokens to a fast lookup set (normalized)
-        # normalize_contract_id is defined in global scope of script
-        valid_tokens = set(normalize_contract_id(t) for t in target_token_ids)
-        print(f"   🎯 Global Fetcher targets {len(valid_tokens)} tokens...")
+        valid_tokens = set()
+        for t in target_token_ids:
+            s = str(t).strip().lower()
+            if s.startswith("0x"):
+                try: valid_tokens.add(str(int(s, 16)))
+                except: valid_tokens.add(s)
+            else:
+                valid_tokens.add(s)
+
+        print(f"   🎯 Global Fetcher targets {len(valid_tokens)} tokens (Normalized)...")
 
         # Constants
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
@@ -2331,10 +2337,15 @@ class TuningRunner:
                             # Non-standard trade (e.g. Token-Token or Unknown)
                             continue
                             
-                        # Filter by Target Tokens (Efficiency)
-                        if token_id not in valid_tokens:
-                            continue
+                        if token_hex.startswith("0x"):
+                            try: token_id_dec = str(int(token_hex, 16))
+                            except: token_id_dec = token_hex
+                        else:
+                            token_id_dec = token_hex
                             
+                        if token_id_dec not in valid_tokens:
+                            continue
+                
                         if size_val <= 0 or usdc_val <= 0: continue
                         price = usdc_val / size_val
                         if not (0.005 <= price <= 0.995): continue # Sanity check
