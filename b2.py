@@ -2147,7 +2147,6 @@ class TuningRunner:
         import csv
         import time
         import os
-        import traceback # Added for full crash details
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -2188,6 +2187,7 @@ class TuningRunner:
         stop_ts = current_cursor - (days_back * 86400)
         total_captured = 0
         total_scanned = 0
+        batch_count = 0
 
         # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
@@ -2204,7 +2204,7 @@ class TuningRunner:
 
                     tid = None; mult = 0
                     
-                    # MATCH LOGIC (Fixed to 1e6 for correct scaling)
+                    # 1e6 FIX APPLIED
                     if m_int in valid_token_ints:
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
@@ -2239,12 +2239,14 @@ class TuningRunner:
             writer.writeheader()
             f.flush()
             
-            # Print initial status so we know loop started
-            print(f"   🚀 Starting Loop. First query for < {current_cursor}...")
+            print(f"   🚀 Starting Loop. Target > {stop_ts}")
 
             while current_cursor > stop_ts:
                 try:
-                    # 5. EXECUTE QUERY
+                    batch_count += 1
+                    # VERBOSE: Print before network call
+                    print(f"   [Batch {batch_count}] Req < {current_cursor}...", end='', flush=True)
+
                     query = f"""
                     query {{
                         orderFilledEvents(
@@ -2258,33 +2260,33 @@ class TuningRunner:
                     }}
                     """
                     
-                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=15)
+                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=10)
                     
-                    # Check for HTTP Errors
                     if resp.status_code != 200:
-                        print(f"   ❌ HTTP ERROR {resp.status_code}: {resp.text[:100]}")
-                        time.sleep(5)
+                        print(f" ❌ HTTP {resp.status_code}")
+                        time.sleep(2)
                         continue
 
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
+                    print(f" OK ({len(data)} rows).", end='', flush=True)
                     
                     if not data:
+                        print(" Gap.", end='', flush=True)
                         # Probe Gap
                         probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
-                        
                         p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
                         p_data = p_resp.json().get('data', {}).get('orderFilledEvents', [])
+                        
                         if p_data:
                             next_ts = int(p_data[0]['timestamp'])
-                            jump_diff = current_cursor - next_ts
-                            print(f"   🚀 Jumping gap ({jump_diff}s) -> {datetime.utcfromtimestamp(next_ts)}")
+                            print(f" Jump -> {datetime.utcfromtimestamp(next_ts)}")
                             current_cursor = next_ts + 1 
                         else:
-                            print("   ✅ History exhausted.")
+                            print("\n   ✅ History exhausted.")
                             break
                         continue
 
-                    # 6. PROCESS
+                    # Process
                     by_ts = defaultdict(list)
                     for row in data:
                         ts = int(row['timestamp'])
@@ -2301,15 +2303,16 @@ class TuningRunner:
 
                     total_scanned += len(data)
                     
-                    # 7. DRAIN DENSE BLOCK
+                    # Drain Dense
                     if is_full_batch:
+                        print(" Draining...", end='', flush=True)
                         last_id = by_ts[oldest_ts][-1]['id']
                         count = process_and_write(by_ts[oldest_ts], writer)
                         total_captured += count
                         
                         while True:
                             dq = f"""query {{ orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp: {oldest_ts}, id_lt: "{last_id}" }}) {{ id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled }} }}"""
-                            dresp = session.post(GRAPH_URL, json={'query': dq}, timeout=15)
+                            dresp = session.post(GRAPH_URL, json={'query': dq}, timeout=10)
                             ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
                             if not ddata: break
                             
@@ -2317,23 +2320,16 @@ class TuningRunner:
                             total_captured += count
                             total_scanned += len(ddata)
                             last_id = ddata[-1]['id']
-                            
-                            if total_scanned % 5000 == 0:
-                                f.flush()
-                                os.fsync(f.fileno())
-                                print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned} | Found: {total_captured}", end='\r')
-
+                    
                     current_cursor = oldest_ts
                     
-                    if total_scanned % 5000 == 0:
-                        f.flush()
-                        os.fsync(f.fileno())
-                        print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {datetime.utcfromtimestamp(current_cursor)}", end='\r')
+                    # UPDATE LINE
+                    f.flush()
+                    os.fsync(f.fileno())
+                    print(f" | Tot: {total_captured}")
 
                 except Exception as e:
-                    # 🔴 UN-SILENCED ERROR PRINTING
-                    print(f"\n❌ CRITICAL LOOP ERROR: {str(e)}")
-                    # traceback.print_exc() # Uncomment if simple print isn't enough
+                    print(f"\n❌ ERROR: {e}")
                     time.sleep(2)
 
         print(f"\n   ✅ Capture Complete: {total_captured} trades.")
