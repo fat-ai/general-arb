@@ -2255,7 +2255,7 @@ class TuningRunner:
             session = requests.Session()
             retries = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
             session.mount('https://', HTTPAdapter(max_retries=retries))
-            if not token_str.isdigit(): return False
+            
             last_ts = 2147483647 # Int32 Max
             
             while True:
@@ -2343,6 +2343,10 @@ class TuningRunner:
                                     'size': size,  # Absolute size
                                     'side_mult': side_mult
                                 })
+                                
+                                if len(rows)%1000 == 0:
+                                    print("1000 rows added")
+                                    
                             except:
                                 continue
                         
