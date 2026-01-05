@@ -1813,8 +1813,7 @@ class TuningRunner:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # 2. WHITELIST CONSTRUCTION
-        # We need a Python SET of strings to ensure we capture everything.
+        # 2. WHITELIST CONSTRUCTION (Set Union)
         target_tokens = set()
         
         # A. From Markets API
@@ -1826,12 +1825,10 @@ class TuningRunner:
         count_api = len(target_tokens)
         
         # B. From Subgraph Stats (Source of Truth)
-        # We load this file purely to extract IDs. No merging into 'markets' df yet.
         df_stats = self._fetch_orderbook_stats()
         count_stats = 0
         
         if not df_stats.empty:
-            # Safely extract IDs
             if 'contract_id' in df_stats.columns:
                 stats_ids = df_stats['contract_id'].astype(str).unique()
             elif 'id' in df_stats.columns:
@@ -1844,8 +1841,7 @@ class TuningRunner:
             
             count_stats = len(stats_ids)
             
-            # NOW we merge stats into markets for volume info (optional but good)
-            # Make sure columns match types
+            # Merge stats volume info (Optional but useful)
             markets['contract_id'] = markets['contract_id'].astype(str)
             df_stats['contract_id'] = df_stats['contract_id'].astype(str)
             markets = markets.merge(df_stats, on='contract_id', how='left')
@@ -1859,6 +1855,7 @@ class TuningRunner:
         # 3. TRADES (Stream)
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
+            # Pass the list. The fetcher handles the int conversion safely now.
             _ = self._fetch_gamma_trades_parallel(list(target_tokens), days_back=DAYS_BACK)
             import gc
             gc.collect()
