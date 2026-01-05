@@ -2142,7 +2142,7 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
         import requests
         import csv
         import time
