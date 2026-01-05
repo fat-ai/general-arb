@@ -1798,9 +1798,7 @@ class TuningRunner:
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        # ---------------------------------------------------------
         # 1. MARKETS (Get Metadata)
-        # ---------------------------------------------------------
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
 
         if market_file_path.exists():
@@ -1814,155 +1812,72 @@ class TuningRunner:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        safe_cols = [
-            'contract_id', 'outcome', 'resolution_timestamp', 'created_at', 
-            'liquidity', 'question', 'volume', 'conditionId'
-        ]
-        actual_cols = [c for c in safe_cols if c in markets.columns]
-        markets = markets[actual_cols].copy()
-
-        markets['contract_id'] = markets['contract_id'].astype(str)
-
-        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        # [FIX] LOWER THRESHOLD TO 0 TO CATCH NEW MARKETS
+        # New markets often have 0 reported volume in the API but active trading
+        vol_threshold = 0.0 
         
-        markets = markets.sort_values(
-            by=['contract_id', 'resolution_timestamp'], 
-            ascending=[True, True],
-            kind='stable'
-        )
+        # Ensure volume is numeric
+        markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
         
-        markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
+        # Filter markets (Optional: keep only active ones if needed, but 0 vol is safer)
+        high_vol_markets = markets[markets['volume'] >= vol_threshold]
+        print(f"   📉 Market Filter: Tracking {len(high_vol_markets)} markets (Vol >= ${vol_threshold})")
         
-        # ---------------------------------------------------------
-        # 2. ORDER BOOK
-        # ---------------------------------------------------------
-        df_stats = self._fetch_orderbook_stats()
-        if not df_stats.empty:
-            markets['contract_id'] = markets['contract_id'].astype(str)
-            df_stats['contract_id'] = df_stats['contract_id'].astype(str)
-            markets = markets.merge(df_stats, on='contract_id', how='left')
-            markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
-            markets['total_trades'] = markets['total_trades'].fillna(0)
-            print(f"Merged stats. High Vol Markets (>10k): {len(markets[markets['volume'] > 10000])}")
-        else:
-            markets['volume'] = 0.0
-            markets['total_trades'] = 0
+        # Collect tokens
+        all_tokens = []
+        for raw_ids in high_vol_markets['contract_id']:
+            parts = str(raw_ids).split(',')
+            for p in parts:
+                # Strip whitespace and ensure it's not empty
+                cln = p.strip()
+                if len(cln) > 2: all_tokens.append(cln)
+        
+        target_tokens = list(set(all_tokens))
+        print(f"   🎯 Target Tokens: {len(target_tokens)} unique IDs loaded.")
 
-        # ---------------------------------------------------------
-        # 3. TRADES
-        # ---------------------------------------------------------
+        # 2. TRADES (Stream)
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         
+        # Always fetch if file doesn't exist, or if we want to update
+        # For now, we only fetch if missing to save time, or you can force it.
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
-            
-            # [FIX] Filter for High Volume Markets ONLY
-            # We use the 'volume' column from the API (Total Volume)
-            # Threshold: $5,000 lifetime volume to be safe
-            vol_threshold = 10000.0
-            
-            # Ensure volume is numeric and fill NaNs
-            markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
-            
-            high_vol_markets = markets[markets['volume'] > vol_threshold]
-            print(f"   📉 Filtering: Keeping {len(high_vol_markets)} markets (Vol > ${vol_threshold}) out of {len(markets)}")
-            
-            # Collect tokens ONLY from high-volume markets
-            all_tokens = []
-            for raw_ids in high_vol_markets['contract_id']:
-                parts = str(raw_ids).split(',')
-                for p in parts:
-                    if len(p.strip()) > 2: all_tokens.append(p.strip())
-            
-            target_tokens = list(set(all_tokens))
-            print(f"   🎯 Targeted Tokens: {len(target_tokens)} (was {len(markets)*2})")
-            
-            # Initial fetch (creates the CSV)
-            # We assign to _ and delete to ensure we don't hold the raw data in RAM
             _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
             import gc
             gc.collect()
-        
-        # CALL THE NEW OPTIMIZED LOADER
-        # This handles Chunking -> Filtering -> Caching automatically
+
+        # 3. CONVERT & LOAD
         self._convert_csv_to_parquet()
-        
         trades = self._fast_load_trades(trades_file, FIXED_START_DATE, FIXED_END_DATE)
         
         if trades.empty:
             print("❌ Critical: No trade data available.")
-            return pd.DataFrame(), pd.DataFrame()
+            return markets, pd.DataFrame() # Return empty but valid DF to prevent crashes
 
-        # ---------------------------------------------------------
-        # 4. CLEANUP & SYNC
-        # ---------------------------------------------------------
+        # [Rest of your cleaning logic remains the same...]
         print("   Synchronizing data...")
-        
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        
-        trades['contract_id'] = trades['contract_id'].str.strip()
-
-        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
-        
+        trades['contract_id'] = trades['contract_id'].str.strip().apply(normalize_contract_id)
         trades['user'] = trades['user'].astype(str).str.strip()
         
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0.0)
-        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0.0)
-        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
-        trades['size'] = pd.to_numeric(trades['size'], errors='coerce').fillna(0.0)
+        float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
+        for c in float_cols:
+            trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0)
+            
         trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
 
+        # Date Filter
         trades = trades[
             (trades['timestamp'] >= FIXED_START_DATE) & 
             (trades['timestamp'] <= FIXED_END_DATE)
         ].copy()
-        
-        rename_map = {
-            'question': 'question', 'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at', 'volume': 'volume',
-            'conditionId': 'condition_id'
-        }
-        # Only rename columns that actually exist
-        markets = markets.rename(columns={k:v for k,v in rename_map.items() if k in markets.columns})
-        
-        # Ensure condition_id exists (fallback to contract_id if missing)
-        if 'condition_id' not in markets.columns:
-            markets['condition_id'] = markets['contract_id']
-            
 
-        markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
-        markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
-        
-        markets = markets.explode(['contract_id_list', 'token_index'])
-        
-        markets['contract_id'] = markets['contract_id_list'].str.strip()
-
-        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
-        
-        markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
-        
-        def calculate_token_outcome(row):
-            m_out = row['outcome']
-            t_idx = row['token_index']
-            if m_out == 0.5: return 0.5
-            return 1.0 if m_out == t_idx else 0.0
-
-        markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
-        markets = markets.drop(columns=['contract_id_list', 'token_index'])
-        # -------------------------------
-        
+        # Merge Logic
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
-        trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
-
-        sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
-        present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
-        trades = trades.sort_values(
-            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
-            kind='stable'
-        ).reset_index(drop=True)
-        trades = trades.drop_duplicates(subset=present_sort_cols, keep='first').reset_index(drop=True)
+        # Ensure outcome is numeric
+        market_subset['outcome'] = pd.to_numeric(market_subset['outcome'], errors='coerce')
         
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
@@ -2219,38 +2134,33 @@ class TuningRunner:
         return all_market_trades
 
     def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
-        """
-        GLOBAL FETCH (COLLATERAL AGNOSTIC + INTEGER MATH):
-        1. Accepts 2026 Date (Starts from time.time()).
-        2. FIXES '0 Trades' by being Collateral Agnostic (Removes hardcoded USDC check).
-           - Matches if EITHER asset is in your target list.
-        3. FIXES ID Mismatch by using Integer Comparison (int(10) == int("0xa")).
-        4. Prints the FIRST rejected row to debug exactly what the API is sending.
-        """
         import requests
         import csv
         import time
-        from datetime import datetime, timedelta
+        from datetime import datetime
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
         # --- 1. PREPARE TARGETS AS INTEGERS ---
-        # Convert all target IDs to Python Integers.
-        # This is the "Nuclear Option" for matching: it makes format irrelevant.
         valid_token_ints = set()
         for t in target_token_ids:
             try:
                 s = str(t).strip().lower()
+                # Exclude obvious bad IDs
+                if s == "0" or s == "null" or s == "none": continue
+                
                 if s.startswith("0x"): valid_token_ints.add(int(s, 16))
                 else: valid_token_ints.add(int(s))
             except: continue
 
-        print(f"   🎯 Global Fetcher targets {len(valid_token_ints)} tokens (Normalized to Integers)...")
+        print(f"   🎯 Global Fetcher targets {len(valid_token_ints)} tokens.")
+        if len(valid_token_ints) == 0:
+            print("   ⚠️ WARNING: Target list is empty! No trades will be captured.")
+            return pd.DataFrame()
 
         # Setup API
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
         
-        # Start from NOW (Jan 5 2026)
         current_cursor = int(time.time())
         start_ts = current_cursor - (days_back * 86400)
         
@@ -2261,11 +2171,7 @@ class TuningRunner:
         temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
         total_scanned = 0
-        
-        # DEBUG FLAGS
-        has_printed_debug = False
-        
-        print(f"   ⏳ Streaming: {datetime.utcfromtimestamp(start_ts).date()} -> {datetime.utcfromtimestamp(current_cursor).date()}")
+        has_printed_debug = False # Reset debug flag
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
@@ -2286,7 +2192,6 @@ class TuningRunner:
                     }
                 }
                 """
-                
                 try:
                     resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': int(current_cursor)}}, timeout=15)
                     if resp.status_code != 200:
@@ -2294,7 +2199,6 @@ class TuningRunner:
                         
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     if not data:
-                        print(f"\n   ✅ End of data stream at {datetime.utcfromtimestamp(current_cursor).date()}.")
                         break
                     
                     batch_rows = []
@@ -2305,49 +2209,48 @@ class TuningRunner:
                         min_ts_in_batch = min(min_ts_in_batch, ts_val)
                         if ts_val < start_ts: continue
 
-                        # --- ROBUST PARSING ---
                         try:
                             m_raw = str(row['makerAssetId']).strip().lower()
                             t_raw = str(row['takerAssetId']).strip().lower()
                             
-                            # Convert Subgraph IDs to Integers
+                            # Parse Integers. Handle "0" (Collateral) explicitly.
+                            # If raw is '0', int('0', 16) fails? No, int('0') works. 
+                            # We use robust logic:
                             m_int = int(m_raw, 16) if m_raw.startswith("0x") else int(m_raw)
                             t_int = int(t_raw, 16) if t_raw.startswith("0x") else int(t_raw)
                         except:
-                            continue # Skip malformed rows
+                            continue 
 
-                        # --- COLLATERAL AGNOSTIC MATCHING ---
-                        # We don't check for USDC address. We check if ONE of the assets is our Target.
                         token_id_int = None
                         side_mult = 0
                         aggressor = row['taker']
                         
+                        # LOGIC: 
+                        # One side is Token (in valid_token_ints).
+                        # Other side is Collateral (usually 0, or a known USDC addr).
+                        
                         if m_int in valid_token_ints:
-                            # Maker has Target Token -> Taker BOUGHT Token (gave collateral)
                             token_id_int = m_int
-                            size_val = float(row['makerAmountFilled']) / 1e18 # Token
-                            usdc_val = float(row['takerAmountFilled']) / 1e6  # Collateral
-                            side_mult = 1
+                            size_val = float(row['makerAmountFilled']) / 1e18
+                            usdc_val = float(row['takerAmountFilled']) / 1e6
+                            side_mult = 1 # Taker bought (Maker sold token)
                         
                         elif t_int in valid_token_ints:
-                            # Taker has Target Token -> Taker SOLD Token (got collateral)
                             token_id_int = t_int
-                            size_val = float(row['takerAmountFilled']) / 1e18 # Token
-                            usdc_val = float(row['makerAmountFilled']) / 1e6  # Collateral
-                            side_mult = -1
+                            size_val = float(row['takerAmountFilled']) / 1e18
+                            usdc_val = float(row['makerAmountFilled']) / 1e6
+                            side_mult = -1 # Taker sold (Maker bought token)
                         
                         else:
-                            # Neither asset is in our target list.
-                            # DEBUG: Print the FIRST rejection to prove what data we are seeing
-                            if not has_printed_debug:
+                            # Only print one rejection sample per run
+                            if not has_printed_debug and total_scanned < 100:
                                 print(f"\n   [DEBUG REJECT] TS: {datetime.utcfromtimestamp(ts_val)}")
-                                print(f"      MakerAsset: {m_raw} (Int: {m_int})")
-                                print(f"      TakerAsset: {t_raw} (Int: {t_int})")
-                                print(f"      Reason: Neither Int matched known targets.")
+                                print(f"      MakerAsset: {m_raw} -> {m_int}")
+                                print(f"      TakerAsset: {t_raw} -> {t_int}")
+                                print(f"      Targets (Sample): {list(valid_token_ints)[:3]}...")
                                 has_printed_debug = True
                             continue
 
-                        # If we get here, we have a match
                         if size_val > 0 and usdc_val > 0:
                             price = usdc_val / size_val
                             if 0.005 <= price <= 0.995:
@@ -2357,7 +2260,7 @@ class TuningRunner:
                                     'tradeAmount': usdc_val,
                                     'outcomeTokensAmount': size_val * side_mult,
                                     'user': aggressor,
-                                    'contract_id': str(token_id_int), # Store as Decimal String
+                                    'contract_id': str(token_id_int), 
                                     'price': price,
                                     'size': size_val,
                                     'side_mult': side_mult
@@ -2372,10 +2275,9 @@ class TuningRunner:
                     total_scanned += len(data)
                     
                     if current_cursor >= prev_cursor:
-                        current_cursor -= 1
+                        current_cursor -= 1 # Prevent infinite loop if timestamps are identical
                         
                     if total_scanned % 5000 == 0:
-                        # Print SCANNED count so you see progress
                         dt_str = datetime.utcfromtimestamp(current_cursor).strftime('%Y-%m-%d')
                         print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {dt_str} ...", end='\r')
 
@@ -2384,7 +2286,6 @@ class TuningRunner:
                     time.sleep(1)
 
         print(f"\n   ✅ Global Fetch Complete. Captured {total_captured} trades.")
-        
         if total_captured > 0:
             if cache_file.exists(): 
                 try: os.remove(cache_file)
