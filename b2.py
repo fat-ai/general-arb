@@ -1800,20 +1800,8 @@ class TuningRunner:
         
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
-        stats_file_path = self.cache_dir / "orderbook_stats.parquet"
 
-        # [CRITICAL FIX] FORCE REFRESH ON FRESH START
-        # If trades are missing, we must ensure our ID lists (Markets & Stats) are up to date.
-        if not trades_file.exists():
-            print(f"   🔄 Fresh Start Detected: Refreshing ID caches to ensure sync...")
-            if market_file_path.exists():
-                try: os.remove(market_file_path)
-                except: pass
-            if stats_file_path.exists():
-                try: os.remove(stats_file_path)
-                except: pass
-
-        # 1. MARKETS (Get Metadata)
+        # 1. MARKETS (Metadata)
         if market_file_path.exists():
             print(f"🔒 LOCKED LOAD: Using local market file: {market_file_path.name}")
             markets = pd.read_parquet(market_file_path)
@@ -1825,42 +1813,53 @@ class TuningRunner:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
-        # 2. ORDER BOOK STATS (Crucial for Whitelist)
-        # We fetch this NOW so we can use its IDs to augment the whitelist
+        # 2. WHITELIST CONSTRUCTION
+        # We need a Python SET of strings to ensure we capture everything.
+        target_tokens = set()
+        
+        # A. From Markets API
+        for raw_ids in markets['contract_id']:
+            parts = str(raw_ids).split(',')
+            for p in parts:
+                if len(p.strip()) > 2: target_tokens.add(p.strip())
+                
+        count_api = len(target_tokens)
+        
+        # B. From Subgraph Stats (Source of Truth)
+        # We load this file purely to extract IDs. No merging into 'markets' df yet.
         df_stats = self._fetch_orderbook_stats()
+        count_stats = 0
         
         if not df_stats.empty:
-            # Merge stats into markets for downstream use
-            # Use string type for safer merge
+            # Safely extract IDs
+            if 'contract_id' in df_stats.columns:
+                stats_ids = df_stats['contract_id'].astype(str).unique()
+            elif 'id' in df_stats.columns:
+                stats_ids = df_stats['id'].astype(str).unique()
+            else:
+                stats_ids = []
+                
+            for sid in stats_ids:
+                if len(sid.strip()) > 0: target_tokens.add(sid.strip())
+            
+            count_stats = len(stats_ids)
+            
+            # NOW we merge stats into markets for volume info (optional but good)
+            # Make sure columns match types
             markets['contract_id'] = markets['contract_id'].astype(str)
             df_stats['contract_id'] = df_stats['contract_id'].astype(str)
             markets = markets.merge(df_stats, on='contract_id', how='left')
             markets['volume'] = pd.to_numeric(markets['volume'], errors='coerce').fillna(0.0)
-        else:
-            markets['volume'] = 0.0
 
-        # [CRITICAL FIX] BUILD ROBUST WHITELIST
-        # 1. Get IDs from Gamma API (Markets)
-        api_tokens = set()
-        for raw_ids in markets['contract_id']:
-            parts = str(raw_ids).split(',')
-            for p in parts:
-                if len(p.strip()) > 2: api_tokens.add(p.strip())
-        
-        # 2. Get IDs from Subgraph (Orderbooks) - The Source of Truth
-        subgraph_tokens = set()
-        if not df_stats.empty:
-            subgraph_tokens = set(df_stats['contract_id'].astype(str))
-            
-        # 3. Union them to catch EVERYTHING
-        target_tokens = list(api_tokens | subgraph_tokens)
-        print(f"   🎯 Target Tokens: {len(target_tokens)} unique IDs (API: {len(api_tokens)} + Subgraph: {len(subgraph_tokens)})")
+        print(f"   🎯 Whitelist Construction:")
+        print(f"      - API IDs:      {count_api}")
+        print(f"      - Subgraph IDs: {count_stats}")
+        print(f"      - UNION TOTAL:  {len(target_tokens)} unique IDs")
 
         # 3. TRADES (Stream)
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
-            # Pass the augmented list
-            _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
+            _ = self._fetch_gamma_trades_parallel(list(target_tokens), days_back=DAYS_BACK)
             import gc
             gc.collect()
 
@@ -1888,7 +1887,6 @@ class TuningRunner:
             (trades['timestamp'] <= FIXED_END_DATE)
         ].copy()
 
-        # Filter markets to only those that appear in trades (efficiency)
         valid_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
         market_subset['outcome'] = pd.to_numeric(market_subset['outcome'], errors='coerce')
@@ -2160,10 +2158,9 @@ class TuningRunner:
         for t in target_token_ids:
             try:
                 s = str(t).strip().lower()
-                # Skip explicit collateral/nulls
                 if s == "0" or s == "null" or s == "none": continue
                 
-                # Robust parsing for Hex or Decimal strings
+                # Robust parsing
                 if s.startswith("0x"): valid_token_ints.add(int(s, 16))
                 else: valid_token_ints.add(int(s))
             except: continue
@@ -2185,7 +2182,7 @@ class TuningRunner:
         temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
         total_scanned = 0
-        has_printed_debug = False 
+        error_count = 0
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
@@ -2222,22 +2219,35 @@ class TuningRunner:
                         min_ts_in_batch = min(min_ts_in_batch, ts_val)
                         if ts_val < start_ts: continue
 
+                        # [CRITICAL] EXPLICIT PARSING BLOCK (NO BROAD EXCEPT)
                         try:
+                            # Force string conversion first
                             m_raw = str(row['makerAssetId']).strip().lower()
                             t_raw = str(row['takerAssetId']).strip().lower()
                             
-                            # Convert Subgraph IDs to Integers
-                            m_int = int(m_raw, 16) if m_raw.startswith("0x") else int(m_raw)
-                            t_int = int(t_raw, 16) if t_raw.startswith("0x") else int(t_raw)
-                        except: continue 
+                            # Safe Integer Conversion
+                            # 1. Handle Hex
+                            if m_raw.startswith("0x"): m_int = int(m_raw, 16)
+                            # 2. Handle Float strings (e.g. "1.23e+20")
+                            elif "e" in m_raw or "." in m_raw: m_int = int(float(m_raw))
+                            # 3. Handle Standard Ints
+                            else: m_int = int(m_raw)
+
+                            if t_raw.startswith("0x"): t_int = int(t_raw, 16)
+                            elif "e" in t_raw or "." in t_raw: t_int = int(float(t_raw))
+                            else: t_int = int(t_raw)
+                        
+                        except Exception as e:
+                            error_count += 1
+                            if error_count < 5:
+                                print(f"   ⚠️ Parse Error on row {row.get('id')}: {e}")
+                            continue
 
                         token_id_int = None
                         side_mult = 0
                         aggressor = row['taker']
                         
-                        # --- MATCHING LOGIC ---
-                        # Check if EITHER side is in our target list.
-                        
+                        # MATCHING
                         if m_int in valid_token_ints:
                             token_id_int = m_int
                             size_val = float(row['makerAmountFilled']) / 1e18
@@ -2251,14 +2261,7 @@ class TuningRunner:
                             side_mult = -1
                         
                         else:
-                            # [FIX] Silent Ignore for Collateral (0) or Irrelevant Trades
-                            # Only debug print if it looks like a real token mismatch (rare)
-                            if (m_int != 0 and t_int != 0) and (not has_printed_debug) and (total_scanned < 100):
-                                print(f"\n   [DEBUG REJECT] TS: {datetime.utcfromtimestamp(ts_val)}")
-                                print(f"      Maker: {m_int}")
-                                print(f"      Taker: {t_int}")
-                                print(f"      Reason: Neither ID found in API or Subgraph whitelists.")
-                                has_printed_debug = True
+                            # No match - skip silently
                             continue
 
                         if size_val > 0 and usdc_val > 0:
@@ -2302,8 +2305,7 @@ class TuningRunner:
             os.rename(temp_file, cache_file)
             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
         
-        return pd.DataFrame()
-        
+        return pd.DataFrame()        
         
     def _fetch_subgraph_trades(self, days_back=365):
         import time
