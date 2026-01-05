@@ -2142,7 +2142,7 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         import requests
         import csv
         import time
@@ -2179,13 +2179,11 @@ class TuningRunner:
         total_captured = 0
         total_scanned = 0
         
-        # We define a helper to process a list of raw API rows
-        def process_rows(rows_to_process, writer_obj):
-            captured_count = 0
+        # Helper: Process a list of raw rows and write to CSV
+        def process_and_write(rows_in, writer_obj):
             out_rows = []
-            for r in rows_to_process:
+            for r in rows_in:
                 try:
-                    # Precision-Safe Parsing
                     m_raw = str(r['makerAssetId']).strip()
                     t_raw = str(r['takerAssetId']).strip()
                     
@@ -2195,7 +2193,6 @@ class TuningRunner:
                     if t_raw.startswith("0x"): t_int = int(t_raw, 16)
                     else: t_int = int(Decimal(t_raw))
 
-                    # Matching
                     tid = None; mult = 0
                     if m_int in valid_token_ints:
                         tid = m_int; mult = 1
@@ -2224,15 +2221,14 @@ class TuningRunner:
             
             if out_rows:
                 writer_obj.writerows(out_rows)
-                captured_count = len(out_rows)
-            return captured_count
+            return len(out_rows)
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
             writer.writeheader()
             
             while current_cursor > stop_ts:
-                # A. Main Query (Desc)
+                # A. FETCH PAGE (Desc)
                 query = """query($max_ts: Int!) { orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: { timestamp_lt: $max_ts }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
                 
                 try:
@@ -2240,74 +2236,75 @@ class TuningRunner:
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
                     if not data:
-                        # Gap in data? Just move back 1 second to verify
-                        # (In dense markets, gaps are rare, but safe to step back)
-                        current_cursor -= 1
+                        current_cursor -= 100 # Skip gap
                         continue
 
-                    # Group by Timestamp
+                    # B. ANALYZE BATCH
+                    # Group rows by timestamp to handle the "Partial Second" problem
                     by_ts = defaultdict(list)
                     for row in data:
                         ts = int(row['timestamp'])
                         by_ts[ts].append(row)
                     
-                    timestamps = sorted(by_ts.keys(), reverse=True) # Newest to Oldest
-                    min_ts_in_batch = timestamps[-1]
-                    
-                    # Logic: 
-                    # If batch is NOT full (len < 1000), we know we got everything.
-                    # If batch IS full (len == 1000), the oldest timestamp 'min_ts_in_batch' might be incomplete.
-                    
+                    sorted_ts = sorted(by_ts.keys(), reverse=True) # Newest -> Oldest
+                    oldest_ts = sorted_ts[-1]
                     is_full_batch = (len(data) >= 1000)
                     
-                    # Process safe timestamps (Newer than the oldest one in the batch)
-                    for ts in timestamps:
-                        if is_full_batch and ts == min_ts_in_batch:
-                            # Skip processing the incomplete timestamp here
-                            continue
+                    # C. PROCESS "SAFE" ROWS (Newer than the oldest second)
+                    # These are guaranteed complete because we sort Descending.
+                    for ts in sorted_ts:
+                        if is_full_batch and ts == oldest_ts:
+                            continue # Don't process the cutoff second yet
                         
-                        count = process_rows(by_ts[ts], writer)
+                        count = process_and_write(by_ts[ts], writer)
                         total_captured += count
 
                     total_scanned += len(data)
                     
-                    # Handle the problematic oldest timestamp
+                    # D. HANDLE THE CUTOFF SECOND (Oldest TS)
                     if is_full_batch:
-                        # We must "Drain" this specific second using SKIP to ensure we get everything
-                        print(f"   ⚠️ draining dense second: {min_ts_in_batch}...", end='\r')
+                        # The batch was full, so 'oldest_ts' might be incomplete.
+                        # We must "Drain" it specifically using ID pagination.
+                        # We start from the ID of the last row we saw for this timestamp.
                         
-                        skip_offset = 0
-                        while True:
-                            dq = """query($target_ts: Int!, $skip_val: Int!) { orderFilledEvents(first: 1000, skip: $skip_val, orderBy: timestamp, orderDirection: desc, where: { timestamp: $target_ts }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
-                            dresp = session.post(GRAPH_URL, json={'query': dq, 'variables': {'target_ts': min_ts_in_batch, 'skip_val': skip_offset}}, timeout=15)
-                            ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
-                            
-                            if not ddata: break
-                            
-                            count = process_rows(ddata, writer)
-                            total_captured += count
-                            total_scanned += len(ddata)
-                            skip_offset += 1000
-                            
-                            if len(ddata) < 1000: break # Drained
+                        last_id_seen = by_ts[oldest_ts][-1]['id']
                         
-                    else:
-                        # Batch wasn't full, so even the oldest timestamp was complete.
-                        # We just process it.
-                        count = process_rows(by_ts[min_ts_in_batch], writer)
+                        # Process the partial chunk we already have
+                        count = process_and_write(by_ts[oldest_ts], writer)
                         total_captured += count
                         
-                    # Advance Cursor
-                    # Since we have fully handled 'min_ts_in_batch' (either via drain or because batch wasn't full)
-                    # We can safely move the cursor to that time.
-                    # Next iteration query uses 'lt', so it will strictly exclude what we just did.
-                    current_cursor = min_ts_in_batch
+                        # Now fetch the REST of that second
+                        while True:
+                            dq = """query($ts: Int!, $lid: String!) { orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: { timestamp: $ts, id_lt: $lid }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
+                            
+                            dresp = session.post(GRAPH_URL, json={'query': dq, 'variables': {'ts': oldest_ts, 'lid': last_id_seen}}, timeout=15)
+                            ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
+                            
+                            if not ddata: break # Drained!
+                            
+                            process_and_write(ddata, writer)
+                            total_captured += len(ddata)
+                            total_scanned += len(ddata)
+                            last_id_seen = ddata[-1]['id']
+                            
+                            if total_scanned % 5000 == 0:
+                                print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned}", end='\r')
+
+                    else:
+                        # Batch wasn't full, so even 'oldest_ts' is complete.
+                        count = process_and_write(by_ts[oldest_ts], writer)
+                        total_captured += count
+
+                    # E. ADVANCE CURSOR
+                    # We have fully processed 'oldest_ts' (either naturally or via drain).
+                    # So we can safely set the cursor to it. 
+                    # The next query uses 'timestamp_lt', so it will start at (oldest_ts - 1).
+                    current_cursor = oldest_ts
                     
                     if total_scanned % 5000 == 0:
                         print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {datetime.utcfromtimestamp(current_cursor)}", end='\r')
 
                 except Exception as e:
-                    print(f"   ⚠️ Stream Error: {e}")
                     time.sleep(1)
 
         print(f"\n   ✅ Capture Complete: {total_captured} trades.")
