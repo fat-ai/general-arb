@@ -2142,11 +2142,12 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         import requests
         import csv
         import time
         import os
+        import traceback # Added for full crash details
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -2191,7 +2192,6 @@ class TuningRunner:
         # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
             out_rows = []
-            
             for r in rows_in:
                 try:
                     m_raw = str(r.get('makerAssetId', '0')).strip()
@@ -2204,24 +2204,18 @@ class TuningRunner:
 
                     tid = None; mult = 0
                     
-                    # [FIX] BOTH USDC and OUTCOME TOKENS ARE 6 DECIMALS (1e6)
-                    # We remove 1e18 and use 1e6 for everything.
-                    
+                    # MATCH LOGIC (Fixed to 1e6 for correct scaling)
                     if m_int in valid_token_ints:
-                        # Maker has the Outcome Token (Target)
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
-                        val_size = float(r['makerAmountFilled']) / 1e6  # FIXED
+                        val_size = float(r['makerAmountFilled']) / 1e6
                     elif t_int in valid_token_ints:
-                        # Taker has the Outcome Token (Target)
                         tid = t_int; mult = -1
                         val_usdc = float(r['makerAmountFilled']) / 1e6
-                        val_size = float(r['takerAmountFilled']) / 1e6  # FIXED
+                        val_size = float(r['takerAmountFilled']) / 1e6
                     
                     if tid and val_usdc > 0 and val_size > 0:
                         price = val_usdc / val_size
-                        
-                        # Only save valid prices (0.5% to 99.5%)
                         if 0.005 <= price <= 0.995:
                             out_rows.append({
                                 'id': r['id'], 
@@ -2245,41 +2239,49 @@ class TuningRunner:
             writer.writeheader()
             f.flush()
             
+            # Print initial status so we know loop started
+            print(f"   🚀 Starting Loop. First query for < {current_cursor}...")
+
             while current_cursor > stop_ts:
-                # 5. EXECUTE QUERY
-                query = f"""
-                query {{
-                    orderFilledEvents(
-                        first: 1000, 
-                        orderBy: timestamp, 
-                        orderDirection: desc, 
-                        where: {{ timestamp_lt: {current_cursor} }}
-                    ) {{
-                        id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
-                    }}
-                }}
-                """
-                
                 try:
+                    # 5. EXECUTE QUERY
+                    query = f"""
+                    query {{
+                        orderFilledEvents(
+                            first: 1000, 
+                            orderBy: timestamp, 
+                            orderDirection: desc, 
+                            where: {{ timestamp_lt: {current_cursor} }}
+                        ) {{
+                            id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+                        }}
+                    }}
+                    """
+                    
                     resp = session.post(GRAPH_URL, json={'query': query}, timeout=15)
+                    
+                    # Check for HTTP Errors
+                    if resp.status_code != 200:
+                        print(f"   ❌ HTTP ERROR {resp.status_code}: {resp.text[:100]}")
+                        time.sleep(5)
+                        continue
+
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
                     if not data:
                         # Probe Gap
                         probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
-                        try:
-                            p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
-                            p_data = p_resp.json().get('data', {}).get('orderFilledEvents', [])
-                            if p_data:
-                                next_ts = int(p_data[0]['timestamp'])
-                                jump_diff = current_cursor - next_ts
-                                print(f"   🚀 Jumping gap ({jump_diff}s) -> {datetime.utcfromtimestamp(next_ts)}")
-                                current_cursor = next_ts + 1 
-                            else:
-                                print("   ✅ History exhausted.")
-                                break
-                        except:
-                            current_cursor -= 1000 
+                        
+                        p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
+                        p_data = p_resp.json().get('data', {}).get('orderFilledEvents', [])
+                        if p_data:
+                            next_ts = int(p_data[0]['timestamp'])
+                            jump_diff = current_cursor - next_ts
+                            print(f"   🚀 Jumping gap ({jump_diff}s) -> {datetime.utcfromtimestamp(next_ts)}")
+                            current_cursor = next_ts + 1 
+                        else:
+                            print("   ✅ History exhausted.")
+                            break
                         continue
 
                     # 6. PROCESS
@@ -2329,7 +2331,10 @@ class TuningRunner:
                         print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {datetime.utcfromtimestamp(current_cursor)}", end='\r')
 
                 except Exception as e:
-                    time.sleep(1)
+                    # 🔴 UN-SILENCED ERROR PRINTING
+                    print(f"\n❌ CRITICAL LOOP ERROR: {str(e)}")
+                    # traceback.print_exc() # Uncomment if simple print isn't enough
+                    time.sleep(2)
 
         print(f"\n   ✅ Capture Complete: {total_captured} trades.")
         if total_captured > 0:
