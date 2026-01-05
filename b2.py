@@ -2172,7 +2172,7 @@ class TuningRunner:
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
 
         # 3. PAGINATION STATE
-        current_cursor = int(time.time())
+        current_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
         stop_ts = current_cursor - (days_back * 86400)
         
         temp_file = cache_file.with_suffix(".tmp.csv")
