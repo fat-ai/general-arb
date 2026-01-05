@@ -2216,8 +2216,7 @@ class TuningRunner:
                     
                     if tid and val_usdc > 0 and val_size > 0:
                         price = val_usdc / val_size
-                        if 0.005 <= price <= 0.995:
-                            out_rows.append({
+                        out_rows.append({
                                 'id': r['id'], 
                                 'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
                                 'tradeAmount': val_usdc, 
@@ -2227,7 +2226,7 @@ class TuningRunner:
                                 'price': price, 
                                 'size': val_size, 
                                 'side_mult': mult
-                            })
+                                })
                 except: continue
 
             if out_rows: 
