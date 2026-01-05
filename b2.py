@@ -2187,11 +2187,9 @@ class TuningRunner:
         stop_ts = current_cursor - (days_back * 86400)
         total_captured = 0
         total_scanned = 0
-        debug_prints = 0
 
         # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
-            nonlocal debug_prints
             out_rows = []
             
             for r in rows_in:
@@ -2206,38 +2204,36 @@ class TuningRunner:
 
                     tid = None; mult = 0
                     
-                    # DIAGNOSTIC: Check Filters on matches
-                    is_match = (m_int in valid_token_ints) or (t_int in valid_token_ints)
+                    # [FIX] BOTH USDC and OUTCOME TOKENS ARE 6 DECIMALS (1e6)
+                    # We remove 1e18 and use 1e6 for everything.
                     
                     if m_int in valid_token_ints:
+                        # Maker has the Outcome Token (Target)
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
-                        val_size = float(r['makerAmountFilled']) / 1e18
+                        val_size = float(r['makerAmountFilled']) / 1e6  # FIXED
                     elif t_int in valid_token_ints:
+                        # Taker has the Outcome Token (Target)
                         tid = t_int; mult = -1
                         val_usdc = float(r['makerAmountFilled']) / 1e6
-                        val_size = float(r['takerAmountFilled']) / 1e18
+                        val_size = float(r['takerAmountFilled']) / 1e6  # FIXED
                     
-                    if tid:
-                        if val_usdc > 0 and val_size > 0:
-                            price = val_usdc / val_size
-                            # Log why a match might be dropped
-                            if debug_prints < 10 and (price < 0.005 or price > 0.995):
-                                print(f"   ⚠️ DROPPING MATCH: Price {price:.4f} out of bounds (0.005-0.995)")
-                                debug_prints += 1
-                                
-                            if 0.005 <= price <= 0.995:
-                                out_rows.append({
-                                    'id': r['id'], 
-                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
-                                    'tradeAmount': val_usdc, 
-                                    'outcomeTokensAmount': val_size * mult,
-                                    'user': r['taker'], 
-                                    'contract_id': str(tid),
-                                    'price': price, 
-                                    'size': val_size, 
-                                    'side_mult': mult
-                                })
+                    if tid and val_usdc > 0 and val_size > 0:
+                        price = val_usdc / val_size
+                        
+                        # Only save valid prices (0.5% to 99.5%)
+                        if 0.005 <= price <= 0.995:
+                            out_rows.append({
+                                'id': r['id'], 
+                                'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                'tradeAmount': val_usdc, 
+                                'outcomeTokensAmount': val_size * mult,
+                                'user': r['taker'], 
+                                'contract_id': str(tid),
+                                'price': price, 
+                                'size': val_size, 
+                                'side_mult': mult
+                            })
                 except: continue
 
             if out_rows: 
@@ -2247,7 +2243,7 @@ class TuningRunner:
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
             writer.writeheader()
-            f.flush() # Ensure header is written immediately
+            f.flush()
             
             while current_cursor > stop_ts:
                 # 5. EXECUTE QUERY
@@ -2320,7 +2316,6 @@ class TuningRunner:
                             total_scanned += len(ddata)
                             last_id = ddata[-1]['id']
                             
-                            # STATUS UPDATE (With Flush)
                             if total_scanned % 5000 == 0:
                                 f.flush()
                                 os.fsync(f.fileno())
@@ -2328,7 +2323,6 @@ class TuningRunner:
 
                     current_cursor = oldest_ts
                     
-                    # STATUS UPDATE (Standard)
                     if total_scanned % 5000 == 0:
                         f.flush()
                         os.fsync(f.fileno())
