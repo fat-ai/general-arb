@@ -2142,10 +2142,11 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         import requests
         import csv
         import time
+        import os
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -2154,16 +2155,14 @@ class TuningRunner:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         temp_file = cache_file.with_suffix(".tmp.csv")
         
-        # 2. PARSE TARGETS (ROBUST PRECISISION FIX)
+        # 2. PARSE TARGETS
         valid_token_ints = set()
         for t in target_token_ids:
             try:
-                # Handle Float/Scientific Notation Inputs
-                if isinstance(t, float):
-                    val = int(t)
+                if isinstance(t, float): val = int(t)
                 else:
                     s = str(t).strip().lower()
-                    if "e+" in s: val = int(float(s)) # Handle scientific str
+                    if "e+" in s: val = int(float(s))
                     elif s.startswith("0x"): val = int(s, 16)
                     else: val = int(Decimal(s))
                 valid_token_ints.add(val)
@@ -2188,7 +2187,7 @@ class TuningRunner:
         stop_ts = current_cursor - (days_back * 86400)
         total_captured = 0
         total_scanned = 0
-        debug_prints = 0 # Counter for diagnostic
+        debug_prints = 0
 
         # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
@@ -2197,7 +2196,6 @@ class TuningRunner:
             
             for r in rows_in:
                 try:
-                    # PARSE API IDS
                     m_raw = str(r.get('makerAssetId', '0')).strip()
                     if m_raw.startswith("0x"): m_int = int(m_raw, 16)
                     else: m_int = int(Decimal(m_raw))
@@ -2206,16 +2204,11 @@ class TuningRunner:
                     if t_raw.startswith("0x"): t_int = int(t_raw, 16)
                     else: t_int = int(Decimal(t_raw))
 
-                    # MATCHING LOGIC
                     tid = None; mult = 0
                     
-                    # DIAGNOSTIC: Print the first 5 rows seen to prove what's happening
-                    if debug_prints < 5:
-                        in_white_m = m_int in valid_token_ints
-                        in_white_t = t_int in valid_token_ints
-                        print(f"   🔍 DEBUG ROW: Time={r['timestamp']} | MakerID={m_int} (In? {in_white_m}) | TakerID={t_int} (In? {in_white_t})")
-                        debug_prints += 1
-
+                    # DIAGNOSTIC: Check Filters on matches
+                    is_match = (m_int in valid_token_ints) or (t_int in valid_token_ints)
+                    
                     if m_int in valid_token_ints:
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
@@ -2225,30 +2218,36 @@ class TuningRunner:
                         val_usdc = float(r['makerAmountFilled']) / 1e6
                         val_size = float(r['takerAmountFilled']) / 1e18
                     
-                    if tid and val_usdc > 0 and val_size > 0:
-                        price = val_usdc / val_size
-                        if 0.005 <= price <= 0.995:
-                            out_rows.append({
-                                'id': r['id'], 
-                                'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
-                                'tradeAmount': val_usdc, 
-                                'outcomeTokensAmount': val_size * mult,
-                                'user': r['taker'], 
-                                'contract_id': str(tid),
-                                'price': price, 
-                                'size': val_size, 
-                                'side_mult': mult
-                            })
-                except Exception as e:
-                    # Capture basic errors (DivZero, etc)
-                    continue
+                    if tid:
+                        if val_usdc > 0 and val_size > 0:
+                            price = val_usdc / val_size
+                            # Log why a match might be dropped
+                            if debug_prints < 10 and (price < 0.005 or price > 0.995):
+                                print(f"   ⚠️ DROPPING MATCH: Price {price:.4f} out of bounds (0.005-0.995)")
+                                debug_prints += 1
+                                
+                            if 0.005 <= price <= 0.995:
+                                out_rows.append({
+                                    'id': r['id'], 
+                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                    'tradeAmount': val_usdc, 
+                                    'outcomeTokensAmount': val_size * mult,
+                                    'user': r['taker'], 
+                                    'contract_id': str(tid),
+                                    'price': price, 
+                                    'size': val_size, 
+                                    'side_mult': mult
+                                })
+                except: continue
 
-            if out_rows: writer_obj.writerows(out_rows)
+            if out_rows: 
+                writer_obj.writerows(out_rows)
             return len(out_rows)
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
             writer.writeheader()
+            f.flush() # Ensure header is written immediately
             
             while current_cursor > stop_ts:
                 # 5. EXECUTE QUERY
@@ -2270,7 +2269,7 @@ class TuningRunner:
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
                     if not data:
-                        # Probe for next valid timestamp
+                        # Probe Gap
                         probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
                         try:
                             p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
@@ -2307,7 +2306,8 @@ class TuningRunner:
                     # 7. DRAIN DENSE BLOCK
                     if is_full_batch:
                         last_id = by_ts[oldest_ts][-1]['id']
-                        process_and_write(by_ts[oldest_ts], writer)
+                        count = process_and_write(by_ts[oldest_ts], writer)
+                        total_captured += count
                         
                         while True:
                             dq = f"""query {{ orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp: {oldest_ts}, id_lt: "{last_id}" }}) {{ id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled }} }}"""
@@ -2315,15 +2315,23 @@ class TuningRunner:
                             ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
                             if not ddata: break
                             
-                            process_and_write(ddata, writer)
-                            total_captured += len(ddata)
+                            count = process_and_write(ddata, writer)
+                            total_captured += count
                             total_scanned += len(ddata)
                             last_id = ddata[-1]['id']
-                            print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned}", end='\r')
+                            
+                            # STATUS UPDATE (With Flush)
+                            if total_scanned % 5000 == 0:
+                                f.flush()
+                                os.fsync(f.fileno())
+                                print(f"   ⚡ Draining dense second {oldest_ts}... Scanned: {total_scanned} | Found: {total_captured}", end='\r')
 
                     current_cursor = oldest_ts
                     
+                    # STATUS UPDATE (Standard)
                     if total_scanned % 5000 == 0:
+                        f.flush()
+                        os.fsync(f.fileno())
                         print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {datetime.utcfromtimestamp(current_cursor)}", end='\r')
 
                 except Exception as e:
