@@ -2142,7 +2142,7 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
         import requests
         import csv
         import time
@@ -2154,13 +2154,18 @@ class TuningRunner:
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         temp_file = cache_file.with_suffix(".tmp.csv")
         
-        # 2. PARSE TARGETS
+        # 2. PARSE TARGETS (ROBUST PRECISISION FIX)
         valid_token_ints = set()
         for t in target_token_ids:
             try:
-                s = str(t).strip().lower()
-                if s.startswith("0x"): val = int(s, 16)
-                else: val = int(Decimal(s))
+                # Handle Float/Scientific Notation Inputs
+                if isinstance(t, float):
+                    val = int(t)
+                else:
+                    s = str(t).strip().lower()
+                    if "e+" in s: val = int(float(s)) # Handle scientific str
+                    elif s.startswith("0x"): val = int(s, 16)
+                    else: val = int(Decimal(s))
                 valid_token_ints.add(val)
             except: continue
             
@@ -2172,34 +2177,45 @@ class TuningRunner:
         session = requests.Session()
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
 
-        # 4. INITIALIZE CURSOR (Direct Access)
-        # We access FIXED_END_DATE directly from the module scope.
-        # If it's missing, we crash intentionally rather than guessing.
+        # 4. INITIALIZE CURSOR
         try:
             current_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
             print(f"   ⏱️  CURSOR LOCKED: {FIXED_END_DATE} (Int: {current_cursor})")
         except NameError:
-            print("   ⚠️  FIXED_END_DATE not found in scope. Using 'Now'.")
+            print("   ⚠️  FIXED_END_DATE not found. Using 'Now'.")
             current_cursor = int(time.time())
 
         stop_ts = current_cursor - (days_back * 86400)
         total_captured = 0
         total_scanned = 0
+        debug_prints = 0 # Counter for diagnostic
 
         # Helper: Write rows
         def process_and_write(rows_in, writer_obj):
+            nonlocal debug_prints
             out_rows = []
+            
             for r in rows_in:
                 try:
-                    m_raw = str(r['makerAssetId']).strip()
+                    # PARSE API IDS
+                    m_raw = str(r.get('makerAssetId', '0')).strip()
                     if m_raw.startswith("0x"): m_int = int(m_raw, 16)
                     else: m_int = int(Decimal(m_raw))
 
-                    t_raw = str(r['takerAssetId']).strip()
+                    t_raw = str(r.get('takerAssetId', '0')).strip()
                     if t_raw.startswith("0x"): t_int = int(t_raw, 16)
                     else: t_int = int(Decimal(t_raw))
 
+                    # MATCHING LOGIC
                     tid = None; mult = 0
+                    
+                    # DIAGNOSTIC: Print the first 5 rows seen to prove what's happening
+                    if debug_prints < 5:
+                        in_white_m = m_int in valid_token_ints
+                        in_white_t = t_int in valid_token_ints
+                        print(f"   🔍 DEBUG ROW: Time={r['timestamp']} | MakerID={m_int} (In? {in_white_m}) | TakerID={t_int} (In? {in_white_t})")
+                        debug_prints += 1
+
                     if m_int in valid_token_ints:
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
@@ -2223,7 +2239,10 @@ class TuningRunner:
                                 'size': val_size, 
                                 'side_mult': mult
                             })
-                except: continue
+                except Exception as e:
+                    # Capture basic errors (DivZero, etc)
+                    continue
+
             if out_rows: writer_obj.writerows(out_rows)
             return len(out_rows)
 
@@ -2232,8 +2251,7 @@ class TuningRunner:
             writer.writeheader()
             
             while current_cursor > stop_ts:
-                # 5. EXECUTE QUERY (String Injection - Proven to work)
-                # We do NOT use variables to avoid any parsing mismatch.
+                # 5. EXECUTE QUERY
                 query = f"""
                 query {{
                     orderFilledEvents(
@@ -2251,9 +2269,8 @@ class TuningRunner:
                     resp = session.post(GRAPH_URL, json={'query': query}, timeout=15)
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     
-                    # 6. HANDLE EMPTY ZONES (Gap Jumping)
                     if not data:
-                        # Probe for the next valid timestamp to teleport
+                        # Probe for next valid timestamp
                         probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
                         try:
                             p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
@@ -2262,15 +2279,15 @@ class TuningRunner:
                                 next_ts = int(p_data[0]['timestamp'])
                                 jump_diff = current_cursor - next_ts
                                 print(f"   🚀 Jumping gap ({jump_diff}s) -> {datetime.utcfromtimestamp(next_ts)}")
-                                current_cursor = next_ts + 1 # +1 to include it in next 'lt' query
+                                current_cursor = next_ts + 1 
                             else:
                                 print("   ✅ History exhausted.")
                                 break
                         except:
-                            current_cursor -= 1000 # Fallback
+                            current_cursor -= 1000 
                         continue
 
-                    # 7. PROCESS BATCH
+                    # 6. PROCESS
                     by_ts = defaultdict(list)
                     for row in data:
                         ts = int(row['timestamp'])
@@ -2287,7 +2304,7 @@ class TuningRunner:
 
                     total_scanned += len(data)
                     
-                    # 8. HANDLE DENSE BLOCK
+                    # 7. DRAIN DENSE BLOCK
                     if is_full_batch:
                         last_id = by_ts[oldest_ts][-1]['id']
                         process_and_write(by_ts[oldest_ts], writer)
@@ -2296,7 +2313,6 @@ class TuningRunner:
                             dq = f"""query {{ orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp: {oldest_ts}, id_lt: "{last_id}" }}) {{ id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled }} }}"""
                             dresp = session.post(GRAPH_URL, json={'query': dq}, timeout=15)
                             ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
-                            
                             if not ddata: break
                             
                             process_and_write(ddata, writer)
