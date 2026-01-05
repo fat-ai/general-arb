@@ -2142,165 +2142,175 @@ class TuningRunner:
         
         return all_market_trades
 
-    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
+    def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         import requests
         import csv
         import time
         from datetime import datetime
-        from decimal import Decimal, InvalidOperation # Import Decimal for precision
+        from decimal import Decimal
+        from collections import defaultdict
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
-        # --- 1. PREPARE TARGETS AS INTEGERS (SAFE) ---
+        # 1. PARSE TARGETS SAFELY
         valid_token_ints = set()
         for t in target_token_ids:
             try:
                 s = str(t).strip().lower()
-                if s in ["0", "null", "none"]: continue
-                
-                # Use Decimal to handle ANY numeric string safely, then cast to int
-                # This handles "1.23e+20" AND "123" without precision loss
-                if s.startswith("0x"): 
-                    val = int(s, 16)
-                else:
-                    val = int(Decimal(s))
+                if s in ["0", "null", "none", "nan"]: continue
+                if s.startswith("0x"): val = int(s, 16)
+                else: val = int(Decimal(s))
                 valid_token_ints.add(val)
             except: continue
 
-        print(f"   🎯 Global Fetcher configured with {len(valid_token_ints)} numeric targets.")
-        if len(valid_token_ints) == 0:
-            return pd.DataFrame()
+        print(f"   🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
+        if not valid_token_ints: return pd.DataFrame()
 
+        # 2. SETUP SESSION
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
-        
-        current_cursor = int(time.time())
-        start_ts = current_cursor - (days_back * 86400)
-        
         session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=5, backoff_factor=1))
-        session.mount("https://", adapter)
+        session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
 
+        # 3. PAGINATION STATE
+        current_cursor = int(time.time())
+        stop_ts = current_cursor - (days_back * 86400)
+        
         temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
         total_scanned = 0
-        debug_mismatches = 0 # Counter for debugging
+        
+        # We define a helper to process a list of raw API rows
+        def process_rows(rows_to_process, writer_obj):
+            captured_count = 0
+            out_rows = []
+            for r in rows_to_process:
+                try:
+                    # Precision-Safe Parsing
+                    m_raw = str(r['makerAssetId']).strip()
+                    t_raw = str(r['takerAssetId']).strip()
+                    
+                    if m_raw.startswith("0x"): m_int = int(m_raw, 16)
+                    else: m_int = int(Decimal(m_raw))
+
+                    if t_raw.startswith("0x"): t_int = int(t_raw, 16)
+                    else: t_int = int(Decimal(t_raw))
+
+                    # Matching
+                    tid = None; mult = 0
+                    if m_int in valid_token_ints:
+                        tid = m_int; mult = 1
+                        val_usdc = float(r['takerAmountFilled']) / 1e6
+                        val_size = float(r['makerAmountFilled']) / 1e18
+                    elif t_int in valid_token_ints:
+                        tid = t_int; mult = -1
+                        val_usdc = float(r['makerAmountFilled']) / 1e6
+                        val_size = float(r['takerAmountFilled']) / 1e18
+                    
+                    if tid and val_usdc > 0 and val_size > 0:
+                        price = val_usdc / val_size
+                        if 0.005 <= price <= 0.995:
+                            out_rows.append({
+                                'id': r['id'], 
+                                'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                'tradeAmount': val_usdc, 
+                                'outcomeTokensAmount': val_size * mult,
+                                'user': r['taker'], 
+                                'contract_id': str(tid),
+                                'price': price, 
+                                'size': val_size, 
+                                'side_mult': mult
+                            })
+                except: continue
+            
+            if out_rows:
+                writer_obj.writerows(out_rows)
+                captured_count = len(out_rows)
+            return captured_count
 
         with open(temp_file, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
             writer.writeheader()
             
-            while current_cursor > start_ts:
-                query = """
-                query($max_ts: Int!) {
-                    orderFilledEvents(
-                        first: 1000
-                        orderBy: timestamp
-                        orderDirection: desc
-                        where: { timestamp_lt: $max_ts }
-                    ) {
-                        id, timestamp, maker, taker
-                        makerAssetId, takerAssetId
-                        makerAmountFilled, takerAmountFilled
-                    }
-                }
-                """
+            while current_cursor > stop_ts:
+                # A. Main Query (Desc)
+                query = """query($max_ts: Int!) { orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: { timestamp_lt: $max_ts }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
+                
                 try:
-                    resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': int(current_cursor)}}, timeout=15)
-                    if resp.status_code != 200:
-                        time.sleep(2); continue
-                        
+                    resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': current_cursor}}, timeout=15)
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
-                    if not data: break
                     
-                    batch_rows = []
-                    min_ts_in_batch = current_cursor
-                    
+                    if not data:
+                        # Gap in data? Just move back 1 second to verify
+                        # (In dense markets, gaps are rare, but safe to step back)
+                        current_cursor -= 1
+                        continue
+
+                    # Group by Timestamp
+                    by_ts = defaultdict(list)
                     for row in data:
-                        ts_val = int(row['timestamp'])
-                        min_ts_in_batch = min(min_ts_in_batch, ts_val)
-                        if ts_val < start_ts: continue
-
-                        # [CRITICAL] SAFE PARSING
-                        try:
-                            m_raw = str(row['makerAssetId']).strip().lower()
-                            t_raw = str(row['takerAssetId']).strip().lower()
-                            
-                            # Parse Maker
-                            if m_raw.startswith("0x"): m_int = int(m_raw, 16)
-                            else: m_int = int(Decimal(m_raw)) # PRECISION SAFE
-
-                            # Parse Taker
-                            if t_raw.startswith("0x"): t_int = int(t_raw, 16)
-                            else: t_int = int(Decimal(t_raw)) # PRECISION SAFE
-                        
-                        except Exception as e:
-                            # Skip bad rows silently
-                            continue
-
-                        token_id_int = None
-                        side_mult = 0
-                        aggressor = row['taker']
-                        
-                        # MATCHING
-                        if m_int in valid_token_ints:
-                            token_id_int = m_int
-                            size_val = float(row['makerAmountFilled']) / 1e18
-                            usdc_val = float(row['takerAmountFilled']) / 1e6
-                            side_mult = 1
-                        
-                        elif t_int in valid_token_ints:
-                            token_id_int = t_int
-                            size_val = float(row['takerAmountFilled']) / 1e18
-                            usdc_val = float(row['makerAmountFilled']) / 1e6
-                            side_mult = -1
-                        
-                        else:
-                            # DEBUG: If no match found, print WHY for the first few failures
-                            # This removes the guessing.
-                            if debug_mismatches < 3 and m_int != 0 and t_int != 0:
-                                print(f"\n   [DEBUG MISMATCH] TS: {datetime.utcfromtimestamp(ts_val)}")
-                                print(f"      Maker ID: {m_int} (Type: {type(m_int)})")
-                                print(f"      Taker ID: {t_int} (Type: {type(t_int)})")
-                                # Check if it's close to a whitelist item (formatting check)
-                                sample = list(valid_token_ints)[0]
-                                print(f"      Whitelist Sample: {sample} (Type: {type(sample)})")
-                                debug_mismatches += 1
-                            continue
-
-                        if size_val > 0 and usdc_val > 0:
-                            price = usdc_val / size_val
-                            if 0.005 <= price <= 0.995:
-                                batch_rows.append({
-                                    'id': row['id'],
-                                    'timestamp': datetime.utcfromtimestamp(ts_val).isoformat(),
-                                    'tradeAmount': usdc_val,
-                                    'outcomeTokensAmount': size_val * side_mult,
-                                    'user': aggressor,
-                                    'contract_id': str(token_id_int), 
-                                    'price': price,
-                                    'size': size_val,
-                                    'side_mult': side_mult
-                                })
+                        ts = int(row['timestamp'])
+                        by_ts[ts].append(row)
                     
-                    if batch_rows:
-                        writer.writerows(batch_rows)
-                        total_captured += len(batch_rows)
+                    timestamps = sorted(by_ts.keys(), reverse=True) # Newest to Oldest
+                    min_ts_in_batch = timestamps[-1]
+                    
+                    # Logic: 
+                    # If batch is NOT full (len < 1000), we know we got everything.
+                    # If batch IS full (len == 1000), the oldest timestamp 'min_ts_in_batch' might be incomplete.
+                    
+                    is_full_batch = (len(data) >= 1000)
+                    
+                    # Process safe timestamps (Newer than the oldest one in the batch)
+                    for ts in timestamps:
+                        if is_full_batch and ts == min_ts_in_batch:
+                            # Skip processing the incomplete timestamp here
+                            continue
                         
-                    prev_cursor = current_cursor
-                    current_cursor = min_ts_in_batch
+                        count = process_rows(by_ts[ts], writer)
+                        total_captured += count
+
                     total_scanned += len(data)
                     
-                    if current_cursor >= prev_cursor: current_cursor -= 1
+                    # Handle the problematic oldest timestamp
+                    if is_full_batch:
+                        # We must "Drain" this specific second using SKIP to ensure we get everything
+                        print(f"   ⚠️ draining dense second: {min_ts_in_batch}...", end='\r')
                         
+                        skip_offset = 0
+                        while True:
+                            dq = """query($target_ts: Int!, $skip_val: Int!) { orderFilledEvents(first: 1000, skip: $skip_val, orderBy: timestamp, orderDirection: desc, where: { timestamp: $target_ts }) { id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled } }"""
+                            dresp = session.post(GRAPH_URL, json={'query': dq, 'variables': {'target_ts': min_ts_in_batch, 'skip_val': skip_offset}}, timeout=15)
+                            ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
+                            
+                            if not ddata: break
+                            
+                            count = process_rows(ddata, writer)
+                            total_captured += count
+                            total_scanned += len(ddata)
+                            skip_offset += 1000
+                            
+                            if len(ddata) < 1000: break # Drained
+                        
+                    else:
+                        # Batch wasn't full, so even the oldest timestamp was complete.
+                        # We just process it.
+                        count = process_rows(by_ts[min_ts_in_batch], writer)
+                        total_captured += count
+                        
+                    # Advance Cursor
+                    # Since we have fully handled 'min_ts_in_batch' (either via drain or because batch wasn't full)
+                    # We can safely move the cursor to that time.
+                    # Next iteration query uses 'lt', so it will strictly exclude what we just did.
+                    current_cursor = min_ts_in_batch
+                    
                     if total_scanned % 5000 == 0:
-                        dt_str = datetime.utcfromtimestamp(current_cursor).strftime('%Y-%m-%d')
-                        print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {dt_str} ...", end='\r')
+                        print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {datetime.utcfromtimestamp(current_cursor)}", end='\r')
 
                 except Exception as e:
                     print(f"   ⚠️ Stream Error: {e}")
                     time.sleep(1)
 
-        print(f"\n   ✅ Global Fetch Complete. Captured {total_captured} trades.")
+        print(f"\n   ✅ Capture Complete: {total_captured} trades.")
         if total_captured > 0:
             if cache_file.exists(): 
                 try: os.remove(cache_file)
