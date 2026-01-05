@@ -2220,9 +2220,12 @@ class TuningRunner:
 
     def _fetch_gamma_trades_parallel(self, target_token_ids, days_back=200):
         """
-        GLOBAL ORDERBOOK FETCH:
-        Queries the Subgraph by timestamp globally, rather than iterating tokens.
-        Significantly faster and more robust against 429 errors.
+        GLOBAL FETCH (COLLATERAL AGNOSTIC + INTEGER MATH):
+        1. Accepts 2026 Date (Starts from time.time()).
+        2. FIXES '0 Trades' by being Collateral Agnostic (Removes hardcoded USDC check).
+           - Matches if EITHER asset is in your target list.
+        3. FIXES ID Mismatch by using Integer Comparison (int(10) == int("0xa")).
+        4. Prints the FIRST rejected row to debug exactly what the API is sending.
         """
         import requests
         import csv
@@ -2231,39 +2234,41 @@ class TuningRunner:
         
         cache_file = self.cache_dir / "gamma_trades_stream.csv"
         
-        valid_tokens = set()
+        # --- 1. PREPARE TARGETS AS INTEGERS ---
+        # Convert all target IDs to Python Integers.
+        # This is the "Nuclear Option" for matching: it makes format irrelevant.
+        valid_token_ints = set()
         for t in target_token_ids:
-            s = str(t).strip().lower()
-            if s.startswith("0x"):
-                try: valid_tokens.add(str(int(s, 16)))
-                except: valid_tokens.add(s)
-            else:
-                valid_tokens.add(s)
+            try:
+                s = str(t).strip().lower()
+                if s.startswith("0x"): valid_token_ints.add(int(s, 16))
+                else: valid_token_ints.add(int(s))
+            except: continue
 
-        print(f"   🎯 Global Fetcher targets {len(valid_tokens)} tokens (Normalized)...")
+        print(f"   🎯 Global Fetcher targets {len(valid_token_ints)} tokens (Normalized to Integers)...")
 
-        # Constants
+        # Setup API
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
-        USDC_ADDR = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174" # Polygon USDC
         
-        # Time Window
-        end_ts = int(time.time())
-        start_ts = int((datetime.now() - timedelta(days=days_back)).timestamp())
-        
-        current_cursor = end_ts
-        FINAL_COLS = ['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 
-                      'contract_id', 'price', 'size', 'side_mult']
+        # Start from NOW (Jan 5 2026)
+        current_cursor = int(time.time())
+        start_ts = current_cursor - (days_back * 86400)
         
         session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=5, backoff_factor=1))
         session.mount("https://", adapter)
 
-        # We write to a temp file first
         temp_file = cache_file.with_suffix(".tmp.csv")
         total_captured = 0
+        total_scanned = 0
         
+        # DEBUG FLAGS
+        has_printed_debug = False
+        
+        print(f"   ⏳ Streaming: {datetime.utcfromtimestamp(start_ts).date()} -> {datetime.utcfromtimestamp(current_cursor).date()}")
+
         with open(temp_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=FINAL_COLS)
+            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
             writer.writeheader()
             
             while current_cursor > start_ts:
@@ -2275,28 +2280,21 @@ class TuningRunner:
                         orderDirection: desc
                         where: { timestamp_lt: $max_ts }
                     ) {
-                        id
-                        timestamp
-                        maker
-                        taker
-                        makerAssetId
-                        takerAssetId
-                        makerAmountFilled
-                        takerAmountFilled
+                        id, timestamp, maker, taker
+                        makerAssetId, takerAssetId
+                        makerAmountFilled, takerAmountFilled
                     }
                 }
                 """
                 
                 try:
-                    resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': int(current_cursor)}}, timeout=20)
+                    resp = session.post(GRAPH_URL, json={'query': query, 'variables': {'max_ts': int(current_cursor)}}, timeout=15)
                     if resp.status_code != 200:
-                        print(f"   ⚠️ API Error {resp.status_code}. Retrying...")
-                        time.sleep(2)
-                        continue
+                        time.sleep(2); continue
                         
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
                     if not data:
-                        print("   ⚠️ No more data returned.")
+                        print(f"\n   ✅ End of data stream at {datetime.utcfromtimestamp(current_cursor).date()}.")
                         break
                     
                     batch_rows = []
@@ -2305,93 +2303,96 @@ class TuningRunner:
                     for row in data:
                         ts_val = int(row['timestamp'])
                         min_ts_in_batch = min(min_ts_in_batch, ts_val)
-                        
                         if ts_val < start_ts: continue
 
-                        # Logic: Identify Side based on USDC
-                        # makerAssetId, takerAssetId. One is USDC, one is Token.
-                        m_asset = str(row['makerAssetId']).lower()
-                        t_asset = str(row['takerAssetId']).lower()
-                        
-                        is_maker_usdc = (USDC_ADDR.lower() in m_asset)
-                        is_taker_usdc = (USDC_ADDR.lower() in t_asset)
-                        
-                        if is_maker_usdc and not is_taker_usdc:
-                            # Maker gave USDC, Taker gave Token.
-                            # Taker SOLD Token.
-                            token_id = normalize_contract_id(t_asset)
-                            usdc_val = float(row['makerAmountFilled']) / 1e6
-                            size_val = float(row['takerAmountFilled']) / 1e18
-                            side_mult = -1 # Sell
-                            aggressor = row['taker']
+                        # --- ROBUST PARSING ---
+                        try:
+                            m_raw = str(row['makerAssetId']).strip().lower()
+                            t_raw = str(row['takerAssetId']).strip().lower()
                             
-                        elif is_taker_usdc and not is_maker_usdc:
-                            # Taker gave USDC, Maker gave Token.
-                            # Taker BOUGHT Token.
-                            token_id = normalize_contract_id(m_asset)
-                            usdc_val = float(row['takerAmountFilled']) / 1e6
-                            size_val = float(row['makerAmountFilled']) / 1e18
-                            side_mult = 1 # Buy
-                            aggressor = row['taker']
-                        else:
-                            # Non-standard trade (e.g. Token-Token or Unknown)
-                            continue
-                            
-                        if token_hex.startswith("0x"):
-                            try: token_id_dec = str(int(token_hex, 16))
-                            except: token_id_dec = token_hex
-                        else:
-                            token_id_dec = token_hex
-                            
-                        if token_id_dec not in valid_tokens:
-                            continue
-                
-                        if size_val <= 0 or usdc_val <= 0: continue
-                        price = usdc_val / size_val
-                        if not (0.005 <= price <= 0.995): continue # Sanity check
+                            # Convert Subgraph IDs to Integers
+                            m_int = int(m_raw, 16) if m_raw.startswith("0x") else int(m_raw)
+                            t_int = int(t_raw, 16) if t_raw.startswith("0x") else int(t_raw)
+                        except:
+                            continue # Skip malformed rows
 
-                        batch_rows.append({
-                            'id': row['id'],
-                            'timestamp': datetime.utcfromtimestamp(ts_val).isoformat(),
-                            'tradeAmount': usdc_val,
-                            'outcomeTokensAmount': size_val * side_mult,
-                            'user': aggressor,
-                            'contract_id': token_id,
-                            'price': price,
-                            'size': size_val,
-                            'side_mult': side_mult
-                        })
+                        # --- COLLATERAL AGNOSTIC MATCHING ---
+                        # We don't check for USDC address. We check if ONE of the assets is our Target.
+                        token_id_int = None
+                        side_mult = 0
+                        aggressor = row['taker']
+                        
+                        if m_int in valid_token_ints:
+                            # Maker has Target Token -> Taker BOUGHT Token (gave collateral)
+                            token_id_int = m_int
+                            size_val = float(row['makerAmountFilled']) / 1e18 # Token
+                            usdc_val = float(row['takerAmountFilled']) / 1e6  # Collateral
+                            side_mult = 1
+                        
+                        elif t_int in valid_token_ints:
+                            # Taker has Target Token -> Taker SOLD Token (got collateral)
+                            token_id_int = t_int
+                            size_val = float(row['takerAmountFilled']) / 1e18 # Token
+                            usdc_val = float(row['makerAmountFilled']) / 1e6  # Collateral
+                            side_mult = -1
+                        
+                        else:
+                            # Neither asset is in our target list.
+                            # DEBUG: Print the FIRST rejection to prove what data we are seeing
+                            if not has_printed_debug:
+                                print(f"\n   [DEBUG REJECT] TS: {datetime.utcfromtimestamp(ts_val)}")
+                                print(f"      MakerAsset: {m_raw} (Int: {m_int})")
+                                print(f"      TakerAsset: {t_raw} (Int: {t_int})")
+                                print(f"      Reason: Neither Int matched known targets.")
+                                has_printed_debug = True
+                            continue
+
+                        # If we get here, we have a match
+                        if size_val > 0 and usdc_val > 0:
+                            price = usdc_val / size_val
+                            if 0.005 <= price <= 0.995:
+                                batch_rows.append({
+                                    'id': row['id'],
+                                    'timestamp': datetime.utcfromtimestamp(ts_val).isoformat(),
+                                    'tradeAmount': usdc_val,
+                                    'outcomeTokensAmount': size_val * side_mult,
+                                    'user': aggressor,
+                                    'contract_id': str(token_id_int), # Store as Decimal String
+                                    'price': price,
+                                    'size': size_val,
+                                    'side_mult': side_mult
+                                })
                     
                     if batch_rows:
                         writer.writerows(batch_rows)
                         total_captured += len(batch_rows)
                         
-                    # Move Cursor
                     prev_cursor = current_cursor
                     current_cursor = min_ts_in_batch
+                    total_scanned += len(data)
                     
-                    # If cursor didn't move (all events in same second), decrement
                     if current_cursor >= prev_cursor:
                         current_cursor -= 1
                         
-                    if total_captured % 5000 == 0:
+                    if total_scanned % 5000 == 0:
+                        # Print SCANNED count so you see progress
                         dt_str = datetime.utcfromtimestamp(current_cursor).strftime('%Y-%m-%d')
-                        print(f"   📉 Global Fetch: {total_captured} trades. Cursor: {dt_str} ...", end='\r')
+                        print(f"   📉 Scanned: {total_scanned} | Found: {total_captured} | Cursor: {dt_str} ...", end='\r')
 
                 except Exception as e:
-                    print(f"   ⚠️ Chunk Error: {e}")
+                    print(f"   ⚠️ Stream Error: {e}")
                     time.sleep(1)
 
         print(f"\n   ✅ Global Fetch Complete. Captured {total_captured} trades.")
         
-        # Swap files
         if total_captured > 0:
-            if cache_file.exists(): os.remove(cache_file)
+            if cache_file.exists(): 
+                try: os.remove(cache_file)
+                except: pass
             os.rename(temp_file, cache_file)
             return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
-        else:
-            if temp_file.exists(): os.remove(temp_file)
-            return pd.DataFrame()
+        
+        return pd.DataFrame()
         
     def _fetch_subgraph_trades(self, days_back=365):
         import time
