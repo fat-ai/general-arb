@@ -1612,7 +1612,7 @@ class TuningRunner:
         log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
     
         safe_train = max(5, int(total_days * 0.33))
-        safe_test = max(5, int(total_days * 0.60))
+        safe_test = max(5, int(total_days * 0.65))
         required_days = safe_train + safe_test + 2
         
         if total_days < required_days:
