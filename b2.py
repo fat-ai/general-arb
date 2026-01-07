@@ -2187,6 +2187,7 @@ class TuningRunner:
         stop_ts = current_cursor - (days_back * 86400)
         total_captured = 0
         total_scanned = 0
+        total_dropped = 0
         batch_count = 0
 
         # Helper: Write rows
@@ -2194,6 +2195,11 @@ class TuningRunner:
             out_rows = []
             for r in rows_in:
                 try:
+                    
+                    if r.get('maker') == r.get('taker'):
+                        total_dropped += 1
+                        continue
+                        
                     m_raw = str(r.get('makerAssetId', '0')).strip()
                     if m_raw.startswith("0x"): m_int = int(m_raw, 16)
                     else: m_int = int(Decimal(m_raw))
@@ -2216,6 +2222,12 @@ class TuningRunner:
                     
                     if tid and val_usdc > 0 and val_size > 0:
                         price = val_usdc / val_size
+                        if price > 1.00: 
+                            total_dropped += 1
+                            continue
+                        if price < 0.000001:
+                            total_dropped += 1
+                            continue
                         out_rows.append({
                                 'id': r['id'], 
                                 'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
@@ -2325,7 +2337,7 @@ class TuningRunner:
                     # UPDATE LINE
                     f.flush()
                     os.fsync(f.fileno())
-                    print(f" | Tot: {total_captured}")
+                    print(f" | Tot: {total_captured} | 🗑️ Dropped: {total_dropped}")
 
                 except Exception as e:
                     print(f"\n❌ ERROR: {e}")
