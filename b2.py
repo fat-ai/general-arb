@@ -2477,28 +2477,40 @@ class TuningRunner:
             }
             """
             
-            try:
-                resp = requests.post(URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=30)
-                if resp.status_code != 200:
-                    print(f"   ⚠️ Stats fetch failed: {resp.status_code}")
-                    break
+            success = False
+            for attempt in range(5):  # Try up to 5 times
+                try:
+                    # Use 'session.post' instead of 'requests.post'
+                    resp = session.post(URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=60)
                     
-                data = resp.json().get('data', {}).get('orderbooks', [])
-                if not data: break
-                
-                for row in data:
-                    all_stats.append({
-                        'contract_id': row['id'],
-                        'total_volume': float(row.get('scaledCollateralVolume', 0) or 0),
-                        'total_trades': int(row.get('tradesQuantity', 0) or 0)
-                    })
-                
-                last_id = data[-1]['id']
-                print(f"   Fetched {len(all_stats)} stats...", end='\r')
-                
-            except Exception as e:
-                print(f"   ⚠️ Stats fetch error: {e}")
+                    if resp.status_code == 200:
+                        success = True
+                        break  # Success! Exit the retry loop
+                    else:
+                        print(f"   ⚠️ API Error {resp.status_code}. Retrying in {2**attempt}s...")
+                        time.sleep(2 ** attempt) # Exponential Backoff: 1s, 2s, 4s...
+                except Exception as e:
+                    print(f"   ⚠️ Network Error: {e}. Retrying in {2**attempt}s...")
+                    time.sleep(2 ** attempt)
+            
+            if not success:
+                print("   ❌ Critical: Max retries exceeded. Aborting fetch.")
                 break
+
+            # Proceed with processing (resp is guaranteed to be 200 OK here)
+            data = resp.json().get('data', {}).get('orderbooks', [])
+            if not data: break
+                
+            for row in data:
+                all_stats.append({
+                    'contract_id': row['id'],
+                    'total_volume': float(row.get('scaledCollateralVolume', 0) or 0),
+                    'total_trades': int(row.get('tradesQuantity', 0) or 0)
+                })
+                
+            last_id = data[-1]['id']
+            print(f"   Fetched {len(all_stats)} stats...", end='\r')
+                
         
         print(f"\n   ✅ Loaded stats for {len(all_stats)} tokens.")
         df = pd.DataFrame(all_stats)
