@@ -2456,7 +2456,11 @@ class TuningRunner:
         URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
         all_stats = []
         last_id = ""
-        
+    
+        session = requests.Session()
+        # Retry connection errors/status codes (500, 502, 503, 504) automatically
+        retries = requests.adapters.Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         while True:
             query = """
             query($last_id: String!) {
