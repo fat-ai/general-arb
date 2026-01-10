@@ -1425,12 +1425,11 @@ class TuningRunner:
             "side_mult": pl.Float32
         }
 
-        # --- THE FIX: Use the Batched Reader ---
-        # This prevents Polars from trying to "optimize" the plan by reading too much ahead.
+        # Use Batched Reader to strictly limit RAM usage
         reader = pl.read_csv_batched(
             str(csv_path), 
             schema_overrides=dtypes, 
-            batch_size=50000,   # Process 50k rows at a time (approx 10-20MB RAM)
+            batch_size=50000, 
             ignore_errors=True
         )
 
@@ -1438,13 +1437,13 @@ class TuningRunner:
         chunks_processed = 0
 
         while True:
-            chunks = reader.next_batches(1) # Read 1 batch
+            chunks = reader.next_batches(1) 
             if not chunks:
                 break
             
             chunk = chunks[0]
             
-            # Perform your cleanups on this small chunk
+            # Data Cleanup
             chunk = chunk.with_columns([
                 pl.col("timestamp").str.to_datetime(strict=False).dt.replace_time_zone(None),
                 pl.col("contract_id").cast(pl.Categorical),
@@ -1454,12 +1453,13 @@ class TuningRunner:
             # Convert to PyArrow Table
             pa_table = chunk.to_arrow()
 
-            # Initialize Parquet Writer with the schema of the first chunk
+            # Initialize Writer
             if writer is None:
                 writer = pq.ParquetWriter(
                     str(parquet_path), 
                     pa_table.schema, 
-                    compression='snappy'
+                    compression='snappy',
+                    version='1.0'  # <--- CRITICAL FIX: Forces compatibility with Polars
                 )
             
             writer.write_table(pa_table)
@@ -1472,7 +1472,7 @@ class TuningRunner:
             writer.close()
             
         print(f"\n✅ Success! Saved optimized data to {parquet_path.name}")
-    
+        
     def _fast_load_trades(self, csv_path, start_date, end_date):
         import polars as pl
         import pandas as pd
