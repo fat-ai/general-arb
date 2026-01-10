@@ -1499,9 +1499,9 @@ class TuningRunner:
 
                 # 3. Convert to Pandas safely
                 try:
-                    pdf = df.to_pandas(use_pyarrow_extension_array=True)
+                    pdf = df.to_pandas(use_pyarrow_extension_array=True, split_blocks=True, self_destruct=True)
                 except TypeError:
-                    pdf = df.to_pandas()
+                    pdf = df.to_pandas(use_pyarrow_extension_array=True)
                 
                 del df
                 gc.collect() 
@@ -1690,7 +1690,7 @@ class TuningRunner:
             
             # --- CRITICAL FIXES ---
             #max_concurrent_trials=max_parallel,
-            max_concurrent_trials=4,
+            max_concurrent_trials=2,
             resources_per_trial={"cpu": 1},
             # ----------------------
         )
@@ -1870,8 +1870,8 @@ class TuningRunner:
 
         print("   Synchronizing data...")
         trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        trades['contract_id'] = trades['contract_id'].str.strip().apply(normalize_contract_id)
-        trades['user'] = trades['user'].astype(str).str.strip()
+        #trades['contract_id'] = trades['contract_id'].str.strip().apply(normalize_contract_id)
+        #trades['user'] = trades['user'].astype(str).str.strip()
         
         float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
         for c in float_cols:
