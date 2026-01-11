@@ -1482,65 +1482,86 @@ class TuningRunner:
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Reading {parquet_path.name} using PyArrow...")
+        print(f"⚡ FAST LOAD: Iterative Batch Reading of {parquet_path.name}...")
         print(f"   Target Range: {start_date} to {end_date}")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
             return pd.DataFrame()
 
-        # 1. Define Filters (Predicate Pushdown)
-        # This prevents loading rows outside your date range
-        filters = [
-            ('timestamp', '>=', pd.Timestamp(start_date)),
-            ('timestamp', '<=', pd.Timestamp(end_date)),
-            ('tradeAmount', '>=', 1.0)  # Filter small trades at source
+        # Define explicit columns to save RAM (only load what we need)
+        columns = [
+            'id', 'contract_id', 'user', 'tradeAmount', 
+            'price', 'size', 'outcomeTokensAmount', 'timestamp'
         ]
         
+        # timestamps for fast filtering
+        ts_start = pd.Timestamp(start_date)
+        ts_end = pd.Timestamp(end_date)
+        
+        accumulated_frames = []
+        total_rows_loaded = 0
+        
         try:
-            # 2. Read into PyArrow Table (Efficient C++ Load)
-            # We select only the columns we need
-            columns = [
-                'id', 'contract_id', 'user', 'tradeAmount', 
-                'price', 'size', 'outcomeTokensAmount', 'timestamp'
-            ]
+            # 1. Open the file without reading data
+            parquet_file = pq.ParquetFile(parquet_path)
             
-            # Using PyArrow directly bypasses the Polars version conflict
-            table = pq.read_table(
-                parquet_path, 
-                columns=columns, 
-                filters=filters
-            )
+            # 2. Iterate row groups (SAFE MEMORY USAGE)
+            # We read roughly 100k rows at a time
+            for batch in parquet_file.iter_batches(batch_size=100_000, columns=columns):
+                
+                # Convert this small batch to Pandas
+                # split_blocks=True helps preventing memory fragmentation
+                df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
+                
+                # 3. IMMEDIATE FILTERING (The Key Step)
+                # Drop rows immediately before they accumulate memory
+                if 'timestamp' in df_chunk.columns and not df_chunk.empty:
+                    mask = (
+                        (df_chunk['timestamp'] >= ts_start) & 
+                        (df_chunk['timestamp'] <= ts_end) & 
+                        (df_chunk['tradeAmount'] >= 1.0)
+                    )
+                    df_chunk = df_chunk[mask]
+                
+                # If chunk is not empty after filtering, save it
+                if not df_chunk.empty:
+                    # Optimize types immediately
+                    f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
+                    for c in f32_cols:
+                        if c in df_chunk.columns:
+                            df_chunk[c] = df_chunk[c].astype('float32')
+                            
+                    accumulated_frames.append(df_chunk)
+                    total_rows_loaded += len(df_chunk)
+                    
+                # Periodic print to show progress (and prove it's not hung)
+                if total_rows_loaded % 200_000 == 0 and total_rows_loaded > 0:
+                     print(f"   ...loaded {total_rows_loaded} valid rows", end='\r')
+
+            print(f"\n   ✅ Batch read complete. Merging {len(accumulated_frames)} chunks...")
             
-            rows = len(table)
-            print(f"   ✅ Read {rows} rows from disk. Converting to Pandas...")
-            
-            if rows == 0:
+            if not accumulated_frames:
+                print("   ⚠️ No trades matched criteria.")
                 return pd.DataFrame(columns=columns)
 
-            # 3. Convert to Pandas with Categorical Optimization
-            # This is CRITICAL for 64GB RAM. It compresses the strings instantly.
-            df = table.to_pandas(
-                categories=['contract_id', 'user'], 
-                split_blocks=True,      # Optimization for large memory
-                self_destruct=True      # Frees PyArrow memory as it creates Pandas
-            )
+            # 4. Final Merge
+            final_df = pd.concat(accumulated_frames, ignore_index=True)
             
-            # 4. Final Type Safety Check
-            # Ensure float32 is maintained to save RAM
-            f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
-            for c in f32_cols:
-                if c in df.columns:
-                    df[c] = df[c].astype('float32')
+            # 5. Final Categorical Optimization (Done ONCE at the end)
+            final_df['contract_id'] = final_df['contract_id'].astype('category')
+            final_df['user'] = final_df['user'].astype('category')
 
-            print(f"   ✅ DataFrame Ready: {len(df)} rows loaded.")
+            print(f"   ✅ DataFrame Ready: {len(final_df)} rows loaded.")
             
-            del table
+            # Cleanup
+            del accumulated_frames
             gc.collect()
-            return df
+            
+            return final_df
             
         except Exception as e:
-            print(f"❌ PyArrow Loader Failed: {e}")
+            print(f"❌ Batch Loader Failed: {e}")
             import traceback
             traceback.print_exc()
             return pd.DataFrame()
