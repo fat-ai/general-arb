@@ -1386,7 +1386,7 @@ class TuningRunner:
     def _convert_csv_to_parquet(self):
         """
         Memory-Safe Conversion: Reads CSV in small chunks and appends to Parquet.
-        Safe for 80GB+ files on 16GB+ RAM.
+        FIXED: Uses Parquet 1.0 compatibility to prevent Polars 'Plain encoding' errors.
         """
         import polars as pl
         import pyarrow as pa
@@ -1405,14 +1405,14 @@ class TuningRunner:
                 return
             print(f"🔄 CSV has changed. Updating Parquet...")
         
-        # Remove old file
+        # Remove old file to ensure clean write
         if parquet_path.exists():
             try: os.remove(parquet_path)
             except: pass
 
-        print(f"🚀 Starting Chunked Conversion (Low RAM Mode)...")
+        print(f"🚀 Starting Chunked Conversion (Low RAM + Compatible Mode)...")
 
-        # Define Schema explicitly to save inference overhead
+        # Define Schema explicitly
         dtypes = {
             "id": pl.String,
             "contract_id": pl.String,
@@ -1425,7 +1425,7 @@ class TuningRunner:
             "side_mult": pl.Float32
         }
 
-        # Use Batched Reader to strictly limit RAM usage
+        # Use Batched Reader
         reader = pl.read_csv_batched(
             str(csv_path), 
             schema_overrides=dtypes, 
@@ -1446,20 +1446,22 @@ class TuningRunner:
             # Data Cleanup
             chunk = chunk.with_columns([
                 pl.col("timestamp").str.to_datetime(strict=False).dt.replace_time_zone(None),
-                pl.col("contract_id").cast(pl.Categorical),
-                pl.col("user").cast(pl.Categorical),
+                pl.col("contract_id").cast(pl.String), 
+                pl.col("user").cast(pl.String),
             ]).filter(pl.col("timestamp").is_not_null())
 
             # Convert to PyArrow Table
             pa_table = chunk.to_arrow()
 
-            # Initialize Writer
+            # Initialize Writer with COMPATIBILITY options
             if writer is None:
                 writer = pq.ParquetWriter(
                     str(parquet_path), 
                     pa_table.schema, 
                     compression='snappy',
-                    version='1.0'  # <--- CRITICAL FIX: Forces compatibility with Polars
+                    version='1.0',          # Forces legacy format Polars can definitely read
+                    use_dictionary=False,   # Disables dictionary encoding (often the cause of "Plain" errors)
+                    write_statistics=False  # Reduces overhead
                 )
             
             writer.write_table(pa_table)
@@ -1471,7 +1473,7 @@ class TuningRunner:
         if writer:
             writer.close()
             
-        print(f"\n✅ Success! Saved optimized data to {parquet_path.name}")
+        print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
         
     def _fast_load_trades(self, csv_path, start_date, end_date):
         import polars as pl
