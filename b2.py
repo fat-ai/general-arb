@@ -1482,20 +1482,20 @@ class TuningRunner:
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Iterative Batch Reading of {parquet_path.name}...")
+        print(f"⚡ FAST LOAD: Memory-Optimized Batch Reading...")
         print(f"   Target Range: {start_date} to {end_date}")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
             return pd.DataFrame()
 
-        # Define explicit columns to save RAM (only load what we need)
+        # 1. OPTIMIZATION: Only load strictly necessary columns
+        # Dropped 'id' (transaction hash) because it is high-cardinality string bloat
         columns = [
-            'id', 'contract_id', 'user', 'tradeAmount', 
+            'contract_id', 'user', 'tradeAmount', 
             'price', 'size', 'outcomeTokensAmount', 'timestamp'
         ]
         
-        # timestamps for fast filtering
         ts_start = pd.Timestamp(start_date)
         ts_end = pd.Timestamp(end_date)
         
@@ -1503,19 +1503,15 @@ class TuningRunner:
         total_rows_loaded = 0
         
         try:
-            # 1. Open the file without reading data
             parquet_file = pq.ParquetFile(parquet_path)
             
-            # 2. Iterate row groups (SAFE MEMORY USAGE)
-            # We read roughly 100k rows at a time
-            for batch in parquet_file.iter_batches(batch_size=100_000, columns=columns):
+            # 2. Iterate in smaller chunks (50k rows)
+            for i, batch in enumerate(parquet_file.iter_batches(batch_size=50_000, columns=columns)):
                 
-                # Convert this small batch to Pandas
-                # split_blocks=True helps preventing memory fragmentation
+                # Convert to Pandas
                 df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
                 
-                # 3. IMMEDIATE FILTERING (The Key Step)
-                # Drop rows immediately before they accumulate memory
+                # 3. Filter Immediately
                 if 'timestamp' in df_chunk.columns and not df_chunk.empty:
                     mask = (
                         (df_chunk['timestamp'] >= ts_start) & 
@@ -1524,9 +1520,13 @@ class TuningRunner:
                     )
                     df_chunk = df_chunk[mask]
                 
-                # If chunk is not empty after filtering, save it
                 if not df_chunk.empty:
-                    # Optimize types immediately
+                    # 4. CRITICAL: Optimize Types *BEFORE* Accumulating
+                    # This prevents holding millions of raw strings in RAM
+                    df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
+                    df_chunk['user'] = df_chunk['user'].astype('category')
+                    
+                    # Downcast floats
                     f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
                     for c in f32_cols:
                         if c in df_chunk.columns:
@@ -1535,7 +1535,10 @@ class TuningRunner:
                     accumulated_frames.append(df_chunk)
                     total_rows_loaded += len(df_chunk)
                     
-                # Periodic print to show progress (and prove it's not hung)
+                # Force Garbage Collection every 10 chunks to prevent creep
+                if i % 10 == 0:
+                    gc.collect()
+                    
                 if total_rows_loaded % 200_000 == 0 and total_rows_loaded > 0:
                      print(f"   ...loaded {total_rows_loaded} valid rows", end='\r')
 
@@ -1545,19 +1548,13 @@ class TuningRunner:
                 print("   ⚠️ No trades matched criteria.")
                 return pd.DataFrame(columns=columns)
 
-            # 4. Final Merge
+            # 5. Concatenate (Now much safer because chunks are pre-compressed)
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
-            # 5. Final Categorical Optimization (Done ONCE at the end)
-            final_df['contract_id'] = final_df['contract_id'].astype('category')
-            final_df['user'] = final_df['user'].astype('category')
-
             print(f"   ✅ DataFrame Ready: {len(final_df)} rows loaded.")
             
-            # Cleanup
             del accumulated_frames
             gc.collect()
-            
             return final_df
             
         except Exception as e:
