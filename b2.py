@@ -1489,11 +1489,11 @@ class TuningRunner:
             print("❌ Parquet file missing.")
             return pd.DataFrame()
 
-        # 1. OPTIMIZATION: Only load strictly necessary columns
-        # Dropped 'id' (transaction hash) because it is high-cardinality string bloat
+        # 1. OPTIMIZATION: Added 'side_mult' back to the list
         columns = [
             'contract_id', 'user', 'tradeAmount', 
-            'price', 'size', 'outcomeTokensAmount', 'timestamp'
+            'price', 'size', 'outcomeTokensAmount', 
+            'timestamp', 'side_mult'  # <--- FIXED: Added back
         ]
         
         ts_start = pd.Timestamp(start_date)
@@ -1505,7 +1505,7 @@ class TuningRunner:
         try:
             parquet_file = pq.ParquetFile(parquet_path)
             
-            # 2. Iterate in smaller chunks (50k rows)
+            # 2. Iterate in smaller chunks
             for i, batch in enumerate(parquet_file.iter_batches(batch_size=50_000, columns=columns)):
                 
                 # Convert to Pandas
@@ -1521,13 +1521,12 @@ class TuningRunner:
                     df_chunk = df_chunk[mask]
                 
                 if not df_chunk.empty:
-                    # 4. CRITICAL: Optimize Types *BEFORE* Accumulating
-                    # This prevents holding millions of raw strings in RAM
+                    # 4. Optimize Types *BEFORE* Accumulating
                     df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
                     df_chunk['user'] = df_chunk['user'].astype('category')
                     
-                    # Downcast floats
-                    f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
+                    # Downcast floats (Added 'side_mult' here too)
+                    f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount', 'side_mult']
                     for c in f32_cols:
                         if c in df_chunk.columns:
                             df_chunk[c] = df_chunk[c].astype('float32')
@@ -1535,7 +1534,7 @@ class TuningRunner:
                     accumulated_frames.append(df_chunk)
                     total_rows_loaded += len(df_chunk)
                     
-                # Force Garbage Collection every 10 chunks to prevent creep
+                # Force Garbage Collection every 10 chunks
                 if i % 10 == 0:
                     gc.collect()
                     
@@ -1548,7 +1547,7 @@ class TuningRunner:
                 print("   ⚠️ No trades matched criteria.")
                 return pd.DataFrame(columns=columns)
 
-            # 5. Concatenate (Now much safer because chunks are pre-compressed)
+            # 5. Concatenate
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
             print(f"   ✅ DataFrame Ready: {len(final_df)} rows loaded.")
