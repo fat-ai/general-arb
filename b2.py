@@ -1482,7 +1482,7 @@ class TuningRunner:
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Memory-Optimized Batch Reading...")
+        print(f"⚡ FAST LOAD: Processing in 50k chunks (Full Optimization)...")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
@@ -1510,31 +1510,42 @@ class TuningRunner:
                 
                 df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
                 
-                if 'timestamp' in df_chunk.columns and not df_chunk.empty:
-                    # 1. Date & Size Filter
+                # 1. OPTIMIZE TIMESTAMP IMMEDIATELY (The Fix)
+                # Doing this here on 50k rows costs 0 RAM. 
+                # Doing it later on 50M rows causes OOM.
+                if 'timestamp' in df_chunk.columns:
+                    df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], errors='coerce')
+                    if df_chunk['timestamp'].dt.tz is not None:
+                         df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
+
+                if not df_chunk.empty:
+                    # 2. Date & Size Filter
                     mask = (
                         (df_chunk['timestamp'] >= ts_start) & 
                         (df_chunk['timestamp'] <= ts_end) & 
                         (df_chunk['tradeAmount'] >= 1.0)
                     )
                     
-                    # 2. Whitelist Filter (Prevents loading garbage)
+                    # 3. Whitelist Filter
                     if allowed_set is not None:
                          mask = mask & df_chunk['contract_id'].astype(str).isin(allowed_set)
 
-                    df_chunk = df_chunk[mask]
+                    df_chunk = df_chunk[mask].copy()
                 
                 if not df_chunk.empty:
-                    # 3. CHUNK DEDUP (The Fix)
-                    # Deduplicate this small chunk immediately. 
-                    # This catches 99% of duplicates (overlap between fetch pages) without RAM spike.
+                    # 4. Deduplicate Chunk
                     df_chunk.drop_duplicates(
                         subset=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
                         keep='first', 
                         inplace=True
                     )
+                    
+                    # 5. Fill NAs & Optimize Types
+                    df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
+                    for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
+                        if col in df_chunk.columns:
+                            df_chunk[col] = df_chunk[col].fillna(0.0)
 
-                    # Optimize Types
                     df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
                     df_chunk['user'] = df_chunk['user'].astype('category')
                     
@@ -1853,7 +1864,7 @@ class TuningRunner:
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        # 1. MARKETS (Get Metadata)
+        # 1. MARKETS
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
 
         if market_file_path.exists():
@@ -1885,8 +1896,7 @@ class TuningRunner:
         if 'condition_id' not in markets.columns:
             markets['condition_id'] = markets['contract_id']
 
-        # --- MEMORY FIX: Explode Markets EARLY ---
-        # We explode markets NOW so we can pass the specific Token IDs to the trade loader.
+        # --- EXPLODE MARKETS (Early) ---
         markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
         
@@ -1905,14 +1915,12 @@ class TuningRunner:
         markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
 
         # ---------------------------------------------------------
-        # 2. TRADES (Filtered Load)
+        # 2. TRADES
         # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
-        
-        # Pass the Valid IDs (now exploded) to the loader
-        # This prevents loading "ghost" trades that don't match our tokens
         valid_market_ids = set(markets['contract_id'].unique())
         
+        # Load Trades (Data is now CLEAN and TYPED coming out of this)
         trades = self._fast_load_trades(
             trades_file, 
             FIXED_START_DATE, 
@@ -1925,35 +1933,19 @@ class TuningRunner:
             return pd.DataFrame(), pd.DataFrame()
 
         # ---------------------------------------------------------
-        # 3. CLEANUP & SYNC
+        # 3. FINAL SYNC (Zero Copy)
         # ---------------------------------------------------------
         print("   Synchronizing data...")
         
-        # Optimize Timestamp
-        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-            trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce')
-        if trades['timestamp'].dt.tz is not None:
-             trades['timestamp'] = trades['timestamp'].dt.tz_localize(None)
-
-        # --- FIX: Safe Numeric Filling (No Inplace Warning) ---
-        numeric_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
-        for c in numeric_cols:
-            if c in trades.columns:
-                 # Check for NaNs first to avoid unnecessary writes
-                 if trades[c].hasnans:
-                      fill_val = 1.0 if c == 'side_mult' else 0.0
-                      # Use direct assignment, NOT inplace=True
-                      trades[c] = trades[c].fillna(fill_val)
-
-        # Final Filter (Fast Category Check)
+        # Filter Markets to match loaded trades
+        # Use Categorical optimization if available
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-            valid_ids = set(trades['contract_id'].cat.categories)
+            final_ids = set(trades['contract_id'].cat.categories)
         else:
-            valid_ids = set(trades['contract_id'].unique())
+            final_ids = set(trades['contract_id'].unique())
 
-        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
+        market_subset = markets[markets['contract_id'].isin(final_ids)].copy()
         
-        # Clean up markets
         del markets
         gc.collect()
 
@@ -1962,7 +1954,7 @@ class TuningRunner:
         print(f"   Trades:  {len(trades)}")
         
         return market_subset, trades
-    
+        
     def _fetch_gamma_markets(self, days_back=365):
         import os
         import json
