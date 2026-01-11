@@ -1984,57 +1984,73 @@ class TuningRunner:
         markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
 
         # ---------------------------------------------------------
-        # 5. FINAL FILTER & SORT (Restored Strict Logic)
+        # 5. FINAL FILTER & SORT (Memory Optimized)
         # ---------------------------------------------------------
-        print("   Filtering Markets to valid IDs...")
-        # Filter Markets to valid IDs in Trades
+        
+        # 1. Identify Valid IDs in Trades
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-            valid_ids = set(trades['contract_id'].cat.categories)
+            trade_cat_ids = set(trades['contract_id'].cat.categories)
         else:
-            valid_ids = set(trades['contract_id'].unique())
+            trade_cat_ids = set(trades['contract_id'].unique())
 
-        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
+        # 2. Filter Markets (Keep only those in trades)
+        market_subset = markets[markets['contract_id'].isin(trade_cat_ids)].copy()
         
-        # Filter Trades to match final Markets
-        # Note: We must convert market IDs to set for fast lookup
-        final_valid_market_ids = set(market_subset['contract_id'])
+        # 3. Filter Trades (The Memory Safe Way)
+        # Instead of copying the whole dataframe (trades = trades[...]),
+        # we calculate exactly which IDs are bad and drop them in-place.
         
-        if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-             # 1. Filter the unique categories (~50k items)
-             all_cats = trades['contract_id'].cat.categories
-             valid_cats = all_cats[all_cats.isin(final_valid_market_ids)]
-             # 2. Filter dataframe using valid categories
-             trades = trades[trades['contract_id'].isin(valid_cats)]
+        valid_market_ids = set(market_subset['contract_id'])
+        ids_to_remove = trade_cat_ids - valid_market_ids
+
+        if not ids_to_remove:
+            print("   ✨ Trades match Markets perfectly. Skipping filter copy.")
         else:
-             trades = trades[trades['contract_id'].isin(final_valid_market_ids)]
-        print("   Final Sorting & Dedup...")
-        # Strict Sorting & Dedup (Restored from your snippet)
+            print(f"   ⚠️ Dropping {len(ids_to_remove)} invalid contract IDs from trades...")
+            
+            # Find indices to drop (Fast Categorical Lookup)
+            if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+                # .isin on categorical column is very fast
+                mask = trades['contract_id'].isin(ids_to_remove)
+            else:
+                mask = trades['contract_id'].isin(ids_to_remove)
+                
+            drop_indices = trades.index[mask]
+            
+            if len(drop_indices) > 0:
+                # In-place drop avoids creating a second 30GB dataframe
+                trades.drop(drop_indices, inplace=True)
+            
+            # Remove unused categories to free small memory
+            if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+                trades['contract_id'] = trades['contract_id'].cat.remove_unused_categories()
+
+        # 4. Clean up Markets Memory *Before* Sorting
+        del markets
+        gc.collect()
+
+        # 5. In-Place Sorting & Dedup
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
+        # Sort In-Place (Safe)
         trades.sort_values(
             by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
             kind='stable',
-            inplace=True 
+            inplace=True
         )
         
-        # 3. Reset Index IN-PLACE
         trades.reset_index(drop=True, inplace=True)
         
-        # 4. Dedup IN-PLACE
+        # Dedup In-Place (Safe)
         trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
         trades.reset_index(drop=True, inplace=True)
-        
-        # Cleanup
-        del markets
-        gc.collect()
         
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
         
         return market_subset, trades
-        
         
     def _fetch_gamma_markets(self, days_back=365):
         import os
