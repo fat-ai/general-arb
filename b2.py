@@ -1482,7 +1482,7 @@ class TuningRunner:
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Processing in 50k chunks (Shared Category Mode)...")
+        print(f"⚡ FAST LOAD: Memory-Optimized Batch Reading (Integer Code Mode)...")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
@@ -1497,17 +1497,17 @@ class TuningRunner:
         ts_start = pd.Timestamp(start_date)
         ts_end = pd.Timestamp(end_date)
         
-        # --- CRITICAL FIX: PRE-COMPUTE SHARED DTYPE ---
-        # This ensures pd.concat does NOT revert to 'object' (strings).
-        # We tell Pandas: "All chunks use this specific list of categories."
+        # --- PREPARE INTEGER MAP ---
+        # Instead of dealing with heavy strings, we map them to simple integers (0, 1, 2...)
+        # This makes the accumulated frames 10x smaller and prevents object-dtype reversion.
         if allowed_contract_ids is not None:
-            # Sort for determinism
-            unique_ids = sorted(list(allowed_contract_ids))
-            shared_contract_dtype = pd.CategoricalDtype(categories=unique_ids, ordered=False)
+            sorted_unique_ids = sorted(list(allowed_contract_ids))
+            # Map: "0xabc" -> 15
+            id_to_code = {val: i for i, val in enumerate(sorted_unique_ids)}
             allowed_set = set(allowed_contract_ids)
         else:
-            shared_contract_dtype = None
-            allowed_set = None
+            print("❌ Critical: allowed_contract_ids is required for this optimization.")
+            return pd.DataFrame()
         
         accumulated_frames = []
         total_rows_loaded = 0
@@ -1519,43 +1519,54 @@ class TuningRunner:
                 
                 df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
                 
-                if 'timestamp' in df_chunk.columns and not df_chunk.empty:
-                    # 1. OPTIMIZE TIMESTAMP (Zero Copy)
+                # 1. OPTIMIZE TIMESTAMP (Zero Copy)
+                if 'timestamp' in df_chunk.columns:
                     df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], errors='coerce')
                     if df_chunk['timestamp'].dt.tz is not None:
                          df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
 
-                    # 2. FILTER
+                if not df_chunk.empty:
+                    # 2. FILTER DATES
                     mask = (
                         (df_chunk['timestamp'] >= ts_start) & 
                         (df_chunk['timestamp'] <= ts_end) & 
                         (df_chunk['tradeAmount'] >= 1.0)
                     )
                     
-                    if allowed_set is not None:
-                         # Use string conversion for safety during check, 
-                         # but we cast to efficient Category later
-                         mask = mask & df_chunk['contract_id'].astype(str).isin(allowed_set)
+                    # 3. FILTER IDS (Strict String Check)
+                    # Ensure we are working with strings for the lookup
+                    str_ids = df_chunk['contract_id'].astype(str)
+                    mask = mask & str_ids.isin(allowed_set)
 
                     df_chunk = df_chunk[mask].copy()
                 
                 if not df_chunk.empty:
-                    # 3. DEDUP CHUNK
+                    # 4. MAP TO INTEGERS (The Fix)
+                    # We convert the strings to int32 codes immediately.
+                    # This avoids the "astype" crash and saves massive RAM.
+                    
+                    # Ensure we map the strings, not objects
+                    chunk_str_ids = df_chunk['contract_id'].astype(str)
+                    
+                    # Map to codes. Rows not in map become NaN (shouldn't happen due to filter above)
+                    codes = chunk_str_ids.map(id_to_code)
+                    
+                    # Fill NaN with -1 and cast to int32
+                    df_chunk['contract_id'] = codes.fillna(-1).astype('int32')
+                    
+                    # Drop any rows that failed mapping (Safety)
+                    if (df_chunk['contract_id'] == -1).any():
+                        df_chunk = df_chunk[df_chunk['contract_id'] != -1]
+
+                    # 5. DEDUPLICATE CHUNK
                     df_chunk.drop_duplicates(
                         subset=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
                         keep='first', 
                         inplace=True
                     )
                     
-                    # 4. APPLY SHARED DTYPE (THE FIX)
-                    # This forces the chunk to use the GLOBAL ID list.
-                    if shared_contract_dtype is not None:
-                        df_chunk['contract_id'] = df_chunk['contract_id'].astype(shared_contract_dtype)
-                    else:
-                        df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
-
-                    # 5. OTHER OPTIMIZATIONS
-                    df_chunk['user'] = df_chunk['user'].astype('category')
+                    # 6. OPTIMIZE OTHER COLUMNS
+                    df_chunk['user'] = df_chunk['user'].astype(str).astype('category')
                     
                     df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
                     for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
@@ -1581,13 +1592,20 @@ class TuningRunner:
             if not accumulated_frames:
                 return pd.DataFrame(columns=columns)
 
-            # 6. SAFE MERGE
-            # Because all chunks share 'shared_contract_dtype', 
-            # pd.concat will PRESERVE the Category dtype instead of upcasting to Object.
+            # 7. MERGE (Fast & Low Memory because 'contract_id' is int32)
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
             del accumulated_frames
             gc.collect()
+
+            # 8. RESTORE CATEGORICALS (Zero Copy)
+            # We assume the integers correspond exactly to the index in sorted_unique_ids
+            print("   Reconstructing Categories...")
+            final_df['contract_id'] = pd.Categorical.from_codes(
+                final_df['contract_id'], 
+                categories=sorted_unique_ids
+            )
+
             return final_df
             
         except Exception as e:
