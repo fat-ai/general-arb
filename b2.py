@@ -1476,69 +1476,73 @@ class TuningRunner:
         print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
         
     def _fast_load_trades(self, csv_path, start_date, end_date):
-        import polars as pl
         import pandas as pd
+        import pyarrow.parquet as pq
         import gc
-        
+
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        if parquet_path.exists():
-            print(f"⚡ FAST LOAD: Scanning parquet...")
-            try:
-                lf = pl.scan_parquet(parquet_path)
-                
-                # 1. Filter Dates AND Volume (Crucial for RAM)
-                # Dropping trades < $1.00 usually reduces row count by ~70%
-                lf = lf.filter(
-                    (pl.col("timestamp") >= start_date) & 
-                    (pl.col("timestamp") <= end_date) &
-                    (pl.col("tradeAmount") >= 1.0)
-                )
+        print(f"⚡ FAST LOAD: Reading {parquet_path.name} using PyArrow...")
+        print(f"   Target Range: {start_date} to {end_date}")
+        
+        if not parquet_path.exists():
+            print("❌ Parquet file missing.")
+            return pd.DataFrame()
 
-                # 2. OPTIMIZE TYPES IN POLARS
-                # Clean strings here. Doing this in Pandas later would crash the VM.
-                df = lf.select([
-                    pl.col("id").cast(pl.String),
-                    pl.col("timestamp"),
-                    
-                    # Normalize Contract ID: Lowercase, remove 0x, strip -> Categorical
-                    pl.col("contract_id").cast(pl.String)
-                      .str.strip_chars().str.to_lowercase().str.replace("^0x", "")
-                      .cast(pl.Categorical),
-                      
-                    # Normalize User
-                    pl.col("user").cast(pl.String).str.strip_chars().cast(pl.Categorical),
-                    
-                    pl.col("tradeAmount").cast(pl.Float32),
-                    pl.col("price").cast(pl.Float32),
-                    pl.col("size").cast(pl.Float32),
-                    pl.col("outcomeTokensAmount").cast(pl.Float32)
-                ]).collect()
-                
-                rows = df.height
-                print(f"   [DEBUG] Rows Loaded (Volume >= $1.0): {rows}")
+        # 1. Define Filters (Predicate Pushdown)
+        # This prevents loading rows outside your date range
+        filters = [
+            ('timestamp', '>=', pd.Timestamp(start_date)),
+            ('timestamp', '<=', pd.Timestamp(end_date)),
+            ('tradeAmount', '>=', 1.0)  # Filter small trades at source
+        ]
+        
+        try:
+            # 2. Read into PyArrow Table (Efficient C++ Load)
+            # We select only the columns we need
+            columns = [
+                'id', 'contract_id', 'user', 'tradeAmount', 
+                'price', 'size', 'outcomeTokensAmount', 'timestamp'
+            ]
+            
+            # Using PyArrow directly bypasses the Polars version conflict
+            table = pq.read_table(
+                parquet_path, 
+                columns=columns, 
+                filters=filters
+            )
+            
+            rows = len(table)
+            print(f"   ✅ Read {rows} rows from disk. Converting to Pandas...")
+            
+            if rows == 0:
+                return pd.DataFrame(columns=columns)
 
-                if rows == 0:
-                    print("⚠️ WARNING: Loaded 0 trades. Check filters/dates.")
-                    return pd.DataFrame()
+            # 3. Convert to Pandas with Categorical Optimization
+            # This is CRITICAL for 64GB RAM. It compresses the strings instantly.
+            df = table.to_pandas(
+                categories=['contract_id', 'user'], 
+                split_blocks=True,      # Optimization for large memory
+                self_destruct=True      # Frees PyArrow memory as it creates Pandas
+            )
+            
+            # 4. Final Type Safety Check
+            # Ensure float32 is maintained to save RAM
+            f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
+            for c in f32_cols:
+                if c in df.columns:
+                    df[c] = df[c].astype('float32')
 
-                # 3. Convert to Pandas safely
-                try:
-                    pdf = df.to_pandas(use_pyarrow_extension_array=True, split_blocks=True, self_destruct=True)
-                except TypeError:
-                    pdf = df.to_pandas(use_pyarrow_extension_array=True)
-                
-                del df
-                gc.collect() 
-                return pdf
-
-            except Exception as e:
-                print(f"❌ Loader Error: {e}")
-                import traceback
-                traceback.print_exc()
-                return pd.DataFrame()
-        else:
-            print("⚠️ Parquet not found. Please run convert_data.py.")
+            print(f"   ✅ DataFrame Ready: {len(df)} rows loaded.")
+            
+            del table
+            gc.collect()
+            return df
+            
+        except Exception as e:
+            print(f"❌ PyArrow Loader Failed: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
             
     def run_tuning_job(self):
