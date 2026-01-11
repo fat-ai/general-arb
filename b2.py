@@ -1945,7 +1945,8 @@ class TuningRunner:
                       trades[c].fillna(0.0 if c != 'side_mult' else 1, inplace=True)
                      
         # --- RESTORED: Market Explosion & Renaming Logic ---
-        
+        print("   Renaming columns...")
+
         # 1. Rename Columns
         rename_map = {
             'question': 'question', 'endDate': 'resolution_timestamp', 
@@ -1959,6 +1960,7 @@ class TuningRunner:
 
         # 2. EXPLODE MARKETS (Critical Step Restored)
         # This handles cases where contract_id is "0x123,0x456"
+        print("   Exploding Markets...")
         markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
         
