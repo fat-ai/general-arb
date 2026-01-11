@@ -2012,12 +2012,18 @@ class TuningRunner:
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
-        trades = trades.sort_values(
+        trades.sort_values(
             by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
-            kind='stable'
-        ).reset_index(drop=True)
+            kind='stable',
+            inplace=True 
+        )
         
-        trades = trades.drop_duplicates(subset=present_sort_cols, keep='first').reset_index(drop=True)
+        # 3. Reset Index IN-PLACE
+        trades.reset_index(drop=True, inplace=True)
+        
+        # 4. Dedup IN-PLACE
+        trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
+        trades.reset_index(drop=True, inplace=True)
         
         # Cleanup
         del markets
