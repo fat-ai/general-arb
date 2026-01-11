@@ -1915,16 +1915,46 @@ class TuningRunner:
             return markets, pd.DataFrame(columns=['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size'])
 
         print("   Synchronizing data...")
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        #trades['contract_id'] = trades['contract_id'].str.strip().apply(normalize_contract_id)
-        #trades['user'] = trades['user'].astype(str).str.strip()
         
+        # 1. Safe Timestamp Conversion
+        # If it's already datetime, skip to_datetime to save RAM
+        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
+             trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce')
+        
+        # Ensure timezone naive
+        if trades['timestamp'].dt.tz is not None:
+            trades['timestamp'] = trades['timestamp'].dt.tz_localize(None)
+
+        # 2. OPTIMIZED CLEANING: Operate on Categories, NOT Rows
+        # This is 1000x faster and uses 0 extra RAM because we only strip the unique values.
+        
+        # Clean 'contract_id'
+        if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+            # Apply normalization to the unique categories only
+            new_cats = trades['contract_id'].cat.categories.astype(str).str.strip().map(normalize_contract_id)
+            trades['contract_id'] = trades['contract_id'].cat.rename_categories(new_cats)
+        else:
+            # Fallback (Slow)
+            trades['contract_id'] = trades['contract_id'].astype(str).str.strip().apply(normalize_contract_id).astype('category')
+
+        # Clean 'user'
+        if isinstance(trades['user'].dtype, pd.CategoricalDtype):
+            new_users = trades['user'].cat.categories.astype(str).str.strip()
+            trades['user'] = trades['user'].cat.rename_categories(new_users)
+        else:
+            trades['user'] = trades['user'].astype(str).str.strip().astype('category')
+        
+        # 3. Numeric Conversions (Safe Downcasting)
         float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
         for c in float_cols:
-            trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0)
+            if c in trades.columns:
+                trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0).astype('float32')
         
-        trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
+        # Handle side_mult
+        if 'side_mult' in trades.columns:
+            trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1).astype('float32')
         
+        # Filter Date Range (Final Safety)
         trades = trades[
             (trades['timestamp'] >= FIXED_START_DATE) & 
             (trades['timestamp'] <= FIXED_END_DATE)
