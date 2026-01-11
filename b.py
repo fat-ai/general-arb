@@ -1694,8 +1694,10 @@ class TuningRunner:
         
     def _load_data(self):
         import pandas as pd
+        import numpy as np
         import glob
         import os
+        import gc
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
@@ -1715,6 +1717,7 @@ class TuningRunner:
             print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
 
+        # --- RESTORED: Column Selection & Normalization ---
         safe_cols = [
             'contract_id', 'outcome', 'resolution_timestamp', 'created_at', 
             'liquidity', 'question', 'volume', 'conditionId'
@@ -1722,20 +1725,19 @@ class TuningRunner:
         actual_cols = [c for c in safe_cols if c in markets.columns]
         markets = markets[actual_cols].copy()
 
-        markets['contract_id'] = markets['contract_id'].astype(str)
-
-        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        # Normalize ID
+        markets['contract_id'] = markets['contract_id'].astype(str).apply(normalize_contract_id)
         
+        # Sort & Dedup (Markets)
         markets = markets.sort_values(
             by=['contract_id', 'resolution_timestamp'], 
             ascending=[True, True],
             kind='stable'
         )
-        
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         
         # ---------------------------------------------------------
-        # 2. ORDER BOOK
+        # 2. ORDER BOOK STATS
         # ---------------------------------------------------------
         df_stats = self._fetch_orderbook_stats()
         if not df_stats.empty:
@@ -1750,13 +1752,13 @@ class TuningRunner:
             markets['total_trades'] = 0
 
         # ---------------------------------------------------------
-        # 3. TRADES
+        # 3. TRADES (Memory Optimized Load)
         # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
         
         if not trades_file.exists():
             print("   ⚠️ No local trades found. Downloading from scratch...")
-            # Collect tokens from markets
+            # Collect tokens from markets (RESTORED LOGIC)
             all_tokens = []
             for raw_ids in markets['contract_id']:
                 parts = str(raw_ids).split(',')
@@ -1764,13 +1766,11 @@ class TuningRunner:
                     if len(p.strip()) > 2: all_tokens.append(p.strip())
             target_tokens = list(set(all_tokens))
             
-            # Initial fetch (creates the CSV)
-            # We assign to _ and delete to ensure we don't hold the raw data in RAM
+            # Fetch and clear RAM
             _ = self._fetch_gamma_trades_parallel(target_tokens, days_back=DAYS_BACK)
-            import gc; gc.collect()
+            gc.collect()
         
-        # CALL THE NEW OPTIMIZED LOADER
-        # This handles Chunking -> Filtering -> Caching automatically
+        # USE OPTIMIZED LOADER (Keeps Categoricals)
         trades = self._fast_load_trades(trades_file, FIXED_START_DATE, FIXED_END_DATE)
 
         if trades.empty:
@@ -1782,63 +1782,71 @@ class TuningRunner:
         # ---------------------------------------------------------
         print("   Synchronizing data...")
         
-        trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce').dt.tz_localize(None)
-        
-        trades['contract_id'] = trades['contract_id'].str.strip()
+        # Optimize Timestamp (avoid copy if possible)
+        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
+            trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce')
+        if trades['timestamp'].dt.tz is not None:
+             trades['timestamp'] = trades['timestamp'].dt.tz_localize(None)
 
-        trades['contract_id'] = trades['contract_id'].apply(normalize_contract_id)
-        
-        trades['user'] = trades['user'].astype(str).str.strip()
-        
-        trades['tradeAmount'] = pd.to_numeric(trades['tradeAmount'], errors='coerce').fillna(0.0)
-        trades['price'] = pd.to_numeric(trades['price'], errors='coerce').fillna(0.0)
-        trades['outcomeTokensAmount'] = pd.to_numeric(trades['outcomeTokensAmount'], errors='coerce').fillna(0.0)
-        trades['size'] = pd.to_numeric(trades['size'], errors='coerce').fillna(0.0)
-        trades['side_mult'] = pd.to_numeric(trades['side_mult'], errors='coerce').fillna(1)
+        # In-Place Numeric Fills (Memory Safe)
+        for c in ['tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']:
+            if c in trades.columns:
+                 trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0 if c != 'side_mult' else 1).astype('float32')
 
-        trades = trades[
-            (trades['timestamp'] >= FIXED_START_DATE) & 
-            (trades['timestamp'] <= FIXED_END_DATE)
-        ].copy()
+        # --- RESTORED: Market Explosion & Renaming Logic ---
         
+        # 1. Rename Columns
         rename_map = {
             'question': 'question', 'endDate': 'resolution_timestamp', 
             'createdAt': 'created_at', 'volume': 'volume',
             'conditionId': 'condition_id'
         }
-        # Only rename columns that actually exist
         markets = markets.rename(columns={k:v for k,v in rename_map.items() if k in markets.columns})
         
-        # Ensure condition_id exists (fallback to contract_id if missing)
         if 'condition_id' not in markets.columns:
             markets['condition_id'] = markets['contract_id']
-            
 
+        # 2. EXPLODE MARKETS (Critical Step Restored)
+        # This handles cases where contract_id is "0x123,0x456"
         markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
         
         markets = markets.explode(['contract_id_list', 'token_index'])
         
-        markets['contract_id'] = markets['contract_id_list'].str.strip()
-
-        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
+        # Normalize the exploded IDs
+        markets['contract_id'] = markets['contract_id_list'].str.strip().apply(normalize_contract_id)
         
         markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
         
+        # 3. Calculate Outcome (Restored)
         def calculate_token_outcome(row):
-            m_out = row['outcome']
-            t_idx = row['token_index']
+            m_out = float(row['outcome']) # Ensure float
+            t_idx = int(row['token_index'])
             if m_out == 0.5: return 0.5
-            return 1.0 if m_out == t_idx else 0.0
+            # Polymarket: if outcome matches index, it pays out 1.0
+            return 1.0 if round(m_out) == t_idx else 0.0
 
         markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
-        markets = markets.drop(columns=['contract_id_list', 'token_index'])
-        # -------------------------------
-        
-        valid_ids = set(trades['contract_id'].unique())
-        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
-        trades = trades[trades['contract_id'].isin(set(market_subset['contract_id']))]
+        markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
 
+        # ---------------------------------------------------------
+        # 5. FINAL FILTER & SORT (Restored Strict Logic)
+        # ---------------------------------------------------------
+        
+        # Filter Markets to valid IDs in Trades
+        if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+            valid_ids = set(trades['contract_id'].cat.categories)
+        else:
+            valid_ids = set(trades['contract_id'].unique())
+
+        market_subset = markets[markets['contract_id'].isin(valid_ids)].copy()
+        
+        # Filter Trades to match final Markets
+        # Note: We must convert market IDs to set for fast lookup
+        final_valid_market_ids = set(market_subset['contract_id'])
+        trades = trades[trades['contract_id'].isin(final_valid_market_ids)]
+
+        # Strict Sorting & Dedup (Restored from your snippet)
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
@@ -1846,7 +1854,12 @@ class TuningRunner:
             by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
             kind='stable'
         ).reset_index(drop=True)
+        
         trades = trades.drop_duplicates(subset=present_sort_cols, keep='first').reset_index(drop=True)
+        
+        # Cleanup
+        del markets
+        gc.collect()
         
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
