@@ -1853,7 +1853,7 @@ class TuningRunner:
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        # 1. MARKETS (Metadata)
+        # 1. MARKETS (Get Metadata)
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
 
         if market_file_path.exists():
@@ -1935,13 +1935,15 @@ class TuningRunner:
         if trades['timestamp'].dt.tz is not None:
              trades['timestamp'] = trades['timestamp'].dt.tz_localize(None)
 
-        # In-Place Numeric Fills
-        for c in ['tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']:
+        # --- FIX: Safe Numeric Filling (No Inplace Warning) ---
+        numeric_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
+        for c in numeric_cols:
             if c in trades.columns:
-                 if not pd.api.types.is_numeric_dtype(trades[c]):
-                      trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0 if c != 'side_mult' else 1).astype('float32')
-                 else:
-                      trades[c].fillna(0.0 if c != 'side_mult' else 1, inplace=True)
+                 # Check for NaNs first to avoid unnecessary writes
+                 if trades[c].hasnans:
+                      fill_val = 1.0 if c == 'side_mult' else 0.0
+                      # Use direct assignment, NOT inplace=True
+                      trades[c] = trades[c].fillna(fill_val)
 
         # Final Filter (Fast Category Check)
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
