@@ -1986,48 +1986,50 @@ class TuningRunner:
         # ---------------------------------------------------------
         # 5. FINAL FILTER & SORT (Memory Optimized)
         # ---------------------------------------------------------
-        
-        # 1. Identify Invalid IDs
+        print("   Final Filter & Sort...")
+        # 1. Identify All Contract IDs in Trades
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             trade_cat_ids = set(trades['contract_id'].cat.categories)
         else:
             trade_cat_ids = set(trades['contract_id'].unique())
 
+        # 2. Create market_subset (The Missing Line)
+        # We assume markets with NO trades are irrelevant, so we filter them out now.
+        market_subset = markets[markets['contract_id'].isin(trade_cat_ids)].copy()
+
+        # 3. Clean up the heavy 'markets' dataframe immediately
+        del markets
+        gc.collect()
+
+        print("   Cleaning Invalid Market IDs...")
+        # 4. Filter Trades (Remove trades that have no matching market)
         valid_market_ids = set(market_subset['contract_id'])
         ids_to_remove = trade_cat_ids - valid_market_ids
 
-        # 2. Filter Trades (Boolean Mask is Safer than Drop)
         if ids_to_remove:
             print(f"   ⚠️ Dropping trades for {len(ids_to_remove)} invalid contract IDs...")
             
-            # Optimization: Mask by Category if possible
+            # Optimization: Mask by Category
             if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
                 mask = ~trades['contract_id'].isin(ids_to_remove)
             else:
                 mask = ~trades['contract_id'].isin(ids_to_remove)
             
-            # Apply mask (Creates new object, but safer linear memory access)
+            # Apply mask (Creates a copy, but necessary if we have bad data)
             trades = trades[mask].copy()
             
             # Immediate GC
             del mask
             gc.collect()
-
-        # REMOVED: trades['contract_id'].cat.remove_unused_categories()
-        # REASON: It triggers a full column rewrite which causes OOM.
-
-        # 3. Clean up Markets Memory
-        del markets
-        gc.collect()
-
-        # 4. DEDUPLICATION (Skip Sort)
-        # We skip .sort_values() because it causes OOM and is redundant.
-        # (The data is sorted again later in _transform_to_events)
+        else:
+            print("   ✨ Trades match Markets perfectly. Skipping filter copy.")
         
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
-        
+
+        print("   Dropping Dupes...")
         if present_sort_cols:
+             # Drop duplicates in-place (safer than sort+drop)
              trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
              trades.reset_index(drop=True, inplace=True)
 
@@ -2035,8 +2037,9 @@ class TuningRunner:
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
         
-        return market_subset, trades
-        
+        return market_subset, trades   
+
+    
     def _fetch_gamma_markets(self, days_back=365):
         import os
         import json
