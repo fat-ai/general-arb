@@ -1482,7 +1482,7 @@ class TuningRunner:
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Processing in 50k chunks (Full Optimization)...")
+        print(f"⚡ FAST LOAD: Processing in 50k chunks (Shared Category Mode)...")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
@@ -1497,8 +1497,17 @@ class TuningRunner:
         ts_start = pd.Timestamp(start_date)
         ts_end = pd.Timestamp(end_date)
         
-        # Optimize Lookup
-        allowed_set = set(allowed_contract_ids) if allowed_contract_ids is not None else None
+        # --- CRITICAL FIX: PRE-COMPUTE SHARED DTYPE ---
+        # This ensures pd.concat does NOT revert to 'object' (strings).
+        # We tell Pandas: "All chunks use this specific list of categories."
+        if allowed_contract_ids is not None:
+            # Sort for determinism
+            unique_ids = sorted(list(allowed_contract_ids))
+            shared_contract_dtype = pd.CategoricalDtype(categories=unique_ids, ordered=False)
+            allowed_set = set(allowed_contract_ids)
+        else:
+            shared_contract_dtype = None
+            allowed_set = None
         
         accumulated_frames = []
         total_rows_loaded = 0
@@ -1510,45 +1519,49 @@ class TuningRunner:
                 
                 df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
                 
-                # 1. OPTIMIZE TIMESTAMP IMMEDIATELY (The Fix)
-                # Doing this here on 50k rows costs 0 RAM. 
-                # Doing it later on 50M rows causes OOM.
-                if 'timestamp' in df_chunk.columns:
+                if 'timestamp' in df_chunk.columns and not df_chunk.empty:
+                    # 1. OPTIMIZE TIMESTAMP (Zero Copy)
                     df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], errors='coerce')
                     if df_chunk['timestamp'].dt.tz is not None:
                          df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
 
-                if not df_chunk.empty:
-                    # 2. Date & Size Filter
+                    # 2. FILTER
                     mask = (
                         (df_chunk['timestamp'] >= ts_start) & 
                         (df_chunk['timestamp'] <= ts_end) & 
                         (df_chunk['tradeAmount'] >= 1.0)
                     )
                     
-                    # 3. Whitelist Filter
                     if allowed_set is not None:
+                         # Use string conversion for safety during check, 
+                         # but we cast to efficient Category later
                          mask = mask & df_chunk['contract_id'].astype(str).isin(allowed_set)
 
                     df_chunk = df_chunk[mask].copy()
                 
                 if not df_chunk.empty:
-                    # 4. Deduplicate Chunk
+                    # 3. DEDUP CHUNK
                     df_chunk.drop_duplicates(
                         subset=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
                         keep='first', 
                         inplace=True
                     )
                     
-                    # 5. Fill NAs & Optimize Types
+                    # 4. APPLY SHARED DTYPE (THE FIX)
+                    # This forces the chunk to use the GLOBAL ID list.
+                    if shared_contract_dtype is not None:
+                        df_chunk['contract_id'] = df_chunk['contract_id'].astype(shared_contract_dtype)
+                    else:
+                        df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
+
+                    # 5. OTHER OPTIMIZATIONS
+                    df_chunk['user'] = df_chunk['user'].astype('category')
+                    
                     df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
                     for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
                         if col in df_chunk.columns:
                             df_chunk[col] = df_chunk[col].fillna(0.0)
 
-                    df_chunk['contract_id'] = df_chunk['contract_id'].astype('category')
-                    df_chunk['user'] = df_chunk['user'].astype('category')
-                    
                     f32_cols = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount', 'side_mult']
                     for c in f32_cols:
                         if c in df_chunk.columns:
@@ -1568,6 +1581,9 @@ class TuningRunner:
             if not accumulated_frames:
                 return pd.DataFrame(columns=columns)
 
+            # 6. SAFE MERGE
+            # Because all chunks share 'shared_contract_dtype', 
+            # pd.concat will PRESERVE the Category dtype instead of upcasting to Object.
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
             del accumulated_frames
