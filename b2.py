@@ -1967,6 +1967,7 @@ class TuningRunner:
         markets = markets.explode(['contract_id_list', 'token_index'])
         
         # Normalize the exploded IDs
+        print("   Normalizing Exploded Market IDs...")
         markets['contract_id'] = markets['contract_id_list'].str.strip().apply(normalize_contract_id)
         
         markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
@@ -1985,7 +1986,7 @@ class TuningRunner:
         # ---------------------------------------------------------
         # 5. FINAL FILTER & SORT (Restored Strict Logic)
         # ---------------------------------------------------------
-        
+        print("   Filtering Markets to valid IDs...")
         # Filter Markets to valid IDs in Trades
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             valid_ids = set(trades['contract_id'].cat.categories)
@@ -2006,7 +2007,7 @@ class TuningRunner:
              trades = trades[trades['contract_id'].isin(valid_cats)]
         else:
              trades = trades[trades['contract_id'].isin(final_valid_market_ids)]
-
+        print("   Final Sorting & Dedup...")
         # Strict Sorting & Dedup (Restored from your snippet)
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
