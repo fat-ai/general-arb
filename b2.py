@@ -1987,65 +1987,50 @@ class TuningRunner:
         # 5. FINAL FILTER & SORT (Memory Optimized)
         # ---------------------------------------------------------
         
-        # 1. Identify Valid IDs in Trades
+        # 1. Identify Invalid IDs
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             trade_cat_ids = set(trades['contract_id'].cat.categories)
         else:
             trade_cat_ids = set(trades['contract_id'].unique())
 
-        # 2. Filter Markets (Keep only those in trades)
-        market_subset = markets[markets['contract_id'].isin(trade_cat_ids)].copy()
-        
-        # 3. Filter Trades (The Memory Safe Way)
-        # Instead of copying the whole dataframe (trades = trades[...]),
-        # we calculate exactly which IDs are bad and drop them in-place.
-        
         valid_market_ids = set(market_subset['contract_id'])
         ids_to_remove = trade_cat_ids - valid_market_ids
 
-        if not ids_to_remove:
-            print("   ✨ Trades match Markets perfectly. Skipping filter copy.")
-        else:
-            print(f"   ⚠️ Dropping {len(ids_to_remove)} invalid contract IDs from trades...")
+        # 2. Filter Trades (Boolean Mask is Safer than Drop)
+        if ids_to_remove:
+            print(f"   ⚠️ Dropping trades for {len(ids_to_remove)} invalid contract IDs...")
             
-            # Find indices to drop (Fast Categorical Lookup)
+            # Optimization: Mask by Category if possible
             if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-                # .isin on categorical column is very fast
-                mask = trades['contract_id'].isin(ids_to_remove)
+                mask = ~trades['contract_id'].isin(ids_to_remove)
             else:
-                mask = trades['contract_id'].isin(ids_to_remove)
-                
-            drop_indices = trades.index[mask]
+                mask = ~trades['contract_id'].isin(ids_to_remove)
             
-            if len(drop_indices) > 0:
-                # In-place drop avoids creating a second 30GB dataframe
-                trades.drop(drop_indices, inplace=True)
+            # Apply mask (Creates new object, but safer linear memory access)
+            trades = trades[mask].copy()
             
-            # Remove unused categories to free small memory
-            if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-                trades['contract_id'] = trades['contract_id'].cat.remove_unused_categories()
+            # Immediate GC
+            del mask
+            gc.collect()
 
-        # 4. Clean up Markets Memory *Before* Sorting
+        # REMOVED: trades['contract_id'].cat.remove_unused_categories()
+        # REASON: It triggers a full column rewrite which causes OOM.
+
+        # 3. Clean up Markets Memory
         del markets
         gc.collect()
 
-        # 5. In-Place Sorting & Dedup
+        # 4. DEDUPLICATION (Skip Sort)
+        # We skip .sort_values() because it causes OOM and is redundant.
+        # (The data is sorted again later in _transform_to_events)
+        
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
         
-        # Sort In-Place (Safe)
-        trades.sort_values(
-            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
-            kind='stable',
-            inplace=True
-        )
-        
-        trades.reset_index(drop=True, inplace=True)
-        
-        # Dedup In-Place (Safe)
-        trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
-        trades.reset_index(drop=True, inplace=True)
-        
+        if present_sort_cols:
+             trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
+             trades.reset_index(drop=True, inplace=True)
+
         print(f"✅ SYSTEM READY.")
         print(f"   Markets: {len(market_subset)}")
         print(f"   Trades:  {len(trades)}")
