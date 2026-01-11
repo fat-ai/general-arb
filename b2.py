@@ -1986,50 +1986,52 @@ class TuningRunner:
         # ---------------------------------------------------------
         # 5. FINAL FILTER & SORT (Memory Optimized)
         # ---------------------------------------------------------
-        print("   Final Filter & Sort...")
+        
         # 1. Identify All Contract IDs in Trades
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             trade_cat_ids = set(trades['contract_id'].cat.categories)
         else:
             trade_cat_ids = set(trades['contract_id'].unique())
 
-        # 2. Create market_subset (The Missing Line)
-        # We assume markets with NO trades are irrelevant, so we filter them out now.
+        # 2. Create market_subset
         market_subset = markets[markets['contract_id'].isin(trade_cat_ids)].copy()
 
         # 3. Clean up the heavy 'markets' dataframe immediately
         del markets
         gc.collect()
 
-        print("   Cleaning Invalid Market IDs...")
-        # 4. Filter Trades (Remove trades that have no matching market)
+        # 4. Filter Trades (Memory Safe In-Place Drop)
         valid_market_ids = set(market_subset['contract_id'])
         ids_to_remove = trade_cat_ids - valid_market_ids
 
-        if ids_to_remove:
-            print(f"   ⚠️ Dropping trades for {len(ids_to_remove)} invalid contract IDs...")
-            
-            # Optimization: Mask by Category
-            if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-                mask = ~trades['contract_id'].isin(ids_to_remove)
-            else:
-                mask = ~trades['contract_id'].isin(ids_to_remove)
-            
-            # Apply mask (Creates a copy, but necessary if we have bad data)
-            trades = trades[mask].copy()
-            
-            # Immediate GC
-            del mask
-            gc.collect()
+        if not ids_to_remove:
+            print("   ✨ Trades match Markets perfectly. Skipping filter.")
         else:
-            print("   ✨ Trades match Markets perfectly. Skipping filter copy.")
-        
+            print(f"   ⚠️ Removing {len(ids_to_remove)} invalid contract IDs from trades...")
+            
+            # A. Calculate Boolean Mask (Fast)
+            # We look for rows that contain the BAD IDs
+            bad_mask = trades['contract_id'].isin(ids_to_remove)
+            
+            # B. Get Indices to Drop
+            bad_indices = trades.index[bad_mask]
+            
+            if len(bad_indices) > 0:
+                print(f"      Dropping {len(bad_indices)} rows in-place...")
+                # C. Drop In-Place (Avoids creating a new 30GB dataframe copy)
+                trades.drop(bad_indices, inplace=True)
+            
+            # Cleanup
+            del bad_mask
+            del bad_indices
+            gc.collect()
+
+        # 5. DEDUPLICATION (Skip Sort)
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
         present_sort_cols = [c for c in sort_cols if c in trades.columns]
-
-        print("   Dropping Dupes...")
+        
         if present_sort_cols:
-             # Drop duplicates in-place (safer than sort+drop)
+             # Drop duplicates in-place
              trades.drop_duplicates(subset=present_sort_cols, keep='first', inplace=True)
              trades.reset_index(drop=True, inplace=True)
 
