@@ -1932,12 +1932,18 @@ class TuningRunner:
             trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce')
         if trades['timestamp'].dt.tz is not None:
              trades['timestamp'] = trades['timestamp'].dt.tz_localize(None)
-
-        # In-Place Numeric Fills (Memory Safe)
+            
+        print("   Converting non-numeric data...")
         for c in ['tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']:
             if c in trades.columns:
-                 trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0 if c != 'side_mult' else 1).astype('float32')
-
+                 # If PyArrow loaded it as float32, to_numeric will copy it to float64 (doubling RAM).
+                 # We only run to_numeric if it's currently an object/string.
+                 if not pd.api.types.is_numeric_dtype(trades[c]):
+                      trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0 if c != 'side_mult' else 1).astype('float32')
+                 else:
+                      # Just fill NaNs in place (Zero Copy)
+                      trades[c].fillna(0.0 if c != 'side_mult' else 1, inplace=True)
+                     
         # --- RESTORED: Market Explosion & Renaming Logic ---
         
         # 1. Rename Columns
@@ -1989,7 +1995,15 @@ class TuningRunner:
         # Filter Trades to match final Markets
         # Note: We must convert market IDs to set for fast lookup
         final_valid_market_ids = set(market_subset['contract_id'])
-        trades = trades[trades['contract_id'].isin(final_valid_market_ids)]
+        
+        if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+             # 1. Filter the unique categories (~50k items)
+             all_cats = trades['contract_id'].cat.categories
+             valid_cats = all_cats[all_cats.isin(final_valid_market_ids)]
+             # 2. Filter dataframe using valid categories
+             trades = trades[trades['contract_id'].isin(valid_cats)]
+        else:
+             trades = trades[trades['contract_id'].isin(final_valid_market_ids)]
 
         # Strict Sorting & Dedup (Restored from your snippet)
         sort_cols = ['timestamp', 'contract_id', 'user', 'tradeAmount', 'price', 'outcomeTokensAmount', 'size', 'side_mult']
