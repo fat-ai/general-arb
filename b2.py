@@ -1942,7 +1942,7 @@ class TuningRunner:
                       trades[c] = pd.to_numeric(trades[c], errors='coerce').fillna(0.0 if c != 'side_mult' else 1).astype('float32')
                  else:
                       # Just fill NaNs in place (Zero Copy)
-                      trades[c].fillna(0.0 if c != 'side_mult' else 1, inplace=True)
+                      trades[c].fillna(0.0 if c != 'side_mult' else 1)
                      
         # --- RESTORED: Market Explosion & Renaming Logic ---
         print("   Renaming columns...")
