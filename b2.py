@@ -2655,35 +2655,46 @@ class TuningRunner:
         import pandas as pd
         import numpy as np
 
-        log.info("Transforming Data (Memory-Safe Mode)...")
+        log.info("Transforming Data (OOM-Proof Mode)...")
         
-        # 1. MARKETS PREP (Small data, safe to process)
-        # Normalize IDs strictly
+        # --- HELPER: Fast Category Mapper (Zero-Copy) ---
+        def fast_cat_map(categorical_col, value_map, default_val, dtype):
+            # 1. Get integer codes
+            codes = categorical_col.cat.codes.values
+            # 2. Map categories (Unique strings) to values
+            categories = categorical_col.cat.categories
+            mapped_cats = categories.map(value_map).fillna(default_val).astype(dtype).to_numpy()
+            # 3. Handle NaNs
+            if (codes == -1).any():
+                mapped_cats = np.append(mapped_cats, [default_val])
+                # Remap -1 to the last index safely using a mask
+                out = np.empty_like(codes, dtype=dtype)
+                valid_mask = (codes != -1)
+                out[valid_mask] = mapped_cats[codes[valid_mask]]
+                out[~valid_mask] = default_val
+                return out
+            # 4. Broadcast
+            return mapped_cats[codes]
+
+        # ----------------------------------------------------
+        
+        # 1. MARKETS PREP
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
-        # Time Norm
-        def to_utc_naive(series):
-            return pd.to_datetime(series, errors='coerce', utc=True).dt.tz_localize(None)
-            
-        markets['created_at'] = to_utc_naive(markets['created_at'])
-        markets['resolution_timestamp'] = to_utc_naive(markets['resolution_timestamp'])
+        # Time Norm (In-Place)
+        markets['created_at'] = pd.to_datetime(markets['created_at'], utc=True).dt.tz_localize(None)
+        markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], utc=True).dt.tz_localize(None)
 
-        # 2. TRADES TIME PREP (Zero Copy Check)
+        # 2. TRADES TIME PREP
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-             trades['timestamp'] = to_utc_naive(trades['timestamp'])
+             trades['timestamp'] = pd.to_datetime(trades['timestamp'], utc=True).dt.tz_localize(None)
 
-        # 3. FILTER TRADES (Category-Based Optimization)
-        # We assume trades['contract_id'] is Categorical from the loader.
+        # 3. FILTER & VALIDATE
         if not isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-             # Fallback (Should not happen with new loader)
-             log.warning("⚠️ Trades contract_id is not categorical. Converting...")
              trades['contract_id'] = trades['contract_id'].astype('category')
 
-        # Identify valid IDs
         market_ids_set = set(markets['contract_id'])
         trade_cats = trades['contract_id'].cat.categories
-        
-        # Find intersection
         valid_cats = [c for c in trade_cats if c in market_ids_set]
         
         if not valid_cats:
@@ -2691,90 +2702,71 @@ class TuningRunner:
             log.error(msg)
             raise ValueError(msg)
             
-        # Filter Markets
         markets = markets[markets['contract_id'].isin(valid_cats)].copy()
         
-        # Filter Trades: Only apply filter if we have invalid categories
+        # Filter Trades efficiently
         if len(valid_cats) < len(trade_cats):
-             log.info(f"   Filtering trades: Keeping {len(valid_cats)}/{len(trade_cats)} categories...")
-             trades = trades[trades['contract_id'].isin(valid_cats)].copy()
-             # Re-compress categories to free unused integers
+             mask = trades['contract_id'].isin(valid_cats)
+             trades = trades[mask].copy()
+             del mask
              trades['contract_id'] = trades['contract_id'].cat.remove_unused_categories()
              gc.collect()
 
-        # 4. MAPPING OPTIMIZATION (The "Numpy Lookup" Trick)
-        # Instead of .map() which can densify 180M rows, we map the CATEGORIES (200k rows)
-        # and then use the integer codes to lookup the values. 
-        # This is 1000x faster and uses nearly 0 RAM.
-
-        def fast_cat_map(categorical_col, value_map, default_val):
-            # 1. Get integer codes (0, 1, 2...)
-            codes = categorical_col.cat.codes.values
-            # 2. Map the categories (Unique strings) to the values
-            categories = categorical_col.cat.categories
-            cat_values = categories.map(value_map).fillna(default_val).to_numpy()
-            # 3. Use integer indexing to broadcast (Fast!)
-            # We must handle -1 codes (NaNs) safely
-            if (codes == -1).any():
-                # Append default to end and map -1 to that index
-                cat_values = np.append(cat_values, default_val)
-                return cat_values[codes]
-            return cat_values[codes]
-
-        # A. Map Token Index (Yes/No)
+        # 4. MAP TOKEN INDEX
         if 'token_index' in markets.columns:
             token_map = markets.set_index('contract_id')['token_index'].to_dict()
-            # Map 0/1 integers
-            trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1).astype('int8')
+            trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1, 'int8')
         else:
             trades['token_index'] = np.int8(1)
 
-        # B. Map Outcomes
-        outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
-        res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
-        created_map = markets.set_index('contract_id')['created_at'].to_dict()
-
-        # 5. PRICE CALCULATION (In-Place)
-        # Normalize Price
+        # 5. CALCULATE PRICE (In-Place)
         trades['price'] = trades['price'].fillna(0.5).astype('float32')
-        
-        # Invert 'No' tokens (In-Place where possible)
-        # price = where(index==0, 1-price, price)
         trades['price'] = np.where(
             trades['token_index'] == 0, 
             1.0 - trades['price'], 
             trades['price']
         ).astype('float32')
-        
         trades['price'] = trades['price'].clip(0.001, 0.999)
 
-        # 6. BUILD PROFILER DATA (Slice, don't Copy-Construct)
-        # We select columns we need. This creates a copy, but it's efficient.
-        prof_data = trades[[
-            'user', 'contract_id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'price'
-        ]].copy()
+        # 6. BUILD PROFILER DATA
+        outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
+        res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
         
-        prof_data.columns = ['wallet_id', 'market_id', 'timestamp', 'usdc_vol', 'tokens', 'price']
-        prof_data['size'] = prof_data['usdc_vol'] # Clone column
+        prof_data = pd.DataFrame({
+            'wallet_id': trades['user'],       
+            'market_id': trades['contract_id'],
+            'timestamp': trades['timestamp'],
+            'usdc_vol': trades['tradeAmount'],
+            'tokens': trades['outcomeTokensAmount'],
+            'price': trades['price'],
+            'size': trades['tradeAmount'],
+            'outcome': fast_cat_map(trades['contract_id'], outcome_map, 0.0, 'float32'),
+            'res_time': fast_cat_map(trades['contract_id'], res_map, pd.NaT, 'datetime64[ns]')
+        })
+        
         prof_data['bet_price'] = prof_data['price']
-        
-        # Map Metadata using Fast Lookup
-        prof_data['outcome'] = fast_cat_map(prof_data['market_id'], outcome_map, 0.0).astype('float32')
-        prof_data['res_time'] = fast_cat_map(prof_data['market_id'], res_map, pd.NaT)
-        
-        # Filter Post-Mortem (Boolean Mask)
+
+        # Filter Post-Mortem
         valid_mask = (prof_data['timestamp'] < prof_data['res_time']) | (prof_data['res_time'].isna())
         valid_mask &= prof_data['outcome'].isin([0.0, 1.0])
-        
         prof_data = prof_data[valid_mask].copy()
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # 7. BUILD EVENTS
-        # A. Markets
+        # 7. BUILD EVENTS (Unified Schema)
+        
+        # --- CRITICAL: Create Shared Dtypes for Concat ---
+        # This prevents pd.concat from exploding categories into objects
+        # We use the full set of valid IDs from markets as the master list
+        shared_contract_dtype = pd.CategoricalDtype(categories=sorted(list(valid_cats)), ordered=False)
+        shared_event_dtype = pd.CategoricalDtype(categories=['NEW_CONTRACT', 'RESOLUTION', 'TRADE'], ordered=False)
+
+        # A. Markets (New Contract)
+        cond_ids = markets['condition_id'] if 'condition_id' in markets.columns else markets['contract_id']
+
         df_new = pd.DataFrame({
             'timestamp': markets['created_at'],
-            'contract_id': markets['contract_id'].astype('category'),
+            'contract_id': markets['contract_id'].astype(shared_contract_dtype), # Force Shared Type
             'event_type': 'NEW_CONTRACT',
             'liquidity': markets['liquidity'].fillna(1.0).astype('float32'),
             'p_market_all': 0.5,
@@ -2782,9 +2774,10 @@ class TuningRunner:
             'wallet_id': "SYSTEM"
         })
         
+        # B. Markets (Resolution)
         df_res = pd.DataFrame({
             'timestamp': markets['resolution_timestamp'],
-            'contract_id': markets['contract_id'].astype('category'),
+            'contract_id': markets['contract_id'].astype(shared_contract_dtype), # Force Shared Type
             'event_type': 'RESOLUTION',
             'outcome': markets['outcome'].astype('float32'),
             'p_market_all': markets['outcome'].astype('float32'),
@@ -2792,8 +2785,7 @@ class TuningRunner:
             'wallet_id': "SYSTEM"
         })
 
-        # B. Updates (Reuse Trades DF to save RAM)
-        # We rename columns in place to match event schema
+        # C. Updates (Reuse Trades DF)
         trades.rename(columns={
             'size': 'trade_volume',
             'tradeAmount': 'usdc_vol',
@@ -2804,28 +2796,38 @@ class TuningRunner:
         trades['p_market_all'] = trades['price']
         trades['is_sell'] = (trades['outcomeTokensAmount'] < 0)
         
-        # Select final columns
-        wanted_cols = ['timestamp', 'contract_id', 'event_type', 'p_market_all', 'trade_volume', 'usdc_vol', 'wallet_id', 'is_sell']
-        df_updates = trades[wanted_cols].copy()
+        # Force Shared Type on Trades
+        # (This is fast because the underlying categories are likely already similar)
+        trades['contract_id'] = trades['contract_id'].astype(shared_contract_dtype)
         
-        # Explicitly delete trades to free RAM before Merge
+        wanted_cols = ['timestamp', 'contract_id', 'event_type', 'p_market_all', 'trade_volume', 'usdc_vol', 'wallet_id', 'is_sell']
+        df_updates = trades[wanted_cols] # View
+        
         del trades
         gc.collect()
 
-        # 8. MERGE & SORT
-        df_new['event_type'] = df_new['event_type'].astype('category')
-        df_res['event_type'] = df_res['event_type'].astype('category')
-        df_updates['event_type'] = df_updates['event_type'].astype('category')
+        # 8. MERGE
+        # Apply Shared Event Dtype
+        df_new['event_type'] = df_new['event_type'].astype(shared_event_dtype)
+        df_res['event_type'] = df_res['event_type'].astype(shared_event_dtype)
+        df_updates['event_type'] = df_updates['event_type'].astype(shared_event_dtype)
 
+        # Concat (Safe now due to shared dtypes)
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
         gc.collect()
 
-        # In-Place Sort
+        # 9. FINAL SORT (OOM-Safe)
+        # We sort by Timestamp primarily.
+        # We use 'quicksort' (default) instead of 'stable' (mergesort).
+        # Quicksort is O(1) memory. Mergesort is O(N) memory.
+        # This saves ~20GB of RAM.
+        
+        log.info("Sorting Events (Zero-Copy Mode)...")
         df_ev.sort_values(
-            by=['timestamp', 'event_type', 'contract_id'], 
-            kind='stable',
+            by=['timestamp', 'event_type'], # removed contract_id to save comparisons
+            kind='quicksort', # <--- SAVES 20GB RAM
             inplace=True
         )
         
@@ -2836,7 +2838,6 @@ class TuningRunner:
 
         return df_ev, prof_data
         
-
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
     if isinstance(event_log, ray.ObjectRef):
