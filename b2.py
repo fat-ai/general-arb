@@ -1499,26 +1499,16 @@ class TuningRunner:
         ts_end = pd.Timestamp(end_date)
         
         # --- PREPARE GLOBAL MAP ---
-        # We need a fixed list of IDs to map strings -> int32.
-        # This ensures Chunk 1 and Chunk 100 use the exact same integer for "0xABC".
         if allowed_contract_ids is None:
             print("❌ Critical: allowed_contract_ids required for integer mode.")
             return pd.DataFrame()
 
-        # 1. Sort IDs to ensure code '0' always means the same contract
+        # 1. Create Lookup: Normalized String -> Int32
         sorted_unique_ids = sorted(list(allowed_contract_ids))
-        
-        # 2. Create optimized Lookup (String -> Int32)
-        # Using a Series map is faster/cleaner than a dict for millions of rows
         id_series = pd.Series(
             data=np.arange(len(sorted_unique_ids), dtype='int32'),
             index=sorted_unique_ids
         )
-        
-        # 3. Also prepare User mapping on the fly? 
-        # No, users are too high cardinality to pre-map efficiently without scanning first.
-        # We will keep users as Strings in the chunk, cast to Category after concat 
-        # (Users are less dangerous than IDs for duplication).
         
         accumulated_frames = []
         total_rows_loaded = 0
@@ -1546,21 +1536,21 @@ class TuningRunner:
                     df_chunk = df_chunk[mask].copy()
                 
                 if not df_chunk.empty:
-                    # C. ID MAPPING (The Memory Fix)
-                    # Convert String IDs to Global Int32 Codes immediately.
-                    # Rows not in our allowed list become NaN -> cast to -1 -> drop.
+                    # C. ID MAPPING (Memory Fix)
                     
-                    # 1. Map (Fastest way)
-                    # df_chunk['contract_id'] is object/string here.
-                    # We map it against our pre-built Series.
-                    codes = df_chunk['contract_id'].map(id_series)
+                    # 1. Normalize Chunk IDs to ensure they match the Map
+                    # (Assumes your IDs are lowercase/stripped)
+                    chunk_ids = df_chunk['contract_id'].astype(str).str.strip().str.lower()
                     
-                    # 2. Drop Invalid (The Filter)
-                    # Any ID not in 'sorted_unique_ids' gets NaN. We drop them.
-                    df_chunk = df_chunk[codes.notna()].copy()
-                    codes = codes.dropna()
+                    # 2. Map to Integers
+                    codes = chunk_ids.map(id_series)
+                    
+                    # 3. Drop Invalid (Rows not in allowed list)
+                    valid_mask = codes.notna()
+                    df_chunk = df_chunk[valid_mask].copy()
+                    codes = codes[valid_mask]
 
-                    # 3. Assign Integer
+                    # 4. Assign Integer (Zero memory overhead compared to strings)
                     df_chunk['contract_id'] = codes.astype('int32')
 
                     # D. Deduplicate (On Integers = Fast)
@@ -1571,9 +1561,7 @@ class TuningRunner:
                     )
                     
                     # E. Optimize Columns
-                    # Note: We leave 'user' as object/string for now to avoid Category misalignment.
-                    # We will categorize it *once* at the end.
-                    df_chunk['user'] = df_chunk['user'].astype(str)
+                    df_chunk['user'] = df_chunk['user'].astype(str) # Keep as string until end
                     
                     df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
                     for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
@@ -1596,7 +1584,7 @@ class TuningRunner:
             if not accumulated_frames:
                 return pd.DataFrame(columns=columns)
 
-            # F. CONCAT (Safe because 'contract_id' is just int32 numbers)
+            # F. CONCAT (Safe because 'contract_id' is int32)
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
             del accumulated_frames
@@ -1605,13 +1593,13 @@ class TuningRunner:
             # G. RECONSTRUCT CATEGORIES (Zero Copy)
             print("   Reconstructing Categories...")
             
-            # 1. Contract ID: Use `from_codes` with our sorted list
+            # 1. Contract ID: Restore strings via Categorical
             final_df['contract_id'] = pd.Categorical.from_codes(
                 final_df['contract_id'], 
                 categories=sorted_unique_ids
             )
             
-            # 2. User: Now we can categorize users safely (Global conversion)
+            # 2. User: Categorize users now (Global conversion)
             final_df['user'] = final_df['user'].astype('category')
 
             return final_df
@@ -1908,7 +1896,7 @@ class TuningRunner:
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        # 1. MARKETS
+        # 1. MARKETS (Metadata)
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
 
         if market_file_path.exists():
@@ -1945,7 +1933,8 @@ class TuningRunner:
         markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
         
         markets = markets.explode(['contract_id_list', 'token_index'])
-        markets['contract_id'] = markets['contract_id_list'].str.strip().apply(normalize_contract_id)
+        # Normalize: strip, lower, etc. to match what we do in the loader
+        markets['contract_id'] = markets['contract_id_list'].str.strip().str.lower().apply(normalize_contract_id)
         
         markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
         
@@ -1956,31 +1945,22 @@ class TuningRunner:
             return 1.0 if round(m_out) == t_idx else 0.0
 
         markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
-        markets = markets.drop(columns=['contract_id_list'], errors='ignore')
+        markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
 
         # ---------------------------------------------------------
         # 2. TRADES
         # ---------------------------------------------------------
         trades_file = self.cache_dir / "gamma_trades_stream.csv"
-        token_map = markets.set_index('contract_id')['token_index'].to_dict()
         
-        # 2. Resolution Time Map: {contract_id: resolution_timestamp}
-        res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
-        
-        # 3. Outcome Map: {contract_id: outcome}
-        outcome_map = markets.set_index('contract_id')['outcome'].to_dict()
-
-        # Pass Maps to the loader
+        # EXTRACT VALID IDS for the loader map
         valid_market_ids = set(markets['contract_id'].unique())
         
+        # CALL LOADER (Correct Arguments)
         trades = self._fast_load_trades(
             trades_file, 
             FIXED_START_DATE, 
             FIXED_END_DATE, 
-            allowed_contract_ids=valid_market_ids,
-            token_map=token_map,
-            res_map=res_map,
-            outcome_map=outcome_map
+            allowed_contract_ids=valid_market_ids
         )
 
         if trades.empty:
@@ -1988,12 +1968,12 @@ class TuningRunner:
             return pd.DataFrame(), pd.DataFrame()
 
         # ---------------------------------------------------------
-        # 3. FINAL SYNC (Zero Copy)
+        # 3. FINAL SYNC
         # ---------------------------------------------------------
         print("   Synchronizing data...")
         
         # Filter Markets to match loaded trades
-        # Use Categorical optimization if available
+        # Use Categorical optimization
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             final_ids = set(trades['contract_id'].cat.categories)
         else:
