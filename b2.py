@@ -2731,39 +2731,68 @@ class TuningRunner:
 
         # 5. BUILD PROFILER DATA
         print("build profiler data ...")
+        # ---------------------------------------------------------
+        # MEMORY-SAFE FILTERING (Column-by-Column Reconstruction)
+        # ---------------------------------------------------------
+        
+        # 1. Prepare Maps
         outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
         res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
 
-        # 2. Calculate New Columns as Independent Arrays (Low Memory)
-        # We don't put them in a DataFrame yet. Just simple numpy arrays.
+        # 2. Calculate Arrays (Low Memory)
         outcome_arr = fast_cat_map(trades['contract_id'], outcome_map, 0.0, 'float32')
         res_time_arr = fast_cat_map(trades['contract_id'], res_map, pd.NaT, 'datetime64[ns]')
 
-        # 3. Calculate Filter Mask FIRST (The Fix)
-        # We identify which rows to keep using the arrays, BEFORE creating the new DataFrame.
-        # This prevents allocating memory for the millions of rows we are about to drop.
+        # 3. Calculate Filter Mask
+        # Identify rows to KEEP
         ts_values = trades['timestamp'].values
-        
         valid_mask = (ts_values < res_time_arr) | (np.isnat(res_time_arr))
-        # Use np.isin for fast boolean check on float array
         valid_mask &= np.isin(outcome_arr, [0.0, 1.0])
-
-        # 4. Create prof_data using ONLY valid rows (Slicing)
-        # We only copy the data we actually need.
-        cols_needed = ['user', 'contract_id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'price']
-        prof_data = trades.loc[valid_mask, cols_needed].copy()
-
-        # 5. Rename and Assign calculated columns (Sliced)
-        prof_data.columns = ['wallet_id', 'market_id', 'timestamp', 'usdc_vol', 'tokens', 'price']
-        prof_data['size'] = prof_data['usdc_vol']
-        prof_data['bet_price'] = prof_data['price']
         
-        # Assign the pre-calculated arrays (applying the same mask)
-        prof_data['outcome'] = outcome_arr[valid_mask]
-        prof_data['res_time'] = res_time_arr[valid_mask]
+        # Cleanup temporary arrays now to free RAM for the reconstruction
+        del ts_values
+        gc.collect()
 
-        # Cleanup large temporary arrays immediately
-        del outcome_arr, res_time_arr, valid_mask, ts_values
+        # 4. DESTRUCTIVE RECONSTRUCTION
+        # We build prof_data while DELETING 'trades' columns one by one.
+        # This keeps Peak RAM = (Old Size) + (1 Column), instead of (Old Size) * 2.
+        
+        prof_data_dict = {}
+        
+        # Define mapping: {Target Name: Source Name}
+        col_map = {
+            'wallet_id': 'user',
+            'market_id': 'contract_id',
+            'timestamp': 'timestamp',
+            'usdc_vol': 'tradeAmount',
+            'tokens': 'outcomeTokensAmount',
+            'price': 'price'
+        }
+        
+        # Move columns one by one
+        for target_col, source_col in col_map.items():
+            # Slice the valid data
+            prof_data_dict[target_col] = trades[source_col].values[valid_mask]
+            # DELETE the source column immediately to free RAM
+            del trades[source_col]
+            gc.collect()
+
+        # Add calculated columns (sliced)
+        prof_data_dict['outcome'] = outcome_arr[valid_mask]
+        prof_data_dict['res_time'] = res_time_arr[valid_mask]
+        prof_data_dict['size'] = prof_data_dict['usdc_vol'] # Shallow copy / ref
+        prof_data_dict['bet_price'] = prof_data_dict['price'] # Shallow copy / ref
+
+        # Cleanup remainders
+        del outcome_arr, res_time_arr, valid_mask
+        # Explicitly delete the empty 'trades' shell
+        del trades
+        gc.collect()
+
+        # 5. Create Final DataFrame (Safe now because 'trades' is gone)
+        prof_data = pd.DataFrame(prof_data_dict)
+        
+        del prof_data_dict
         gc.collect()
         
         del valid_mask
