@@ -2657,155 +2657,181 @@ class TuningRunner:
 
         log.info("Transforming Data (Memory-Safe Mode)...")
         
-        # 1. TIME/STRING NORMALIZATION
+        # 1. TIME NORMALIZATION
         def to_utc_naive(series):
             return pd.to_datetime(series, errors='coerce', utc=True).dt.tz_localize(None)
 
         markets['created_at'] = to_utc_naive(markets['created_at'])
         markets['resolution_timestamp'] = to_utc_naive(markets['resolution_timestamp'])
+        
+        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
+             trades['timestamp'] = to_utc_naive(trades['timestamp'])
+        
+        # 2. MARKETS ID NORMALIZATION
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
-        # 2. FILTER MARKETS
-        log.info("Filtering Markets...")
+        # 3. FILTER TO COMMON IDs (Fast)
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             unique_trade_ids = set(trades['contract_id'].cat.categories)
         else:
             unique_trade_ids = set(trades['contract_id'].unique())
             
-        markets = markets[markets['contract_id'].isin(unique_trade_ids)].copy()
+        unique_market_ids = set(markets['contract_id'])
+        common_ids = unique_market_ids.intersection(unique_trade_ids)
         
-        # 3. BUILD PROFILER DATA
-        log.info("Building Profiler Data...")
+        if not common_ids:
+            msg = "❌ CRITICAL: No overlapping Contract IDs found. Check your data sources."
+            log.error(msg)
+            raise ValueError(msg)
+            
+        # Filter Markets
+        markets = markets[markets['contract_id'].isin(common_ids)].copy()
+        
+        # Filter Trades (Preserve Categories)
+        if len(unique_trade_ids) > len(common_ids):
+            if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
+                 valid_cats = trades['contract_id'].cat.categories[trades['contract_id'].cat.categories.isin(common_ids)]
+                 trades = trades[trades['contract_id'].isin(valid_cats)]
+            else:
+                 trades = trades[trades['contract_id'].isin(common_ids)]
+
+        # 4. TOKEN INDEX & PRICE CALCULATION
+        if 'token_index' in markets.columns:
+            token_map = markets.set_index('contract_id')['token_index'].to_dict()
+            trades['token_index'] = trades['contract_id'].map(token_map).fillna(1).astype('int8')
+        else:
+            trades['token_index'] = 1
+            
+        # Price Calculation (Vectorized)
+        price_raw = pd.to_numeric(trades['price'], errors='coerce').fillna(0.5).astype('float32')
+        
+        trades['price'] = np.where(
+            trades['token_index'] == 0, 
+            1.0 - price_raw, 
+            price_raw
+        ).astype('float32')
+        
+        trades['price'] = trades['price'].clip(0.001, 0.999)
+        del price_raw
+        gc.collect()
+
+        # 5. BUILD PROFILER DATA
+        # ------------------------------------------------------------------
+        # FIX: Initialize 'outcome' to 0.0. Do not look for 'market_outcome'.
+        # ------------------------------------------------------------------
         prof_data = pd.DataFrame({
-            'wallet_id': trades['user'],
-            'market_id': trades['contract_id'],
+            'wallet_id': trades['user'],        # Keep Category
+            'market_id': trades['contract_id'], # Keep Category
             'timestamp': trades['timestamp'],
             'usdc_vol': trades['tradeAmount'],
             'tokens': trades['outcomeTokensAmount'],
-            'price': trades['price'], 
+            'price': trades['price'],
             'size': trades['tradeAmount'],
-            'outcome': trades['market_outcome'], 
-            'bet_price': trades['price']
+            'outcome': np.float32(0.0), # <--- FIXED HERE
+            'bet_price': np.float32(0.0)
         })
-        prof_data['entity_type'] = 'default_topic'
+
+        # MAP OUTCOMES (Safe Map)
+        # Create mapping series (Contract ID -> Outcome)
+        outcome_map = markets.set_index('contract_id')['outcome'].astype('float32')
+        res_map = markets.set_index('contract_id')['resolution_timestamp']
+        created_map = markets.set_index('contract_id')['created_at']
+
+        # Apply Map (Fastest way for Categories)
+        prof_data['outcome'] = prof_data['market_id'].map(outcome_map)
+        prof_data['res_time'] = prof_data['market_id'].map(res_map)
+        prof_data['market_created'] = prof_data['market_id'].map(created_map)
+        
+        # Filter Post-Mortem Trades
+        valid_time_mask = (prof_data['timestamp'] < prof_data['res_time']) | (prof_data['res_time'].isna())
+        valid_outcome_mask = prof_data['outcome'].isin([0.0, 1.0])
+        
+        prof_data = prof_data[valid_time_mask & valid_outcome_mask].copy()
+
+        # Set bet_price
+        prof_data['bet_price'] = prof_data['price']
         
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
-        # --- PREPARE CATEGORIES (Crucial for OOM Prevention) ---
-        # We must add "SYSTEM" to the existing User Categories so we can use the same dtype.
-        # This prevents pd.concat from exploding the column into Strings.
-        if "SYSTEM" not in trades['user'].cat.categories:
-            trades['user'] = trades['user'].cat.add_categories(["SYSTEM"])
-        
-        user_dtype = trades['user'].dtype
-        contract_dtype = trades['contract_id'].dtype
+        # --- BUILD EVENTS ---
 
-        # --- A. NEW_CONTRACT ---
+        # A. NEW_CONTRACT
         cond_ids = markets['condition_id'] if 'condition_id' in markets.columns else markets['contract_id']
+
         df_new = pd.DataFrame({
             'timestamp': markets['created_at'],
-            'contract_id': markets['contract_id'].astype(contract_dtype), # Shared Dtype
+            'contract_id': markets['contract_id'].astype('category'),
             'event_type': 'NEW_CONTRACT',
             'liquidity': markets['liquidity'].fillna(1.0).astype('float32'),
             'condition_id': cond_ids,
             'token_outcome_label': markets['token_outcome_label'].fillna('Yes'),
             'end_date': markets['resolution_timestamp'],
-            'p_market_all': 0.5, 'trade_volume': 0.0, 'usdc_vol': 0.0, 
-            'is_sell': False, 
-            'wallet_id': "SYSTEM" 
+            'p_market_all': 0.5,
+            'trade_volume': 0.0,
+            'usdc_vol': 0.0,
+            'is_sell': False,
+            'wallet_id': "SYSTEM"
         })
-        # Force "SYSTEM" to be the correct Category Code
-        df_new['wallet_id'] = df_new['wallet_id'].astype(user_dtype)
             
-        # --- B. RESOLUTION ---
+        # B. RESOLUTION
         df_res = pd.DataFrame({
             'timestamp': markets['resolution_timestamp'],
-            'contract_id': markets['contract_id'].astype(contract_dtype), # Shared Dtype
+            'contract_id': markets['contract_id'].astype('category'),
             'event_type': 'RESOLUTION',
             'outcome': markets['outcome'].astype('float32'),
             'p_market_all': markets['outcome'].astype('float32'),
-            'trade_volume': 0.0001, 'usdc_vol': 0.0001, 
-            'is_sell': False, 
+            'trade_volume': 0.0001,
+            'usdc_vol': 0.0001,
+            'is_sell': False,
             'wallet_id': "SYSTEM"
         })
-        # Force "SYSTEM" to be the correct Category Code
-        df_res['wallet_id'] = df_res['wallet_id'].astype(user_dtype)
 
-        # --- C. TRADES ---
-        # No Sort here (Loader handled it)
+        # C. TRADES (In-Place Sort)
+        trades.sort_values(
+            by=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
+            kind='stable',
+            inplace=True
+        )
+
         df_updates = pd.DataFrame({
             'timestamp': trades['timestamp'],
             'contract_id': trades['contract_id'],
             'event_type': 'TRADE',
             'p_market_all': trades['price'],
-            'trade_volume': trades['size'],
+            'trade_volume': trades['size'], 
             'usdc_vol': trades['tradeAmount'],
-            'wallet_id': trades['user'], # Shared Dtype
+            'wallet_id': trades['user'], 
             'is_sell': (trades['outcomeTokensAmount'] < 0)
         })
 
         del trades
         gc.collect()
         
-        # --- D. MERGE ---
-        # Align event_type
+        # D. MERGE
         df_new['event_type'] = df_new['event_type'].astype('category')
         df_res['event_type'] = df_res['event_type'].astype('category')
         df_updates['event_type'] = df_updates['event_type'].astype('category')
 
-        # SAFE CONCAT: Now all columns match Dtypes perfectly.
-        # No "Object" bloat will occur.
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
         gc.collect()
         
-        # --- E. FINAL SORT (Low Memory) ---
-        # Because df_ev is now strictly Categories + Float32, it is small (~6GB).
-        # Sorting it requires ~6GB buffer, which fits easily in 64GB RAM.
+        # E. FINAL SORT
+        df_ev.sort_values(
+            by=['timestamp', 'event_type', 'contract_id'], 
+            kind='stable',
+            inplace=True
+        )
         
-        # Optimization: Sort by Index (often faster/lighter than sort_values)
+        df_ev.dropna(subset=['timestamp'], inplace=True)
         df_ev.set_index('timestamp', inplace=True)
-        df_ev.sort_index(kind='stable', inplace=True)
-        
-        # Note: If we need secondary sort (event_type), sort_index alone isn't enough.
-        # But sorting by Timestamp is usually sufficient for simulators.
-        # If strict secondary sort is needed, use sort_values instead:
-        # df_ev.sort_values(by=['timestamp', 'event_type'], kind='stable', inplace=True)
-        log.info("Teleportng Old Data...")
-        # Teleport Logic
-        if not prof_data.empty:
-            start_cutoff = prof_data['timestamp'].min() - pd.Timedelta(days=1)
-            # Use Index slicing which is fast
-            # Ensure index is sorted first (it is)
-            
-            # Since we are indexed by timestamp, we can't easily boolean mask on it 
-            # without resetting or using index operations.
-            # Let's reset for safety in teleport logic, then re-index.
-            df_ev.reset_index(inplace=True)
-            
-            mask_old = df_ev['timestamp'] < start_cutoff
-            if mask_old.any():
-                df_old = df_ev[mask_old]
-                df_keep = df_ev[~mask_old]
-                
-                rescued = df_old[df_old['event_type'] == 'NEW_CONTRACT'].copy()
-                if not rescued.empty:
-                    rescued['timestamp'] = start_cutoff
-                    df_ev = pd.concat([rescued, df_keep], ignore_index=True)
-                    df_ev.sort_values(by=['timestamp', 'event_type'], inplace=True)
-                else:
-                    df_ev = df_keep
-            
-            # Final Indexing
-            df_ev.set_index('timestamp', inplace=True)
-        
-        if 'contract_id' in df_ev.columns and df_ev['contract_id'].dtype == 'object':
-             df_ev['contract_id'] = df_ev['contract_id'].astype('category')
 
         log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
+
         return df_ev, prof_data
-        
+
+
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
     if isinstance(event_log, ray.ObjectRef):
