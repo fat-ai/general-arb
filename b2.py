@@ -2655,7 +2655,7 @@ class TuningRunner:
         import pandas as pd
         import numpy as np
 
-        log.info("Transforming Data (OOM-Proof Mode)...")
+        log.info("Transforming Data (OOM-Proof + Date Fix)...")
         
         # --- HELPER: Fast Category Mapper (Zero-Copy) ---
         def fast_cat_map(categorical_col, value_map, default_val, dtype):
@@ -2667,7 +2667,6 @@ class TuningRunner:
             # 3. Handle NaNs
             if (codes == -1).any():
                 mapped_cats = np.append(mapped_cats, [default_val])
-                # Remap -1 to the last index safely using a mask
                 out = np.empty_like(codes, dtype=dtype)
                 valid_mask = (codes != -1)
                 out[valid_mask] = mapped_cats[codes[valid_mask]]
@@ -2681,13 +2680,23 @@ class TuningRunner:
         # 1. MARKETS PREP
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
-        # Time Norm (In-Place)
-        markets['created_at'] = pd.to_datetime(markets['created_at'], utc=True).dt.tz_localize(None)
-        markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], utc=True).dt.tz_localize(None)
+        # --- FIX: Robust Date Parsing (Handles mixed formats) ---
+        markets['created_at'] = pd.to_datetime(
+            markets['created_at'], 
+            format='mixed',  # <--- FIX IS HERE
+            utc=True
+        ).dt.tz_localize(None)
+        
+        markets['resolution_timestamp'] = pd.to_datetime(
+            markets['resolution_timestamp'], 
+            format='mixed',  # <--- FIX IS HERE
+            utc=True
+        ).dt.tz_localize(None)
 
         # 2. TRADES TIME PREP
+        # (Trades are usually consistent from the loader, but we use coerce to be safe)
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-             trades['timestamp'] = pd.to_datetime(trades['timestamp'], utc=True).dt.tz_localize(None)
+             trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
 
         # 3. FILTER & VALIDATE
         if not isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
@@ -2756,8 +2765,6 @@ class TuningRunner:
         # 7. BUILD EVENTS (Unified Schema)
         
         # --- CRITICAL: Create Shared Dtypes for Concat ---
-        # This prevents pd.concat from exploding categories into objects
-        # We use the full set of valid IDs from markets as the master list
         shared_contract_dtype = pd.CategoricalDtype(categories=sorted(list(valid_cats)), ordered=False)
         shared_event_dtype = pd.CategoricalDtype(categories=['NEW_CONTRACT', 'RESOLUTION', 'TRADE'], ordered=False)
 
@@ -2766,7 +2773,7 @@ class TuningRunner:
 
         df_new = pd.DataFrame({
             'timestamp': markets['created_at'],
-            'contract_id': markets['contract_id'].astype(shared_contract_dtype), # Force Shared Type
+            'contract_id': markets['contract_id'].astype(shared_contract_dtype),
             'event_type': 'NEW_CONTRACT',
             'liquidity': markets['liquidity'].fillna(1.0).astype('float32'),
             'p_market_all': 0.5,
@@ -2777,7 +2784,7 @@ class TuningRunner:
         # B. Markets (Resolution)
         df_res = pd.DataFrame({
             'timestamp': markets['resolution_timestamp'],
-            'contract_id': markets['contract_id'].astype(shared_contract_dtype), # Force Shared Type
+            'contract_id': markets['contract_id'].astype(shared_contract_dtype),
             'event_type': 'RESOLUTION',
             'outcome': markets['outcome'].astype('float32'),
             'p_market_all': markets['outcome'].astype('float32'),
@@ -2797,11 +2804,10 @@ class TuningRunner:
         trades['is_sell'] = (trades['outcomeTokensAmount'] < 0)
         
         # Force Shared Type on Trades
-        # (This is fast because the underlying categories are likely already similar)
         trades['contract_id'] = trades['contract_id'].astype(shared_contract_dtype)
         
         wanted_cols = ['timestamp', 'contract_id', 'event_type', 'p_market_all', 'trade_volume', 'usdc_vol', 'wallet_id', 'is_sell']
-        df_updates = trades[wanted_cols] # View
+        df_updates = trades[wanted_cols]
         
         del trades
         gc.collect()
@@ -2812,22 +2818,17 @@ class TuningRunner:
         df_res['event_type'] = df_res['event_type'].astype(shared_event_dtype)
         df_updates['event_type'] = df_updates['event_type'].astype(shared_event_dtype)
 
-        # Concat (Safe now due to shared dtypes)
+        # Concat
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
         gc.collect()
 
         # 9. FINAL SORT (OOM-Safe)
-        # We sort by Timestamp primarily.
-        # We use 'quicksort' (default) instead of 'stable' (mergesort).
-        # Quicksort is O(1) memory. Mergesort is O(N) memory.
-        # This saves ~20GB of RAM.
-        
         log.info("Sorting Events (Zero-Copy Mode)...")
         df_ev.sort_values(
-            by=['timestamp', 'event_type'], # removed contract_id to save comparisons
-            kind='quicksort', # <--- SAVES 20GB RAM
+            by=['timestamp', 'event_type'], 
+            kind='quicksort', # O(1) Memory
             inplace=True
         )
         
