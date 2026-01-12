@@ -1675,17 +1675,6 @@ class TuningRunner:
         float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
         for c in float_cols:
             df_trades[c] = pd.to_numeric(df_trades[c], downcast='float')
-        
-        # Use categorical for repeated strings
-       # df_trades['contract_id'] = df_trades['contract_id'].astype('category')
-
-       # df_trades['contract_id'] = df_trades['contract_id'].apply(normalize_contract_id)
-
-       # df_trades['user'] = df_trades['user'].astype('category')
-       # float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
-       # for c in float_cols:
-       #     if c in df_trades.columns:
-       #         df_trades[c] = df_trades[c].astype('float32')
                 
         if df_markets.empty or df_trades.empty: 
             log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
@@ -1714,22 +1703,17 @@ class TuningRunner:
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
         
         log.info("📉 Optimizing DataFrame memory footprint...")
-        if 'wallet_id' in profiler_data.columns:
-            profiler_data['wallet_id'] = profiler_data['wallet_id'].astype('string')
         if 'market_id' in profiler_data.columns:
             profiler_data['market_id'] = profiler_data['market_id'].astype('category')
         if 'entity_type' in profiler_data.columns:
             profiler_data['entity_type'] = profiler_data['entity_type'].astype('category')
-            
-        # Also optimize event_log if needed, though usually smaller
         if 'event_type' in event_log.columns:
             event_log['event_type'] = event_log['event_type'].astype('category')
 
-        event_log = event_log[event_log.index <= FIXED_END_DATE]
-        event_log = event_log[
-            (event_log.index >= FIXED_START_DATE) | 
-            (event_log['event_type'] == 'NEW_CONTRACT')
-        ]
+        mask_date = (event_log.index <= FIXED_END_DATE) & \
+                    ((event_log.index >= FIXED_START_DATE) | (event_log['event_type'] == 'NEW_CONTRACT'))
+        
+        event_log = event_log[mask_date].copy()
     
         if event_log.empty:
             log.error("⛔ Event log is empty after transformation.")
@@ -2708,6 +2692,7 @@ class TuningRunner:
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
         # 2. FILTER MARKETS
+        log.info("Filtering Markets...")
         if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
             unique_trade_ids = set(trades['contract_id'].cat.categories)
         else:
@@ -2716,6 +2701,7 @@ class TuningRunner:
         markets = markets[markets['contract_id'].isin(unique_trade_ids)].copy()
         
         # 3. BUILD PROFILER DATA
+        log.info("Building Profiler Data...")
         prof_data = pd.DataFrame({
             'wallet_id': trades['user'],
             'market_id': trades['contract_id'],
@@ -2728,6 +2714,7 @@ class TuningRunner:
             'bet_price': trades['price']
         })
         prof_data['entity_type'] = 'default_topic'
+        
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
         # --- PREPARE CATEGORIES (Crucial for OOM Prevention) ---
@@ -2811,7 +2798,7 @@ class TuningRunner:
         # But sorting by Timestamp is usually sufficient for simulators.
         # If strict secondary sort is needed, use sort_values instead:
         # df_ev.sort_values(by=['timestamp', 'event_type'], kind='stable', inplace=True)
-        
+        log.info("Teleportng Old Data...")
         # Teleport Logic
         if not prof_data.empty:
             start_cutoff = prof_data['timestamp'].min() - pd.Timedelta(days=1)
