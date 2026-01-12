@@ -2714,7 +2714,7 @@ class TuningRunner:
              gc.collect()
 
         # 4. MAP TOKENS & PRICE
-         print("map tokens and price ...")
+        print("map tokens and price ...")
         if 'token_index' in markets.columns:
             token_map = markets.set_index('contract_id')['token_index'].to_dict()
             trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1, 'int8')
