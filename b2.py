@@ -1630,15 +1630,33 @@ class TuningRunner:
         print(f"Trades contract_id dtype: {df_trades['contract_id'].dtype}")
         
         # Check overlap BEFORE transformation
-        markets_ids = set(df_markets['contract_id'].astype(str).str.strip().str.lower())
-        trades_ids = set(df_trades['contract_id'].astype(str).str.strip().str.lower())
-        overlap = markets_ids.intersection(trades_ids)
-        print(f"Pre-transform overlap: {len(overlap)} common IDs")
-        if len(overlap) == 0:
-            print("❌ FATAL: No overlap before transformation!")
-            print(f"Market IDs (first 5): {list(markets_ids)[:5]}")
-            print(f"Trade IDs (first 5): {list(trades_ids)[:5]}")
-            sys.exit(1)
+        # --- MEMORY SAFE VALIDATION ---
+        
+        # 1. Get Market IDs (Safe because markets df is smaller)
+        market_ids = set(df_markets['contract_id'].astype(str).str.strip().str.lower())
+
+        # 2. Get Trade IDs (CRITICAL FIX)
+        # Instead of expanding 181M rows to strings, we access the unique categories directly.
+        # This operates on ~400k items instead of 181M.
+        if isinstance(df_trades['contract_id'].dtype, pd.CategoricalDtype):
+            trades_ids = set(df_trades['contract_id'].cat.categories.astype(str).str.strip().str.lower())
+        else:
+            # Fallback only if somehow not categorical (should not happen now)
+            trades_ids = set(df_trades['contract_id'].unique().astype(str))
+
+        common = market_ids.intersection(trades_ids)
+        
+        print(f"🔗 ID OVERLAP CHECK:")
+        print(f"   Unique Market IDs: {len(market_ids)}")
+        print(f"   Unique Trade IDs:  {len(trades_ids)}")
+        print(f"   Common IDs:        {len(common)}")
+        
+        if len(common) == 0:
+            print("❌ CRITICAL: No intersection between Market IDs and Trade IDs!")
+            # Print samples to debug formatting mismatch
+            print(f"   Sample Market: {list(market_ids)[:1]}")
+            print(f"   Sample Trade:  {list(trades_ids)[:1]}")
+            return None
  
         float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
         for c in float_cols:
