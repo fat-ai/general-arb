@@ -2674,6 +2674,7 @@ class TuningRunner:
         # ----------------------------------------------------
 
         # 1. MARKETS PREP (Strict Types)
+        print("preparing markets data...")
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
         # Fix Date Parsing (Mixed Format)
@@ -2685,6 +2686,7 @@ class TuningRunner:
         markets['outcome'] = markets['outcome'].astype('float32')
 
         # 2. TRADES PREP
+        print("preparing trades data...")
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
              trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
 
@@ -2692,6 +2694,7 @@ class TuningRunner:
              trades['contract_id'] = trades['contract_id'].astype('category')
 
         # 3. INTERSECTION FILTER
+        print("intersection filter...")
         market_ids_set = set(markets['contract_id'])
         trade_cats = trades['contract_id'].cat.categories
         valid_cats = [c for c in trade_cats if c in market_ids_set]
@@ -2711,6 +2714,7 @@ class TuningRunner:
              gc.collect()
 
         # 4. MAP TOKENS & PRICE
+         print("map tokens and price ...")
         if 'token_index' in markets.columns:
             token_map = markets.set_index('contract_id')['token_index'].to_dict()
             trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1, 'int8')
@@ -2726,6 +2730,7 @@ class TuningRunner:
         trades['price'] = trades['price'].clip(0.001, 0.999)
 
         # 5. BUILD PROFILER DATA
+        print("build profiler data ...")
         outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
         res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
         
@@ -2751,7 +2756,7 @@ class TuningRunner:
         log.info(f"Profiler Data Built: {len(prof_data)} records.")
 
         # 6. BUILD EVENTS (Memory Optimized Concat)
-        
+        print("build events ...")
         # Create SHARED CATEGORIES to prevent object upcasting
         shared_contract_dtype = pd.CategoricalDtype(categories=sorted(list(valid_cats)), ordered=False)
         shared_event_dtype = pd.CategoricalDtype(categories=['NEW_CONTRACT', 'RESOLUTION', 'TRADE'], ordered=False)
@@ -2782,6 +2787,7 @@ class TuningRunner:
         })
 
         # C. Updates (Transform Trades In-Place)
+        print("apply trades updates ...")
         # Apply Shared Dtypes NOW to trades
         trades['contract_id'] = trades['contract_id'].astype(shared_contract_dtype)
         
@@ -2806,6 +2812,7 @@ class TuningRunner:
         gc.collect()
 
         # 7. MERGE
+        print("final merge...")
         # Apply Shared Event Dtype
         df_new['event_type'] = df_new['event_type'].astype(shared_event_dtype)
         df_res['event_type'] = df_res['event_type'].astype(shared_event_dtype)
