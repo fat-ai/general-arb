@@ -1475,14 +1475,15 @@ class TuningRunner:
             
         print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
        
-    def _fast_load_trades(self, csv_path, start_date, end_date, allowed_contract_ids=None, token_map=None, res_map=None, outcome_map=None):
+    def _fast_load_trades(self, csv_path, start_date, end_date, allowed_contract_ids=None):
         import pandas as pd
         import pyarrow.parquet as pq
         import gc
+        import numpy as np
 
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
         
-        print(f"⚡ FAST LOAD: Memory-Optimized Batch Reading (Integer Code Mode)...")
+        print(f"⚡ FAST LOAD: Integer-Code Mode (Fixing Concat OOM)...")
         
         if not parquet_path.exists():
             print("❌ Parquet file missing.")
@@ -1497,17 +1498,27 @@ class TuningRunner:
         ts_start = pd.Timestamp(start_date)
         ts_end = pd.Timestamp(end_date)
         
-        # --- PREPARE INTEGER MAP ---
-        # Instead of dealing with heavy strings, we map them to simple integers (0, 1, 2...)
-        # This makes the accumulated frames 10x smaller and prevents object-dtype reversion.
-        if allowed_contract_ids is not None:
-            sorted_unique_ids = sorted(list(allowed_contract_ids))
-            # Map: "0xabc" -> 15
-            id_to_code = {val: i for i, val in enumerate(sorted_unique_ids)}
-            allowed_set = set(allowed_contract_ids)
-        else:
-            print("❌ Critical: allowed_contract_ids is required for this optimization.")
+        # --- PREPARE GLOBAL MAP ---
+        # We need a fixed list of IDs to map strings -> int32.
+        # This ensures Chunk 1 and Chunk 100 use the exact same integer for "0xABC".
+        if allowed_contract_ids is None:
+            print("❌ Critical: allowed_contract_ids required for integer mode.")
             return pd.DataFrame()
+
+        # 1. Sort IDs to ensure code '0' always means the same contract
+        sorted_unique_ids = sorted(list(allowed_contract_ids))
+        
+        # 2. Create optimized Lookup (String -> Int32)
+        # Using a Series map is faster/cleaner than a dict for millions of rows
+        id_series = pd.Series(
+            data=np.arange(len(sorted_unique_ids), dtype='int32'),
+            index=sorted_unique_ids
+        )
+        
+        # 3. Also prepare User mapping on the fly? 
+        # No, users are too high cardinality to pre-map efficiently without scanning first.
+        # We will keep users as Strings in the chunk, cast to Category after concat 
+        # (Users are less dangerous than IDs for duplication).
         
         accumulated_frames = []
         total_rows_loaded = 0
@@ -1519,85 +1530,64 @@ class TuningRunner:
                 
                 df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
                 
-                # 1. OPTIMIZE TIMESTAMP (Zero Copy)
+                # A. Optimize Timestamp
                 if 'timestamp' in df_chunk.columns:
                     df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], errors='coerce')
                     if df_chunk['timestamp'].dt.tz is not None:
                          df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
 
                 if not df_chunk.empty:
-                    # --- IN-LOOP TRANSFORMATION (The OOM Fix) ---
+                    # B. Time Filter
+                    mask = (
+                        (df_chunk['timestamp'] >= ts_start) & 
+                        (df_chunk['timestamp'] <= ts_end) & 
+                        (df_chunk['tradeAmount'] >= 1.0)
+                    )
+                    df_chunk = df_chunk[mask].copy()
+                
+                if not df_chunk.empty:
+                    # C. ID MAPPING (The Memory Fix)
+                    # Convert String IDs to Global Int32 Codes immediately.
+                    # Rows not in our allowed list become NaN -> cast to -1 -> drop.
                     
-                    # 1. Map Token Index (Fast integer map)
-                    # We map the string IDs to the token index (0 or 1)
-                    if token_map:
-                         df_chunk['token_index'] = df_chunk['contract_id'].map(token_map).fillna(1).astype('int8')
-                    else:
-                         df_chunk['token_index'] = 1
+                    # 1. Map (Fastest way)
+                    # df_chunk['contract_id'] is object/string here.
+                    # We map it against our pre-built Series.
+                    codes = df_chunk['contract_id'].map(id_series)
                     
-                    # 2. Calculate True Price (Invert 'No' tokens)
-                    # We do this now so we don't have to copy the float column later
-                    price_raw = df_chunk['price'].fillna(0.5).astype('float32')
-                    df_chunk['price'] = np.where(
-                        df_chunk['token_index'] == 0, 
-                        1.0 - price_raw, 
-                        price_raw
-                    ).astype('float32')
-                    # Clip strictly
-                    df_chunk['price'] = df_chunk['price'].clip(0.001, 0.999)
-                    
-                    # 3. Filter Post-Mortem Trades
-                    # Check timestamp vs resolution time immediately
-                    if res_map:
-                         # Map resolution time to this chunk
-                         chunk_res_time = df_chunk['contract_id'].map(res_map)
-                         # Keep rows where (timestamp < res_time) OR (res_time is NaN)
-                         valid_time_mask = (df_chunk['timestamp'] < chunk_res_time) | (chunk_res_time.isna())
-                         df_chunk = df_chunk[valid_time_mask].copy()
+                    # 2. Drop Invalid (The Filter)
+                    # Any ID not in 'sorted_unique_ids' gets NaN. We drop them.
+                    df_chunk = df_chunk[codes.notna()].copy()
+                    codes = codes.dropna()
 
-                    if df_chunk.empty:
-                        continue
+                    # 3. Assign Integer
+                    df_chunk['contract_id'] = codes.astype('int32')
 
-                    # 4. Map Outcome (for later filtering)
-                    if outcome_map:
-                         df_chunk['market_outcome'] = df_chunk['contract_id'].map(outcome_map).astype('float32')
-                         # Filter valid outcomes immediately
-                         df_chunk = df_chunk[df_chunk['market_outcome'].isin([0.0, 1.0])]
-                    
-                    if df_chunk.empty:
-                        continue
-
-                    # 5. DEDUPLICATE CHUNK
+                    # D. Deduplicate (On Integers = Fast)
                     df_chunk.drop_duplicates(
                         subset=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
                         keep='first', 
                         inplace=True
                     )
-
-                    df_chunk.sort_values(by=['timestamp', 'contract_id', 'tradeAmount'], inplace=True)
-                    # 6. OPTIMIZE TYPES (Compress)
-                    # Convert to Integer Codes strategy (as implemented before)
-                    chunk_str_ids = df_chunk['contract_id'].astype(str)
-                    if id_to_code:
-                         codes = chunk_str_ids.map(id_to_code).fillna(-1).astype('int32')
-                         df_chunk['contract_id'] = codes
-                         df_chunk = df_chunk[df_chunk['contract_id'] != -1]
-
-                    df_chunk['user'] = df_chunk['user'].astype(str).astype('category')
                     
-                    # Fill NAs
+                    # E. Optimize Columns
+                    # Note: We leave 'user' as object/string for now to avoid Category misalignment.
+                    # We will categorize it *once* at the end.
+                    df_chunk['user'] = df_chunk['user'].astype(str)
+                    
                     df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
-                    cols_to_fill = ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']
-                    for col in cols_to_fill:
+                    for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
                         if col in df_chunk.columns:
                             df_chunk[col] = df_chunk[col].fillna(0.0).astype('float32')
-
+                    
+                    if 'side_mult' in df_chunk.columns:
+                        df_chunk['side_mult'] = df_chunk['side_mult'].astype('float32')
+                            
                     accumulated_frames.append(df_chunk)
                     total_rows_loaded += len(df_chunk)
                     
                 if i % 10 == 0:
                     gc.collect()
-                    
                 if (i * 50000) % 200_000 == 0:
                      print(f"   ...scanned {i*50000} rows (kept {total_rows_loaded})", end='\r')
 
@@ -1606,19 +1596,23 @@ class TuningRunner:
             if not accumulated_frames:
                 return pd.DataFrame(columns=columns)
 
-            # 7. MERGE (Fast & Low Memory because 'contract_id' is int32)
+            # F. CONCAT (Safe because 'contract_id' is just int32 numbers)
             final_df = pd.concat(accumulated_frames, ignore_index=True)
             
             del accumulated_frames
             gc.collect()
 
-            # 8. RESTORE CATEGORICALS (Zero Copy)
-            # We assume the integers correspond exactly to the index in sorted_unique_ids
+            # G. RECONSTRUCT CATEGORIES (Zero Copy)
             print("   Reconstructing Categories...")
+            
+            # 1. Contract ID: Use `from_codes` with our sorted list
             final_df['contract_id'] = pd.Categorical.from_codes(
                 final_df['contract_id'], 
                 categories=sorted_unique_ids
             )
+            
+            # 2. User: Now we can categorize users safely (Global conversion)
+            final_df['user'] = final_df['user'].astype('category')
 
             return final_df
             
