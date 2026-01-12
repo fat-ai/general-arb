@@ -1962,7 +1962,7 @@ class TuningRunner:
             return 1.0 if round(m_out) == t_idx else 0.0
 
         markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
-        markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
+        markets = markets.drop(columns=['contract_id_list'], errors='ignore')
 
         # ---------------------------------------------------------
         # 2. TRADES
