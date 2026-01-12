@@ -2655,14 +2655,13 @@ class TuningRunner:
         import pandas as pd
         import numpy as np
 
-        log.info("Transforming Data (Float32 Strict Mode)...")
+        log.info("Transforming Data (In-Place Optimization)...")
         
-        # --- HELPER: Fast Category Mapper (Zero-Copy) ---
+        # --- HELPER: Fast Category Mapper ---
         def fast_cat_map(categorical_col, value_map, default_val, dtype):
             codes = categorical_col.cat.codes.values
             categories = categorical_col.cat.categories
             mapped_cats = categories.map(value_map).fillna(default_val).astype(dtype).to_numpy()
-            
             if (codes == -1).any():
                 mapped_cats = np.append(mapped_cats, [default_val])
                 out = np.empty_like(codes, dtype=dtype)
@@ -2671,10 +2670,9 @@ class TuningRunner:
                 out[~valid_mask] = default_val
                 return out
             return mapped_cats[codes]
-        # ----------------------------------------------------
+        # ------------------------------------
 
         # 1. MARKETS PREP (Strict Types)
-        print("preparing markets data...")
         markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
         
         # Fix Date Parsing (Mixed Format)
@@ -2685,8 +2683,7 @@ class TuningRunner:
         markets['liquidity'] = markets['liquidity'].fillna(1.0).astype('float32')
         markets['outcome'] = markets['outcome'].astype('float32')
 
-        # 2. TRADES PREP
-        print("preparing trades data...")
+        # 2. TRADES TIME PREP
         if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
              trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
 
@@ -2694,7 +2691,6 @@ class TuningRunner:
              trades['contract_id'] = trades['contract_id'].astype('category')
 
         # 3. INTERSECTION FILTER
-        print("intersection filter...")
         market_ids_set = set(markets['contract_id'])
         trade_cats = trades['contract_id'].cat.categories
         valid_cats = [c for c in trade_cats if c in market_ids_set]
@@ -2713,8 +2709,7 @@ class TuningRunner:
              trades['contract_id'] = trades['contract_id'].cat.remove_unused_categories()
              gc.collect()
 
-        # 4. MAP TOKENS & PRICE
-        print("map tokens and price ...")
+        # 4. MAP TOKENS & PRICE (In-Place)
         if 'token_index' in markets.columns:
             token_map = markets.set_index('contract_id')['token_index'].to_dict()
             trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1, 'int8')
@@ -2729,91 +2724,73 @@ class TuningRunner:
         ).astype('float32')
         trades['price'] = trades['price'].clip(0.001, 0.999)
 
-        # 5. BUILD PROFILER DATA
-        print("build profiler data ...")
-        # ---------------------------------------------------------
-        # MEMORY-SAFE FILTERING (Column-by-Column Reconstruction)
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------
+        # 5. SINGLE-PASS FILTERING (The Fix)
+        # We filter 'trades' NOW. We do NOT create a separate 'prof_data' yet.
+        # This prevents holding 2 copies of the dataset.
+        # -----------------------------------------------------------
         
-        # 1. Prepare Maps
+        # Prepare Maps
         outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
         res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
 
-        # 2. Calculate Arrays (Low Memory)
-        outcome_arr = fast_cat_map(trades['contract_id'], outcome_map, 0.0, 'float32')
+        # Calculate Validation Arrays
         res_time_arr = fast_cat_map(trades['contract_id'], res_map, pd.NaT, 'datetime64[ns]')
+        outcome_arr = fast_cat_map(trades['contract_id'], outcome_map, 0.0, 'float32')
 
-        # 3. Calculate Filter Mask
-        # Identify rows to KEEP
+        # Calculate Mask
+        # Rule: Keep trade if timestamp < resolution_time AND outcome is valid
         ts_values = trades['timestamp'].values
         valid_mask = (ts_values < res_time_arr) | (np.isnat(res_time_arr))
         valid_mask &= np.isin(outcome_arr, [0.0, 1.0])
         
-        # Cleanup temporary arrays now to free RAM for the reconstruction
-        del ts_values
-        gc.collect()
-
-        # 4. DESTRUCTIVE RECONSTRUCTION
-        # We build prof_data while DELETING 'trades' columns one by one.
-        # This keeps Peak RAM = (Old Size) + (1 Column), instead of (Old Size) * 2.
+        # APPLY FILTER IN-PLACE (Reduces Memory)
+        trades = trades[valid_mask].copy()
         
-        prof_data_dict = {}
+        # Add the mapped columns to 'trades' directly (Sliced to match filter)
+        trades['outcome'] = outcome_arr[valid_mask]
+        trades['res_time'] = res_time_arr[valid_mask]
         
-        # Define mapping: {Target Name: Source Name}
-        col_map = {
-            'wallet_id': 'user',
-            'market_id': 'contract_id',
-            'timestamp': 'timestamp',
-            'usdc_vol': 'tradeAmount',
-            'tokens': 'outcomeTokensAmount',
-            'price': 'price'
-        }
-        
-        # Move columns one by one
-        for target_col, source_col in col_map.items():
-            # Slice the valid data
-            prof_data_dict[target_col] = trades[source_col].values[valid_mask]
-            # DELETE the source column immediately to free RAM
-            del trades[source_col]
-            gc.collect()
-
-        # Add calculated columns (sliced)
-        prof_data_dict['outcome'] = outcome_arr[valid_mask]
-        prof_data_dict['res_time'] = res_time_arr[valid_mask]
-        prof_data_dict['size'] = prof_data_dict['usdc_vol'] # Shallow copy / ref
-        prof_data_dict['bet_price'] = prof_data_dict['price'] # Shallow copy / ref
-
-        # Cleanup remainders
-        del outcome_arr, res_time_arr, valid_mask
-        # Explicitly delete the empty 'trades' shell
-        del trades
-        gc.collect()
-
-        # 5. Create Final DataFrame (Safe now because 'trades' is gone)
-        prof_data = pd.DataFrame(prof_data_dict)
-        
-        del prof_data_dict
+        # Cleanup
+        del valid_mask, ts_values, res_time_arr, outcome_arr
         gc.collect()
         
-        del valid_mask
-        log.info(f"Profiler Data Built: {len(prof_data)} records.")
+        log.info(f"Valid Trades Filtered: {len(trades)} records.")
 
-        # 6. BUILD EVENTS (Memory Optimized Concat)
-        print("build events ...")
-        # Create SHARED CATEGORIES to prevent object upcasting
+        # 6. CONVERT TRADES TO PROF_DATA (Rename In-Place)
+        # We reuse the 'trades' dataframe to serve as 'prof_data'.
+        # We rename columns to match the Profiler schema.
+        
+        trades.rename(columns={
+            'user': 'wallet_id',
+            'contract_id': 'market_id',
+            'tradeAmount': 'usdc_vol',
+            'outcomeTokensAmount': 'tokens'
+        }, inplace=True)
+        
+        # Create aliases for columns needed by both (Shallow Copy)
+        trades['size'] = trades['usdc_vol']
+        trades['bet_price'] = trades['price']
+        
+        # 'prof_data' is now just a reference to 'trades'. No memory cost.
+        prof_data = trades
+
+        # 7. EXTRACT EVENTS
+        # We extract the 'df_updates' from the modified 'trades' dataframe.
+        
+        # Create SHARED CATEGORIES
         shared_contract_dtype = pd.CategoricalDtype(categories=sorted(list(valid_cats)), ordered=False)
         shared_event_dtype = pd.CategoricalDtype(categories=['NEW_CONTRACT', 'RESOLUTION', 'TRADE'], ordered=False)
 
         # A. Markets (New Contract)
         cond_ids = markets['condition_id'] if 'condition_id' in markets.columns else markets['contract_id']
 
-        # NOTE: np.float32(0.5) enforces type. Regular 0.5 is float64.
         df_new = pd.DataFrame({
             'timestamp': markets['created_at'],
             'contract_id': markets['contract_id'].astype(shared_contract_dtype),
             'event_type': 'NEW_CONTRACT',
-            'liquidity': markets['liquidity'], # Already float32
-            'p_market_all': np.float32(0.5),   # STRICT FLOAT32
+            'liquidity': markets['liquidity'], 
+            'p_market_all': np.float32(0.5),
             'is_sell': False,
             'wallet_id': "SYSTEM"
         })
@@ -2823,60 +2800,46 @@ class TuningRunner:
             'timestamp': markets['resolution_timestamp'],
             'contract_id': markets['contract_id'].astype(shared_contract_dtype),
             'event_type': 'RESOLUTION',
-            'outcome': markets['outcome'],     # Already float32
-            'p_market_all': markets['outcome'],# Already float32
+            'outcome': markets['outcome'],
+            'p_market_all': markets['outcome'],
             'is_sell': False,
             'wallet_id': "SYSTEM"
         })
 
-        # C. Updates (Transform Trades In-Place)
-        print("apply trades updates ...")
-        # Apply Shared Dtypes NOW to trades
-        trades['contract_id'] = trades['contract_id'].astype(shared_contract_dtype)
+        # C. Updates (Extracted from prof_data/trades)
+        # Note: 'market_id' is 'contract_id', 'usdc_vol' is 'tradeAmount'
         
-        trades.rename(columns={
-            'size': 'trade_volume',
-            'tradeAmount': 'usdc_vol',
-            'user': 'wallet_id'
-        }, inplace=True)
-        
-        trades['event_type'] = 'TRADE'
-        trades['p_market_all'] = trades['price']
-        trades['is_sell'] = (trades['outcomeTokensAmount'] < 0)
-        
-        # Select columns and ensure types match df_new/df_res EXACTLY
-        wanted_cols = ['timestamp', 'contract_id', 'event_type', 'p_market_all', 'trade_volume', 'usdc_vol', 'wallet_id', 'is_sell']
-        
-        # We perform the slicing. 
-        df_updates = trades[wanted_cols]
-        
-        # IMPORTANT: Force garbage collection of the old 'trades' structure.
-        del trades
-        gc.collect()
+        # We construct df_updates. This creates a copy, but it's unavoidable for structure change.
+        # However, we can select only what we need.
+        df_updates = pd.DataFrame({
+            'timestamp': trades['timestamp'],
+            'contract_id': trades['market_id'].astype(shared_contract_dtype), # Re-cast to shared
+            'event_type': 'TRADE',
+            'p_market_all': trades['price'],
+            'trade_volume': trades['size'],
+            'usdc_vol': trades['usdc_vol'],
+            'wallet_id': trades['wallet_id'],
+            'is_sell': (trades['tokens'] < 0)
+        })
 
-        # 7. MERGE
-        print("final merge...")
-        # Apply Shared Event Dtype
+        # 8. MERGE
         df_new['event_type'] = df_new['event_type'].astype(shared_event_dtype)
         df_res['event_type'] = df_res['event_type'].astype(shared_event_dtype)
         df_updates['event_type'] = df_updates['event_type'].astype(shared_event_dtype)
 
-        # DEBUG: Check types before concat to ensure no upcasting
-        # If df_new['p_market_all'] is float64, it will explode df_updates.
-        # We force cast small DFs just in case.
+        # Force types on small DFs
         for col in ['p_market_all', 'liquidity', 'outcome']:
             if col in df_new.columns: df_new[col] = df_new[col].astype('float32')
             if col in df_res.columns: df_res[col] = df_res[col].astype('float32')
             
         log.info("Concatenating Events...")
-        # ignore_index=True is faster and uses less memory
         df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
         
         del df_new, df_res, df_updates
         gc.collect()
 
-        # 8. FINAL SORT (Quicksort = Low RAM)
-        log.info("Sorting Events (Zero-Copy Mode)...")
+        # 9. FINAL SORT
+        log.info("Sorting Events (Quicksort)...")
         df_ev.sort_values(
             by=['timestamp', 'event_type'], 
             kind='quicksort', 
