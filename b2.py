@@ -1590,9 +1590,8 @@ class TuningRunner:
     
         analysis = tune.run(
             tune.with_parameters(
-                _wrapper,
-                event_log=event_log_ref,
-                profiler_data=profiler_ref,
+                ray_backtest_wrapper,
+                data_dir=dataset_dir_str,
             ),
             config=search_space,
             metric="smart_score",
