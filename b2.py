@@ -1384,117 +1384,79 @@ class TuningRunner:
             if not ray.is_initialized():
                 ray.init(logging_level=logging.ERROR, ignore_reinit_error=True)
                 
-    def _convert_csv_to_parquet(self):
-        """
-        Memory-Safe Conversion: Reads CSV in small chunks and appends to Parquet.
-        FIXED: Uses Parquet 1.0 compatibility to prevent Polars 'Plain encoding' errors.
-        """
+    def _convert_csv_to_parquet_safe(self):
         import polars as pl
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-        
         csv_path = self.cache_dir / "gamma_trades_stream.csv"
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
-        
+    
         if not csv_path.exists():
-            print(f"❌ Cannot convert: Input CSV not found at {csv_path}")
             return
-
-        # Smart Check: Only convert if CSV is newer than Parquet
+    
+        print(f"🚀 Streaming conversion: {csv_path.name} -> {parquet_path.name}")
+    
+        # 1. DELETE the corrupted file first to ensure a clean start
         if parquet_path.exists():
-            if csv_path.stat().st_mtime <= parquet_path.stat().st_mtime:
-                return
-            print(f"🔄 CSV has changed. Updating Parquet...")
-        
-        # Remove old file to ensure clean write
-        if parquet_path.exists():
-            try: os.remove(parquet_path)
-            except: pass
-
-        print(f"🚀 Starting Chunked Conversion (Low RAM + Compatible Mode)...")
-
-        # Define Schema explicitly
-        dtypes = {
-            "id": pl.String,
-            "contract_id": pl.String,
-            "user": pl.String,
-            "tradeAmount": pl.Float32,
-            "price": pl.Float32,
-            "size": pl.Float32,
-            "outcomeTokensAmount": pl.Float32,
-            "timestamp": pl.String,
-            "side_mult": pl.Float32
-        }
-
-        # Use Batched Reader
-        reader = pl.read_csv_batched(
-            str(csv_path), 
-            schema_overrides=dtypes, 
-            batch_size=50000, 
-            ignore_errors=True
-        )
-
-        writer = None
-        chunks_processed = 0
-
-        while True:
-            chunks = reader.next_batches(1) 
-            if not chunks:
-                break
-            
-            chunk = chunks[0]
-            
-            # Data Cleanup
-            chunk = chunk.with_columns([
-                pl.col("timestamp").str.to_datetime(strict=False).dt.replace_time_zone(None),
-                pl.col("contract_id").cast(pl.String), 
-                pl.col("user").cast(pl.String),
-            ]).filter(pl.col("timestamp").is_not_null())
-
-            # Convert to PyArrow Table
-            pa_table = chunk.to_arrow()
-
-            # Initialize Writer with COMPATIBILITY options
-            if writer is None:
-                writer = pq.ParquetWriter(
-                    str(parquet_path), 
-                    pa_table.schema, 
-                    compression='snappy',
-                    version='1.0',          # Forces legacy format Polars can definitely read
-                    use_dictionary=False,   # Disables dictionary encoding (often the cause of "Plain" errors)
-                    write_statistics=False  # Reduces overhead
+            parquet_path.unlink()
+    
+        # 2. Use Lazy Scanning with a Sink
+        # This reads the CSV in chunks and 'streams' it directly to Parquet disk
+        try:
+            (
+                pl.scan_csv(
+                    str(csv_path),
+                    infer_schema_length=10000, 
+                    ignore_errors=True
                 )
+                .with_columns([
+                    # Ensure timestamp is parsed correctly during the stream
+                    pl.col("timestamp").str.to_datetime(strict=False),
+                    pl.col("contract_id").cast(pl.String),
+                ])
+                .sink_parquet(
+                    parquet_path,
+                    compression="snappy",
+                    row_group_size=100_000  # Smaller groups prevent OOM during write
+                )
+            )
+            print("✅ Conversion successful and file finalized with PAR1 footer.")
+        except Exception as e:
+            print(f"❌ Conversion failed: {e}")
             
-            writer.write_table(pa_table)
-            chunks_processed += 1
-            
-            if chunks_processed % 10 == 0:
-                print(f"   Processed {chunks_processed * 50000} rows...", end='\r')
+    def _fast_load_trades(self, start_date, end_date, allowed_ids):
+    import polars as pl
+    parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
 
-        if writer:
-            writer.close()
-            
-        print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
-       
-    def _fast_load_trades(self, parquet_path, start_date, end_date, allowed_contract_ids):
-        import polars as pl
-        
-        # scan_parquet does NOT load the file into RAM. It just reads the metadata.
+    if not parquet_path.exists():
+        raise FileNotFoundError("Optimized parquet file not found. Run conversion first.")
+
+    # Convert allowed_ids to list for Polars compatibility
+    id_list = list(allowed_ids)
+
+    try:
+        # scan_parquet is lazy; no data is loaded yet
         q = (
             pl.scan_parquet(parquet_path)
             .filter(
                 (pl.col("timestamp") >= start_date) & 
                 (pl.col("timestamp") <= end_date) &
-                (pl.col("contract_id").is_in(list(allowed_contract_ids)))
+                (pl.col("contract_id").is_in(id_list))
             )
             .select([
                 "contract_id", "user", "price", "size", "timestamp", "side_mult"
             ])
         )
         
-        # Only now does it actually read and filter the data
-        return q.collect().to_pandas()
-            
+        # streaming=True is key for 80GB files to keep RAM usage near-zero
+        return q.collect(streaming=True).to_pandas()
+        
+    except polars.exceptions.ComputeError as e:
+        if "PAR1" in str(e):
+            print("⚠️ Detected corrupted Parquet file. Deleting and re-converting...")
+            parquet_path.unlink()
+            self._convert_csv_to_parquet_safe()
+            return self._fast_load_trades(start_date, end_date, allowed_ids)
+        raise e
+        
     def run_tuning_job(self):
 
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
