@@ -2414,83 +2414,42 @@ class TuningRunner:
         import pandas as pd
         import gc
         import numpy as np
-        from datetime import timedelta
         
-        # TARGET: ~20-25 Million rows per chunk to stay safe
-        MAX_ROWS_PER_CHUNK = 20_000_000 
+        # 1. SKIP PRE-SCAN. Use a safe, fixed window.
+        # 30 Days is safe. Even in peak 2025, 30 days is < 25M rows.
+        # In quiet years (2020), it will just be fast.
+        CHUNK_DAYS = 30
         
-        log.info("📊 Pre-scanning to build safe memory chunks...")
+        start_ts = pd.Timestamp(FIXED_START_DATE)
+        end_ts = pd.Timestamp(FIXED_END_DATE)
         
-        # 1. PRE-SCAN: Count trades per month to estimate density
-        # This is very fast on Parquet (reads metadata only)
-        density_stats = (
-            trades_lazy
-            .with_columns(pl.col("timestamp").dt.truncate("1mo").alias("month"))
-            .group_by("month")
-            .agg(pl.count("contract_id").alias("count"))
-            .sort("month")
-            .collect()
-        )
-        
-        # 2. BUILD DYNAMIC RANGES
-        # We merge months until we hit the MAX_ROWS_PER_CHUNK limit
-        chunk_ranges = []
-        current_start = None
-        current_count = 0
-        
-        start_ts = pd.Timestamp(FIXED_START_DATE).replace(tzinfo=None)
-        end_ts = pd.Timestamp(FIXED_END_DATE).replace(tzinfo=None)
-        
-        rows = density_stats.to_dicts()
-        
-        for row in rows:
-            m_date = pd.Timestamp(row["month"]).replace(tzinfo=None)
-            count = row["count"]
+        # Create strict 30-day windows
+        periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
+        if periods[-1] < end_ts:
+            periods = periods.union([end_ts])
             
-            if m_date < start_ts or m_date > end_ts:
-                continue
-                
-            if current_start is None:
-                current_start = m_date
-            
-            current_count += count
-            
-            # If adding this month exceeds limit, close the previous chunk
-            if current_count >= MAX_ROWS_PER_CHUNK:
-                # Close chunk at the end of this month
-                next_month = m_date + pd.offsets.MonthBegin(1)
-                chunk_ranges.append((current_start, next_month))
-                
-                # Reset
-                current_start = next_month
-                current_count = 0
-        
-        # Add final chunk if remains
-        if current_start is not None and current_start < end_ts:
-            chunk_ranges.append((current_start, end_ts))
-            
-        # Fallback if data is empty or too sparse
-        if not chunk_ranges:
-            chunk_ranges = [(start_ts, end_ts)]
-            
-        log.info(f"🚀 Processing {len(chunk_ranges)} dynamic chunks (Target: <{MAX_ROWS_PER_CHUNK/1e6:.0f}M rows)...")
-
         event_log_chunks = []
         profiler_chunks = []
+        
+        log.info(f"🚀 Starting Fixed Chunk Processing ({len(periods)-1} batches of {CHUNK_DAYS} days)...")
     
-        for i, (p_start, p_end) in enumerate(chunk_ranges):
-            # Ensure timezone awareness matches your data (usually UTC)
+        for i in range(len(periods) - 1):
+            p_start = periods[i]
+            p_end = periods[i+1]
+            
+            # Ensure TZ awareness is consistent
             if p_start.tzinfo is None: p_start = p_start.tz_localize('UTC')
             if p_end.tzinfo is None: p_end = p_end.tz_localize('UTC')
+
+            print(f"   📦 Batch {i+1}/{len(periods)-1}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            print(f"   📦 Batch {i+1}/{len(chunk_ranges)}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
-            
-            # 1. TRADES SLICE
+            # 2. FILTER TRADES (Lazy)
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
             )
             
+            # 3. JOIN (String Key -> String Key)
             joined = trades_slice.join(
                 markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
                 on="contract_id",
@@ -2499,8 +2458,8 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
-            # EVENT 1: TRADES
-            # We revert wallet_id to String here to ensure safe concat with 'SYSTEM'
+            # 4. EVENT 1: TRADES (Strict Types)
+            # wallet_id = String (safest for concat)
             ev_trades = joined.select([
                 pl.col("timestamp"),
                 pl.col("contract_id"), 
@@ -2508,18 +2467,18 @@ class TuningRunner:
                 pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("price").cast(pl.Float32).alias("p_market_all"),
                 (pl.col("side_mult") < 0).alias("is_sell"),
-                pl.col("user").cast(pl.String).alias("wallet_id"), # Cast back to String for safety
+                pl.col("user").cast(pl.String).alias("wallet_id"), 
                 
-                # These are Float32 from the load function
+                # Float32s from load
                 pl.col("tradeAmount").alias("usdc_vol"),
                 pl.col("outcomeTokensAmount").alias("tokens"),
                 pl.col("price").alias("bet_price"),
                 
-                pl.col("outcome").cast(pl.Float64), # Ensure Float64
+                pl.col("outcome").cast(pl.Float64),
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
-            # EVENT 2: NEW CONTRACTS
+            # 5. EVENT 2: NEW CONTRACTS (Strict Types & Float32 Fillers)
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
@@ -2531,16 +2490,15 @@ class TuningRunner:
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id"), # String
                 
-                # STRICT FIX: Force 0.0 to be Float32
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
                 
-                pl.lit(0.0).cast(pl.Float64).alias("outcome"), # Match Float64
+                pl.lit(0.0).cast(pl.Float64).alias("outcome"), 
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
-            # EVENT 3: RESOLUTIONS
+            # 6. EVENT 3: RESOLUTIONS (Strict Types & Float32 Fillers)
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
@@ -2552,27 +2510,27 @@ class TuningRunner:
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id"), # String
                 
-                # STRICT FIX: Force 0.0 to be Float32
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
                 
-                pl.col("outcome").cast(pl.Float64), # Match Float64
+                pl.col("outcome").cast(pl.Float64),
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
             
-            # Execute
+            # 7. EXECUTE (Streaming Engine)
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # OPTIMIZATION: Convert Strings to Categories HERE (The final safe place)
+                # 8. FINAL OPTIMIZATION (String -> Categorical)
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.Categorical),
                     pl.col("wallet_id").cast(pl.Categorical)
                 ])
                 
+                # 9. CONVERT TO PANDAS (Zero Copy)
                 pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
                 
                 prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
@@ -2585,6 +2543,7 @@ class TuningRunner:
                 
             print(f" Done ({chunk_df.height} rows).")
             
+            # Aggressive Cleanup
             del chunk_df, pdf, trades_slice, joined
             gc.collect()
     
