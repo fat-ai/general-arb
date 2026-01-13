@@ -335,7 +335,7 @@ def process_data_chunk(args):
 
     return results, chunk_lookup
     
-@ray.remote 
+
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     import gc
     import pandas as pd
@@ -1300,10 +1300,11 @@ class FastBacktestEngine:
         # We run one remote task for the entire remaining duration.
         # This keeps the engine alive, so positions are held until resolution.
         try:
-            result = ray.get(execute_period_remote.remote(
+            # CHANGED: Direct call instead of ray.get(remote.remote(...))
+            result = execute_period_local(
                 test_slice_df, fold_wallet_scores, config, fw_slope, fw_intercept, 
                 train_end, max_date, {}, self.market_lifecycle
-            ))
+            )
         except Exception as e:
             print(f"❌ Simulation execution failed: {e}")
             traceback.print_exc()
@@ -1531,44 +1532,40 @@ class TuningRunner:
         import gc
         import pandas as pd
         import numpy as np
+        import shutil
+        from pathlib import Path
 
-        log.info("--- Starting Full Strategy Optimization (Lazy Architecture) ---")
+        log.info("--- Starting Full Strategy Optimization (Disk-Based Architecture) ---")
         
-        # 1. LOAD (Returns LazyFrames, 0 RAM usage)
+        # 1. LOAD LAZY FRAMES (Must be done first!)
+        # df_markets and df_trades are Polars LazyFrames (pointers, not data)
         df_markets, df_trades = self._load_data()
 
-        print("\n🔍 DATA PIPELINE READY (Lazy Mode)")
+        print("\n🔍 DATA PIPELINE READY")
         print(f"   Markets Plan: {type(df_markets)}")
         print(f"   Trades Plan:  {type(df_trades)}")
         
-        # 2. TRANSFORM (Executes in chunks)
-        # This function materializes small batches and returns final Pandas DFs
-        event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        # 2. TRANSFORM TO DISK
+        # We pass the LazyFrames. This function executes them in chunks and saves to disk.
+        # It returns the DIRECTORY PATH where the files are saved.
+        dataset_dir_path = self._transform_to_events(df_markets, df_trades)
         
-        # 3. CLEANUP (Critical: Drop Lazy Plans)
+        # 3. CLEANUP
+        # We no longer need the plans. The data is safely on disk.
         del df_markets, df_trades
         gc.collect()
 
-        if event_log.empty:
-            log.error("⛔ Event log is empty after transformation. Check data sync.")
-            return None
-    
-        # --- DIAGNOSTICS CAN RUN NOW (On the reduced Event Log) ---
-        min_date = event_log.index.min()
-        max_date = event_log.index.max()
-        total_days = (max_date - min_date).days
-    
-        log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date.date()} to {max_date.date()})")
-    
-        safe_train = max(5, int(total_days * 0.33))
-        safe_test = max(5, int(total_days * 0.60))
-        required_days = safe_train + safe_test + 2
-        
-        if total_days < required_days:
-            log.error(f"⛔ Not enough data: Have {total_days} days, need {required_days}.")
+        # 4. VALIDATION
+        # Check if the transformation actually produced files
+        if not list(dataset_dir_path.glob("events_*.parquet")):
+            log.error("⛔ No data generated! Check your date range or input files.")
             return None
             
-        log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
+        # 5. PREPARE FOR RAY
+        # We pass the PATH string. Ray workers will read from this path.
+        dataset_dir_str = str(dataset_dir_path.absolute())
+        
+        print(f"🚀 Launching tuning using data at: {dataset_dir_str}")
         
         # === FIXED SEARCH SPACE ===
         search_space = {
@@ -1613,7 +1610,7 @@ class TuningRunner:
     
         analysis = tune.run(
             tune.with_parameters(
-                ray_backtest_wrapper,
+                _wrapper,
                 event_log=event_log_ref,
                 profiler_data=profiler_ref,
             ),
@@ -1670,12 +1667,22 @@ class TuningRunner:
         print(f"   Trades:           {metrics.get('trades', 0)}")
         print("="*60 + "\n")
 
-        # Re-run for Plotting
-        print("📥 Fetching data back for plotting...")
-        event_log = ray.get(event_log_ref)
-        profiler_data = ray.get(profiler_ref)
+        # 8. FINAL PLOT (Local Load)
+        print("📥 Loading data locally for final plot...")
         
-        # Unpack sizing for local engine
+        # Load from the same disk path we used for Ray
+        event_log = pl.read_parquet(dataset_dir_path / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
+        
+        profiler_data = pl.read_parquet(dataset_dir_path / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        
+        # Helper cols
+        if 'ts_int' not in event_log.columns:
+            event_log['ts_int'] = event_log.index.astype(np.int64)
+        if 'ts_int' not in profiler_data.columns:
+            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
+        
+        # Unpack Sizing
         if 'sizing' in best_config:
             mode, val = best_config['sizing']
             best_config['sizing_mode'] = mode
@@ -1683,6 +1690,7 @@ class TuningRunner:
             elif mode == 'fixed_pct': best_config['fixed_size'] = val
             elif mode == 'fixed': best_config['fixed_size'] = val
 
+        # Run Engine locally
         engine = FastBacktestEngine(event_log, profiler_data, None, {})
         final_results = engine.run_walk_forward(best_config)
         
@@ -1692,20 +1700,8 @@ class TuningRunner:
         if curve_data:
             plot_performance(curve_data, trade_count)
             
-            # Print curve stats
-            if isinstance(curve_data[0], (tuple, list)):
-                values = [x[1] for x in curve_data]
-            else:
-                values = curve_data
-                
-            start = values[0]
-            end = values[-1]
-            peak = max(values)
-            low = min(values)
-            print(f"   Start: ${start:.0f} -> Peak: ${peak:.0f} -> End: ${end:.0f}")
-            print(f"   Lowest Point: ${low:.0f}")
-    
         return best_config
+        
         
     def _fast_load_trades(self, start_date, end_date, allowed_ids):
         import polars as pl
@@ -2418,15 +2414,15 @@ class TuningRunner:
         import numpy as np
         from pathlib import Path
         
-        # Setup Temp Directory for Disk Buffering
-        temp_dir = self.cache_dir / "processing_chunks"
-        if temp_dir.exists(): shutil.rmtree(temp_dir)
-        temp_dir.mkdir(exist_ok=True)
+        # 1. SETUP PERSISTENT CACHE DIR
+        # We use a stable directory so workers can find it
+        dataset_dir = self.cache_dir / "tuning_dataset"
+        if dataset_dir.exists(): shutil.rmtree(dataset_dir)
+        dataset_dir.mkdir(exist_ok=True)
         
-        # 1. FIXED CHUNK SIZE (30 Days)
+        # 2. FIXED CHUNK SIZE (30 Days)
         CHUNK_DAYS = 7
         
-        # Ensure start/end are Naive (TZ-stripped)
         start_ts = pd.Timestamp(FIXED_START_DATE).tz_localize(None)
         end_ts = pd.Timestamp(FIXED_END_DATE).tz_localize(None)
         
@@ -2434,25 +2430,24 @@ class TuningRunner:
         if periods[-1] < end_ts:
             periods = periods.union([end_ts])
             
-        log.info(f"🚀 Starting Fixed Chunk Processing ({len(periods)-1} batches)...")
+        log.info(f"🚀 Processing Data to Disk ({len(periods)-1} batches)...")
     
         for i in range(len(periods) - 1):
             p_start = periods[i]
             p_end = periods[i+1]
             
-            # STRIP TIMEZONES
+            # Strip Timezones
             if p_start.tzinfo is not None: p_start = p_start.tz_localize(None)
             if p_end.tzinfo is not None: p_end = p_end.tz_localize(None)
 
             print(f"   📦 Batch {i+1}/{len(periods)-1}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            # 2. FILTER TRADES
+            # FILTER & JOIN (Same logic as before)
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
             )
             
-            # 3. JOIN
             joined = trades_slice.join(
                 markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
                 on="contract_id",
@@ -2461,7 +2456,7 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
-            # 4. EVENT 1: TRADES
+            # EVENT 1: TRADES
             ev_trades = joined.select([
                 pl.col("timestamp"),
                 pl.col("contract_id"), 
@@ -2470,16 +2465,14 @@ class TuningRunner:
                 pl.col("price").cast(pl.Float32).alias("p_market_all"),
                 (pl.col("side_mult") < 0).alias("is_sell"),
                 pl.col("user").cast(pl.String).alias("wallet_id"), 
-                
                 pl.col("tradeAmount").alias("usdc_vol"),
                 pl.col("outcomeTokensAmount").alias("tokens"),
                 pl.col("price").alias("bet_price"),
-                
                 pl.col("outcome").cast(pl.Float64),
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
-            # 5. EVENT 2: NEW CONTRACTS
+            # EVENT 2: NEW CONTRACTS
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
@@ -2490,16 +2483,14 @@ class TuningRunner:
                 pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id"), 
-                
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
-                
                 pl.lit(0.0).cast(pl.Float64).alias("outcome"), 
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
-            # 6. EVENT 3: RESOLUTIONS
+            # EVENT 3: RESOLUTIONS
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
@@ -2510,76 +2501,72 @@ class TuningRunner:
                 pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id"), 
-                
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
-                
                 pl.col("outcome").cast(pl.Float64),
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
-            
-            # 7. EXECUTE
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # 8. OPTIMIZATION & DISK WRITE
-                # We cast to Categorical here for compression on disk
+                # Cast to Categorical for disk compression
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.Categorical),
                     pl.col("wallet_id").cast(pl.Categorical)
                 ])
                 
-                # Split and Write immediately to avoid RAM accumulation
-                
-                # A. Write Event Log
+                # Write to Partitioned Parquet
                 base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
                 chunk_df.select(base_cols).write_parquet(
-                    temp_dir / f"events_{i}.parquet",
+                    dataset_dir / f"events_{i}.parquet",
                     compression='snappy'
                 )
                 
-                # B. Write Profiler Data
                 prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
                 chunk_df.filter(pl.col("event_type") == "TRADE").select(prof_cols).rename({"contract_id": "market_id"}).write_parquet(
-                    temp_dir / f"profiler_{i}.parquet",
+                    dataset_dir / f"profiler_{i}.parquet",
                     compression='snappy'
                 )
                 
             print(f" Done ({chunk_df.height} rows) -> Disk.")
-            
-            # Aggressive Cleanup
             del chunk_df, trades_slice, joined
             gc.collect()
-    
-        print("🏁 Loading merged results from disk (Zero-Copy)...")
-        
-        try:
-            # Check if we generated any data
-            if not list(temp_dir.glob("events_*.parquet")):
-                return pd.DataFrame(), pd.DataFrame()
 
-            # 9. READ FROM DISK (Efficient Merge)
-            # Polars reads all chunks as one dataset. This allocates memory ONCE.
-            # Compare this to pd.concat which allocates memory 2-3 times.
-            
-            # Use PyArrow extension for String optimization
-            event_log = pl.read_parquet(temp_dir / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
-            profiler_data = pl.read_parquet(temp_dir / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
-            
-            # Final Sort
-            event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
-            
-        finally:
-            # Cleanup disk space
-            if temp_dir.exists(): shutil.rmtree(temp_dir)
+        # RETURN THE PATH, NOT THE DATAFRAME
+        log.info(f"✅ Data successfully prepared in {dataset_dir}")
+        return dataset_dir
         
-        return event_log, profiler_data
         
-def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
+def ray_backtest_wrapper(config, data_dir, nlp_cache=None, priors=None):
+    import polars as pl
+    import pandas as pd
+    from pathlib import Path
     
+    # 1. Load Data Locally (Each worker loads its own copy from disk)
+    # This prevents the "Object Store" OOM kill.
+    # We use PyArrow for zero-copy loading to keep worker RAM low.
+    data_path = Path(data_dir)
+    
+    try:
+        # Load Events
+        event_log = pl.read_parquet(data_path / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
+        
+        # Load Profiler
+        profiler_data = pl.read_parquet(data_path / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        
+        if 'ts_int' not in event_log.columns:
+            event_log['ts_int'] = event_log.index.astype(np.int64)
+        if 'ts_int' not in profiler_data.columns:
+            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
+            
+    except Exception as e:
+        print(f"Worker Load Failed: {e}")
+        return {'smart_score': -99.0}
+        
     if isinstance(event_log, ray.ObjectRef):
         event_log = ray.get(event_log)
     if isinstance(profiler_data, ray.ObjectRef):
