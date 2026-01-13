@@ -1495,7 +1495,6 @@ class TuningRunner:
             print("⚠️ Parquet missing. Converting...")
             self._convert_csv_to_parquet_safe()
     
-        # FIX 1: Keep allowed_ids as String for the Join
         allowed_df = pl.DataFrame({"contract_id": list(allowed_ids)}).with_columns(
             pl.col("contract_id").cast(pl.String) 
         )
@@ -1506,18 +1505,19 @@ class TuningRunner:
                 (pl.col("timestamp") >= start_date) & 
                 (pl.col("timestamp") <= end_date)
             )
-            # FIX 2: String <-> String Join (Safe & Fast)
             .join(allowed_df.lazy(), on="contract_id", how="inner")
             .select([
                 "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
             ])
             .with_columns([
-                # FIX 3: Do NOT cast contract_id to Categorical yet. Keep it String for the next join.
+                # Join Key -> String
                 pl.col("contract_id").cast(pl.String),
                 
-                # We CAN cast 'user' now because we don't join on it.
-                pl.col("user").cast(pl.Categorical),
+                # Time Key -> Datetime (Fixes potential string comparison errors)
+                pl.col("timestamp").cast(pl.Datetime),
                 
+                # Optimizations
+                pl.col("user").cast(pl.Categorical),
                 pl.col("price").cast(pl.Float32),
                 pl.col("size").cast(pl.Float32),
                 pl.col("tradeAmount").cast(pl.Float32),
@@ -1526,7 +1526,7 @@ class TuningRunner:
             ])
         )
         
-        print("⚡ LazyFrame Prepared (String Keys)")
+        print("⚡ LazyFrame Prepared (Type Safe)")
         return q
         
     def run_tuning_job(self):
@@ -1723,12 +1723,21 @@ class TuningRunner:
         else:
             markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
     
+        # 1. Normalize IDs
         markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
         
-        # FIX 4: Keep contract_id as String here too
-        markets_pl = pl.from_pandas(markets_pd).lazy().with_columns(
-            pl.col("contract_id").cast(pl.String)
-        )
+        # 2. STRICT TYPE ENFORCEMENT (Pandas Side)
+        # We coerce errors='coerce' to ensure we have valid datetimes or NaT (which Polars handles)
+        markets_pd['created_at'] = pd.to_datetime(markets_pd['created_at'], utc=True, errors='coerce')
+        markets_pd['resolution_timestamp'] = pd.to_datetime(markets_pd['resolution_timestamp'], utc=True, errors='coerce')
+
+        # 3. Create LazyFrame with Explicit Casts (Polars Side)
+        # We cast contract_id to String (for the join) AND timestamps to Datetime (for the filter)
+        markets_pl = pl.from_pandas(markets_pd).lazy().with_columns([
+            pl.col("contract_id").cast(pl.String),
+            pl.col("created_at").cast(pl.Datetime),
+            pl.col("resolution_timestamp").cast(pl.Datetime)
+        ])
     
         valid_market_ids = set(markets_pd['contract_id'].unique())
     
@@ -2426,12 +2435,12 @@ class TuningRunner:
             
             print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
+            # TRADES FILTER
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
             )
             
-            # JOIN: Now String <-> String. This will work perfectly.
             joined = trades_slice.join(
                 markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
                 on="contract_id",
@@ -2440,16 +2449,14 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
-            # Build Events (Keep contract_id as String for now)
             ev_trades = joined.select([
                 pl.col("timestamp"),
-                pl.col("contract_id"), # String
+                pl.col("contract_id"), 
                 pl.lit("TRADE").alias("event_type").cast(pl.Categorical),
                 pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("price").cast(pl.Float32).alias("p_market_all"),
                 (pl.col("side_mult") < 0).alias("is_sell"),
-                pl.col("user").alias("wallet_id"), # Already Categorical from load
-                
+                pl.col("user").alias("wallet_id"), 
                 pl.col("tradeAmount").alias("usdc_vol"),
                 pl.col("outcomeTokensAmount").alias("tokens"),
                 pl.col("price").alias("bet_price"),
@@ -2457,11 +2464,12 @@ class TuningRunner:
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
+            # NEW CONTRACTS FILTER (Strict Datetime Check)
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
                 pl.col("created_at").alias("timestamp"),
-                pl.col("contract_id"), # String
+                pl.col("contract_id"),
                 pl.lit("NEW_CONTRACT").alias("event_type").cast(pl.Categorical),
                 pl.col("liquidity").cast(pl.Float32),
                 pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
@@ -2470,11 +2478,12 @@ class TuningRunner:
                 pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.lit(0.0).alias("outcome"), pl.col("resolution_timestamp").alias("res_time")
             ])
     
+            # RESOLUTIONS FILTER (Strict Datetime Check)
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
                 pl.col("resolution_timestamp").alias("timestamp"),
-                pl.col("contract_id"), # String
+                pl.col("contract_id"),
                 pl.lit("RESOLUTION").alias("event_type").cast(pl.Categorical),
                 pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
@@ -2485,16 +2494,13 @@ class TuningRunner:
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
             
-            # Execute the Join
+            # Execute
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # FIX 5: Convert String IDs to Categorical HERE (Before Pandas)
-                # This is the "Magic Moment" that prevents OOM.
+                # OOM SAFEGUARD: Convert Strings to Categories HERE
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.Categorical),
-                    # wallet_id might be mixed (Cat from trades, String "SYSTEM" from markets)
-                    # So we enforce categorical unification here:
                     pl.col("wallet_id").cast(pl.Categorical)
                 ])
                 
