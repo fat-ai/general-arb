@@ -2435,7 +2435,7 @@ class TuningRunner:
             
             print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            # 1. TRADES FILTER
+            # 1. TRADES SLICE
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
@@ -2449,7 +2449,8 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
-            # Schema Reference: usdc_vol, tokens, bet_price are Float32 here (from _fast_load_trades)
+            # EVENT 1: TRADES
+            # We revert wallet_id to String here to ensure safe concat with 'SYSTEM'
             ev_trades = joined.select([
                 pl.col("timestamp"),
                 pl.col("contract_id"), 
@@ -2457,15 +2458,18 @@ class TuningRunner:
                 pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("price").cast(pl.Float32).alias("p_market_all"),
                 (pl.col("side_mult") < 0).alias("is_sell"),
-                pl.col("user").alias("wallet_id"), 
+                pl.col("user").cast(pl.String).alias("wallet_id"), # Cast back to String for safety
+                
+                # These are Float32 from the load function
                 pl.col("tradeAmount").alias("usdc_vol"),
                 pl.col("outcomeTokensAmount").alias("tokens"),
                 pl.col("price").alias("bet_price"),
-                pl.col("outcome"),     
+                
+                pl.col("outcome").cast(pl.Float64), # Ensure Float64
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
-            # 2. NEW CONTRACTS (Fixing Schema Mismatch)
+            # EVENT 2: NEW CONTRACTS
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
@@ -2475,18 +2479,18 @@ class TuningRunner:
                 pl.col("liquidity").cast(pl.Float32),
                 pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
-                pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+                pl.lit("SYSTEM").alias("wallet_id"), # String
                 
-                # FIX: Explicit cast to Float32 to match ev_trades
+                # STRICT FIX: Force 0.0 to be Float32
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
                 
-                pl.lit(0.0).alias("outcome"), # outcome is Float64 in trades, so keep 0.0 (Float64)
+                pl.lit(0.0).cast(pl.Float64).alias("outcome"), # Match Float64
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
-            # 3. RESOLUTIONS (Fixing Schema Mismatch)
+            # EVENT 3: RESOLUTIONS
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
@@ -2496,14 +2500,14 @@ class TuningRunner:
                 pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
-                pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+                pl.lit("SYSTEM").alias("wallet_id"), # String
                 
-                # FIX: Explicit cast to Float32
+                # STRICT FIX: Force 0.0 to be Float32
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
                 pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
                 
-                pl.col("outcome"), # Float64
+                pl.col("outcome").cast(pl.Float64), # Match Float64
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
@@ -2513,7 +2517,7 @@ class TuningRunner:
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # OOM SAFEGUARD: Convert Strings to Categories HERE
+                # OPTIMIZATION: Convert Strings to Categories HERE (The final safe place)
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.Categorical),
                     pl.col("wallet_id").cast(pl.Categorical)
