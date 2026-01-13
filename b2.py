@@ -52,6 +52,7 @@ from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 from decimal import Decimal
+import polars as pl
 
 def set_global_seed(seed: int):
     """
@@ -1475,140 +1476,24 @@ class TuningRunner:
             
         print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
        
-    def _fast_load_trades(self, csv_path, start_date, end_date, allowed_contract_ids=None):
-        import pandas as pd
-        import pyarrow.parquet as pq
-        import gc
-        import numpy as np
-
-        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
+    def _fast_load_trades_streaming(self, parquet_path, start_date, end_date, allowed_ids):
+        import polars as pl
         
-        print(f"⚡ FAST LOAD: Integer-Code Mode (Fixing Concat OOM)...")
-        
-        if not parquet_path.exists():
-            print("❌ Parquet file missing.")
-            return pd.DataFrame()
-
-        columns = [
-            'contract_id', 'user', 'tradeAmount', 
-            'price', 'size', 'outcomeTokensAmount', 
-            'timestamp', 'side_mult'
-        ]
-        
-        ts_start = pd.Timestamp(start_date)
-        ts_end = pd.Timestamp(end_date)
-        
-        # --- PREPARE GLOBAL MAP ---
-        if allowed_contract_ids is None:
-            print("❌ Critical: allowed_contract_ids required for integer mode.")
-            return pd.DataFrame()
-
-        # 1. Create Lookup: Normalized String -> Int32
-        sorted_unique_ids = sorted(list(allowed_contract_ids))
-        id_series = pd.Series(
-            data=np.arange(len(sorted_unique_ids), dtype='int32'),
-            index=sorted_unique_ids
+        # scan_parquet does NOT load the file into RAM. It just reads the metadata.
+        q = (
+            pl.scan_parquet(parquet_path)
+            .filter(
+                (pl.col("timestamp") >= start_date) & 
+                (pl.col("timestamp") <= end_date) &
+                (pl.col("contract_id").is_in(list(allowed_ids)))
+            )
+            .select([
+                "contract_id", "user", "price", "size", "timestamp", "side_mult"
+            ])
         )
         
-        accumulated_frames = []
-        total_rows_loaded = 0
-        
-        try:
-            parquet_file = pq.ParquetFile(parquet_path)
-            
-            for i, batch in enumerate(parquet_file.iter_batches(batch_size=50_000, columns=columns)):
-                
-                df_chunk = batch.to_pandas(split_blocks=True, self_destruct=True)
-                
-                # A. Optimize Timestamp
-                if 'timestamp' in df_chunk.columns:
-                    df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], errors='coerce')
-                    if df_chunk['timestamp'].dt.tz is not None:
-                         df_chunk['timestamp'] = df_chunk['timestamp'].dt.tz_localize(None)
-
-                if not df_chunk.empty:
-                    # B. Time Filter
-                    mask = (
-                        (df_chunk['timestamp'] >= ts_start) & 
-                        (df_chunk['timestamp'] <= ts_end) & 
-                        (df_chunk['tradeAmount'] >= 1.0)
-                    )
-                    df_chunk = df_chunk[mask].copy()
-                
-                if not df_chunk.empty:
-                    # C. ID MAPPING (Memory Fix)
-                    
-                    # 1. Normalize Chunk IDs to ensure they match the Map
-                    # (Assumes your IDs are lowercase/stripped)
-                    chunk_ids = df_chunk['contract_id'].astype(str).str.strip().str.lower()
-                    
-                    # 2. Map to Integers
-                    codes = chunk_ids.map(id_series)
-                    
-                    # 3. Drop Invalid (Rows not in allowed list)
-                    valid_mask = codes.notna()
-                    df_chunk = df_chunk[valid_mask].copy()
-                    codes = codes[valid_mask]
-
-                    # 4. Assign Integer (Zero memory overhead compared to strings)
-                    df_chunk['contract_id'] = codes.astype('int32')
-
-                    # D. Deduplicate (On Integers = Fast)
-                    df_chunk.drop_duplicates(
-                        subset=['timestamp', 'contract_id', 'user', 'tradeAmount'], 
-                        keep='first', 
-                        inplace=True
-                    )
-                    
-                    # E. Optimize Columns
-                    df_chunk['user'] = df_chunk['user'].astype(str) # Keep as string until end
-                    
-                    df_chunk['side_mult'] = df_chunk['side_mult'].fillna(1.0)
-                    for col in ['tradeAmount', 'price', 'size', 'outcomeTokensAmount']:
-                        if col in df_chunk.columns:
-                            df_chunk[col] = df_chunk[col].fillna(0.0).astype('float32')
-                    
-                    if 'side_mult' in df_chunk.columns:
-                        df_chunk['side_mult'] = df_chunk['side_mult'].astype('float32')
-                            
-                    accumulated_frames.append(df_chunk)
-                    total_rows_loaded += len(df_chunk)
-                    
-                if i % 10 == 0:
-                    gc.collect()
-                if (i * 50000) % 200_000 == 0:
-                     print(f"   ...scanned {i*50000} rows (kept {total_rows_loaded})", end='\r')
-
-            print(f"\n   ✅ Batch read complete. Merging {len(accumulated_frames)} chunks...")
-            
-            if not accumulated_frames:
-                return pd.DataFrame(columns=columns)
-
-            # F. CONCAT (Safe because 'contract_id' is int32)
-            final_df = pd.concat(accumulated_frames, ignore_index=True)
-            
-            del accumulated_frames
-            gc.collect()
-
-            # G. RECONSTRUCT CATEGORIES (Zero Copy)
-            print("   Reconstructing Categories...")
-            
-            # 1. Contract ID: Restore strings via Categorical
-            final_df['contract_id'] = pd.Categorical.from_codes(
-                final_df['contract_id'], 
-                categories=sorted_unique_ids
-            )
-            
-            # 2. User: Categorize users now (Global conversion)
-            final_df['user'] = final_df['user'].astype('category')
-
-            return final_df
-            
-        except Exception as e:
-            print(f"❌ Batch Loader Failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return pd.DataFrame()
+        # Only now does it actually read and filter the data
+        return q.collect().to_pandas()
             
     def run_tuning_job(self):
 
@@ -2649,210 +2534,79 @@ class TuningRunner:
                 print(f"   Resolution range: {markets['resolution_timestamp'].min()} to {markets['resolution_timestamp'].max()}")
         
         print("="*60 + "\n")
+
+def _transform_to_events(self, markets_pd, trades_pd):
+    log.info("🚀 Transforming Data using Polars (Memory Optimized)...")
     
-    def _transform_to_events(self, markets, trades):
-        import gc
-        import pandas as pd
-        import numpy as np
+    # 1. Convert Markets to Polars (it's small, so this is fine)
+    markets = pl.from_pandas(markets_pd)
+    
+    # 2. Convert Trades to Polars 
+    # NOTE: If trades_pd is already loaded, this is a 'zero-copy' view in some cases.
+    trades = pl.from_pandas(trades_pd)
+    
+    # 3. Join Market Metadata (Outcome/Resolution) onto Trades
+    # We do a LEFT JOIN to keep only trades that exist in our market metadata
+    trades = trades.join(
+        markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity"]),
+        on="contract_id",
+        how="inner"
+    )
 
-        log.info("Transforming Data (In-Place Optimization)...")
-        
-        # --- HELPER: Fast Category Mapper ---
-        def fast_cat_map(categorical_col, value_map, default_val, dtype):
-            codes = categorical_col.cat.codes.values
-            categories = categorical_col.cat.categories
-            mapped_cats = categories.map(value_map).fillna(default_val).astype(dtype).to_numpy()
-            if (codes == -1).any():
-                mapped_cats = np.append(mapped_cats, [default_val])
-                out = np.empty_like(codes, dtype=dtype)
-                valid_mask = (codes != -1)
-                out[valid_mask] = mapped_cats[codes[valid_mask]]
-                out[~valid_mask] = default_val
-                return out
-            return mapped_cats[codes]
-        # ------------------------------------
+    # 4. Filter: Only keep trades that happened BEFORE resolution
+    # This removes millions of rows of "post-settlement" noise
+    trades = trades.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
 
-        # 1. MARKETS PREP (Strict Types)
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower()
-        
-        # Fix Date Parsing (Mixed Format)
-        markets['created_at'] = pd.to_datetime(markets['created_at'], format='mixed', utc=True).dt.tz_localize(None)
-        markets['resolution_timestamp'] = pd.to_datetime(markets['resolution_timestamp'], format='mixed', utc=True).dt.tz_localize(None)
-        
-        # Force float32 early
-        markets['liquidity'] = markets['liquidity'].fillna(1.0).astype('float32')
-        markets['outcome'] = markets['outcome'].astype('float32')
+    # 5. Create the Event Log using 'Vertical Concatenation'
+    # Instead of creating 3 DataFrames and pd.concat, we build them as Expressions
+    
+    # NEW_CONTRACT Events
+    ev_new = markets.select([
+        pl.col("created_at").alias("timestamp"),
+        pl.col("contract_id"),
+        pl.lit("NEW_CONTRACT").alias("event_type"),
+        pl.col("liquidity"),
+        pl.lit(0.5).alias("p_market_all"),
+        pl.lit(False).alias("is_sell"),
+        pl.lit("SYSTEM").alias("wallet_id")
+    ])
 
-        # 2. TRADES TIME PREP
-        if not pd.api.types.is_datetime64_any_dtype(trades['timestamp']):
-             trades['timestamp'] = pd.to_datetime(trades['timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
+    # RESOLUTION Events
+    ev_res = markets.select([
+        pl.col("resolution_timestamp").alias("timestamp"),
+        pl.col("contract_id"),
+        pl.lit("RESOLUTION").alias("event_type"),
+        pl.lit(1.0).alias("liquidity"), # Placeholder
+        pl.col("outcome").alias("p_market_all"),
+        pl.lit(False).alias("is_sell"),
+        pl.lit("SYSTEM").alias("wallet_id")
+    ])
 
-        if not isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-             trades['contract_id'] = trades['contract_id'].astype('category')
+    # TRADE Events (The Bulk)
+    ev_trades = trades.select([
+        pl.col("timestamp"),
+        pl.col("contract_id"),
+        pl.lit("TRADE").alias("event_type"),
+        pl.lit(0.0).alias("liquidity"),
+        pl.col("price").alias("p_market_all"),
+        (pl.col("side_mult") < 0).alias("is_sell"),
+        pl.col("user").alias("wallet_id")
+    ])
 
-        # 3. INTERSECTION FILTER
-        market_ids_set = set(markets['contract_id'])
-        trade_cats = trades['contract_id'].cat.categories
-        valid_cats = [c for c in trade_cats if c in market_ids_set]
-        
-        if not valid_cats:
-            msg = "❌ CRITICAL: No overlapping Contract IDs found."
-            log.error(msg)
-            raise ValueError(msg)
-            
-        markets = markets[markets['contract_id'].isin(valid_cats)].copy()
-        
-        if len(valid_cats) < len(trade_cats):
-             mask = trades['contract_id'].isin(valid_cats)
-             trades = trades[mask].copy()
-             del mask
-             trades['contract_id'] = trades['contract_id'].cat.remove_unused_categories()
-             gc.collect()
+    # 6. Global Concatenate & Sort
+    # Polars sort is significantly faster and uses less memory than Pandas
+    event_log = pl.concat([ev_new, ev_res, ev_trades]).sort(["timestamp", "event_type"])
 
-        # 4. MAP TOKENS & PRICE (In-Place)
-        if 'token_index' in markets.columns:
-            token_map = markets.set_index('contract_id')['token_index'].to_dict()
-            trades['token_index'] = fast_cat_map(trades['contract_id'], token_map, 1, 'int8')
-        else:
-            trades['token_index'] = np.int8(1)
+    # 7. Convert back to Pandas for Nautilus (Nautilus expects Pandas/Numpy)
+    # We do this at the very last second to minimize the "Pandas Memory Tax"
+    log.info("Converting final event log to Pandas...")
+    final_event_log = event_log.to_pandas().set_index("timestamp")
+    
+    # profiler_data just needs the trades subset
+    profiler_data = trades.to_pandas()
 
-        trades['price'] = trades['price'].fillna(0.5).astype('float32')
-        trades['price'] = np.where(
-            trades['token_index'] == 0, 
-            1.0 - trades['price'], 
-            trades['price']
-        ).astype('float32')
-        trades['price'] = trades['price'].clip(0.001, 0.999)
-
-        # -----------------------------------------------------------
-        # 5. SINGLE-PASS FILTERING (The Fix)
-        # We filter 'trades' NOW. We do NOT create a separate 'prof_data' yet.
-        # This prevents holding 2 copies of the dataset.
-        # -----------------------------------------------------------
-        
-        # Prepare Maps
-        outcome_map = markets.set_index('contract_id')['outcome'].astype('float32').to_dict()
-        res_map = markets.set_index('contract_id')['resolution_timestamp'].to_dict()
-
-        # Calculate Validation Arrays
-        res_time_arr = fast_cat_map(trades['contract_id'], res_map, pd.NaT, 'datetime64[ns]')
-        outcome_arr = fast_cat_map(trades['contract_id'], outcome_map, 0.0, 'float32')
-
-        # Calculate Mask
-        # Rule: Keep trade if timestamp < resolution_time AND outcome is valid
-        ts_values = trades['timestamp'].values
-        valid_mask = (ts_values < res_time_arr) | (np.isnat(res_time_arr))
-        valid_mask &= np.isin(outcome_arr, [0.0, 1.0])
-        
-        # APPLY FILTER IN-PLACE (Reduces Memory)
-        trades = trades[valid_mask].copy()
-        
-        # Add the mapped columns to 'trades' directly (Sliced to match filter)
-        trades['outcome'] = outcome_arr[valid_mask]
-        trades['res_time'] = res_time_arr[valid_mask]
-        
-        # Cleanup
-        del valid_mask, ts_values, res_time_arr, outcome_arr
-        gc.collect()
-        
-        log.info(f"Valid Trades Filtered: {len(trades)} records.")
-
-        # 6. CONVERT TRADES TO PROF_DATA (Rename In-Place)
-        # We reuse the 'trades' dataframe to serve as 'prof_data'.
-        # We rename columns to match the Profiler schema.
-        
-        trades.rename(columns={
-            'user': 'wallet_id',
-            'contract_id': 'market_id',
-            'tradeAmount': 'usdc_vol',
-            'outcomeTokensAmount': 'tokens'
-        }, inplace=True)
-        
-        # Create aliases for columns needed by both (Shallow Copy)
-        trades['size'] = trades['usdc_vol']
-        trades['bet_price'] = trades['price']
-        
-        # 'prof_data' is now just a reference to 'trades'. No memory cost.
-        prof_data = trades
-
-        # 7. EXTRACT EVENTS
-        # We extract the 'df_updates' from the modified 'trades' dataframe.
-        
-        # Create SHARED CATEGORIES
-        shared_contract_dtype = pd.CategoricalDtype(categories=sorted(list(valid_cats)), ordered=False)
-        shared_event_dtype = pd.CategoricalDtype(categories=['NEW_CONTRACT', 'RESOLUTION', 'TRADE'], ordered=False)
-
-        # A. Markets (New Contract)
-        cond_ids = markets['condition_id'] if 'condition_id' in markets.columns else markets['contract_id']
-
-        df_new = pd.DataFrame({
-            'timestamp': markets['created_at'],
-            'contract_id': markets['contract_id'].astype(shared_contract_dtype),
-            'event_type': 'NEW_CONTRACT',
-            'liquidity': markets['liquidity'], 
-            'p_market_all': np.float32(0.5),
-            'is_sell': False,
-            'wallet_id': "SYSTEM"
-        })
-        
-        # B. Markets (Resolution)
-        df_res = pd.DataFrame({
-            'timestamp': markets['resolution_timestamp'],
-            'contract_id': markets['contract_id'].astype(shared_contract_dtype),
-            'event_type': 'RESOLUTION',
-            'outcome': markets['outcome'],
-            'p_market_all': markets['outcome'],
-            'is_sell': False,
-            'wallet_id': "SYSTEM"
-        })
-
-        # C. Updates (Extracted from prof_data/trades)
-        # Note: 'market_id' is 'contract_id', 'usdc_vol' is 'tradeAmount'
-        
-        # We construct df_updates. This creates a copy, but it's unavoidable for structure change.
-        # However, we can select only what we need.
-        df_updates = pd.DataFrame({
-            'timestamp': trades['timestamp'],
-            'contract_id': trades['market_id'].astype(shared_contract_dtype), # Re-cast to shared
-            'event_type': 'TRADE',
-            'p_market_all': trades['price'],
-            'trade_volume': trades['size'],
-            'usdc_vol': trades['usdc_vol'],
-            'wallet_id': trades['wallet_id'],
-            'is_sell': (trades['tokens'] < 0)
-        })
-
-        # 8. MERGE
-        df_new['event_type'] = df_new['event_type'].astype(shared_event_dtype)
-        df_res['event_type'] = df_res['event_type'].astype(shared_event_dtype)
-        df_updates['event_type'] = df_updates['event_type'].astype(shared_event_dtype)
-
-        # Force types on small DFs
-        for col in ['p_market_all', 'liquidity', 'outcome']:
-            if col in df_new.columns: df_new[col] = df_new[col].astype('float32')
-            if col in df_res.columns: df_res[col] = df_res[col].astype('float32')
-            
-        log.info("Concatenating Events...")
-        df_ev = pd.concat([df_new, df_res, df_updates], ignore_index=True)
-        
-        del df_new, df_res, df_updates
-        gc.collect()
-
-        # 9. FINAL SORT
-        log.info("Sorting Events (Quicksort)...")
-        df_ev.sort_values(
-            by=['timestamp', 'event_type'], 
-            kind='quicksort', 
-            inplace=True
-        )
-        
-        df_ev.dropna(subset=['timestamp'], inplace=True)
-        df_ev.set_index('timestamp', inplace=True)
-
-        log.info(f"Transformation Complete. Event Log Size: {len(df_ev)} rows.")
-
-        return df_ev, prof_data
-        
+    return final_event_log, profiler_data
+    
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
     if isinstance(event_log, ray.ObjectRef):
@@ -2873,8 +2627,6 @@ def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, prior
         print("⚠️ Trial skipped: No valid outcomes in profiler")
         return {'smart_score': -99.0}
 
-    
-    
     config_str = json.dumps(config, sort_keys=True, default=str)
     # Generate a deterministic 32-bit integer seed from the config hash
     trial_seed = int(hashlib.md5(config_str.encode()).hexdigest(), 16) % (2**31)
