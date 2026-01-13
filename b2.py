@@ -1423,39 +1423,39 @@ class TuningRunner:
             print(f"❌ Conversion failed: {e}")
             
     def _fast_load_trades(self, start_date, end_date, allowed_ids):
-    import polars as pl
-    parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
-
-    if not parquet_path.exists():
-        raise FileNotFoundError("Optimized parquet file not found. Run conversion first.")
-
-    # Convert allowed_ids to list for Polars compatibility
-    id_list = list(allowed_ids)
-
-    try:
-        # scan_parquet is lazy; no data is loaded yet
-        q = (
-            pl.scan_parquet(parquet_path)
-            .filter(
-                (pl.col("timestamp") >= start_date) & 
-                (pl.col("timestamp") <= end_date) &
-                (pl.col("contract_id").is_in(id_list))
+        import polars as pl
+        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
+    
+        if not parquet_path.exists():
+            raise FileNotFoundError("Optimized parquet file not found. Run conversion first.")
+    
+        # Convert allowed_ids to list for Polars compatibility
+        id_list = list(allowed_ids)
+    
+        try:
+            # scan_parquet is lazy; no data is loaded yet
+            q = (
+                pl.scan_parquet(parquet_path)
+                .filter(
+                    (pl.col("timestamp") >= start_date) & 
+                    (pl.col("timestamp") <= end_date) &
+                    (pl.col("contract_id").is_in(id_list))
+                )
+                .select([
+                    "contract_id", "user", "price", "size", "timestamp", "side_mult"
+                ])
             )
-            .select([
-                "contract_id", "user", "price", "size", "timestamp", "side_mult"
-            ])
-        )
-        
-        # streaming=True is key for 80GB files to keep RAM usage near-zero
-        return q.collect(streaming=True).to_pandas()
-        
-    except polars.exceptions.ComputeError as e:
-        if "PAR1" in str(e):
-            print("⚠️ Detected corrupted Parquet file. Deleting and re-converting...")
-            parquet_path.unlink()
-            self._convert_csv_to_parquet_safe()
-            return self._fast_load_trades(start_date, end_date, allowed_ids)
-        raise e
+            
+            # streaming=True is key for 80GB files to keep RAM usage near-zero
+            return q.collect(streaming=True).to_pandas()
+            
+        except polars.exceptions.ComputeError as e:
+            if "PAR1" in str(e):
+                print("⚠️ Detected corrupted Parquet file. Deleting and re-converting...")
+                parquet_path.unlink()
+                self._convert_csv_to_parquet_safe()
+                return self._fast_load_trades(start_date, end_date, allowed_ids)
+            raise e
         
     def run_tuning_job(self):
 
