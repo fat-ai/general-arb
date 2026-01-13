@@ -2417,7 +2417,7 @@ class TuningRunner:
         import numpy as np
         
         # 1. FIXED CHUNK SIZE (30 Days is safe for RAM)
-        CHUNK_DAYS = 30
+        CHUNK_DAYS = 7
         
         # Ensure start/end are Naive (TZ-stripped)
         start_ts = pd.Timestamp(FIXED_START_DATE).tz_localize(None)
