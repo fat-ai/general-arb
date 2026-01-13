@@ -1476,7 +1476,7 @@ class TuningRunner:
             
         print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
        
-    def _fast_load_trades(self, parquet_path, start_date, end_date, allowed_ids):
+    def _fast_load_trades(self, parquet_path, start_date, end_date, allowed_contract_ids):
         import polars as pl
         
         # scan_parquet does NOT load the file into RAM. It just reads the metadata.
@@ -1485,7 +1485,7 @@ class TuningRunner:
             .filter(
                 (pl.col("timestamp") >= start_date) & 
                 (pl.col("timestamp") <= end_date) &
-                (pl.col("contract_id").is_in(list(allowed_ids)))
+                (pl.col("contract_id").is_in(list(allowed_contract_ids)))
             )
             .select([
                 "contract_id", "user", "price", "size", "timestamp", "side_mult"
