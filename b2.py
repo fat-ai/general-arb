@@ -1488,51 +1488,43 @@ class TuningRunner:
             raise e
         
     def _fast_load_trades(self, start_date, end_date, allowed_ids):
-        import polars as pl
-        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
+    import polars as pl
+    parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
+
+    if not parquet_path.exists():
+        print("⚠️ Parquet missing. Converting...")
+        self._convert_csv_to_parquet_safe()
+
+    # Create LazyFrame for efficient filtering
+    allowed_df = pl.DataFrame({"contract_id": list(allowed_ids)}).with_columns(
+        pl.col("contract_id").cast(pl.Categorical)
+    )
+
+    # Note: We do NOT call .collect() here. We return the LazyFrame.
+    q = (
+        pl.scan_parquet(parquet_path)
+        .filter(
+            (pl.col("timestamp") >= start_date) & 
+            (pl.col("timestamp") <= end_date)
+        )
+        .join(allowed_df.lazy(), on="contract_id", how="inner")
+        .select([
+            "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
+        ])
+        .with_columns([
+            pl.col("contract_id").cast(pl.Categorical),
+            pl.col("user").cast(pl.Categorical),
+            pl.col("price").cast(pl.Float32),
+            pl.col("size").cast(pl.Float32),
+            pl.col("tradeAmount").cast(pl.Float32),
+            pl.col("outcomeTokensAmount").cast(pl.Float32),
+            pl.col("side_mult").cast(pl.Float32),
+        ])
+    )
     
-        if not parquet_path.exists():
-            print("⚠️ Parquet missing. Starting safe streaming conversion...")
-            self._convert_csv_to_parquet_safe()
+    print("⚡ LazyFrame Prepared (No RAM used yet)")
+    return q
     
-        try:
-            # 1. Define the Lazy Query
-            q = (
-                pl.scan_parquet(parquet_path)
-                .filter(
-                    (pl.col("timestamp") >= start_date) & 
-                    (pl.col("timestamp") <= end_date) &
-                    (pl.col("contract_id").is_in(list(allowed_ids)))
-                )
-                .select([
-                    "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
-                ])
-            )
-    
-            # 2. OPTIMIZATION: Cast to low-memory types INSIDE Polars
-            # This prevents the memory explosion when converting to Pandas
-            q = q.with_columns([
-                pl.col("contract_id").cast(pl.Categorical),
-                pl.col("user").cast(pl.Categorical),
-                pl.col("price").cast(pl.Float32),
-                pl.col("size").cast(pl.Float32),
-                pl.col("tradeAmount").cast(pl.Float32),
-                pl.col("outcomeTokensAmount").cast(pl.Float32),
-                pl.col("side_mult").cast(pl.Float32),
-            ])
-            
-            print("⚡ Executing streaming load (Optimized)...")
-            # 3. Collect directly to a memory-efficient structure
-            return q.collect(engine="streaming").to_pandas()
-            
-        except Exception as e:
-            if "PAR1" in str(e):
-                print("❌ Parquet corrupted. Deleting and re-converting...")
-                parquet_path.unlink(missing_ok=True)
-                self._convert_csv_to_parquet_safe()
-                return self._fast_load_trades(start_date, end_date, allowed_ids)
-            raise e
-        
     def run_tuning_job(self):
 
         log.info("--- Starting Full Strategy Optimization (FIXED) ---")
@@ -1816,45 +1808,38 @@ class TuningRunner:
         return best_config
         
     def _load_data(self):
-        import pandas as pd
-        import gc
-        
-        print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
-        
-        # 1. Load Markets (Small Metadata)
-        market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
-        if market_file_path.exists():
-            markets = pd.read_parquet(market_file_path)
-        else:
-            markets = self._fetch_gamma_markets(days_back=DAYS_BACK)
+    import pandas as pd
+    import polars as pl
+    import gc
     
-        if markets.empty:
-            return pd.DataFrame(), pd.DataFrame()
+    print(f"Initializing Data Engine...")
     
-        # Normalize Market IDs
-        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
-        valid_market_ids = set(markets['contract_id'].unique())
+    # 1. Load Markets (Keep this eager, it's small)
+    market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
+    if market_file_path.exists():
+        markets_pd = pd.read_parquet(market_file_path)
+    else:
+        markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
+
+    # Normalize IDs
+    markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
     
-        # 2. CALL LOADER (FIXED ARGUMENTS)
-        # We no longer pass trades_file because the function knows where it is
-        trades = self._fast_load_trades(
-            start_date=FIXED_START_DATE, 
-            end_date=FIXED_END_DATE, 
-            allowed_ids=valid_market_ids
-        )
-    
-        if trades.empty:
-            print("❌ Critical: No trade data available.")
-            return pd.DataFrame(), pd.DataFrame()
-    
-        # 3. Final Sync
-        final_ids = set(trades['contract_id'].unique())
-        market_subset = markets[markets['contract_id'].isin(final_ids)].copy()
-        
-        del markets
-        gc.collect()
-    
-        return market_subset, trades
+    # Convert markets to LazyFrame immediately for the join
+    markets_pl = pl.from_pandas(markets_pd).lazy().with_columns(
+        pl.col("contract_id").cast(pl.Categorical)
+    )
+
+    valid_market_ids = set(markets_pd['contract_id'].unique())
+
+    # 2. Get Lazy Trades
+    trades_lazy = self._fast_load_trades(
+        start_date=FIXED_START_DATE, 
+        end_date=FIXED_END_DATE, 
+        allowed_ids=valid_market_ids
+    )
+
+    # Return Lazy objects
+    return markets_pl, trades_lazy
     
     def _fetch_gamma_markets(self, days_back=365):
         import os
@@ -2516,102 +2501,154 @@ class TuningRunner:
         
         print("="*60 + "\n")
 
-def _transform_to_events(self, markets_pd, trades_pd):
+def _transform_to_events(self, markets_lazy, trades_lazy):
     import polars as pl
+    import pandas as pd
     import gc
+    import numpy as np
     
-    log.info(f"🚀 Transforming Data (Inputs: Markets={len(markets_pd)}, Trades={len(trades_pd)})...")
-
-    # 1. Convert to Polars
-    # If trades_pd is already Categorical (from Fix A), Polars handles it efficiently
-    markets = pl.from_pandas(markets_pd)
-    trades = pl.from_pandas(trades_pd)
-
-    # 2. Join Market Metadata (Lazy is safer for huge joins)
-    joined = trades.join(
-        markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
-        on="contract_id",
-        how="inner"
-    )
-
-    # 3. Filter
-    joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
-
-    # 4. Construct Event Streams
-    # Ensure types match the Trades schema to avoid Polars concat errors
-    ev_new = markets.select([
-        pl.col("created_at").alias("timestamp"),
-        pl.col("contract_id"),
-        pl.lit("NEW_CONTRACT").alias("event_type"), # Will cast to Categorical later
-        pl.col("liquidity").cast(pl.Float32),
-        pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
-        pl.lit(False).alias("is_sell"),
-        pl.lit("SYSTEM").alias("wallet_id")
-    ])
-
-    ev_res = markets.select([
-        pl.col("resolution_timestamp").alias("timestamp"),
-        pl.col("contract_id"),
-        pl.lit("RESOLUTION").alias("event_type"),
-        pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
-        pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
-        pl.lit(False).alias("is_sell"),
-        pl.lit("SYSTEM").alias("wallet_id")
-    ])
-
-    ev_trades = joined.select([
-        pl.col("timestamp"),
-        pl.col("contract_id"),
-        pl.lit("TRADE").alias("event_type"),
-        pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
-        pl.col("price").cast(pl.Float32).alias("p_market_all"),
-        (pl.col("side_mult") < 0).alias("is_sell"),
-        pl.col("user").alias("wallet_id"),
+    # Define Chunk Size (e.g., 90 Days)
+    # Smaller chunks = Less RAM usage
+    CHUNK_DAYS = 90
+    
+    # Create Time Ranges
+    start_ts = pd.Timestamp(FIXED_START_DATE)
+    end_ts = pd.Timestamp(FIXED_END_DATE)
+    
+    periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
+    # Add the final end date if not covered
+    if periods[-1] < end_ts:
+        periods = periods.union([end_ts])
         
-        # Extra columns for Profiler
-        pl.col("tradeAmount").alias("usdc_vol"),
-        pl.col("outcomeTokensAmount").alias("tokens"),
-        pl.col("price").alias("bet_price"),
-        pl.col("outcome"),
-        pl.col("resolution_timestamp").alias("res_time")
-    ])
-
-    # 5. Extract Profiler Data (Keep Categoricals!)
-    prof_data_pl = ev_trades.select([
-        "timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"
-    ]).rename({"contract_id": "market_id"})
-
-    # 6. Global Merge
-    common_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
+    event_log_chunks = []
+    profiler_chunks = []
     
-    final_log_pl = pl.concat([
-        ev_new.select(common_cols),
-        ev_res.select(common_cols),
-        ev_trades.select(common_cols)
-    ]).sort(["timestamp", "event_type"])
+    log.info(f"🚀 Starting Chunked Processing ({len(periods)-1} batches)...")
 
-    # 7. CRITICAL: Optimize Output Types before to_pandas()
-    # Cast low cardinality strings to Categorical
-    final_log_pl = final_log_pl.with_columns([
-        pl.col("event_type").cast(pl.Categorical),
-        pl.col("contract_id").cast(pl.Categorical),
-        pl.col("wallet_id").cast(pl.Categorical)
-    ])
+    # 1. Global Setup (Markets are small, keep them lazy/available)
+    # Prepare the query structures once
+    
+    for i in range(len(periods) - 1):
+        p_start = periods[i]
+        p_end = periods[i+1]
+        
+        print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
+        
+        # 2. Filter Lazy Frames for this Slice
+        # Polars pushes this filter down to the Parquet reader (Predicate Pushdown)
+        # It only reads the rows for these 90 days.
+        trades_slice = trades_lazy.filter(
+            (pl.col("timestamp") >= p_start) & 
+            (pl.col("timestamp") < p_end)
+        )
+        
+        # 3. Perform Logic on the Slice (Same logic as before)
+        joined = trades_slice.join(
+            markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
+            on="contract_id",
+            how="inner"
+        )
+        
+        # Filter post-resolution
+        joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
+        
+        # Construct Events (Same schema)
+        ev_trades = joined.select([
+            pl.col("timestamp"),
+            pl.col("contract_id"),
+            pl.lit("TRADE").alias("event_type").cast(pl.Categorical),
+            pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
+            pl.col("price").cast(pl.Float32).alias("p_market_all"),
+            (pl.col("side_mult") < 0).alias("is_sell"),
+            pl.col("user").alias("wallet_id"),
+            
+            pl.col("tradeAmount").alias("usdc_vol"),
+            pl.col("outcomeTokensAmount").alias("tokens"),
+            pl.col("price").alias("bet_price"),
+            pl.col("outcome"),     
+            pl.col("resolution_timestamp").alias("res_time") 
+        ])
 
-    prof_data_pl = prof_data_pl.with_columns([
-        pl.col("wallet_id").cast(pl.Categorical),
-        pl.col("market_id").cast(pl.Categorical)
-    ])
+        # 4. Market Events (NEW_CONTRACT / RESOLUTION)
+        # We also need to slice market events to match this time window
+        # otherwise we duplicate them in every chunk.
+        
+        m_new = markets_lazy.filter(
+            (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
+        ).select([
+            pl.col("created_at").alias("timestamp"),
+            pl.col("contract_id"),
+            pl.lit("NEW_CONTRACT").alias("event_type").cast(pl.Categorical),
+            pl.col("liquidity").cast(pl.Float32),
+            pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
+            pl.lit(False).alias("is_sell"),
+            pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+            # Fill extras with nulls/zeros
+            pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.lit(0.0).alias("outcome"), pl.col("resolution_timestamp").alias("res_time")
+        ])
 
-    log.info("Converting final logs to Pandas (Optimized)...")
-    event_log = final_log_pl.to_pandas().set_index("timestamp")
-    profiler_data = prof_data_pl.to_pandas()
+        m_res = markets_lazy.filter(
+             (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
+        ).select([
+            pl.col("resolution_timestamp").alias("timestamp"),
+            pl.col("contract_id"),
+            pl.lit("RESOLUTION").alias("event_type").cast(pl.Categorical),
+            pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
+            pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
+            pl.lit(False).alias("is_sell"),
+            pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+            pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.col("outcome"), pl.col("resolution_timestamp").alias("res_time")
+        ])
 
-    # Manual Cleanup
-    del markets, trades, joined, final_log_pl, ev_new, ev_res, ev_trades
-    gc.collect()
+        # 5. Concatenate & Materialize *JUST THIS CHUNK*
+        # We keep the "profiler columns" in the event log for now to simplify concat
+        # then split them after.
+        
+        chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
+        
+        # EXECUTE! This is where RAM is used.
+        chunk_df = chunk_lazy.collect(engine="streaming")
+        
+        if chunk_df.height > 0:
+            # Optimize types
+            chunk_df = chunk_df.with_columns([
+                pl.col("event_type").cast(pl.Categorical),
+                pl.col("contract_id").cast(pl.Categorical),
+                pl.col("wallet_id").cast(pl.Categorical)
+            ])
+            
+            # Convert to Pandas (Small Batch = No OOM)
+            pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
+            
+            # Split into the two required outputs
+            prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
+            base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
+            
+            # Only keeping TRADE rows for profiler
+            prof_mask = pdf['event_type'] == 'TRADE'
+            
+            event_log_chunks.append(pdf[base_cols])
+            profiler_chunks.append(pdf.loc[prof_mask, prof_cols].rename(columns={"contract_id": "market_id"}))
+            
+        print(f" Done ({chunk_df.height} rows).")
+        
+        # 6. CRITICAL: Cleanup to free RAM for next batch
+        del chunk_df, pdf, trades_slice, joined
+        gc.collect()
 
-    return event_log, profiler_data
+    # 7. Final Concatenation
+    print("🏁 Merging batches...")
+    if not event_log_chunks:
+        return pd.DataFrame(), pd.DataFrame()
+        
+    final_events = pd.concat(event_log_chunks)
+    final_profiler = pd.concat(profiler_chunks)
+    
+    # Final sort
+    final_events = final_events.sort_values(["timestamp", "event_type"])
+    final_events = final_events.set_index("timestamp")
+    
+    return final_events, final_profiler
     
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
