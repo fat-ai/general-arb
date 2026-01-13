@@ -1389,65 +1389,63 @@ class TuningRunner:
         csv_path = self.cache_dir / "gamma_trades_stream.csv"
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
     
-        if not csv_path.exists():
-            return
-    
-        print(f"🚀 Streaming conversion: {csv_path.name} -> {parquet_path.name}")
-    
-        # 1. DELETE the corrupted file first to ensure a clean start
+        # Ensure clean state
         if parquet_path.exists():
             parquet_path.unlink()
     
-        # 2. Use Lazy Scanning with a Sink
-        # This reads the CSV in chunks and 'streams' it directly to Parquet disk
-        try:
-            (
-                pl.scan_csv(
-                    str(csv_path),
-                    infer_schema_length=10000, 
-                    ignore_errors=True
-                )
-                .with_columns([
-                    # Ensure timestamp is parsed correctly during the stream
-                    pl.col("timestamp").str.to_datetime(strict=False),
-                    pl.col("contract_id").cast(pl.String),
-                ])
-                .sink_parquet(
-                    parquet_path,
-                    compression="snappy",
-                    row_group_size=100_000  # Smaller groups prevent OOM during write
-                )
+        print(f"🚀 Starting Sink-to-Disk conversion (Low RAM mode)...")
+        
+        # sink_parquet is the only way to handle 80GB on a standard machine
+        (
+            pl.scan_csv(str(csv_path), ignore_errors=True)
+            .with_columns([
+                pl.col("timestamp").str.to_datetime(strict=False),
+                pl.col("contract_id").cast(pl.String),
+                pl.col("price").cast(pl.Float32),
+                pl.col("size").cast(pl.Float32)
+            ])
+            .sink_parquet(
+                parquet_path,
+                compression="snappy",
+                row_group_size=50_000
             )
-            print("✅ Conversion successful and file finalized with PAR1 footer.")
-        except Exception as e:
-            print(f"❌ Conversion failed: {e}")
-            
+        )
+        print("✅ Conversion finished safely.")
+        
     def _fast_load_trades(self, start_date, end_date, allowed_ids):
         import polars as pl
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
     
+        # If the file is missing or corrupted (PAR1 error), we trigger conversion
         if not parquet_path.exists():
-            raise FileNotFoundError("Optimized parquet file not found. Run conversion first.")
-    
-        # Convert allowed_ids to list for Polars compatibility
-        id_list = list(allowed_ids)
+            print("⚠️ Parquet missing. Starting safe streaming conversion...")
+            self._convert_csv_to_parquet_safe()
     
         try:
-            # scan_parquet is lazy; no data is loaded yet
+            # scan_parquet creates a lazy pointer to the 80GB file
             q = (
                 pl.scan_parquet(parquet_path)
                 .filter(
                     (pl.col("timestamp") >= start_date) & 
                     (pl.col("timestamp") <= end_date) &
-                    (pl.col("contract_id").is_in(id_list))
+                    (pl.col("contract_id").is_in(list(allowed_ids)))
                 )
                 .select([
-                    "contract_id", "user", "price", "size", "timestamp", "side_mult"
+                    "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
                 ])
             )
             
-            # streaming=True is key for 80GB files to keep RAM usage near-zero
+            # collect(streaming=True) is the critical memory-saver
+            print("⚡ Executing streaming load...")
             return q.collect(streaming=True).to_pandas()
+            
+        except Exception as e:
+            if "PAR1" in str(e):
+                print("❌ Parquet corrupted. Deleting and re-converting...")
+                parquet_path.unlink(missing_ok=True)
+                self._convert_csv_to_parquet_safe()
+                return self._fast_load_trades(start_date, end_date, allowed_ids)
+            raise e
             
         except polars.exceptions.ComputeError as e:
             if "PAR1" in str(e):
@@ -1736,107 +1734,45 @@ class TuningRunner:
         
     def _load_data(self):
         import pandas as pd
-        import numpy as np
-        import glob
-        import os
         import gc
         
         print(f"Initializing Data Engine (Scope: Last {DAYS_BACK} Days)...")
         
-        # 1. MARKETS (Metadata)
+        # 1. Load Markets (Small Metadata)
         market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
-
         if market_file_path.exists():
-            print(f"🔒 LOCKED LOAD: Using local market file: {market_file_path.name}")
             markets = pd.read_parquet(market_file_path)
         else:
-            print(f"⚠️ File not found at {market_file_path}. Downloading from scratch...")
             markets = self._fetch_gamma_markets(days_back=DAYS_BACK)
-
+    
         if markets.empty:
-            print("❌ Critical: No market data available.")
             return pd.DataFrame(), pd.DataFrame()
-
-        # Clean Markets
-        safe_cols = [
-            'contract_id', 'outcome', 'resolution_timestamp', 'created_at', 
-            'liquidity', 'question', 'volume', 'conditionId'
-        ]
-        actual_cols = [c for c in safe_cols if c in markets.columns]
-        markets = markets[actual_cols].copy()
-
-        # Rename
-        rename_map = {
-            'question': 'question', 'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at', 'volume': 'volume',
-            'conditionId': 'condition_id'
-        }
-        markets = markets.rename(columns={k:v for k,v in rename_map.items() if k in markets.columns})
-        if 'condition_id' not in markets.columns:
-            markets['condition_id'] = markets['contract_id']
-
-        # --- EXPLODE MARKETS (Early) ---
-        markets['contract_id_list'] = markets['contract_id'].astype(str).str.split(',')
-        markets['token_index'] = markets['contract_id_list'].apply(lambda x: list(range(len(x))))
-        
-        markets = markets.explode(['contract_id_list', 'token_index'])
-        # Normalize: strip, lower, etc. to match what we do in the loader
-        markets['contract_id'] = markets['contract_id_list'].str.strip().str.lower().apply(normalize_contract_id)
-        
-        markets['token_outcome_label'] = np.where(markets['token_index'] == 1, "Yes", "No")
-        
-        def calculate_token_outcome(row):
-            m_out = float(row['outcome']) if pd.notnull(row['outcome']) else 0.5
-            t_idx = int(row['token_index']) if pd.notnull(row['token_index']) else 0
-            if m_out == 0.5: return 0.5
-            return 1.0 if round(m_out) == t_idx else 0.0
-
-        markets['outcome'] = markets.apply(calculate_token_outcome, axis=1)
-        markets = markets.drop(columns=['contract_id_list', 'token_index'], errors='ignore')
-
-        # ---------------------------------------------------------
-        # 2. TRADES
-        # ---------------------------------------------------------
-        trades_file = self.cache_dir / "gamma_trades_stream.csv"
-        
-        # EXTRACT VALID IDS for the loader map
+    
+        # Normalize Market IDs
+        markets['contract_id'] = markets['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
         valid_market_ids = set(markets['contract_id'].unique())
-        
-        # CALL LOADER (Correct Arguments)
+    
+        # 2. CALL LOADER (FIXED ARGUMENTS)
+        # We no longer pass trades_file because the function knows where it is
         trades = self._fast_load_trades(
-            trades_file, 
-            FIXED_START_DATE, 
-            FIXED_END_DATE, 
+            start_date=FIXED_START_DATE, 
+            end_date=FIXED_END_DATE, 
             allowed_ids=valid_market_ids
         )
-
+    
         if trades.empty:
             print("❌ Critical: No trade data available.")
             return pd.DataFrame(), pd.DataFrame()
-
-        # ---------------------------------------------------------
-        # 3. FINAL SYNC
-        # ---------------------------------------------------------
-        print("   Synchronizing data...")
-        
-        # Filter Markets to match loaded trades
-        # Use Categorical optimization
-        if isinstance(trades['contract_id'].dtype, pd.CategoricalDtype):
-            final_ids = set(trades['contract_id'].cat.categories)
-        else:
-            final_ids = set(trades['contract_id'].unique())
-
+    
+        # 3. Final Sync
+        final_ids = set(trades['contract_id'].unique())
         market_subset = markets[markets['contract_id'].isin(final_ids)].copy()
         
         del markets
         gc.collect()
-
-        print(f"✅ SYSTEM READY.")
-        print(f"   Markets: {len(market_subset)}")
-        print(f"   Trades:  {len(trades)}")
-        
+    
         return market_subset, trades
-        
+    
     def _fetch_gamma_markets(self, days_back=365):
         import os
         import json
@@ -2498,30 +2434,25 @@ class TuningRunner:
         print("="*60 + "\n")
 
 def _transform_to_events(self, markets_pd, trades_pd):
-    log.info("🚀 Transforming Data using Polars (Memory Optimized)...")
-    
-    # 1. Convert Markets to Polars (it's small, so this is fine)
+    import polars as pl
+    import gc
+    log.info("🚀 Transforming Data (Polars Streaming Mode)...")
+
+    # 1. Convert inputs to Polars for memory-efficient processing
     markets = pl.from_pandas(markets_pd)
-    
-    # 2. Convert Trades to Polars 
-    # NOTE: If trades_pd is already loaded, this is a 'zero-copy' view in some cases.
     trades = pl.from_pandas(trades_pd)
-    
-    # 3. Join Market Metadata (Outcome/Resolution) onto Trades
-    # We do a LEFT JOIN to keep only trades that exist in our market metadata
+
+    # 2. Add resolution data to trades
     trades = trades.join(
         markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity"]),
         on="contract_id",
         how="inner"
     )
 
-    # 4. Filter: Only keep trades that happened BEFORE resolution
-    # This removes millions of rows of "post-settlement" noise
+    # 3. Filter: Only keep trades that occurred before resolution
     trades = trades.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
 
-    # 5. Create the Event Log using 'Vertical Concatenation'
-    # Instead of creating 3 DataFrames and pd.concat, we build them as Expressions
-    
+    # 4. Define Event Type Streams
     # NEW_CONTRACT Events
     ev_new = markets.select([
         pl.col("created_at").alias("timestamp"),
@@ -2538,13 +2469,13 @@ def _transform_to_events(self, markets_pd, trades_pd):
         pl.col("resolution_timestamp").alias("timestamp"),
         pl.col("contract_id"),
         pl.lit("RESOLUTION").alias("event_type"),
-        pl.lit(1.0).alias("liquidity"), # Placeholder
+        pl.lit(1.0).alias("liquidity"),
         pl.col("outcome").alias("p_market_all"),
         pl.lit(False).alias("is_sell"),
         pl.lit("SYSTEM").alias("wallet_id")
     ])
 
-    # TRADE Events (The Bulk)
+    # TRADE Events
     ev_trades = trades.select([
         pl.col("timestamp"),
         pl.col("contract_id"),
@@ -2555,19 +2486,27 @@ def _transform_to_events(self, markets_pd, trades_pd):
         pl.col("user").alias("wallet_id")
     ])
 
-    # 6. Global Concatenate & Sort
-    # Polars sort is significantly faster and uses less memory than Pandas
-    event_log = pl.concat([ev_new, ev_res, ev_trades]).sort(["timestamp", "event_type"])
+    # 5. Concatenate and Sort (Polars handles this with much lower RAM overhead)
+    event_log_pl = pl.concat([ev_new, ev_res, ev_trades]).sort(["timestamp", "event_type"])
 
-    # 7. Convert back to Pandas for Nautilus (Nautilus expects Pandas/Numpy)
-    # We do this at the very last second to minimize the "Pandas Memory Tax"
-    log.info("Converting final event log to Pandas...")
-    final_event_log = event_log.to_pandas().set_index("timestamp")
+    # 6. Final Conversion back to Pandas for Nautilus
+    log.info("Converting to final Pandas DataFrames...")
+    event_log = event_log_pl.to_pandas().set_index("timestamp")
     
-    # profiler_data just needs the trades subset
-    profiler_data = trades.to_pandas()
+    # Rename trades_pd columns to match original Profiler schema requirements
+    prof_data = trades_pd.rename(columns={
+        'user': 'wallet_id',
+        'contract_id': 'market_id',
+        'tradeAmount': 'usdc_vol',
+        'outcomeTokensAmount': 'tokens',
+        'price': 'bet_price'
+    })
+    
+    # Force Garbage Collection
+    del event_log_pl
+    gc.collect()
 
-    return final_event_log, profiler_data
+    return event_log, prof_data
     
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
