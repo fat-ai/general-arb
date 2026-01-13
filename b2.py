@@ -2414,26 +2414,76 @@ class TuningRunner:
         import pandas as pd
         import gc
         import numpy as np
+        from datetime import timedelta
         
-        CHUNK_DAYS = 90
+        # TARGET: ~20-25 Million rows per chunk to stay safe
+        MAX_ROWS_PER_CHUNK = 20_000_000 
         
-        start_ts = pd.Timestamp(FIXED_START_DATE)
-        end_ts = pd.Timestamp(FIXED_END_DATE)
+        log.info("📊 Pre-scanning to build safe memory chunks...")
         
-        periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
-        if periods[-1] < end_ts:
-            periods = periods.union([end_ts])
+        # 1. PRE-SCAN: Count trades per month to estimate density
+        # This is very fast on Parquet (reads metadata only)
+        density_stats = (
+            trades_lazy
+            .with_columns(pl.col("timestamp").dt.truncate("1mo").alias("month"))
+            .group_by("month")
+            .agg(pl.count("contract_id").alias("count"))
+            .sort("month")
+            .collect()
+        )
+        
+        # 2. BUILD DYNAMIC RANGES
+        # We merge months until we hit the MAX_ROWS_PER_CHUNK limit
+        chunk_ranges = []
+        current_start = None
+        current_count = 0
+        
+        start_ts = pd.Timestamp(FIXED_START_DATE).replace(tzinfo=None)
+        end_ts = pd.Timestamp(FIXED_END_DATE).replace(tzinfo=None)
+        
+        rows = density_stats.to_dicts()
+        
+        for row in rows:
+            m_date = pd.Timestamp(row["month"]).replace(tzinfo=None)
+            count = row["count"]
             
+            if m_date < start_ts or m_date > end_ts:
+                continue
+                
+            if current_start is None:
+                current_start = m_date
+            
+            current_count += count
+            
+            # If adding this month exceeds limit, close the previous chunk
+            if current_count >= MAX_ROWS_PER_CHUNK:
+                # Close chunk at the end of this month
+                next_month = m_date + pd.offsets.MonthBegin(1)
+                chunk_ranges.append((current_start, next_month))
+                
+                # Reset
+                current_start = next_month
+                current_count = 0
+        
+        # Add final chunk if remains
+        if current_start is not None and current_start < end_ts:
+            chunk_ranges.append((current_start, end_ts))
+            
+        # Fallback if data is empty or too sparse
+        if not chunk_ranges:
+            chunk_ranges = [(start_ts, end_ts)]
+            
+        log.info(f"🚀 Processing {len(chunk_ranges)} dynamic chunks (Target: <{MAX_ROWS_PER_CHUNK/1e6:.0f}M rows)...")
+
         event_log_chunks = []
         profiler_chunks = []
-        
-        log.info(f"🚀 Starting Chunked Processing ({len(periods)-1} batches)...")
     
-        for i in range(len(periods) - 1):
-            p_start = periods[i]
-            p_end = periods[i+1]
+        for i, (p_start, p_end) in enumerate(chunk_ranges):
+            # Ensure timezone awareness matches your data (usually UTC)
+            if p_start.tzinfo is None: p_start = p_start.tz_localize('UTC')
+            if p_end.tzinfo is None: p_end = p_end.tz_localize('UTC')
             
-            print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
+            print(f"   📦 Batch {i+1}/{len(chunk_ranges)}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
             # 1. TRADES SLICE
             trades_slice = trades_lazy.filter(
