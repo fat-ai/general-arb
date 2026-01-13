@@ -2400,154 +2400,154 @@ class TuningRunner:
         
         print("="*60 + "\n")
 
-def _transform_to_events(self, markets_lazy, trades_lazy):
-    import polars as pl
-    import pandas as pd
-    import gc
-    import numpy as np
-    
-    # Define Chunk Size (e.g., 90 Days)
-    # Smaller chunks = Less RAM usage
-    CHUNK_DAYS = 90
-    
-    # Create Time Ranges
-    start_ts = pd.Timestamp(FIXED_START_DATE)
-    end_ts = pd.Timestamp(FIXED_END_DATE)
-    
-    periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
-    # Add the final end date if not covered
-    if periods[-1] < end_ts:
-        periods = periods.union([end_ts])
+    def _transform_to_events(self, markets_lazy, trades_lazy):
+        import polars as pl
+        import pandas as pd
+        import gc
+        import numpy as np
         
-    event_log_chunks = []
-    profiler_chunks = []
-    
-    log.info(f"🚀 Starting Chunked Processing ({len(periods)-1} batches)...")
-
-    # 1. Global Setup (Markets are small, keep them lazy/available)
-    # Prepare the query structures once
-    
-    for i in range(len(periods) - 1):
-        p_start = periods[i]
-        p_end = periods[i+1]
+        # Define Chunk Size (e.g., 90 Days)
+        # Smaller chunks = Less RAM usage
+        CHUNK_DAYS = 90
         
-        print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
+        # Create Time Ranges
+        start_ts = pd.Timestamp(FIXED_START_DATE)
+        end_ts = pd.Timestamp(FIXED_END_DATE)
         
-        # 2. Filter Lazy Frames for this Slice
-        # Polars pushes this filter down to the Parquet reader (Predicate Pushdown)
-        # It only reads the rows for these 90 days.
-        trades_slice = trades_lazy.filter(
-            (pl.col("timestamp") >= p_start) & 
-            (pl.col("timestamp") < p_end)
-        )
-        
-        # 3. Perform Logic on the Slice (Same logic as before)
-        joined = trades_slice.join(
-            markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
-            on="contract_id",
-            how="inner"
-        )
-        
-        # Filter post-resolution
-        joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
-        
-        # Construct Events (Same schema)
-        ev_trades = joined.select([
-            pl.col("timestamp"),
-            pl.col("contract_id"),
-            pl.lit("TRADE").alias("event_type").cast(pl.Categorical),
-            pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
-            pl.col("price").cast(pl.Float32).alias("p_market_all"),
-            (pl.col("side_mult") < 0).alias("is_sell"),
-            pl.col("user").alias("wallet_id"),
+        periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
+        # Add the final end date if not covered
+        if periods[-1] < end_ts:
+            periods = periods.union([end_ts])
             
-            pl.col("tradeAmount").alias("usdc_vol"),
-            pl.col("outcomeTokensAmount").alias("tokens"),
-            pl.col("price").alias("bet_price"),
-            pl.col("outcome"),     
-            pl.col("resolution_timestamp").alias("res_time") 
-        ])
-
-        # 4. Market Events (NEW_CONTRACT / RESOLUTION)
-        # We also need to slice market events to match this time window
-        # otherwise we duplicate them in every chunk.
+        event_log_chunks = []
+        profiler_chunks = []
         
-        m_new = markets_lazy.filter(
-            (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
-        ).select([
-            pl.col("created_at").alias("timestamp"),
-            pl.col("contract_id"),
-            pl.lit("NEW_CONTRACT").alias("event_type").cast(pl.Categorical),
-            pl.col("liquidity").cast(pl.Float32),
-            pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
-            pl.lit(False).alias("is_sell"),
-            pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
-            # Fill extras with nulls/zeros
-            pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.lit(0.0).alias("outcome"), pl.col("resolution_timestamp").alias("res_time")
-        ])
-
-        m_res = markets_lazy.filter(
-             (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
-        ).select([
-            pl.col("resolution_timestamp").alias("timestamp"),
-            pl.col("contract_id"),
-            pl.lit("RESOLUTION").alias("event_type").cast(pl.Categorical),
-            pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
-            pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
-            pl.lit(False).alias("is_sell"),
-            pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
-            pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.col("outcome"), pl.col("resolution_timestamp").alias("res_time")
-        ])
-
-        # 5. Concatenate & Materialize *JUST THIS CHUNK*
-        # We keep the "profiler columns" in the event log for now to simplify concat
-        # then split them after.
+        log.info(f"🚀 Starting Chunked Processing ({len(periods)-1} batches)...")
+    
+        # 1. Global Setup (Markets are small, keep them lazy/available)
+        # Prepare the query structures once
         
-        chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
-        
-        # EXECUTE! This is where RAM is used.
-        chunk_df = chunk_lazy.collect(engine="streaming")
-        
-        if chunk_df.height > 0:
-            # Optimize types
-            chunk_df = chunk_df.with_columns([
-                pl.col("event_type").cast(pl.Categorical),
-                pl.col("contract_id").cast(pl.Categorical),
-                pl.col("wallet_id").cast(pl.Categorical)
+        for i in range(len(periods) - 1):
+            p_start = periods[i]
+            p_end = periods[i+1]
+            
+            print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
+            
+            # 2. Filter Lazy Frames for this Slice
+            # Polars pushes this filter down to the Parquet reader (Predicate Pushdown)
+            # It only reads the rows for these 90 days.
+            trades_slice = trades_lazy.filter(
+                (pl.col("timestamp") >= p_start) & 
+                (pl.col("timestamp") < p_end)
+            )
+            
+            # 3. Perform Logic on the Slice (Same logic as before)
+            joined = trades_slice.join(
+                markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
+                on="contract_id",
+                how="inner"
+            )
+            
+            # Filter post-resolution
+            joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
+            
+            # Construct Events (Same schema)
+            ev_trades = joined.select([
+                pl.col("timestamp"),
+                pl.col("contract_id"),
+                pl.lit("TRADE").alias("event_type").cast(pl.Categorical),
+                pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
+                pl.col("price").cast(pl.Float32).alias("p_market_all"),
+                (pl.col("side_mult") < 0).alias("is_sell"),
+                pl.col("user").alias("wallet_id"),
+                
+                pl.col("tradeAmount").alias("usdc_vol"),
+                pl.col("outcomeTokensAmount").alias("tokens"),
+                pl.col("price").alias("bet_price"),
+                pl.col("outcome"),     
+                pl.col("resolution_timestamp").alias("res_time") 
             ])
-            
-            # Convert to Pandas (Small Batch = No OOM)
-            pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
-            
-            # Split into the two required outputs
-            prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
-            base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
-            
-            # Only keeping TRADE rows for profiler
-            prof_mask = pdf['event_type'] == 'TRADE'
-            
-            event_log_chunks.append(pdf[base_cols])
-            profiler_chunks.append(pdf.loc[prof_mask, prof_cols].rename(columns={"contract_id": "market_id"}))
-            
-        print(f" Done ({chunk_df.height} rows).")
-        
-        # 6. CRITICAL: Cleanup to free RAM for next batch
-        del chunk_df, pdf, trades_slice, joined
-        gc.collect()
-
-    # 7. Final Concatenation
-    print("🏁 Merging batches...")
-    if not event_log_chunks:
-        return pd.DataFrame(), pd.DataFrame()
-        
-    final_events = pd.concat(event_log_chunks)
-    final_profiler = pd.concat(profiler_chunks)
     
-    # Final sort
-    final_events = final_events.sort_values(["timestamp", "event_type"])
-    final_events = final_events.set_index("timestamp")
+            # 4. Market Events (NEW_CONTRACT / RESOLUTION)
+            # We also need to slice market events to match this time window
+            # otherwise we duplicate them in every chunk.
+            
+            m_new = markets_lazy.filter(
+                (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
+            ).select([
+                pl.col("created_at").alias("timestamp"),
+                pl.col("contract_id"),
+                pl.lit("NEW_CONTRACT").alias("event_type").cast(pl.Categorical),
+                pl.col("liquidity").cast(pl.Float32),
+                pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
+                pl.lit(False).alias("is_sell"),
+                pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+                # Fill extras with nulls/zeros
+                pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.lit(0.0).alias("outcome"), pl.col("resolution_timestamp").alias("res_time")
+            ])
     
-    return final_events, final_profiler
+            m_res = markets_lazy.filter(
+                 (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
+            ).select([
+                pl.col("resolution_timestamp").alias("timestamp"),
+                pl.col("contract_id"),
+                pl.lit("RESOLUTION").alias("event_type").cast(pl.Categorical),
+                pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
+                pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
+                pl.lit(False).alias("is_sell"),
+                pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
+                pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.col("outcome"), pl.col("resolution_timestamp").alias("res_time")
+            ])
+    
+            # 5. Concatenate & Materialize *JUST THIS CHUNK*
+            # We keep the "profiler columns" in the event log for now to simplify concat
+            # then split them after.
+            
+            chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
+            
+            # EXECUTE! This is where RAM is used.
+            chunk_df = chunk_lazy.collect(engine="streaming")
+            
+            if chunk_df.height > 0:
+                # Optimize types
+                chunk_df = chunk_df.with_columns([
+                    pl.col("event_type").cast(pl.Categorical),
+                    pl.col("contract_id").cast(pl.Categorical),
+                    pl.col("wallet_id").cast(pl.Categorical)
+                ])
+                
+                # Convert to Pandas (Small Batch = No OOM)
+                pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
+                
+                # Split into the two required outputs
+                prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
+                base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
+                
+                # Only keeping TRADE rows for profiler
+                prof_mask = pdf['event_type'] == 'TRADE'
+                
+                event_log_chunks.append(pdf[base_cols])
+                profiler_chunks.append(pdf.loc[prof_mask, prof_cols].rename(columns={"contract_id": "market_id"}))
+                
+            print(f" Done ({chunk_df.height} rows).")
+            
+            # 6. CRITICAL: Cleanup to free RAM for next batch
+            del chunk_df, pdf, trades_slice, joined
+            gc.collect()
+    
+        # 7. Final Concatenation
+        print("🏁 Merging batches...")
+        if not event_log_chunks:
+            return pd.DataFrame(), pd.DataFrame()
+            
+        final_events = pd.concat(event_log_chunks)
+        final_profiler = pd.concat(profiler_chunks)
+        
+        # Final sort
+        final_events = final_events.sort_values(["timestamp", "event_type"])
+        final_events = final_events.set_index("timestamp")
+        
+        return final_events, final_profiler
     
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
