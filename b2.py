@@ -2511,24 +2511,27 @@ class TuningRunner:
 def _transform_to_events(self, markets_pd, trades_pd):
     import polars as pl
     import gc
-    log.info("🚀 Transforming Data (Polars Streaming Mode)...")
+    
+    log.info(f"🚀 Transforming Data (Inputs: Markets={len(markets_pd)}, Trades={len(trades_pd)})...")
 
-    # 1. Convert inputs to Polars for memory-efficient processing
+    # 1. Convert to Polars (Zero-Copy where possible)
     markets = pl.from_pandas(markets_pd)
     trades = pl.from_pandas(trades_pd)
 
-    # 2. Add resolution data to trades
-    trades = trades.join(
-        markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity"]),
+    # 2. Join Market Metadata
+    # We need 'outcome' and 'resolution_timestamp' attached to every trade
+    # LEFT JOIN ensures we don't lose trades, but INNER is safer for data integrity
+    joined = trades.join(
+        markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
         on="contract_id",
         how="inner"
     )
 
-    # 3. Filter: Only keep trades that occurred before resolution
-    trades = trades.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
+    # 3. Filter: Post-Resolution Trades are invalid noise
+    joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
 
-    # 4. Define Event Type Streams
-    # NEW_CONTRACT Events
+    # 4. Construct Event Streams (Expressions)
+    # Market Creation Events
     ev_new = markets.select([
         pl.col("created_at").alias("timestamp"),
         pl.col("contract_id"),
@@ -2539,49 +2542,60 @@ def _transform_to_events(self, markets_pd, trades_pd):
         pl.lit("SYSTEM").alias("wallet_id")
     ])
 
-    # RESOLUTION Events
+    # Market Resolution Events
     ev_res = markets.select([
         pl.col("resolution_timestamp").alias("timestamp"),
         pl.col("contract_id"),
         pl.lit("RESOLUTION").alias("event_type"),
-        pl.lit(1.0).alias("liquidity"),
+        pl.lit(1.0).alias("liquidity"), # Dummy val
         pl.col("outcome").alias("p_market_all"),
         pl.lit(False).alias("is_sell"),
         pl.lit("SYSTEM").alias("wallet_id")
     ])
 
-    # TRADE Events
-    ev_trades = trades.select([
+    # Trade Events
+    ev_trades = joined.select([
         pl.col("timestamp"),
         pl.col("contract_id"),
         pl.lit("TRADE").alias("event_type"),
         pl.lit(0.0).alias("liquidity"),
         pl.col("price").alias("p_market_all"),
         (pl.col("side_mult") < 0).alias("is_sell"),
-        pl.col("user").alias("wallet_id")
+        pl.col("user").alias("wallet_id"),
+        
+        # Keep extra columns for Profiler Data
+        pl.col("tradeAmount").alias("usdc_vol"),
+        pl.col("outcomeTokensAmount").alias("tokens"),
+        pl.col("price").alias("bet_price"),
+        pl.col("outcome"),     # Needed for scoring
+        pl.col("resolution_timestamp").alias("res_time") # Needed for scoring
     ])
 
-    # 5. Concatenate and Sort (Polars handles this with much lower RAM overhead)
-    event_log_pl = pl.concat([ev_new, ev_res, ev_trades]).sort(["timestamp", "event_type"])
+    # 5. Create Profiler Data (Subset of Trades)
+    # We do this BEFORE the big concat to keep types clean
+    prof_data = ev_trades.select([
+        "timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"
+    ]).rename({"contract_id": "market_id"})
 
-    # 6. Final Conversion back to Pandas for Nautilus
-    log.info("Converting to final Pandas DataFrames...")
-    event_log = event_log_pl.to_pandas().set_index("timestamp")
+    # 6. Global Merge & Sort
+    # Drop extra columns from ev_trades to match ev_new/ev_res schema
+    common_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
     
-    # Rename trades_pd columns to match original Profiler schema requirements
-    prof_data = trades_pd.rename(columns={
-        'user': 'wallet_id',
-        'contract_id': 'market_id',
-        'tradeAmount': 'usdc_vol',
-        'outcomeTokensAmount': 'tokens',
-        'price': 'bet_price'
-    })
-    
-    # Force Garbage Collection
-    del event_log_pl
+    final_log_pl = pl.concat([
+        ev_new.select(common_cols),
+        ev_res.select(common_cols),
+        ev_trades.select(common_cols)
+    ]).sort(["timestamp", "event_type"])
+
+    # 7. Convert to Pandas (Final Output)
+    log.info("Converting final logs to Pandas...")
+    event_log = final_log_pl.to_pandas().set_index("timestamp")
+    profiler_data = prof_data.to_pandas()
+
+    del markets, trades, joined, final_log_pl
     gc.collect()
 
-    return event_log, prof_data
+    return event_log, profiler_data
     
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
