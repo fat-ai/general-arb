@@ -1476,7 +1476,7 @@ class TuningRunner:
             
         print(f"\n✅ Success! Saved compatible data to {parquet_path.name}")
        
-    def _fast_load_trades_streaming(self, parquet_path, start_date, end_date, allowed_ids):
+    def _fast_load_trades(self, parquet_path, start_date, end_date, allowed_ids):
         import polars as pl
         
         # scan_parquet does NOT load the file into RAM. It just reads the metadata.
