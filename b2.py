@@ -1487,47 +1487,44 @@ class TuningRunner:
             if parquet_path.exists(): os.remove(parquet_path)
             raise e
         
-    def _fast_load_trades(self, start_date, end_date, allowed_ids):
+    def _load_data(self):
+        import pandas as pd
         import polars as pl
-        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
-    
-        if not parquet_path.exists():
-            print("⚠️ Parquet missing. Converting...")
-            self._convert_csv_to_parquet_safe()
-    
-        allowed_df = pl.DataFrame({"contract_id": list(allowed_ids)}).with_columns(
-            pl.col("contract_id").cast(pl.String) 
-        )
-    
-        q = (
-            pl.scan_parquet(parquet_path)
-            .filter(
-                (pl.col("timestamp") >= start_date) & 
-                (pl.col("timestamp") <= end_date)
-            )
-            .join(allowed_df.lazy(), on="contract_id", how="inner")
-            .select([
-                "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
-            ])
-            .with_columns([
-                # Join Key -> String
-                pl.col("contract_id").cast(pl.String),
-                
-                # Time Key -> Datetime (Fixes potential string comparison errors)
-                pl.col("timestamp").cast(pl.Datetime),
-                
-                # Optimizations
-                pl.col("user").cast(pl.Categorical),
-                pl.col("price").cast(pl.Float32),
-                pl.col("size").cast(pl.Float32),
-                pl.col("tradeAmount").cast(pl.Float32),
-                pl.col("outcomeTokensAmount").cast(pl.Float32),
-                pl.col("side_mult").cast(pl.Float32),
-            ])
-        )
+        import gc
         
-        print("⚡ LazyFrame Prepared (Type Safe)")
-        return q
+        print(f"Initializing Data Engine...")
+        
+        market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        if market_file_path.exists():
+            markets_pd = pd.read_parquet(market_file_path)
+        else:
+            markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
+    
+        # 1. Normalize IDs
+        markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
+        
+        # 2. STRICT TZ STRIPPING (Pandas Side)
+        # We convert to UTC, then REMOVE the timezone info. This creates Naive UTC timestamps.
+        markets_pd['created_at'] = pd.to_datetime(markets_pd['created_at'], utc=True, errors='coerce').dt.tz_localize(None)
+        markets_pd['resolution_timestamp'] = pd.to_datetime(markets_pd['resolution_timestamp'], utc=True, errors='coerce').dt.tz_localize(None)
+
+        # 3. Create LazyFrame (Polars Side)
+        # pl.Datetime without arguments defaults to "us" (microseconds) and "No Timezone"
+        markets_pl = pl.from_pandas(markets_pd).lazy().with_columns([
+            pl.col("contract_id").cast(pl.String),
+            pl.col("created_at").cast(pl.Datetime), 
+            pl.col("resolution_timestamp").cast(pl.Datetime)
+        ])
+    
+        valid_market_ids = set(markets_pd['contract_id'].unique())
+    
+        trades_lazy = self._fast_load_trades(
+            start_date=FIXED_START_DATE, 
+            end_date=FIXED_END_DATE, 
+            allowed_ids=valid_market_ids
+        )
+    
+        return markets_pl, trades_lazy
         
     def run_tuning_job(self):
         import polars as pl
@@ -1726,16 +1723,16 @@ class TuningRunner:
         # 1. Normalize IDs
         markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
         
-        # 2. STRICT TYPE ENFORCEMENT (Pandas Side)
-        # We coerce errors='coerce' to ensure we have valid datetimes or NaT (which Polars handles)
-        markets_pd['created_at'] = pd.to_datetime(markets_pd['created_at'], utc=True, errors='coerce')
-        markets_pd['resolution_timestamp'] = pd.to_datetime(markets_pd['resolution_timestamp'], utc=True, errors='coerce')
+        # 2. STRICT TZ STRIPPING (Pandas Side)
+        # We convert to UTC, then REMOVE the timezone info. This creates Naive UTC timestamps.
+        markets_pd['created_at'] = pd.to_datetime(markets_pd['created_at'], utc=True, errors='coerce').dt.tz_localize(None)
+        markets_pd['resolution_timestamp'] = pd.to_datetime(markets_pd['resolution_timestamp'], utc=True, errors='coerce').dt.tz_localize(None)
 
-        # 3. Create LazyFrame with Explicit Casts (Polars Side)
-        # We cast contract_id to String (for the join) AND timestamps to Datetime (for the filter)
+        # 3. Create LazyFrame (Polars Side)
+        # pl.Datetime without arguments defaults to "us" (microseconds) and "No Timezone"
         markets_pl = pl.from_pandas(markets_pd).lazy().with_columns([
             pl.col("contract_id").cast(pl.String),
-            pl.col("created_at").cast(pl.Datetime),
+            pl.col("created_at").cast(pl.Datetime), 
             pl.col("resolution_timestamp").cast(pl.Datetime)
         ])
     
@@ -2415,15 +2412,13 @@ class TuningRunner:
         import gc
         import numpy as np
         
-        # 1. SKIP PRE-SCAN. Use a safe, fixed window.
-        # 30 Days is safe. Even in peak 2025, 30 days is < 25M rows.
-        # In quiet years (2020), it will just be fast.
+        # 1. FIXED CHUNK SIZE (30 Days is safe for RAM)
         CHUNK_DAYS = 30
         
-        start_ts = pd.Timestamp(FIXED_START_DATE)
-        end_ts = pd.Timestamp(FIXED_END_DATE)
+        # Ensure start/end are Naive (TZ-stripped)
+        start_ts = pd.Timestamp(FIXED_START_DATE).tz_localize(None)
+        end_ts = pd.Timestamp(FIXED_END_DATE).tz_localize(None)
         
-        # Create strict 30-day windows
         periods = pd.date_range(start=start_ts, end=end_ts, freq=f'{CHUNK_DAYS}D')
         if periods[-1] < end_ts:
             periods = periods.union([end_ts])
@@ -2431,19 +2426,20 @@ class TuningRunner:
         event_log_chunks = []
         profiler_chunks = []
         
-        log.info(f"🚀 Starting Fixed Chunk Processing ({len(periods)-1} batches of {CHUNK_DAYS} days)...")
+        log.info(f"🚀 Starting Fixed Chunk Processing ({len(periods)-1} batches)...")
     
         for i in range(len(periods) - 1):
             p_start = periods[i]
             p_end = periods[i+1]
             
-            # Ensure TZ awareness is consistent
-            if p_start.tzinfo is None: p_start = p_start.tz_localize('UTC')
-            if p_end.tzinfo is None: p_end = p_end.tz_localize('UTC')
+            # CRITICAL FIX: STRIP TIMEZONES
+            # This ensures the comparison scalar matches the column dtype (Datetime Naive)
+            if p_start.tzinfo is not None: p_start = p_start.tz_localize(None)
+            if p_end.tzinfo is not None: p_end = p_end.tz_localize(None)
 
             print(f"   📦 Batch {i+1}/{len(periods)-1}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            # 2. FILTER TRADES (Lazy)
+            # 2. FILTER TRADES (Naive comparison)
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
@@ -2458,8 +2454,7 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
-            # 4. EVENT 1: TRADES (Strict Types)
-            # wallet_id = String (safest for concat)
+            # 4. EVENT 1: TRADES
             ev_trades = joined.select([
                 pl.col("timestamp"),
                 pl.col("contract_id"), 
@@ -2469,7 +2464,6 @@ class TuningRunner:
                 (pl.col("side_mult") < 0).alias("is_sell"),
                 pl.col("user").cast(pl.String).alias("wallet_id"), 
                 
-                # Float32s from load
                 pl.col("tradeAmount").alias("usdc_vol"),
                 pl.col("outcomeTokensAmount").alias("tokens"),
                 pl.col("price").alias("bet_price"),
@@ -2478,7 +2472,7 @@ class TuningRunner:
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
-            # 5. EVENT 2: NEW CONTRACTS (Strict Types & Float32 Fillers)
+            # 5. EVENT 2: NEW CONTRACTS
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
@@ -2498,7 +2492,7 @@ class TuningRunner:
                 pl.col("resolution_timestamp").alias("res_time")
             ])
     
-            # 6. EVENT 3: RESOLUTIONS (Strict Types & Float32 Fillers)
+            # 6. EVENT 3: RESOLUTIONS
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
@@ -2520,7 +2514,7 @@ class TuningRunner:
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
             
-            # 7. EXECUTE (Streaming Engine)
+            # 7. EXECUTE
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
@@ -2530,7 +2524,7 @@ class TuningRunner:
                     pl.col("wallet_id").cast(pl.Categorical)
                 ])
                 
-                # 9. CONVERT TO PANDAS (Zero Copy)
+                # 9. CONVERT TO PANDAS
                 pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
                 
                 prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
@@ -2543,7 +2537,7 @@ class TuningRunner:
                 
             print(f" Done ({chunk_df.height} rows).")
             
-            # Aggressive Cleanup
+            # Cleanup
             del chunk_df, pdf, trades_slice, joined
             gc.collect()
     
