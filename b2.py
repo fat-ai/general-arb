@@ -1807,7 +1807,7 @@ class TuningRunner:
             trades_file, 
             FIXED_START_DATE, 
             FIXED_END_DATE, 
-            allowed_contract_ids=valid_market_ids
+            allowed_ids=valid_market_ids
         )
 
         if trades.empty:
