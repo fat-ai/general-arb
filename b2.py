@@ -1808,38 +1808,38 @@ class TuningRunner:
         return best_config
         
     def _load_data(self):
-    import pandas as pd
-    import polars as pl
-    import gc
+        import pandas as pd
+        import polars as pl
+        import gc
+        
+        print(f"Initializing Data Engine...")
+        
+        # 1. Load Markets (Keep this eager, it's small)
+        market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        if market_file_path.exists():
+            markets_pd = pd.read_parquet(market_file_path)
+        else:
+            markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
     
-    print(f"Initializing Data Engine...")
+        # Normalize IDs
+        markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
+        
+        # Convert markets to LazyFrame immediately for the join
+        markets_pl = pl.from_pandas(markets_pd).lazy().with_columns(
+            pl.col("contract_id").cast(pl.Categorical)
+        )
     
-    # 1. Load Markets (Keep this eager, it's small)
-    market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
-    if market_file_path.exists():
-        markets_pd = pd.read_parquet(market_file_path)
-    else:
-        markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
-
-    # Normalize IDs
-    markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
+        valid_market_ids = set(markets_pd['contract_id'].unique())
     
-    # Convert markets to LazyFrame immediately for the join
-    markets_pl = pl.from_pandas(markets_pd).lazy().with_columns(
-        pl.col("contract_id").cast(pl.Categorical)
-    )
-
-    valid_market_ids = set(markets_pd['contract_id'].unique())
-
-    # 2. Get Lazy Trades
-    trades_lazy = self._fast_load_trades(
-        start_date=FIXED_START_DATE, 
-        end_date=FIXED_END_DATE, 
-        allowed_ids=valid_market_ids
-    )
-
-    # Return Lazy objects
-    return markets_pl, trades_lazy
+        # 2. Get Lazy Trades
+        trades_lazy = self._fast_load_trades(
+            start_date=FIXED_START_DATE, 
+            end_date=FIXED_END_DATE, 
+            allowed_ids=valid_market_ids
+        )
+    
+        # Return Lazy objects
+        return markets_pl, trades_lazy
     
     def _fetch_gamma_markets(self, days_back=365):
         import os
