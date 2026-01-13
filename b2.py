@@ -1386,31 +1386,106 @@ class TuningRunner:
                 
     def _convert_csv_to_parquet_safe(self):
         import polars as pl
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import os
+        import gc
+    
         csv_path = self.cache_dir / "gamma_trades_stream.csv"
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
     
-        # Ensure clean state
-        if parquet_path.exists():
-            parquet_path.unlink()
+        if not csv_path.exists():
+            print(f"❌ Source CSV missing: {csv_path}")
+            return
     
-        print(f"🚀 Starting Sink-to-Disk conversion (Low RAM mode)...")
+        print(f"🚀 Starting MANUAL CHUNKED conversion (OOM Safe Mode)...")
         
-        # sink_parquet is the only way to handle 80GB on a standard machine
-        (
-            pl.scan_csv(str(csv_path), ignore_errors=True)
-            .with_columns([
-                pl.col("timestamp").str.to_datetime(strict=False),
-                pl.col("contract_id").cast(pl.String),
-                pl.col("price").cast(pl.Float32),
-                pl.col("size").cast(pl.Float32)
-            ])
-            .sink_parquet(
-                parquet_path,
-                compression="snappy",
-                row_group_size=50_000
-            )
+        # 1. Clean up old files
+        if parquet_path.exists():
+            try: os.remove(parquet_path)
+            except OSError: pass
+    
+        # 2. Define Strict Schema (Prevents expensive guessing)
+        # We tell Polars exactly what the columns are so it doesn't scan ahead
+        dtypes = {
+            "id": pl.String,
+            "timestamp": pl.String, # Parse date later to be safe
+            "tradeAmount": pl.Float32,
+            "outcomeTokensAmount": pl.Float32,
+            "user": pl.String,
+            "contract_id": pl.String,
+            "price": pl.Float32,
+            "size": pl.Float32,
+            "side_mult": pl.Float32
+        }
+    
+        # 3. Initialize the Batched Reader
+        # Batch size of 500,000 rows is ~50MB of RAM. Very safe.
+        reader = pl.read_csv_batched(
+            str(csv_path),
+            schema_overrides=dtypes,
+            batch_size=500_000,
+            low_memory=True,
+            ignore_errors=True
         )
-        print("✅ Conversion finished safely.")
+    
+        writer = None
+        chunks_processed = 0
+        total_rows = 0
+    
+        try:
+            while True:
+                # Read ONE chunk
+                batches = reader.next_batches(1)
+                if not batches:
+                    break
+                
+                chunk = batches[0]
+                
+                # 4. Process the Chunk in Memory
+                # (Parse dates and types here on the small slice)
+                chunk = chunk.with_columns([
+                    pl.col("timestamp").str.to_datetime(strict=False),
+                    pl.col("contract_id").cast(pl.String),
+                    pl.col("price").fill_null(0.0),
+                    pl.col("size").fill_null(0.0)
+                ])
+    
+                # Convert to Arrow Table
+                pa_table = chunk.to_arrow()
+    
+                # 5. Initialize Writer on First Chunk
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        str(parquet_path),
+                        pa_table.schema,
+                        compression='snappy',
+                        use_dictionary=False # Faster, less memory
+                    )
+    
+                # 6. Write to Disk and CLEAR MEMORY
+                writer.write_table(pa_table)
+                
+                total_rows += len(chunk)
+                chunks_processed += 1
+                
+                # Force cleanup
+                del chunk, pa_table
+                if chunks_processed % 10 == 0:
+                    print(f"   Processed {total_rows:,} rows...", end='\r')
+                    gc.collect()
+    
+            if writer:
+                writer.close()
+                
+            print(f"\n✅ Success! Converted {total_rows:,} rows to {parquet_path.name}")
+    
+        except Exception as e:
+            print(f"\n❌ Conversion Failed: {e}")
+            if writer: writer.close()
+            # Clean up partial file
+            if parquet_path.exists(): os.remove(parquet_path)
+            raise e
         
     def _fast_load_trades(self, start_date, end_date, allowed_ids):
         import polars as pl
