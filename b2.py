@@ -1512,7 +1512,7 @@ class TuningRunner:
             
             # collect(streaming=True) is the critical memory-saver
             print("⚡ Executing streaming load...")
-            return q.collect(streaming=True).to_pandas()
+            return q.collect(engine="streaming").to_pandas()
             
         except Exception as e:
             if "PAR1" in str(e):
