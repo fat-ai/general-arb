@@ -1606,6 +1606,11 @@ class TuningRunner:
         markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
         
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
+        print("🗑️ Dropping raw inputs to free RAM...")
+        
+        del market_subset
+        del trades
+        gc.collect()
         
         log.info("📉 Optimizing DataFrame memory footprint...")
         if 'market_id' in profiler_data.columns:
