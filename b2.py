@@ -2414,9 +2414,16 @@ class TuningRunner:
         import polars as pl
         import pandas as pd
         import gc
+        import shutil
         import numpy as np
+        from pathlib import Path
         
-        # 1. FIXED CHUNK SIZE (30 Days is safe for RAM)
+        # Setup Temp Directory for Disk Buffering
+        temp_dir = self.cache_dir / "processing_chunks"
+        if temp_dir.exists(): shutil.rmtree(temp_dir)
+        temp_dir.mkdir(exist_ok=True)
+        
+        # 1. FIXED CHUNK SIZE (30 Days)
         CHUNK_DAYS = 7
         
         # Ensure start/end are Naive (TZ-stripped)
@@ -2427,29 +2434,25 @@ class TuningRunner:
         if periods[-1] < end_ts:
             periods = periods.union([end_ts])
             
-        event_log_chunks = []
-        profiler_chunks = []
-        
         log.info(f"🚀 Starting Fixed Chunk Processing ({len(periods)-1} batches)...")
     
         for i in range(len(periods) - 1):
             p_start = periods[i]
             p_end = periods[i+1]
             
-            # CRITICAL FIX: STRIP TIMEZONES
-            # This ensures the comparison scalar matches the column dtype (Datetime Naive)
+            # STRIP TIMEZONES
             if p_start.tzinfo is not None: p_start = p_start.tz_localize(None)
             if p_end.tzinfo is not None: p_end = p_end.tz_localize(None)
 
             print(f"   📦 Batch {i+1}/{len(periods)-1}: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            # 2. FILTER TRADES (Naive comparison)
+            # 2. FILTER TRADES
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
             )
             
-            # 3. JOIN (String Key -> String Key)
+            # 3. JOIN
             joined = trades_slice.join(
                 markets_lazy.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
                 on="contract_id",
@@ -2486,7 +2489,7 @@ class TuningRunner:
                 pl.col("liquidity").cast(pl.Float32),
                 pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
-                pl.lit("SYSTEM").alias("wallet_id"), # String
+                pl.lit("SYSTEM").alias("wallet_id"), 
                 
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
@@ -2506,7 +2509,7 @@ class TuningRunner:
                 pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
                 pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
-                pl.lit("SYSTEM").alias("wallet_id"), # String
+                pl.lit("SYSTEM").alias("wallet_id"), 
                 
                 pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
                 pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
@@ -2522,40 +2525,58 @@ class TuningRunner:
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # 8. FINAL OPTIMIZATION (String -> Categorical)
+                # 8. OPTIMIZATION & DISK WRITE
+                # We cast to Categorical here for compression on disk
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.Categorical),
                     pl.col("wallet_id").cast(pl.Categorical)
                 ])
                 
-                # 9. CONVERT TO PANDAS
-                pdf = chunk_df.to_pandas(use_pyarrow_extension_array=True)
+                # Split and Write immediately to avoid RAM accumulation
                 
-                prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
+                # A. Write Event Log
                 base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
+                chunk_df.select(base_cols).write_parquet(
+                    temp_dir / f"events_{i}.parquet",
+                    compression='snappy'
+                )
                 
-                prof_mask = pdf['event_type'] == 'TRADE'
+                # B. Write Profiler Data
+                prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
+                chunk_df.filter(pl.col("event_type") == "TRADE").select(prof_cols).rename({"contract_id": "market_id"}).write_parquet(
+                    temp_dir / f"profiler_{i}.parquet",
+                    compression='snappy'
+                )
                 
-                event_log_chunks.append(pdf[base_cols])
-                profiler_chunks.append(pdf.loc[prof_mask, prof_cols].rename(columns={"contract_id": "market_id"}))
-                
-            print(f" Done ({chunk_df.height} rows).")
+            print(f" Done ({chunk_df.height} rows) -> Disk.")
             
-            # Cleanup
-            del chunk_df, pdf, trades_slice, joined
+            # Aggressive Cleanup
+            del chunk_df, trades_slice, joined
             gc.collect()
     
-        print("🏁 Merging batches...")
-        if not event_log_chunks:
-            return pd.DataFrame(), pd.DataFrame()
+        print("🏁 Loading merged results from disk (Zero-Copy)...")
+        
+        try:
+            # Check if we generated any data
+            if not list(temp_dir.glob("events_*.parquet")):
+                return pd.DataFrame(), pd.DataFrame()
+
+            # 9. READ FROM DISK (Efficient Merge)
+            # Polars reads all chunks as one dataset. This allocates memory ONCE.
+            # Compare this to pd.concat which allocates memory 2-3 times.
             
-        final_events = pd.concat(event_log_chunks)
-        final_profiler = pd.concat(profiler_chunks)
+            # Use PyArrow extension for String optimization
+            event_log = pl.read_parquet(temp_dir / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+            profiler_data = pl.read_parquet(temp_dir / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+            
+            # Final Sort
+            event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
+            
+        finally:
+            # Cleanup disk space
+            if temp_dir.exists(): shutil.rmtree(temp_dir)
         
-        final_events = final_events.sort_values(["timestamp", "event_type"])
-        final_events = final_events.set_index("timestamp")
-        
-        return final_events, final_profiler
+        return event_log, profiler_data
         
 def ray_backtest_wrapper(config, event_log, profiler_data, nlp_cache=None, priors=None):
     
