@@ -1707,44 +1707,48 @@ class TuningRunner:
     
         return best_config
         
-    def _load_data(self):
-        import pandas as pd
+    def _fast_load_trades(self, start_date, end_date, allowed_ids):
         import polars as pl
-        import gc
-        
-        print(f"Initializing Data Engine...")
-        
-        market_file_path = self.cache_dir / "gamma_markets_all_tokens.parquet"
-        if market_file_path.exists():
-            markets_pd = pd.read_parquet(market_file_path)
-        else:
-            markets_pd = self._fetch_gamma_markets(days_back=DAYS_BACK)
+        parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
     
-        # 1. Normalize IDs
-        markets_pd['contract_id'] = markets_pd['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
-        
-        # 2. STRICT TZ STRIPPING (Pandas Side)
-        # We convert to UTC, then REMOVE the timezone info. This creates Naive UTC timestamps.
-        markets_pd['created_at'] = pd.to_datetime(markets_pd['created_at'], utc=True, errors='coerce').dt.tz_localize(None)
-        markets_pd['resolution_timestamp'] = pd.to_datetime(markets_pd['resolution_timestamp'], utc=True, errors='coerce').dt.tz_localize(None)
-
-        # 3. Create LazyFrame (Polars Side)
-        # pl.Datetime without arguments defaults to "us" (microseconds) and "No Timezone"
-        markets_pl = pl.from_pandas(markets_pd).lazy().with_columns([
-            pl.col("contract_id").cast(pl.String),
-            pl.col("created_at").cast(pl.Datetime), 
-            pl.col("resolution_timestamp").cast(pl.Datetime)
-        ])
+        if not parquet_path.exists():
+            print("⚠️ Parquet missing. Converting...")
+            self._convert_csv_to_parquet_safe()
     
-        valid_market_ids = set(markets_pd['contract_id'].unique())
-    
-        trades_lazy = self._fast_load_trades(
-            start_date=FIXED_START_DATE, 
-            end_date=FIXED_END_DATE, 
-            allowed_ids=valid_market_ids
+        allowed_df = pl.DataFrame({"contract_id": list(allowed_ids)}).with_columns(
+            pl.col("contract_id").cast(pl.String) 
         )
     
-        return markets_pl, trades_lazy
+        q = (
+            pl.scan_parquet(parquet_path)
+            .filter(
+                (pl.col("timestamp") >= start_date) & 
+                (pl.col("timestamp") <= end_date)
+            )
+            .join(allowed_df.lazy(), on="contract_id", how="inner")
+            .select([
+                "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
+            ])
+            .with_columns([
+                # Join Key -> String
+                pl.col("contract_id").cast(pl.String),
+                
+                # Time Key -> Datetime (Naive)
+                # This ensures it matches the Markets data
+                pl.col("timestamp").cast(pl.Datetime),
+                
+                # Optimizations
+                pl.col("user").cast(pl.Categorical),
+                pl.col("price").cast(pl.Float32),
+                pl.col("size").cast(pl.Float32),
+                pl.col("tradeAmount").cast(pl.Float32),
+                pl.col("outcomeTokensAmount").cast(pl.Float32),
+                pl.col("side_mult").cast(pl.Float32),
+            ])
+        )
+        
+        print("⚡ LazyFrame Prepared (Type Safe & Naive TZ)")
+        return q
         
     def _fetch_gamma_markets(self, days_back=365):
         import os
