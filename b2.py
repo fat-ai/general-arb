@@ -2435,7 +2435,7 @@ class TuningRunner:
             
             print(f"   📦 Processing Batch: {p_start.date()} -> {p_end.date()}...", end="", flush=True)
             
-            # TRADES FILTER
+            # 1. TRADES FILTER
             trades_slice = trades_lazy.filter(
                 (pl.col("timestamp") >= p_start) & 
                 (pl.col("timestamp") < p_end)
@@ -2449,6 +2449,7 @@ class TuningRunner:
             
             joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
             
+            # Schema Reference: usdc_vol, tokens, bet_price are Float32 here (from _fast_load_trades)
             ev_trades = joined.select([
                 pl.col("timestamp"),
                 pl.col("contract_id"), 
@@ -2464,7 +2465,7 @@ class TuningRunner:
                 pl.col("resolution_timestamp").alias("res_time") 
             ])
     
-            # NEW CONTRACTS FILTER (Strict Datetime Check)
+            # 2. NEW CONTRACTS (Fixing Schema Mismatch)
             m_new = markets_lazy.filter(
                 (pl.col("created_at") >= p_start) & (pl.col("created_at") < p_end)
             ).select([
@@ -2475,10 +2476,17 @@ class TuningRunner:
                 pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
-                pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.lit(0.0).alias("outcome"), pl.col("resolution_timestamp").alias("res_time")
+                
+                # FIX: Explicit cast to Float32 to match ev_trades
+                pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
+                pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
+                pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
+                
+                pl.lit(0.0).alias("outcome"), # outcome is Float64 in trades, so keep 0.0 (Float64)
+                pl.col("resolution_timestamp").alias("res_time")
             ])
     
-            # RESOLUTIONS FILTER (Strict Datetime Check)
+            # 3. RESOLUTIONS (Fixing Schema Mismatch)
             m_res = markets_lazy.filter(
                  (pl.col("resolution_timestamp") >= p_start) & (pl.col("resolution_timestamp") < p_end)
             ).select([
@@ -2489,7 +2497,14 @@ class TuningRunner:
                 pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
                 pl.lit(False).alias("is_sell"),
                 pl.lit("SYSTEM").alias("wallet_id").cast(pl.Categorical),
-                pl.lit(0.0).alias("usdc_vol"), pl.lit(0.0).alias("tokens"), pl.lit(0.0).alias("bet_price"), pl.col("outcome"), pl.col("resolution_timestamp").alias("res_time")
+                
+                # FIX: Explicit cast to Float32
+                pl.lit(0.0).cast(pl.Float32).alias("usdc_vol"), 
+                pl.lit(0.0).cast(pl.Float32).alias("tokens"), 
+                pl.lit(0.0).cast(pl.Float32).alias("bet_price"), 
+                
+                pl.col("outcome"), # Float64
+                pl.col("resolution_timestamp").alias("res_time")
             ])
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
