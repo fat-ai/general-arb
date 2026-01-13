@@ -1526,124 +1526,51 @@ class TuningRunner:
         return q
     
     def run_tuning_job(self):
+        import polars as pl
+        import gc
+        import pandas as pd
+        import numpy as np
 
-        log.info("--- Starting Full Strategy Optimization (FIXED) ---")
+        log.info("--- Starting Full Strategy Optimization (Lazy Architecture) ---")
         
+        # 1. LOAD (Returns LazyFrames, 0 RAM usage)
         df_markets, df_trades = self._load_data()
 
-        # DIAGNOSTIC BLOCK
-        print("\n🔍 DATA INTEGRITY CHECK:")
-        print(f"Markets shape: {df_markets.shape}")
-        print(f"Trades shape: {df_trades.shape}")
-        print(f"Markets contract_id sample: {df_markets['contract_id'].head(3).tolist()}")
-        print(f"Trades contract_id sample: {df_trades['contract_id'].head(3).tolist()}")
-        print(f"Markets contract_id dtype: {df_markets['contract_id'].dtype}")
-        print(f"Trades contract_id dtype: {df_trades['contract_id'].dtype}")
+        print("\n🔍 DATA PIPELINE READY (Lazy Mode)")
+        print(f"   Markets Plan: {type(df_markets)}")
+        print(f"   Trades Plan:  {type(df_trades)}")
         
-        # Check overlap BEFORE transformation
-        # --- MEMORY SAFE VALIDATION ---
-        
-        # 1. Get Market IDs (Safe because markets df is smaller)
-        market_ids = set(df_markets['contract_id'].astype(str).str.strip().str.lower())
-
-        # 2. Get Trade IDs (CRITICAL FIX)
-        # Instead of expanding 181M rows to strings, we access the unique categories directly.
-        # This operates on ~400k items instead of 181M.
-        if isinstance(df_trades['contract_id'].dtype, pd.CategoricalDtype):
-            trades_ids = set(df_trades['contract_id'].cat.categories.astype(str).str.strip().str.lower())
-        else:
-            # Fallback only if somehow not categorical (should not happen now)
-            trades_ids = set(df_trades['contract_id'].unique().astype(str))
-
-        common = market_ids.intersection(trades_ids)
-        
-        print(f"🔗 ID OVERLAP CHECK:")
-        print(f"   Unique Market IDs: {len(market_ids)}")
-        print(f"   Unique Trade IDs:  {len(trades_ids)}")
-        print(f"   Common IDs:        {len(common)}")
-        
-        if len(common) == 0:
-            print("❌ CRITICAL: No intersection between Market IDs and Trade IDs!")
-            # Print samples to debug formatting mismatch
-            print(f"   Sample Market: {list(market_ids)[:1]}")
-            print(f"   Sample Trade:  {list(trades_ids)[:1]}")
-            return None
- 
-        float_cols = ['tradeAmount', 'price', 'outcomeTokensAmount', 'size']
-        for c in float_cols:
-            df_trades[c] = pd.to_numeric(df_trades[c], downcast='float')
-                
-        if df_markets.empty or df_trades.empty: 
-            log.error("⛔ CRITICAL: Data load failed. Cannot run tuning.")
-            return None
-
-        safe_cols = [
-            'contract_id', 'outcome', 'resolution_timestamp', 
-            'created_at', 'liquidity', 'question', 'volume'
-        ]
-
-        actual_cols = [c for c in safe_cols if c in df_markets.columns]
-        markets = df_markets[actual_cols].copy()
-
-        
-        markets['contract_id'] = markets['contract_id'].astype(str)
-
-        markets['contract_id'] = markets['contract_id'].apply(normalize_contract_id)
-
-        markets = markets.sort_values(
-            by=['contract_id', 'resolution_timestamp'], 
-            ascending=[True, True],
-            kind='stable'
-        )
-        markets = markets.drop_duplicates(subset=['contract_id'], keep='first').copy()
-        
+        # 2. TRANSFORM (Executes in chunks)
+        # This function materializes small batches and returns final Pandas DFs
         event_log, profiler_data = self._transform_to_events(df_markets, df_trades)
-        print("🗑️ Dropping raw inputs to free RAM...")
         
-        del market_subset
-        del trades
+        # 3. CLEANUP (Critical: Drop Lazy Plans)
+        del df_markets, df_trades
         gc.collect()
-        
-        log.info("📉 Optimizing DataFrame memory footprint...")
-        if 'market_id' in profiler_data.columns:
-            profiler_data['market_id'] = profiler_data['market_id'].astype('category')
-        if 'entity_type' in profiler_data.columns:
-            profiler_data['entity_type'] = profiler_data['entity_type'].astype('category')
-        if 'event_type' in event_log.columns:
-            event_log['event_type'] = event_log['event_type'].astype('category')
 
-        mask_date = (event_log.index <= FIXED_END_DATE) & \
-                    ((event_log.index >= FIXED_START_DATE) | (event_log['event_type'] == 'NEW_CONTRACT'))
-        
-        event_log = event_log[mask_date].copy()
-    
         if event_log.empty:
-            log.error("⛔ Event log is empty after transformation.")
+            log.error("⛔ Event log is empty after transformation. Check data sync.")
             return None
     
+        # --- DIAGNOSTICS CAN RUN NOW (On the reduced Event Log) ---
         min_date = event_log.index.min()
         max_date = event_log.index.max()
         total_days = (max_date - min_date).days
     
-        log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date} to {max_date})")
+        log.info(f"📊 DATA STATS: {len(event_log)} events spanning {total_days} days ({min_date.date()} to {max_date.date()})")
     
         safe_train = max(5, int(total_days * 0.33))
         safe_test = max(5, int(total_days * 0.60))
         required_days = safe_train + safe_test + 2
         
         if total_days < required_days:
-            log.error(f"⛔ Not enough data: Have {total_days} days, need {required_days} for current split.")
+            log.error(f"⛔ Not enough data: Have {total_days} days, need {required_days}.")
             return None
             
         log.info(f"⚙️ ADAPTING CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
-    
-        del df_markets, df_trades
-        import gc
-        gc.collect()
         
         # === FIXED SEARCH SPACE ===
         search_space = {
-            # Grid Search: Ray will strictly iterate these combinations
             "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0]),
             "decay_factor": 0.95, 
             "max_weight_cap": 10.0,
@@ -1657,35 +1584,28 @@ class TuningRunner:
             "seed": 42,
         }
     
-        # Execute Tuning
+        # Validation checks on final data
         if 'ts_int' not in event_log.columns:
             event_log['ts_int'] = event_log.index.astype(np.int64)
         if 'ts_int' not in profiler_data.columns:
             profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
     
-        # Upload to Object Store
+        # Upload to Ray
         log.info("Uploading data to Ray Object Store...")
         event_log_ref = ray.put(event_log)
         profiler_ref = ray.put(profiler_data)
-        # Create empty placeholders for the unused refs to satisfy signature
-        nlp_cache_ref = ray.put(None)
-        priors_ref = ray.put({})
     
-        # 2. Calculate Max Parallelism based on RAM (Safety Check)
+        # Resource Logic
         import psutil
-        # Assume ~4GB RAM overhead per worker for safety
         worker_est_ram = 4 
         total_ram_gb = psutil.virtual_memory().total / (1024**3)
         safe_slots = int(total_ram_gb / worker_est_ram)
-        
-        # Use the lower of: Available CPUs OR Safe RAM slots
         cpu_count = os.cpu_count()
         max_parallel = max(1, min(safe_slots, cpu_count - 1))
 
         print("🗑️ Freeing local memory for tuning...")
         del event_log
         del profiler_data
-        import gc
         gc.collect()
         
         print(f"🚀 Launching {max_parallel} parallel trials (1 CPU each)...")
@@ -1695,34 +1615,22 @@ class TuningRunner:
                 ray_backtest_wrapper,
                 event_log=event_log_ref,
                 profiler_data=profiler_ref,
-                # nlp_cache=nlp_cache_ref,
-                # priors=priors_ref
             ),
             config=search_space,
             metric="smart_score",
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            
-            # --- CRITICAL FIXES ---
-            #max_concurrent_trials=max_parallel,
-            max_concurrent_trials=2,
+            max_concurrent_trials=2, # Keep low for safety
             resources_per_trial={"cpu": 1},
-            # ----------------------
         )
     
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
-        print("Sorting results deterministically...")
         all_trials = analysis.trials
-        # Define a robust sort key:
-        # 1. Smart Score (Desc)
-        # 2. Total Return (Desc)
-        # 3. Trades (Desc)
-        # 4. Splash Threshold (Asc - prefer lower threshold if scores are tied)
+
+        # Sort results
         def sort_key(t):
             metrics = t.last_result or {}
-            
-            # Replace NaN/None with -inf for sorting
             def safe_get(key, default=-99.0):
                 val = metrics.get(key, default)
                 return val if (val is not None and not np.isnan(val)) else -99.0
@@ -1738,12 +1646,13 @@ class TuningRunner:
         sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
         best_trial = sorted_trials[0]
         best_config = best_trial.config
-      
         metrics = best_trial.last_result
         
+        # Prepare Display Strings
         mode, val = best_config['sizing']
         sizing_str = f"Kelly {val}x" if mode == "kelly" else f"Fixed {val*100}%"
         
+        # RESTORED EXTENSIVE PRINT BLOCK
         print("\n" + "="*60)
         print("🏆  GRAND CHAMPION STRATEGY  🏆")
         print(f"   Splash Threshold: {best_config['splash_threshold']:.1f}")
@@ -1760,37 +1669,29 @@ class TuningRunner:
         print(f"   Trades:           {metrics.get('trades', 0)}")
         print("="*60 + "\n")
 
-        print("\n--- Generating Visual Report ---")
+        # Re-run for Plotting
         print("📥 Fetching data back for plotting...")
         event_log = ray.get(event_log_ref)
         profiler_data = ray.get(profiler_ref)
-        # 1. FIX: Manually unpack the 'sizing' tuple for the local engine
-        # (This replicates the logic inside ray_backtest_wrapper)
+        
+        # Unpack sizing for local engine
         if 'sizing' in best_config:
             mode, val = best_config['sizing']
             best_config['sizing_mode'] = mode
-            if mode == 'kelly':
-                best_config['kelly_fraction'] = val
-            elif mode == 'fixed_pct':
-                best_config['fixed_size'] = val
-            elif mode == 'fixed':
-                best_config['fixed_size'] = val
+            if mode == 'kelly': best_config['kelly_fraction'] = val
+            elif mode == 'fixed_pct': best_config['fixed_size'] = val
+            elif mode == 'fixed': best_config['fixed_size'] = val
 
-        # 2. Re-instantiate the engine locally
         engine = FastBacktestEngine(event_log, profiler_data, None, {})
-        
-        # 3. Run with the CORRECTED config
         final_results = engine.run_walk_forward(best_config)
         
-        # 2. Extract Curve
         curve_data = final_results.get('full_equity_curve', [])
         trade_count = final_results.get('trades', 0)
         
         if curve_data:
-            # 3. Plot (function now handles both formats)
             plot_performance(curve_data, trade_count)
             
-            # 4. Extract values for terminal output
+            # Print curve stats
             if isinstance(curve_data[0], (tuple, list)):
                 values = [x[1] for x in curve_data]
             else:
@@ -1802,8 +1703,6 @@ class TuningRunner:
             low = min(values)
             print(f"   Start: ${start:.0f} -> Peak: ${peak:.0f} -> End: ${end:.0f}")
             print(f"   Lowest Point: ${low:.0f}")
-        else:
-            print("❌ Error: No equity curve data returned to plot.")
     
         return best_config
         
