@@ -1537,8 +1537,7 @@ class TuningRunner:
 
         log.info("--- Starting Full Strategy Optimization (Disk-Based Architecture) ---")
         
-        # 1. LOAD LAZY FRAMES (Must be done first!)
-        # df_markets and df_trades are Polars LazyFrames (pointers, not data)
+        # 1. LOAD LAZY FRAMES
         df_markets, df_trades = self._load_data()
 
         print("\n🔍 DATA PIPELINE READY")
@@ -1546,26 +1545,33 @@ class TuningRunner:
         print(f"   Trades Plan:  {type(df_trades)}")
         
         # 2. TRANSFORM TO DISK
-        # We pass the LazyFrames. This function executes them in chunks and saves to disk.
-        # It returns the DIRECTORY PATH where the files are saved.
         dataset_dir_path = self._transform_to_events(df_markets, df_trades)
         
         # 3. CLEANUP
-        # We no longer need the plans. The data is safely on disk.
         del df_markets, df_trades
         gc.collect()
 
         # 4. VALIDATION
-        # Check if the transformation actually produced files
         if not list(dataset_dir_path.glob("events_*.parquet")):
             log.error("⛔ No data generated! Check your date range or input files.")
             return None
             
         # 5. PREPARE FOR RAY
-        # We pass the PATH string. Ray workers will read from this path.
         dataset_dir_str = str(dataset_dir_path.absolute())
         
         print(f"🚀 Launching tuning using data at: {dataset_dir_str}")
+        
+        # --- FIX: CALCULATE TRAIN/TEST SPLIT ---
+        # We derive this from the global constants instead of loading data
+        sim_start = pd.Timestamp(FIXED_START_DATE)
+        sim_end = pd.Timestamp(FIXED_END_DATE)
+        total_days = (sim_end - sim_start).days
+        
+        # Default logic: 33% Train, 60% Test
+        safe_train = max(5, int(total_days * 0.33))
+        safe_test = max(5, int(total_days * 0.60))
+        
+        log.info(f"⚙️ AUTO-CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
         
         # === FIXED SEARCH SPACE ===
         search_space = {
@@ -1582,32 +1588,6 @@ class TuningRunner:
             "seed": 42,
         }
     
-        # Validation checks on final data
-        if 'ts_int' not in event_log.columns:
-            event_log['ts_int'] = event_log.index.astype(np.int64)
-        if 'ts_int' not in profiler_data.columns:
-            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
-    
-        # Upload to Ray
-        log.info("Uploading data to Ray Object Store...")
-        event_log_ref = ray.put(event_log)
-        profiler_ref = ray.put(profiler_data)
-    
-        # Resource Logic
-        import psutil
-        worker_est_ram = 4 
-        total_ram_gb = psutil.virtual_memory().total / (1024**3)
-        safe_slots = int(total_ram_gb / worker_est_ram)
-        cpu_count = os.cpu_count()
-        max_parallel = max(1, min(safe_slots, cpu_count - 1))
-
-        print("🗑️ Freeing local memory for tuning...")
-        del event_log
-        del profiler_data
-        gc.collect()
-        
-        print(f"🚀 Launching {max_parallel} parallel trials (1 CPU each)...")
-    
         analysis = tune.run(
             tune.with_parameters(
                 _wrapper,
@@ -1623,23 +1603,16 @@ class TuningRunner:
             resources_per_trial={"cpu": 1},
         )
     
+        # 7. ANALYZE RESULTS
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
         all_trials = analysis.trials
 
-        # Sort results
         def sort_key(t):
             metrics = t.last_result or {}
             def safe_get(key, default=-99.0):
                 val = metrics.get(key, default)
                 return val if (val is not None and not np.isnan(val)) else -99.0
-            
-            return (
-                safe_get('smart_score'),
-                safe_get('total_return'),
-                safe_get('trades', 0),
-                -t.config.get('splash_threshold', 0),
-                t.trial_id
-            )
+            return (safe_get('smart_score'), safe_get('total_return'))
             
         sorted_trials = sorted(all_trials, key=sort_key, reverse=True)
         best_trial = sorted_trials[0]
