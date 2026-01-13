@@ -1491,13 +1491,12 @@ class TuningRunner:
         import polars as pl
         parquet_path = self.cache_dir / "gamma_trades_optimized.parquet"
     
-        # If the file is missing or corrupted (PAR1 error), we trigger conversion
         if not parquet_path.exists():
             print("⚠️ Parquet missing. Starting safe streaming conversion...")
             self._convert_csv_to_parquet_safe()
     
         try:
-            # scan_parquet creates a lazy pointer to the 80GB file
+            # 1. Define the Lazy Query
             q = (
                 pl.scan_parquet(parquet_path)
                 .filter(
@@ -1509,23 +1508,27 @@ class TuningRunner:
                     "contract_id", "user", "price", "size", "timestamp", "side_mult", "tradeAmount", "outcomeTokensAmount"
                 ])
             )
+    
+            # 2. OPTIMIZATION: Cast to low-memory types INSIDE Polars
+            # This prevents the memory explosion when converting to Pandas
+            q = q.with_columns([
+                pl.col("contract_id").cast(pl.Categorical),
+                pl.col("user").cast(pl.Categorical),
+                pl.col("price").cast(pl.Float32),
+                pl.col("size").cast(pl.Float32),
+                pl.col("tradeAmount").cast(pl.Float32),
+                pl.col("outcomeTokensAmount").cast(pl.Float32),
+                pl.col("side_mult").cast(pl.Float32),
+            ])
             
-            # collect(streaming=True) is the critical memory-saver
-            print("⚡ Executing streaming load...")
+            print("⚡ Executing streaming load (Optimized)...")
+            # 3. Collect directly to a memory-efficient structure
             return q.collect(engine="streaming").to_pandas()
             
         except Exception as e:
             if "PAR1" in str(e):
                 print("❌ Parquet corrupted. Deleting and re-converting...")
                 parquet_path.unlink(missing_ok=True)
-                self._convert_csv_to_parquet_safe()
-                return self._fast_load_trades(start_date, end_date, allowed_ids)
-            raise e
-            
-        except polars.exceptions.ComputeError as e:
-            if "PAR1" in str(e):
-                print("⚠️ Detected corrupted Parquet file. Deleting and re-converting...")
-                parquet_path.unlink()
                 self._convert_csv_to_parquet_safe()
                 return self._fast_load_trades(start_date, end_date, allowed_ids)
             raise e
@@ -2514,71 +2517,66 @@ def _transform_to_events(self, markets_pd, trades_pd):
     
     log.info(f"🚀 Transforming Data (Inputs: Markets={len(markets_pd)}, Trades={len(trades_pd)})...")
 
-    # 1. Convert to Polars (Zero-Copy where possible)
+    # 1. Convert to Polars
+    # If trades_pd is already Categorical (from Fix A), Polars handles it efficiently
     markets = pl.from_pandas(markets_pd)
     trades = pl.from_pandas(trades_pd)
 
-    # 2. Join Market Metadata
-    # We need 'outcome' and 'resolution_timestamp' attached to every trade
-    # LEFT JOIN ensures we don't lose trades, but INNER is safer for data integrity
+    # 2. Join Market Metadata (Lazy is safer for huge joins)
     joined = trades.join(
         markets.select(["contract_id", "outcome", "resolution_timestamp", "liquidity", "created_at"]),
         on="contract_id",
         how="inner"
     )
 
-    # 3. Filter: Post-Resolution Trades are invalid noise
+    # 3. Filter
     joined = joined.filter(pl.col("timestamp") < pl.col("resolution_timestamp"))
 
-    # 4. Construct Event Streams (Expressions)
-    # Market Creation Events
+    # 4. Construct Event Streams
+    # Ensure types match the Trades schema to avoid Polars concat errors
     ev_new = markets.select([
         pl.col("created_at").alias("timestamp"),
         pl.col("contract_id"),
-        pl.lit("NEW_CONTRACT").alias("event_type"),
-        pl.col("liquidity"),
-        pl.lit(0.5).alias("p_market_all"),
+        pl.lit("NEW_CONTRACT").alias("event_type"), # Will cast to Categorical later
+        pl.col("liquidity").cast(pl.Float32),
+        pl.lit(0.5).cast(pl.Float32).alias("p_market_all"),
         pl.lit(False).alias("is_sell"),
         pl.lit("SYSTEM").alias("wallet_id")
     ])
 
-    # Market Resolution Events
     ev_res = markets.select([
         pl.col("resolution_timestamp").alias("timestamp"),
         pl.col("contract_id"),
         pl.lit("RESOLUTION").alias("event_type"),
-        pl.lit(1.0).alias("liquidity"), # Dummy val
-        pl.col("outcome").alias("p_market_all"),
+        pl.lit(1.0).cast(pl.Float32).alias("liquidity"),
+        pl.col("outcome").cast(pl.Float32).alias("p_market_all"),
         pl.lit(False).alias("is_sell"),
         pl.lit("SYSTEM").alias("wallet_id")
     ])
 
-    # Trade Events
     ev_trades = joined.select([
         pl.col("timestamp"),
         pl.col("contract_id"),
         pl.lit("TRADE").alias("event_type"),
-        pl.lit(0.0).alias("liquidity"),
-        pl.col("price").alias("p_market_all"),
+        pl.lit(0.0).cast(pl.Float32).alias("liquidity"),
+        pl.col("price").cast(pl.Float32).alias("p_market_all"),
         (pl.col("side_mult") < 0).alias("is_sell"),
         pl.col("user").alias("wallet_id"),
         
-        # Keep extra columns for Profiler Data
+        # Extra columns for Profiler
         pl.col("tradeAmount").alias("usdc_vol"),
         pl.col("outcomeTokensAmount").alias("tokens"),
         pl.col("price").alias("bet_price"),
-        pl.col("outcome"),     # Needed for scoring
-        pl.col("resolution_timestamp").alias("res_time") # Needed for scoring
+        pl.col("outcome"),
+        pl.col("resolution_timestamp").alias("res_time")
     ])
 
-    # 5. Create Profiler Data (Subset of Trades)
-    # We do this BEFORE the big concat to keep types clean
-    prof_data = ev_trades.select([
+    # 5. Extract Profiler Data (Keep Categoricals!)
+    prof_data_pl = ev_trades.select([
         "timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"
     ]).rename({"contract_id": "market_id"})
 
-    # 6. Global Merge & Sort
-    # Drop extra columns from ev_trades to match ev_new/ev_res schema
+    # 6. Global Merge
     common_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
     
     final_log_pl = pl.concat([
@@ -2587,12 +2585,25 @@ def _transform_to_events(self, markets_pd, trades_pd):
         ev_trades.select(common_cols)
     ]).sort(["timestamp", "event_type"])
 
-    # 7. Convert to Pandas (Final Output)
-    log.info("Converting final logs to Pandas...")
-    event_log = final_log_pl.to_pandas().set_index("timestamp")
-    profiler_data = prof_data.to_pandas()
+    # 7. CRITICAL: Optimize Output Types before to_pandas()
+    # Cast low cardinality strings to Categorical
+    final_log_pl = final_log_pl.with_columns([
+        pl.col("event_type").cast(pl.Categorical),
+        pl.col("contract_id").cast(pl.Categorical),
+        pl.col("wallet_id").cast(pl.Categorical)
+    ])
 
-    del markets, trades, joined, final_log_pl
+    prof_data_pl = prof_data_pl.with_columns([
+        pl.col("wallet_id").cast(pl.Categorical),
+        pl.col("market_id").cast(pl.Categorical)
+    ])
+
+    log.info("Converting final logs to Pandas (Optimized)...")
+    event_log = final_log_pl.to_pandas().set_index("timestamp")
+    profiler_data = prof_data_pl.to_pandas()
+
+    # Manual Cleanup
+    del markets, trades, joined, final_log_pl, ev_new, ev_res, ev_trades
     gc.collect()
 
     return event_log, profiler_data
