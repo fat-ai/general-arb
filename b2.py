@@ -1700,45 +1700,68 @@ class TuningRunner:
         import shutil
         from pathlib import Path
 
-        log.info("--- Starting Full Strategy Optimization (Disk-Based Architecture) ---")
+        log.info("--- Starting Full Strategy Optimization (Zero-RAM Worker Arch) ---")
         
-        # 1. LOAD LAZY FRAMES
+        # 1. LOAD & TRANSFORM
         df_markets, df_trades = self._load_data()
-
-        print("\n🔍 DATA PIPELINE READY")
-        print(f"   Markets Plan: {type(df_markets)}")
-        print(f"   Trades Plan:  {type(df_trades)}")
-        
-        # 2. TRANSFORM TO DISK
         dataset_dir_path = self._transform_to_events(df_markets, df_trades)
         
-        # 3. CLEANUP
         del df_markets, df_trades
         gc.collect()
 
-        # 4. VALIDATION
         if not list(dataset_dir_path.glob("events_*.parquet")):
-            log.error("⛔ No data generated! Check your date range or input files.")
+            log.error("⛔ No data generated!")
             return None
             
-        # 5. PREPARE FOR RAY
         dataset_dir_str = str(dataset_dir_path.absolute())
         
-        print(f"🚀 Launching tuning using data at: {dataset_dir_str}")
-        
-        # --- FIX: CALCULATE TRAIN/TEST SPLIT ---
-        # We derive this from the global constants instead of loading data
+        # 2. CALCULATE SPLIT
         sim_start = pd.Timestamp(FIXED_START_DATE)
         sim_end = pd.Timestamp(FIXED_END_DATE)
         total_days = (sim_end - sim_start).days
-        
-        # Default logic: 33% Train, 60% Test
         safe_train = max(5, int(total_days * 0.33))
         safe_test = max(5, int(total_days * 0.60))
         
         log.info(f"⚙️ AUTO-CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
+
+        # 3. PRE-CALCULATE WALLET SCORES (The OOM Fix)
+        # We do this ONCE here, instead of inside every worker.
+        print("🧠 Pre-calculating wallet scores in main process...")
         
-        # === FIXED SEARCH SPACE ===
+        train_cutoff = sim_start + pd.Timedelta(days=safe_train)
+        
+        # Load minimal data for scoring
+        # We scan the dataset we just created
+        profiler_scan = pl.scan_parquet(dataset_dir_path / "profiler_*.parquet")
+        
+        profiler_train = (
+            profiler_scan
+            .filter(pl.col("timestamp") < train_cutoff)
+            .collect()
+            .to_pandas(use_pyarrow_extension_array=True)
+        )
+        
+        if 'ts_int' not in profiler_train.columns:
+            profiler_train['ts_int'] = profiler_train['timestamp'].astype(np.int64)
+
+        # Calculate Scores
+        wallet_scores = fast_calculate_rois(profiler_train, min_trades=5, cutoff_date=train_cutoff)
+        
+        # Calculate Fresh Wallet Params
+        known_experts = sorted(list(set(k.split('|')[0] for k in wallet_scores.keys()))) if wallet_scores else []
+        slope, intercept = self.calibrate_fresh_wallet_model(profiler_train, known_wallet_ids=known_experts, cutoff_date=train_cutoff)
+        
+        print(f"✅ Scores Ready: {len(wallet_scores)} wallets. Model: {slope:.4f}x + {intercept:.4f}")
+        
+        # Clean up immediately
+        del profiler_train
+        gc.collect()
+
+        # 4. UPLOAD SCORES TO RAY (Tiny Object)
+        wallet_scores_ref = ray.put(wallet_scores)
+        params_ref = ray.put((slope, intercept))
+
+        # === SEARCH SPACE ===
         search_space = {
             "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0]),
             "decay_factor": 0.95, 
@@ -1752,22 +1775,27 @@ class TuningRunner:
             "test_days": safe_test,
             "seed": 42,
         }
-    
+        
+        # 5. LAUNCH RAY
         analysis = tune.run(
             tune.with_parameters(
                 ray_backtest_wrapper,
                 data_dir=dataset_dir_str,
+                # PASS PRE-CALCULATED OBJECTS
+                wallet_scores=wallet_scores_ref,
+                fw_params=params_ref,
+                train_cutoff=train_cutoff # Pass the date too
             ),
             config=search_space,
             metric="smart_score",
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=1, # Keep low for safety
+            max_concurrent_trials=1, 
             resources_per_trial={"cpu": 1},
         )
     
-        # 7. ANALYZE RESULTS
+        # 6. RESULTS
         best_config = analysis.get_best_config(metric="smart_score", mode="max")
         all_trials = analysis.trials
 
