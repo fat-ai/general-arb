@@ -1743,17 +1743,20 @@ class TuningRunner:
 
         # 3. PRE-CALCULATE WALLET SCORES (The OOM Fix)
         # We do this ONCE here, instead of inside every worker.
-        print("🧠 Pre-calculating wallet scores in main process...")
+        print("🧠 Pre-calculating wallet scores (Bias-Free)...")
         
         train_cutoff = sim_start + pd.Timedelta(days=safe_train)
         
         # Load minimal data for scoring
-        # We scan the dataset we just created
         profiler_scan = pl.scan_parquet(dataset_dir_path / "profiler_*.parquet")
         
+        # CRITICAL FIX FOR LOOKAHEAD BIAS:
+        # We must ONLY learn from markets that RESOLVED before the training cutoff.
+        # Previously, we filtered by 'timestamp' (trade time), which allowed us to
+        # see the outcome of trades that hadn't resolved yet in the simulation.
         profiler_train = (
             profiler_scan
-            .filter(pl.col("timestamp") < train_cutoff)
+            .filter(pl.col("res_time") < train_cutoff) # <--- STRICT BIAS FILTER
             .collect()
             .to_pandas(use_pyarrow_extension_array=True)
         )
@@ -1762,18 +1765,19 @@ class TuningRunner:
             profiler_train['ts_int'] = profiler_train['timestamp'].astype(np.int64)
 
         # Calculate Scores
-        wallet_scores = fast_calculate_rois(profiler_train, min_trades=5, cutoff_date=train_cutoff)
+        # We pass cutoff_date=None because we already strictly filtered the data above
+        wallet_scores = fast_calculate_rois(profiler_train, min_trades=5)
         
         # Calculate Fresh Wallet Params
         known_experts = sorted(list(set(k.split('|')[0] for k in wallet_scores.keys()))) if wallet_scores else []
-        slope, intercept = self.calibrate_fresh_wallet_model(profiler_train, known_wallet_ids=known_experts, cutoff_date=train_cutoff)
+        slope, intercept = self.calibrate_fresh_wallet_model(profiler_train, known_wallet_ids=known_experts)
         
         print(f"✅ Scores Ready: {len(wallet_scores)} wallets. Model: {slope:.4f}x + {intercept:.4f}")
         
         # Clean up immediately
         del profiler_train
         gc.collect()
-
+        
         # 4. UPLOAD SCORES TO RAY (Tiny Object)
         wallet_scores_ref = ray.put(wallet_scores)
         params_ref = ray.put((slope, intercept))
@@ -2707,7 +2711,7 @@ class TuningRunner:
                     compression='snappy'
                 )
                 
-                prof_cols = ["timestamp", "wallet_id", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
+                prof_cols = ["timestamp", "wallet_id", "entity_type", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
                 chunk_df.filter(pl.col("event_type") == "TRADE").select(prof_cols).rename({"contract_id": "market_id"}).write_parquet(
                     dataset_dir / f"profiler_{i}.parquet",
                     compression='snappy'
