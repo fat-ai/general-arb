@@ -1371,7 +1371,8 @@ class FastBacktestEngine:
         self.last_optimization_ts = 0.0
         self.target_weights_map = {}
         
-        if not event_log.empty:
+        if event_log is not None and not event_log.empty:
+        
             new_contracts = event_log[event_log['event_type'] == 'NEW_CONTRACT']
             for ts, row in new_contracts.iterrows():
           
@@ -1723,6 +1724,29 @@ class TuningRunner:
         # 1. LOAD & TRANSFORM
         df_markets, df_trades = self._load_data()
         dataset_dir_path = self._transform_to_events(df_markets, df_trades)
+
+        print("🧠 Building Market Lifecycle Metadata...")
+        
+        # Collect just the market metadata (Small, ~50MB)
+        # Note: df_markets is a LazyFrame, we collect it to Pandas to iterate
+        lifecycle_df = df_markets.collect().to_pandas()
+        
+        market_lifecycle = {}
+        for _, row in lifecycle_df.iterrows():
+            cid = str(row['contract_id'])
+            # Ensure safe timestamp conversion
+            start_ns = row['created_at'].value if pd.notna(row['created_at']) else 0
+            end_ns = row['resolution_timestamp'].value if pd.notna(row['resolution_timestamp']) else np.iinfo(np.int64).max
+            
+            market_lifecycle[cid] = {
+                'start': start_ns,
+                'end': end_ns,
+                'liquidity': float(row.get('liquidity', 1.0) or 1.0),
+                'condition_id': row.get('condition_id'),
+                'outcome_tag': row.get('token_outcome_label', 'Yes')
+            }
+            
+        dataset_dir_path = self._transform_to_events(df_markets, df_trades)
         
         del df_markets, df_trades
         gc.collect()
@@ -1782,7 +1806,7 @@ class TuningRunner:
         # 4. UPLOAD SCORES TO RAY (Tiny Object)
         wallet_scores_ref = ray.put(wallet_scores)
         params_ref = ray.put((slope, intercept))
-
+        lifecycle_ref = ray.put(market_lifecycle)
         # === SEARCH SPACE ===
         search_space = {
             "splash_threshold": tune.grid_search([500.0, 1000.0, 2000.0]),
@@ -1806,7 +1830,8 @@ class TuningRunner:
                 # PASS PRE-CALCULATED OBJECTS
                 wallet_scores=wallet_scores_ref,
                 fw_params=params_ref,
-                train_cutoff=train_cutoff # Pass the date too
+                train_cutoff=train_cutoff, # Pass the date too
+                market_lifecycle=lifecycle_ref,
             ),
             config=search_space,
             metric="smart_score",
@@ -2730,7 +2755,7 @@ class TuningRunner:
         return dataset_dir
         
         
-def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutoff, nlp_cache=None, priors=None):
+def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutoff, market_lifecycle, nlp_cache=None, priors=None):
     import json
     import hashlib
     import traceback
@@ -2781,7 +2806,7 @@ def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutof
         engine.precalc_scores = wallet_scores
         engine.precalc_slope = slope
         engine.precalc_intercept = intercept
-        
+        engine.market_lifecycle = market_lifecycle
         # 4. EXECUTE
         results = engine.run_walk_forward(run_config)
         
