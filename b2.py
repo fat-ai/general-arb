@@ -366,11 +366,31 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
     venue_id = Venue("POLY")
     engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
     engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
+
+    # 3. FILTER ACTIVE CONTRACTS (The OOM Fix)
+    # Instead of registering ALL 200k markets, we only register the ones 
+    # that overlap with our simulation window.
+    sim_start_ns = start_time.value
+    sim_end_ns = end_time.value
     
-    # 2. LOAD INSTRUMENTS
     inst_map = {}
     local_liquidity = {}
-    active_contracts = list(market_lifecycle.keys()) 
+    active_contracts = []
+    
+    # Pre-filter keys to avoid massive loop overhead
+    print(f"   [Engine] Filtering {len(market_lifecycle)} markets for window {start_time.date()} -> {end_time.date()}...", flush=True)
+
+    for cid, meta in market_lifecycle.items():
+        m_start = meta.get('start', 0)
+        # Default to max integer if no end date provided
+        m_end = meta.get('end', 0)
+        if m_end == 0: m_end = np.iinfo(np.int64).max
+        
+        # LOGIC: Market is valid if it ends AFTER sim starts AND starts BEFORE sim ends
+        if m_end >= sim_start_ns and m_start <= sim_end_ns:
+            active_contracts.append(cid)
+            
+    print(f"   [Engine] Registering {len(active_contracts)} relevant instruments...", flush=True)
     
     try:
         PRICE_INC = Price.from_str("0.000001"); SIZE_INC = Quantity.from_str("0.0001") 
@@ -392,7 +412,7 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
             ts_event=0, ts_init=0, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
         ))
 
-    # 3. SETUP STRATEGY
+    # 3.5. SETUP STRATEGY
     local_wallet_lookup = {}
     strat_config = PolyStrategyConfig()
     strategy = PolymarketNautilusStrategy(strat_config)
@@ -466,6 +486,8 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
             local_wallet_lookup.update(lookup)
             
             if ticks:
+                local_wallet_lookup.clear()
+                local_wallet_lookup.update(lookup)
                 engine.add_data(ticks)
                 engine.run() # Consume & Clear Memory Immediately
             
