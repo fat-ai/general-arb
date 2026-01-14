@@ -859,6 +859,79 @@ def fast_calculate_rois(profiler_data, min_trades: int = 20, cutoff_date=None):
             
         return result
         
+def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
+        """
+        PATCHED: Uses Linear Regression (OLS) to correlate Volume with ROI.
+        CRITICAL FIX: Includes wallets with < 5 trades to capture 'One-Hit Wonder' whales.
+        """
+        from scipy.stats import linregress
+        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 
+        
+        if 'outcome' not in profiler_data.columns or profiler_data.empty: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
+            
+        valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
+        valid = valid[valid['usdc_vol'] >= 1.0]
+        
+        if cutoff_date:
+            if 'res_time' in valid.columns and valid['res_time'].notna().any():
+                valid = valid[valid['res_time'] < cutoff_date]
+            elif 'timestamp' in valid.columns:
+                valid = valid[valid['timestamp'] < cutoff_date]
+            else:
+                if isinstance(valid.index, pd.DatetimeIndex):
+                    valid = valid[valid.index < cutoff_date]
+                    
+        if known_wallet_ids: 
+            valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
+            
+        valid = valid.copy()
+        
+        long_mask = valid['tokens'] > 0
+        valid.loc[long_mask, 'roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
+        
+        short_mask = valid['tokens'] < 0
+        price_no = 1.0 - valid.loc[short_mask, 'bet_price']
+        outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
+        price_no = price_no.clip(lower=0.01)
+        valid.loc[short_mask, 'roi'] = (outcome_no - price_no) / price_no
+        
+        valid['roi'] = valid['roi'].clip(-1.0, 3.0)
+        valid['log_vol'] = np.log1p(valid['usdc_vol'])
+
+        # Aggregate per wallet
+        wallet_stats = valid.groupby('wallet_id').agg({
+            'roi': 'mean',
+            'log_vol': 'mean',
+            'usdc_vol': 'count'
+        }).rename(columns={'usdc_vol': 'trade_count'})
+
+        qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 1]
+        
+        x = qualified_wallets['log_vol'].values
+        y = qualified_wallets['roi'].values
+        
+        if len(qualified_wallets) < 10: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
+
+        try:
+          
+            slope, intercept, r_value, p_value, std_err = linregress(x, y)
+            
+            if not np.isfinite(slope) or not np.isfinite(intercept):
+                return SAFE_SLOPE, SAFE_INTERCEPT
+            
+            if slope <= 0:
+                return SAFE_SLOPE, SAFE_INTERCEPT
+                
+            # Clamp intercept to keep small bets neutral
+            final_intercept = max(-0.10, min(0.10, intercept))
+            
+            return slope, final_intercept
+            
+        except: 
+            return SAFE_SLOPE, SAFE_INTERCEPT
+      
 def persistent_disk_cache(func):
     """
     Thread-safe and Process-safe disk cache using FileLock.
@@ -1332,79 +1405,7 @@ class FastBacktestEngine:
         else:
             pass
 
-    def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
-        """
-        PATCHED: Uses Linear Regression (OLS) to correlate Volume with ROI.
-        CRITICAL FIX: Includes wallets with < 5 trades to capture 'One-Hit Wonder' whales.
-        """
-        from scipy.stats import linregress
-        SAFE_SLOPE, SAFE_INTERCEPT = 0.0, 0.0 
-        
-        if 'outcome' not in profiler_data.columns or profiler_data.empty: 
-            return SAFE_SLOPE, SAFE_INTERCEPT
-            
-        valid = profiler_data.dropna(subset=['outcome', 'usdc_vol', 'tokens'])
-        valid = valid[valid['usdc_vol'] >= 1.0]
-        
-        if cutoff_date:
-            if 'res_time' in valid.columns and valid['res_time'].notna().any():
-                valid = valid[valid['res_time'] < cutoff_date]
-            elif 'timestamp' in valid.columns:
-                valid = valid[valid['timestamp'] < cutoff_date]
-            else:
-                if isinstance(valid.index, pd.DatetimeIndex):
-                    valid = valid[valid.index < cutoff_date]
-                    
-        if known_wallet_ids: 
-            valid = valid[~valid['wallet_id'].isin(known_wallet_ids)]
-            
-        valid = valid.copy()
-        
-        long_mask = valid['tokens'] > 0
-        valid.loc[long_mask, 'roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
-        
-        short_mask = valid['tokens'] < 0
-        price_no = 1.0 - valid.loc[short_mask, 'bet_price']
-        outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
-        price_no = price_no.clip(lower=0.01)
-        valid.loc[short_mask, 'roi'] = (outcome_no - price_no) / price_no
-        
-        valid['roi'] = valid['roi'].clip(-1.0, 3.0)
-        valid['log_vol'] = np.log1p(valid['usdc_vol'])
-
-        # Aggregate per wallet
-        wallet_stats = valid.groupby('wallet_id').agg({
-            'roi': 'mean',
-            'log_vol': 'mean',
-            'usdc_vol': 'count'
-        }).rename(columns={'usdc_vol': 'trade_count'})
-
-        qualified_wallets = wallet_stats[wallet_stats['trade_count'] >= 1]
-        
-        x = qualified_wallets['log_vol'].values
-        y = qualified_wallets['roi'].values
-        
-        if len(qualified_wallets) < 10: 
-            return SAFE_SLOPE, SAFE_INTERCEPT
-
-        try:
-          
-            slope, intercept, r_value, p_value, std_err = linregress(x, y)
-            
-            if not np.isfinite(slope) or not np.isfinite(intercept):
-                return SAFE_SLOPE, SAFE_INTERCEPT
-            
-            if slope <= 0:
-                return SAFE_SLOPE, SAFE_INTERCEPT
                 
-            # Clamp intercept to keep small bets neutral
-            final_intercept = max(-0.10, min(0.10, intercept))
-            
-            return slope, final_intercept
-            
-        except: 
-            return SAFE_SLOPE, SAFE_INTERCEPT
-            
     def run_walk_forward(self, config: dict) -> dict:
         
         train_end = self.train_cutoff
@@ -1770,7 +1771,7 @@ class TuningRunner:
         
         # Calculate Fresh Wallet Params
         known_experts = sorted(list(set(k.split('|')[0] for k in wallet_scores.keys()))) if wallet_scores else []
-        slope, intercept = self.calibrate_fresh_wallet_model(profiler_train, known_wallet_ids=known_experts)
+        slope, intercept = calibrate_fresh_wallet_model(profiler_train, known_wallet_ids=known_experts)
         
         print(f"✅ Scores Ready: {len(wallet_scores)} wallets. Model: {slope:.4f}x + {intercept:.4f}")
         
