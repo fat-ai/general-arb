@@ -859,7 +859,7 @@ def fast_calculate_rois(profiler_data, min_trades: int = 20, cutoff_date=None):
             
         return result
         
-def calibrate_fresh_wallet_model(self, profiler_data, known_wallet_ids=None, cutoff_date=None):
+def calibrate_fresh_wallet_model(profiler_data, known_wallet_ids=None, cutoff_date=None):
         """
         PATCHED: Uses Linear Regression (OLS) to correlate Volume with ROI.
         CRITICAL FIX: Includes wallets with < 5 trades to capture 'One-Hit Wonder' whales.
