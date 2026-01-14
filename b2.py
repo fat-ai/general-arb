@@ -470,13 +470,14 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
             if chunk_df.empty: continue
             
             # 4. Filter Contracts
-            chunk_df['contract_id'] = chunk_df['contract_id'].astype(str)
             chunk_df = chunk_df[chunk_df['contract_id'].isin(valid_cids)]
             if chunk_df.empty: continue
 
             if 'p_market_all' in chunk_df.columns:
                 chunk_df['p_market_all'] = chunk_df['p_market_all'].astype(float)
-
+                
+            chunk_df['contract_id'] = chunk_df['contract_id'].astype('category')
+            chunk_df['wallet_id'] = chunk_df['wallet_id'].astype('category')
             # 5. Process & Feed Engine
             ticks, lookup = process_data_chunk((
                 chunk_df, inst_map, 0, local_liquidity, 0.000001,
@@ -1963,12 +1964,13 @@ class TuningRunner:
                 # Join Key -> String
                 pl.col("contract_id").cast(pl.String),
                 
-                # Time Key -> Datetime (Naive)
-                # This ensures it matches the Markets data
+                # Time Key -> Datetime
                 pl.col("timestamp").cast(pl.Datetime),
                 
-                # Optimizations
-                pl.col("user").cast(pl.Categorical),
+                # Optimizations: READ AS STRINGS, NOT CATEGORICAL
+                # Polars handles string RAM much better than Pandas
+                pl.col("user").cast(pl.String), 
+                
                 pl.col("price").cast(pl.Float32),
                 pl.col("size").cast(pl.Float32),
                 pl.col("tradeAmount").cast(pl.Float32),
@@ -2749,10 +2751,10 @@ class TuningRunner:
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-                # Cast to Categorical for disk compression
+              
                 chunk_df = chunk_df.with_columns([
-                    pl.col("contract_id").cast(pl.Categorical),
-                    pl.col("wallet_id").cast(pl.Categorical)
+                    pl.col("contract_id").cast(pl.String),
+                    pl.col("wallet_id").cast(pl.String)
                 ])
                 
                 # Write to Partitioned Parquet
