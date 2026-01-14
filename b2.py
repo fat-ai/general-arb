@@ -1467,93 +1467,76 @@ class FastBacktestEngine:
                 
     def run_walk_forward(self, config: dict) -> dict:
         
-        train_end = self.train_cutoff
+        # 1. DETERMINE DATES (Robustly)
+        # In Worker Mode, self.event_log is None, so we rely on injected state or defaults
+        if hasattr(self, 'train_cutoff') and self.train_cutoff:
+            train_end = self.train_cutoff
+        else:
+            # Fallback for local testing if event_log exists
+            if self.event_log is not None and not self.event_log.empty:
+                 min_date = self.event_log.index.min()
+                 train_days = config.get('train_days', 60)
+                 train_end = min_date + timedelta(days=train_days)
+            else:
+                 # Last resort fallback
+                 train_end = pd.Timestamp("2025-05-01")
+
         max_date = pd.Timestamp("2026-01-01")
-
-        # 1. SKIP TRAINING (Already done in Main)
-        # We use the injected values
-        fold_wallet_scores = self.precalc_scores
-        fw_slope = self.precalc_slope
-        fw_intercept = self.precalc_intercept
         
-        # 2. EXECUTE (Disk Based)
-        try:
-            result = execute_period_local(
-                self.data_path, # Path
-                fold_wallet_scores, config, fw_slope, fw_intercept, 
-                train_end, max_date, {}, self.market_lifecycle
-            )
-        except Exception as e:
-            print(f"❌ Simulation execution failed: {e}")
-            traceback.print_exc()
-            return {'total_return': 0.0}
+        # 2. GET SCORES (Worker Optimization)
+        # If we have pre-calculated scores (from Driver), use them!
+        if hasattr(self, 'precalc_scores') and self.precalc_scores is not None:
+            fold_wallet_scores = self.precalc_scores
+            fw_slope = getattr(self, 'precalc_slope', 0.0)
+            fw_intercept = getattr(self, 'precalc_intercept', 0.0)
             
-        if self.event_log.empty: return {'total_return': 0.0}
+        else:
+            # Local Mode: We must calculate scores ourselves (Requires Data)
+            if self.profiler_data is None:
+                print("❌ Critical: No profiler data and no precalc scores!")
+                return {'total_return': 0.0}
 
-        # 1. Setup Timestamps
-        if 'ts_int' not in self.profiler_data.columns:
-            self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
-        if 'ts_int' not in self.event_log.columns:
-            self.event_log['ts_int'] = self.event_log.index.values.astype('int64')
+            # Setup Helper Col
+            if 'ts_int' not in self.profiler_data.columns:
+                self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
 
-        # 2. Define Split Points
-        # Train on first X days, Test on the rest.
-        train_days = config.get('train_days', 60)
-        
-        min_date = self.event_log.index.min()
-        max_date = self.event_log.index.max()
-        
-        # Train Window: Start -> Start + 60 Days
-        train_end = min_date + timedelta(days=train_days)
-        # Test Window: Train End + 2 Days -> End of Data
+            train_mask = (self.profiler_data['ts_int'] < train_end.value)
+            train_profiler = self.profiler_data[train_mask]
+            
+            if 'res_time' in train_profiler.columns:
+                train_profiler = train_profiler[train_profiler['res_time'] <= train_end]
+
+            fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
+            
+            known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
+            fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
+
+        # 3. DEFINE TEST WINDOW
+        # Test starts 2 days after training ends to prevent bleed
         test_start = train_end + timedelta(days=2) 
         
-        print(f"\n[CONFIG] Continuous Block Mode")
-        print(f"   Training: {min_date.date()} -> {train_end.date()}")
-        print(f"   Testing:  {test_start.date()} -> {max_date.date()}")
-
-        if test_start >= max_date:
-            print("⚠️ Error: Not enough data for testing window.")
-            return {'total_return': 0.0}
-
-        # 3. TRAIN (Once)
-        # Calculate scores using only the training window
-        train_mask = (self.profiler_data['ts_int'] < train_end.value)
-        train_profiler = self.profiler_data[train_mask]
-        
-        # Only learn from markets resolved during training
-        if 'res_time' in train_profiler.columns:
-            train_profiler = train_profiler[train_profiler['res_time'] <= train_end]
-
-        print(f"   Training on {len(train_profiler)} historical trades...")
-        fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
-        
-        known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
-        fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
-
-        # 4. PREPARE TEST DATA (All remaining data)
-        test_mask = (self.event_log['ts_int'] >= test_start.value)
-        test_slice_df = self.event_log[test_mask].copy()
-
-        if test_slice_df.empty:
-            return {'total_return': 0.0}
-
-        # 5. EXECUTE (Single Long Job)
-        # We run one remote task for the entire remaining duration.
-        # This keeps the engine alive, so positions are held until resolution.
+        # 4. EXECUTE SIMULATION (Streaming from Disk)
         try:
-            # CHANGED: Direct call instead of ray.get(remote.remote(...))
+            # We call execute_period_local, which reads from disk.
+            # It does NOT need self.event_log to be in memory.
             result = execute_period_local(
-                test_slice_df, fold_wallet_scores, config, fw_slope, fw_intercept, 
-                train_end, max_date, {}, self.market_lifecycle
+                self.data_path, 
+                fold_wallet_scores, 
+                config, 
+                fw_slope, 
+                fw_intercept, 
+                train_end, 
+                max_date, 
+                {}, 
+                self.market_lifecycle
             )
         except Exception as e:
             print(f"❌ Simulation execution failed: {e}")
+            import traceback
             traceback.print_exc()
             return {'total_return': 0.0}
 
-        # 6. RETURN RESULTS DIRECTLY
-        # No stitching needed because we have a single equity curve
+        # 5. PROCESS RESULTS
         final_ret = result.get('return', 0.0)
         full_equity_curve = result.get('equity_curve', [])
         
@@ -1566,13 +1549,13 @@ class FastBacktestEngine:
                 max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
                 
                 # Sharpe Calculation
-                df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
-                df_eq['ts'] = pd.to_datetime(df_eq['ts'])
-                df_eq = df_eq.set_index('ts').sort_index()
-                # Resample strictly to daily for standard Sharpe
-                daily_rets = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
-                if len(daily_rets) > 1:
-                    sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=365, rf=0.02)
+                if len(full_equity_curve) > 2:
+                    df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
+                    df_eq['ts'] = pd.to_datetime(df_eq['ts'])
+                    df_eq = df_eq.set_index('ts').sort_index()
+                    daily_rets = df_eq['equity'].resample('D').last().ffill().pct_change().dropna()
+                    if len(daily_rets) > 1:
+                        sharpe = calculate_sharpe_ratio(daily_rets, periods_per_year=365, rf=0.02)
             except Exception: 
                 pass
 
