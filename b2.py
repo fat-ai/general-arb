@@ -507,25 +507,35 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
         print("   [CRITICAL] Portfolio is None!", flush=True)
         final_val = 10000.0
     else:
-        # Try to retrieve the account safely
+        # 1. Try Primary Venue
         account = engine.portfolio.account(venue_id)
         
+        # 2. Recovery Mode: If primary missing, search all venues
         if account is None:
-            # Fallback: Try to find ANY account if the venue ID mismatch occurred
-            print(f"   [WARNING] Account for {venue_id} not found. Checking available accounts...", flush=True)
-            accounts = engine.portfolio.accounts()
-            if accounts:
-                account = list(accounts.values())[0] # Take the first one
-                print(f"   [RECOVERY] Using account: {account.id}", flush=True)
-            else:
-                print("   [CRITICAL] No accounts found in portfolio!", flush=True)
-        
-        # Calculate Value
+            print(f"   [WARNING] Account for {venue_id} not found. Searching portfolio...", flush=True)
+            try:
+                # Use 'venues' property if available to find other accounts
+                if hasattr(engine.portfolio, 'venues'):
+                    for v in engine.portfolio.venues:
+                        found = engine.portfolio.account(v)
+                        if found:
+                            account = found
+                            print(f"   [RECOVERY] Found account for venue: {v}", flush=True)
+                            break
+            except Exception as e:
+                print(f"   [RECOVERY FAILED] {e}", flush=True)
+
+        # 3. Calculate Value
         if account:
-            final_val = account.balance_total(USDC).as_double()
+            try:
+                final_val = account.balance_total(USDC).as_double()
+            except Exception as e:
+                print(f"   [VALUATION ERROR] {e}", flush=True)
+                final_val = 10000.0
         else:
-            # Total failure fallback
+            print("   [CRITICAL] No usable account found. Defaulting to 10k.", flush=True)
             final_val = 10000.0
+            
             
     full_curve = strategy.equity_history
     
