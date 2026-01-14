@@ -2705,139 +2705,76 @@ class TuningRunner:
         return dataset_dir
         
         
-def ray_backtest_wrapper(config, data_dir, nlp_cache=None, priors=None):
-    import polars as pl
-    import pandas as pd
-    from pathlib import Path
+def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutoff, nlp_cache=None, priors=None):
+    import json
+    import hashlib
+    import traceback
+    import gc
+    import numpy as np
     
-    # 1. Load Data Locally (Each worker loads its own copy from disk)
-    # This prevents the "Object Store" OOM kill.
-    # We use PyArrow for zero-copy loading to keep worker RAM low.
-    data_path = Path(data_dir)
-    
-    try:
-        # Load Events
-        event_log = pl.read_parquet(data_path / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
-        event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
+    # 1. Unpack Ray Objects
+    # These are tiny dicts/tuples, instant to load.
+    if isinstance(wallet_scores, ray.ObjectRef):
+        wallet_scores = ray.get(wallet_scores)
+    if isinstance(fw_params, ray.ObjectRef):
+        slope, intercept = ray.get(fw_params)
         
-        # Load Profiler
-        profiler_data = pl.read_parquet(data_path / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
-        
-        if 'ts_int' not in event_log.columns:
-            event_log['ts_int'] = event_log.index.astype(np.int64)
-        if 'ts_int' not in profiler_data.columns:
-            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
-            
-    except Exception as e:
-        print(f"Worker Load Failed: {e}")
-        return {'smart_score': -99.0}
-        
-    if isinstance(event_log, ray.ObjectRef):
-        event_log = ray.get(event_log)
-    if isinstance(profiler_data, ray.ObjectRef):
-        profiler_data = ray.get(profiler_data)
-        
-    if isinstance(nlp_cache, ray.ObjectRef):
-        nlp_cache = ray.get(nlp_cache)
-    if isinstance(priors, ray.ObjectRef):
-        priors = ray.get(priors)
-
-    if event_log.empty or profiler_data.empty:
-        print("⚠️ Trial skipped: Empty input data")
-        return {'smart_score': -99.0}
-    
-    if len(profiler_data[profiler_data['outcome'].isin([0.0, 1.0])]) == 0:
-        print("⚠️ Trial skipped: No valid outcomes in profiler")
-        return {'smart_score': -99.0}
-
+    # 2. Setup Config
     config_str = json.dumps(config, sort_keys=True, default=str)
-    # Generate a deterministic 32-bit integer seed from the config hash
     trial_seed = int(hashlib.md5(config_str.encode()).hexdigest(), 16) % (2**31)
-    
-    # Apply the seed to Python, NumPy, and environment variables
     set_global_seed(trial_seed)
     
-    # 1. Validation
-    decay = config.get('decay_factor', 0.95)
-    if not (0.80 <= decay < 1.0):
-        return {'smart_score': -99.0} # Fail gracefully on invalid params
-
-    if config.get('splash_threshold', 0) <= 0:
-        return {'smart_score': -99.0}
-
     try:
-        # 2. Prepare the Flat Configuration Dictionary
-        # We copy the config to avoid mutating the Ray object store reference
         run_config = config.copy()
-
         for k, v in run_config.items():
-            if isinstance(v, (np.generic)):
-                run_config[k] = v.item()
+            if isinstance(v, (np.generic)): run_config[k] = v.item()
 
-        # UNPACK SIZING TUPLE: ("fixed_pct", 0.05) -> mode="fixed_pct", val=0.05
-        # This handles the complex search space definition in your tuning runner.
         sizing_param = run_config.get('sizing')
-        
-        # Defaults
         run_config['sizing_mode'] = 'fixed'
         run_config['fixed_size'] = 10.0
-        run_config['kelly_fraction'] = 0.1
-
-        if isinstance(sizing_param, tuple):
-            mode, val = sizing_param
-            run_config['sizing_mode'] = mode
-            
-            if mode == 'kelly':
-                run_config['kelly_fraction'] = float(val)
-            elif mode == 'fixed_pct':
-                # Treat 'fixed_size' as the percentage value (e.g. 0.05)
-                run_config['fixed_size'] = float(val)
-            elif mode == 'fixed':
-                # Treat 'fixed_size' as Cash Amount (e.g. 10.0 USDC)
-                run_config['fixed_size'] = float(val)
         
-        # Ensure other optional keys exist with safe defaults if Ray didn't provide them
-        run_config.setdefault('stop_loss', None)
-        run_config.setdefault('use_smart_exit', False)
-        run_config.setdefault('smart_exit_ratio', 0.5)
-        run_config.setdefault('edge_threshold', 0.05)
+        if isinstance(sizing_param, tuple):
+             mode, val = sizing_param
+             run_config['sizing_mode'] = mode
+             if mode == 'kelly': run_config['kelly_fraction'] = float(val)
+             elif mode == 'fixed_pct': run_config['fixed_size'] = float(val)
+             elif mode == 'fixed': run_config['fixed_size'] = float(val)
 
-        # 3. Initialize Engine with direct references
-        # Note: 'priors' defaults to empty dict if None
+        # 3. INITIALIZE ENGINE (Zero RAM)
+        # We pass the pre-calculated scores directly.
+        # We pass NO dataframes.
         engine = FastBacktestEngine(
-            event_log, 
-            profiler_data, 
+            None, 
+            None, # No profiler data needed!
             nlp_cache, 
             priors if priors else {}
         )
         
-        # 4. Run Execution
-        # We pass the fully processed 'run_config' which now has flat keys
+        # Inject state
+        engine.data_path = data_dir
+        engine.train_cutoff = train_cutoff
+        engine.precalc_scores = wallet_scores
+        engine.precalc_slope = slope
+        engine.precalc_intercept = intercept
+        
+        # 4. EXECUTE
         results = engine.run_walk_forward(run_config)
         
-        # 5. Scoring Logic
         ret = results.get('total_return', 0.0)
         dd = results.get('max_drawdown', 0.0)
-        
-        # Protect against div/0
         effective_dd = dd if dd > 0.0001 else 0.0001
-        
         smart_score = ret / (effective_dd + 0.01)
         results['smart_score'] = smart_score
         
-        # Cleanup to prevent RAM explosion in Ray
         del engine
-        import gc
         gc.collect()
         
         return results
         
     except Exception as e:
-        # Log error but return bad score to keep optimization running
         print(f"Trial Failed: {e}")
         traceback.print_exc()
         return {'smart_score': -99.0}
-
 
 if __name__ == "__main__":
     try:
