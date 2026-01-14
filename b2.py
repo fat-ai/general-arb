@@ -501,41 +501,32 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
 
     print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
 
-    # 5. RESULTS
-
-    if engine.portfolio is None:
-        print("   [CRITICAL] Portfolio is None!", flush=True)
-        final_val = 10000.0
-    else:
-        # 1. Try Primary Venue
-        account = engine.portfolio.account(venue_id)
+    # 6. RESULTS (The Correct Access Pattern)
+    final_val = 10000.0
+    
+    # Check if we have any registered instruments to grab the Venue from
+    if strategy.active_instrument_ids:
+        # 1. GET THE AUTHORITATIVE VENUE OBJECT
+        # We grab the Venue object from the first registered instrument. 
+        # This bypasses any object identity mismatch issues.
+        correct_venue = strategy.active_instrument_ids[0].venue
         
-        # 2. Recovery Mode: If primary missing, search all venues
-        if account is None:
-            print(f"   [WARNING] Account for {venue_id} not found. Searching portfolio...", flush=True)
-            try:
-                # Use 'venues' property if available to find other accounts
-                if hasattr(engine.portfolio, 'venues'):
-                    for v in engine.portfolio.venues:
-                        found = engine.portfolio.account(v)
-                        if found:
-                            account = found
-                            print(f"   [RECOVERY] Found account for venue: {v}", flush=True)
-                            break
-            except Exception as e:
-                print(f"   [RECOVERY FAILED] {e}", flush=True)
-
-        # 3. Calculate Value
+        # 2. ACCESS ACCOUNT
+        # This is the standard API call, but now using the correct object key.
+        account = engine.portfolio.account(correct_venue)
+        
         if account:
-            try:
-                final_val = account.balance_total(USDC).as_double()
-            except Exception as e:
-                print(f"   [VALUATION ERROR] {e}", flush=True)
-                final_val = 10000.0
+            final_val = account.balance_total(USDC).as_double()
         else:
-            print("   [CRITICAL] No usable account found. Defaulting to 10k.", flush=True)
-            final_val = 10000.0
+            # If this happens, the engine truly failed to initialize the account
+            print(f"   [CRITICAL] Account lookup failed even with correct Venue object: {correct_venue}", flush=True)
             
+            # Fallback: Use the last recorded equity from the strategy's internal tracker
+            if strategy.equity_history:
+                final_val = strategy.equity_history[-1][1]
+                print(f"   [RECOVERY] Used last equity from strategy history: {final_val}", flush=True)
+    else:
+        print("   [WARNING] No active instruments found. Cannot determine Venue.", flush=True)
             
     full_curve = strategy.equity_history
     
