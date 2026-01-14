@@ -1598,7 +1598,7 @@ class TuningRunner:
             mode="max",
             fail_fast=True, 
             max_failures=0,
-            max_concurrent_trials=2, # Keep low for safety
+            max_concurrent_trials=1, # Keep low for safety
             resources_per_trial={"cpu": 1},
         )
     
