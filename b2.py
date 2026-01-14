@@ -170,9 +170,7 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---def process_data_chunk(args):
 def process_data_chunk(args):
     """
-    FINAL ROBUST VERSION:
-    - [FIX] Prevents "Crossed Markets" (Bid > Ask) when Price is high (e.g. 0.999).
-    - [FIX] Uses float Price() objects to prevent valuation errors.
+    Fixed Version: Correctly uses String IDs for Trade Lookup.
     """
     import numpy as np
     import pandas as pd
@@ -187,7 +185,7 @@ def process_data_chunk(args):
     # 1. Map IDs
     mapped_insts = df_chunk['contract_id'].map(inst_map)
     
-    # 2. Extract Data (Assumes columns are already normalized by parent function)
+    # 2. Extract Data 
     prices = df_chunk['p_market_all'].fillna(0.0).values
     vols = df_chunk['trade_volume'].fillna(0.0).values
     
@@ -195,12 +193,10 @@ def process_data_chunk(args):
     if 'size' in df_chunk.columns:
         sizes = df_chunk['size'].fillna(0.0).values
     else:
-        # Avoid division by zero
         safe_prices = np.where(prices < 0.000001, 1.0, prices)
         sizes = vols / safe_prices
 
     # 3. Filter Valid Rows
-    # We check for valid maps and positive sizes
     valid_mask = (mapped_insts.notna()) & (sizes > 0) & (vols >= 1.0)
     
     if not valid_mask.any(): return [], {}
@@ -213,7 +209,6 @@ def process_data_chunk(args):
     subset_ts = df_chunk['ts_int'].values[valid_mask].astype(np.int64) 
     subset_is_sell = df_chunk['is_sell'].values[valid_mask].astype(bool)
     subset_wallet_ids = df_chunk['wallet_id'].values[valid_mask].astype(str)
-    subset_cids = df_chunk['contract_id'].values[valid_mask]
     
     num_rows = len(subset_insts)
 
@@ -225,24 +220,20 @@ def process_data_chunk(args):
     bids = np.zeros(num_rows, dtype=np.float64)
     asks = np.zeros(num_rows, dtype=np.float64)
     
-    # SNAP LOGIC: Align Bid/Ask exactly to the Trade Price to ensure fill
-    # If Sell (-1) -> Hit Bid -> Bid = Price
     bids[subset_is_sell] = subset_prices[subset_is_sell] - calculated_spreads[subset_is_sell]
     asks[subset_is_sell] = subset_prices[subset_is_sell] 
     
-    # If Buy (1) -> Lift Ask -> Ask = Price
     asks[~subset_is_sell] = subset_prices[~subset_is_sell] + calculated_spreads[~subset_is_sell]
     bids[~subset_is_sell] = subset_prices[~subset_is_sell] 
 
     bids = np.maximum(0.0, bids)
     asks = np.minimum(1.0, asks)
     
-    # Safety Check: If Spread pushed us over edges, uncross them
     cross_mask = bids > asks
     if cross_mask.any():
         asks[cross_mask] = np.minimum(1.0, bids[cross_mask] + 0.001)
 
-    # 5. Rounding (Essential for Float Precision)
+    # 5. Rounding
     bids = np.round(bids, 6)
     asks = np.round(asks, 6)
     subset_prices = np.round(subset_prices, 6)
@@ -266,7 +257,6 @@ def process_data_chunk(args):
             log_vols = np.log1p(subset_vols[calc_mask])
             calc_vals = fw_intercept + (fw_slope * log_vols)
             vols_m = subset_vols[calc_mask]
-            # Heuristic Caps
             calc_vals = np.where(vols_m > 2000.0, np.maximum(calc_vals, 0.06),
                         np.where(vols_m > 500.0, np.maximum(calc_vals, 0.02), calc_vals))
             scores[calc_mask] = calc_vals
@@ -276,9 +266,9 @@ def process_data_chunk(args):
     chunk_lookup = {}
     
     indices = np.arange(start_idx, start_idx + num_rows)
+    # [FIX] Generate Unique String IDs
     tr_id_strs = [f"{ts}-{i}" for ts, i in zip(subset_ts, indices)]
 
-    # Localize classes for speed
     _Price = Price
     _Quantity = Quantity
     _QuoteTick = QuoteTick
@@ -296,18 +286,15 @@ def process_data_chunk(args):
     depth_int = np.round(depth_vals * SIZE_MULT).astype(np.int64)
     sizes_int = np.round(subset_sizes * SIZE_MULT).astype(np.int64)
 
-    # Iterator
-    indices = np.arange(start_idx, start_idx + num_rows)
-    
-    # Loop over standard Python lists (faster than iterating numpy arrays directly)
+    # [FIX] Use tr_id_strs in the iterator
     iterator = zip(
         subset_insts, subset_ts.tolist(), 
         bids_int.tolist(), asks_int.tolist(), trds_int.tolist(), 
         depth_int.tolist(), sizes_int.tolist(), 
-        subset_is_sell.tolist(), scores.tolist(), indices.tolist()
+        subset_is_sell.tolist(), scores.tolist(), tr_id_strs
     )
 
-    for inst, ts, bid_v, ask_v, trd_v, depth_v, size_v, is_sell, score, tr_id in iterator:
+    for inst, ts, bid_i, ask_i, trd_i, depth_i, size_i, is_sell, score, tr_id in iterator:
         
         p_bid = _Price(bid_i, 6)
         p_ask = _Price(ask_i, 6)
@@ -318,7 +305,7 @@ def process_data_chunk(args):
         results.append(_QuoteTick(
             instrument_id=inst,
             bid_price=p_bid, ask_price=p_ask,
-            bid_size=s_bid, ask_size=s_bid,
+            bid_size=s_depth, ask_size=s_depth, # Fixed typo (s_depth vs s_bid)
             ts_event=ts, ts_init=ts
         ))
 
@@ -327,13 +314,15 @@ def process_data_chunk(args):
             price=p_trd,
             size=s_trd,
             aggressor_side=_Agg_SELLER if is_sell else _Agg_BUYER,
-            trade_id=_TradeId(tr_id),
+            trade_id=_TradeId(tr_id), # Passed as String
             ts_event=ts, ts_init=ts
         ))
         
+        # Key is String -> Matches tick.trade_id.value in strategy
         chunk_lookup[tr_id] = (score, is_sell)
 
     return results, chunk_lookup
+    
     
 # --- GLOBAL FUNCTION (Not inside a class) ---
 def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
