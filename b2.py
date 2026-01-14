@@ -1406,11 +1406,28 @@ class FastBacktestEngine:
             return SAFE_SLOPE, SAFE_INTERCEPT
             
     def run_walk_forward(self, config: dict) -> dict:
-        """
-        REPLACEMENT: Continuous Simulation Mode.
-        Trains on the first 'train_days' (e.g., 60), then runs ONE uninterrupted 
-        backtest from that point to the end of the data. Preserves positions.
-        """
+        
+        train_end = self.train_cutoff
+        max_date = pd.Timestamp("2026-01-01")
+
+        # 1. SKIP TRAINING (Already done in Main)
+        # We use the injected values
+        fold_wallet_scores = self.precalc_scores
+        fw_slope = self.precalc_slope
+        fw_intercept = self.precalc_intercept
+        
+        # 2. EXECUTE (Disk Based)
+        try:
+            result = execute_period_local(
+                self.data_path, # Path
+                fold_wallet_scores, config, fw_slope, fw_intercept, 
+                train_end, max_date, {}, self.market_lifecycle
+            )
+        except Exception as e:
+            print(f"❌ Simulation execution failed: {e}")
+            traceback.print_exc()
+            return {'total_return': 0.0}
+            
         if self.event_log.empty: return {'total_return': 0.0}
 
         # 1. Setup Timestamps
