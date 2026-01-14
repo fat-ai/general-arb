@@ -335,7 +335,172 @@ def process_data_chunk(args):
 
     return results, chunk_lookup
     
+# --- GLOBAL FUNCTION (Not inside a class) ---
+def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
+    """
+    True Streaming Execution.
+    Reads Parquet files in small batches (50k rows) to keep RAM usage constant and low.
+    """
+    import gc
+    import pandas as pd
+    import numpy as np
+    import logging
+    import pyarrow.parquet as pq # Required for batch reading
+    from pathlib import Path
+    from decimal import Decimal
+    
+    # Nautilus Imports
+    from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
+    from nautilus_trader.model.objects import Money, Currency, Price, Quantity
+    from nautilus_trader.model.instruments import BinaryOption
+    from nautilus_trader.model.enums import AccountType, OmsType, AssetClass
+    from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
 
+    # Silence Logging
+    logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
+    logging.getLogger("POLY-BOT").setLevel(logging.WARNING)
+    logging.getLogger().setLevel(logging.ERROR) 
+
+    # 1. SETUP ENGINE
+    USDC = Currency.from_str("USDC")
+    venue_id = Venue("POLY")
+    engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
+    engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
+    
+    # 2. LOAD INSTRUMENTS
+    inst_map = {}
+    local_liquidity = {}
+    active_contracts = list(market_lifecycle.keys()) 
+    
+    try:
+        PRICE_INC = Price.from_str("0.000001"); SIZE_INC = Quantity.from_str("0.0001") 
+    except:
+        PRICE_INC = Price(0.000001, 6); SIZE_INC = Quantity(0.0001, 4)
+
+    for cid in active_contracts:
+        inst_id = InstrumentId(Symbol(cid), venue_id)
+        inst_map[cid] = inst_id
+        meta = market_lifecycle.get(cid, {})
+        local_liquidity[cid] = float(meta.get('liquidity', 0.0))
+        ts_exp = int(meta.get('end', 0) or 0) + (365 * 86400 * 1_000_000_000)
+
+        engine.add_instrument(BinaryOption(
+            instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
+            currency=USDC, price_precision=6, size_precision=4, 
+            price_increment=PRICE_INC, size_increment=SIZE_INC, 
+            activation_ns=0, expiration_ns=ts_exp,
+            ts_event=0, ts_init=0, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
+        ))
+
+    # 3. SETUP STRATEGY
+    local_wallet_lookup = {}
+    strat_config = PolyStrategyConfig()
+    strategy = PolymarketNautilusStrategy(strat_config)
+    
+    # Inject Config
+    strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
+    strategy.decay_factor = float(config.get('decay_factor', 0.95))
+    strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
+    strategy.wallet_scores = wallet_scores
+    strategy.fw_slope = float(fw_slope)
+    strategy.fw_intercept = float(fw_intercept)
+    strategy.sizing_mode = str(config.get('sizing_mode', 'fixed'))
+    strategy.fixed_size = float(config.get('fixed_size', 10.0))
+    strategy.kelly_fraction = float(config.get('kelly_fraction', 0.1))
+    strategy.stop_loss = config.get('stop_loss')
+    strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
+    strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
+    strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
+    strategy.sim_start_ns = int(start_time.value)
+    strategy.sim_end_ns = int(end_time.value)
+    strategy.wallet_lookup = local_wallet_lookup 
+    strategy.active_instrument_ids = list(inst_map.values())
+    
+    engine.add_strategy(strategy)
+
+    # 4. STREAMING FILE LOOP (The "Micro-Batch" Fix)
+    files = sorted(Path(data_path).glob("events_*.parquet"), key=lambda x: int(x.stem.split('_')[1]))
+    
+    print(f"   [Engine] Streaming {len(files)} files via PyArrow...", flush=True)
+    
+    start_ns = int(start_time.value)
+    valid_cids = set(inst_map.keys())
+
+    for fp in files:
+        # A. Open Parquet File Stream (Low Memory)
+        try:
+            parquet_file = pq.ParquetFile(fp)
+        except Exception:
+            continue
+
+        # B. Iterate Micro-Batches (e.g. 50k rows)
+        # This guarantees we never hold a massive dataframe in RAM
+        for batch in parquet_file.iter_batches(batch_size=50000):
+            
+            # 1. Convert Batch to Pandas (Tiny footprint ~50MB)
+            chunk_df = batch.to_pandas()
+            
+            if chunk_df.empty: continue
+
+            # 2. Essential Conversions
+            chunk_df['ts_int'] = chunk_df['timestamp'].astype(np.int64)
+            
+            # 3. Filter Start Date (Fast Int Comparison)
+            chunk_df = chunk_df[chunk_df['ts_int'] >= start_ns]
+            if chunk_df.empty: continue
+            
+            # 4. Filter Contracts
+            chunk_df['contract_id'] = chunk_df['contract_id'].astype(str)
+            chunk_df = chunk_df[chunk_df['contract_id'].isin(valid_cids)]
+            if chunk_df.empty: continue
+
+            if 'p_market_all' in chunk_df.columns:
+                chunk_df['p_market_all'] = chunk_df['p_market_all'].astype(float)
+
+            # 5. Process & Feed Engine
+            ticks, lookup = process_data_chunk((
+                chunk_df, inst_map, 0, local_liquidity, 0.000001,
+                wallet_scores, float(fw_slope), float(fw_intercept)
+            ))
+            
+            local_wallet_lookup.update(lookup)
+            
+            if ticks:
+                engine.add_data(ticks)
+                engine.run() # Consume & Clear Memory Immediately
+            
+            # 6. Explicit Delete
+            del chunk_df, ticks, lookup
+            
+        # End of File
+        gc.collect()
+
+    print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
+
+    # 5. RESULTS
+    final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
+    full_curve = strategy.equity_history
+    
+    if not full_curve: full_curve = [(start_time, 10000.0)]
+    
+    captured_trades = strategy.total_closed
+    captured_wins = strategy.wins
+    captured_losses = strategy.losses
+    
+    engine.dispose()
+    del engine, strategy
+    gc.collect()
+    
+    return {
+        'start_ts': start_time,
+        'final_val': final_val,
+        'return': (final_val / 10000.0) - 1.0,
+        'trades': captured_trades, 
+        'wins': captured_wins, 
+        'losses': captured_losses,
+        'equity_curve': full_curve
+    }
+    
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     import gc
     import pandas as pd
