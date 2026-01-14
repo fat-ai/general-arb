@@ -334,208 +334,8 @@ def process_data_chunk(args):
         chunk_lookup[tr_id] = (score, is_sell)
 
     return results, chunk_lookup
+    
 
-
-def execute_period_local(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
-    """
-    Streaming version of the execution logic.
-    Fixes OOM by running the engine incrementally (Load -> Run -> Flush -> Repeat).
-    """
-    import gc
-    import pandas as pd
-    import numpy as np
-    import logging
-    from nautilus_trader.model.identifiers import Venue, InstrumentId, Symbol
-    from nautilus_trader.model.objects import Money, Currency, Price, Quantity
-    from nautilus_trader.model.instruments import BinaryOption
-    from nautilus_trader.model.enums import AccountType, OmsType, AssetClass
-    from nautilus_trader.backtest.engine import BacktestEngine, BacktestEngineConfig
-    from decimal import Decimal
-
-    # 1. Basic Cleanup
-    if slice_df.index.name == 'timestamp':
-        slice_df = slice_df.reset_index()
-
-    # Silence Logging
-    logging.getLogger("nautilus_trader").setLevel(logging.WARNING)
-    logging.getLogger("POLY-BOT").setLevel(logging.WARNING)
-    logging.getLogger().setLevel(logging.ERROR) 
-
-    # 2. Parse Timestamps
-    if 'timestamp' in slice_df.columns:
-        if not pd.api.types.is_numeric_dtype(slice_df['timestamp']):
-             slice_df['ts_int'] = pd.to_datetime(slice_df['timestamp'], utc=True).astype(np.int64)
-        else:
-             slice_df['ts_int'] = slice_df['timestamp'].astype(np.int64)
-
-    # Ensure Price is float
-    if 'p_market_all' in slice_df.columns:
-        slice_df['p_market_all'] = slice_df['p_market_all'].astype(float)
-
-    start_ns = int(start_time.value)
-    end_ns = int(end_time.value)
-    
-    # 3. Filter Data to Window (Reduce Input Size)
-    if 'ts_int' in slice_df.columns:
-        slice_df = slice_df[
-            (slice_df['ts_int'] >= start_ns) & 
-            (slice_df['ts_int'] <= end_ns)
-        ].copy()
-        
-    if len(slice_df) == 0:
-        return {'final_val': 10000.0, 'trades': 0, 'wins': 0, 'losses': 0, 'equity_curve': []}
-
-    active_contracts = slice_df['contract_id'].astype(str).unique()
-    
-    # 4. Setup Engine
-    USDC = Currency.from_str("USDC")
-    venue_id = Venue("POLY")
-    engine = BacktestEngine(config=BacktestEngineConfig(trader_id="POLY-BOT"))
-    engine.add_venue(venue=venue_id, oms_type=OmsType.NETTING, account_type=AccountType.MARGIN, base_currency=USDC, starting_balances=[Money(10_000, USDC)])
-    
-    inst_map = {}
-    local_liquidity = {} 
-    
-    ts_act = 0
-    ts_exp = int(end_time.value) + (365 * 86400 * 1_000_000_000)
-    
-    # Pre-calculate increments
-    try:
-        PRICE_INC = Price.from_str("0.000001")
-        SIZE_INC = Quantity.from_str("0.0001") 
-    except AttributeError:
-        PRICE_INC = Price(0.000001, 6)
-        SIZE_INC = Quantity(0.0001, 4)
-
-    # Register Instruments
-    for cid in active_contracts:
-        inst_id = InstrumentId(Symbol(cid), venue_id)
-        inst_map[cid] = inst_id
-        meta = market_lifecycle.get(cid, {})
-        local_liquidity[cid] = float(meta.get('liquidity', 0.0))
-
-        engine.add_instrument(BinaryOption(
-            instrument_id=inst_id, raw_symbol=Symbol(cid), asset_class=AssetClass.CRYPTOCURRENCY, 
-            currency=USDC, price_precision=6, size_precision=4, 
-            price_increment=PRICE_INC, 
-            size_increment=SIZE_INC, 
-            activation_ns=ts_act, expiration_ns=ts_exp,
-            ts_event=ts_act, ts_init=ts_act, maker_fee=Decimal("0.0"), taker_fee=Decimal("0.0")
-        ))
-
-    # 5. Initialize Strategy
-    local_wallet_lookup = {}
-    
-    # Strategy Config
-    strat_config = PolyStrategyConfig()
-    strategy = PolymarketNautilusStrategy(strat_config)
-    
-    strategy.splash_threshold = float(config.get('splash_threshold', 1000.0))
-    strategy.decay_factor = float(config.get('decay_factor', 0.95))
-    strategy.min_signal_volume = float(config.get('min_signal_volume', 1.0))
-    strategy.wallet_scores = wallet_scores
-    strategy.fw_slope = float(fw_slope)
-    strategy.fw_intercept = float(fw_intercept)
-    strategy.sizing_mode = str(config.get('sizing_mode', 'fixed'))
-    strategy.fixed_size = float(config.get('fixed_size', 10.0))
-    strategy.kelly_fraction = float(config.get('kelly_fraction', 0.1))
-    strategy.stop_loss = config.get('stop_loss')
-    strategy.use_smart_exit = bool(config.get('use_smart_exit', False))
-    strategy.smart_exit_ratio = float(config.get('smart_exit_ratio', 0.5))
-    strategy.edge_threshold = float(config.get('edge_threshold', 0.05))
-    strategy.sim_start_ns = start_ns
-    strategy.sim_end_ns = end_ns
-    strategy.wallet_lookup = local_wallet_lookup # Linked by reference (we update this dict dynamically)
-    strategy.active_instrument_ids = list(inst_map.values())
-    
-    engine.add_strategy(strategy)
-    
-    # 6. STREAMING EXECUTION LOOP (The OOM Fix)
-    # We load small chunks, feed them to the engine, run the engine to consume them,
-    # and then immediately delete them from RAM.
-    
-    chunk_size = 50000  # Smaller chunks to keep RAM low
-    
-    # Filter valid rows first to avoid processing index noise
-    price_events = slice_df.dropna(subset=['contract_id']).copy()
-    price_events['contract_id'] = price_events['contract_id'].astype(str)
-    
-    # Create the filter mask once
-    valid_mask = price_events['contract_id'].isin(inst_map.keys())
-    price_events = price_events[valid_mask]
-    
-    total_rows = len(price_events)
-    print(f"   [Engine] Streaming {total_rows} events in batches of {chunk_size}...", flush=True)
-
-    for i in range(0, total_rows, chunk_size):
-        # A. Slice the DataFrame
-        chunk = price_events.iloc[i : i + chunk_size]
-        
-        # B. Convert to Nautilus Objects (High RAM usage moment)
-        ticks, lookup = process_data_chunk((
-            chunk, inst_map, i, local_liquidity, 0.000001,
-            wallet_scores, float(fw_slope), float(fw_intercept)
-        ))
-        
-        # Update shared lookup dict
-        local_wallet_lookup.update(lookup)
-        
-        # C. Feed & Run
-        if ticks:
-            engine.add_data(ticks)
-            # CRITICAL: Run immediately to consume events and clear queue
-            engine.run() 
-            
-        # D. Aggressive Cleanup
-        # Delete the heavy Tick objects immediately
-        del ticks, lookup, chunk
-        # Force Python to release memory back to OS
-        gc.collect()
-
-    print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
-
-    # 7. Extract Results
-    final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
-    full_curve = strategy.equity_history
-    
-    # Cleanup Input Data
-    del price_events, slice_df
-    gc.collect()
-    
-    if not full_curve:
-        full_curve = [(start_time, 10000.0)]
-        
-    # Resample curve if too large
-    if len(full_curve) > 2000:
-        df_eq = pd.DataFrame(full_curve, columns=['ts', 'val'])
-        df_eq['ts'] = pd.to_datetime(df_eq['ts'])
-        df_eq = df_eq.set_index('ts')
-        resampled = df_eq.resample('h').last().dropna()
-        captured_curve = list(resampled['val'].items())
-        if full_curve and full_curve[-1][0] > captured_curve[-1][0]:
-            captured_curve.append(full_curve[-1])
-    else:
-        captured_curve = full_curve
-        
-    captured_trades = strategy.total_closed
-    captured_wins = strategy.wins
-    captured_losses = strategy.losses
-    
-    # Final Engine Cleanup
-    engine.dispose()
-    del engine, strategy
-    gc.collect()
-    
-    return {
-        'start_ts': start_time,
-        'final_val': final_val,
-        'return': (final_val / 10000.0) - 1.0,
-        'trades': captured_trades, 
-        'wins': captured_wins, 
-        'losses': captured_losses,
-        'equity_curve': captured_curve 
-    }
-    
 def execute_period_remote(slice_df, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     import gc
     import pandas as pd
@@ -2712,97 +2512,139 @@ class TuningRunner:
         return dataset_dir
         
         
-# --- GLOBAL FUNCTION ---
 def ray_backtest_wrapper(config, data_dir, nlp_cache=None, priors=None):
     import polars as pl
     import pandas as pd
     from pathlib import Path
-    import json
-    import hashlib
-    import traceback
-    import gc
-    import numpy as np
     
+    # 1. Load Data Locally (Each worker loads its own copy from disk)
+    # This prevents the "Object Store" OOM kill.
+    # We use PyArrow for zero-copy loading to keep worker RAM low.
     data_path = Path(data_dir)
     
-    # 1. SETUP SEED
+    try:
+        # Load Events
+        event_log = pl.read_parquet(data_path / "events_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        event_log = event_log.sort_values(["timestamp", "event_type"]).set_index("timestamp")
+        
+        # Load Profiler
+        profiler_data = pl.read_parquet(data_path / "profiler_*.parquet").to_pandas(use_pyarrow_extension_array=True)
+        
+        if 'ts_int' not in event_log.columns:
+            event_log['ts_int'] = event_log.index.astype(np.int64)
+        if 'ts_int' not in profiler_data.columns:
+            profiler_data['ts_int'] = profiler_data['timestamp'].astype(np.int64)
+            
+    except Exception as e:
+        print(f"Worker Load Failed: {e}")
+        return {'smart_score': -99.0}
+        
+    if isinstance(event_log, ray.ObjectRef):
+        event_log = ray.get(event_log)
+    if isinstance(profiler_data, ray.ObjectRef):
+        profiler_data = ray.get(profiler_data)
+        
+    if isinstance(nlp_cache, ray.ObjectRef):
+        nlp_cache = ray.get(nlp_cache)
+    if isinstance(priors, ray.ObjectRef):
+        priors = ray.get(priors)
+
+    if event_log.empty or profiler_data.empty:
+        print("⚠️ Trial skipped: Empty input data")
+        return {'smart_score': -99.0}
+    
+    if len(profiler_data[profiler_data['outcome'].isin([0.0, 1.0])]) == 0:
+        print("⚠️ Trial skipped: No valid outcomes in profiler")
+        return {'smart_score': -99.0}
+
     config_str = json.dumps(config, sort_keys=True, default=str)
+    # Generate a deterministic 32-bit integer seed from the config hash
     trial_seed = int(hashlib.md5(config_str.encode()).hexdigest(), 16) % (2**31)
+    
+    # Apply the seed to Python, NumPy, and environment variables
     set_global_seed(trial_seed)
     
+    # 1. Validation
+    decay = config.get('decay_factor', 0.95)
+    if not (0.80 <= decay < 1.0):
+        return {'smart_score': -99.0} # Fail gracefully on invalid params
+
+    if config.get('splash_threshold', 0) <= 0:
+        return {'smart_score': -99.0}
+
     try:
-        # 2. LOAD TRAINING DATA ONLY (Small)
-        # We need profiler data to calculate wallet scores.
-        # We load it efficiently using Polars.
-        train_days = config.get('train_days', 60)
-        
-        # We need the start date to calculate the cutoff
-        # A quick metadata scan is cheap
-        scan = pl.scan_parquet(data_path / "profiler_*.parquet")
-        min_ts = scan.select(pl.col("timestamp").min()).collect().item()
-        
-        # Calculate Cutoff
-        train_cutoff = pd.Timestamp(min_ts) + pd.Timedelta(days=train_days)
-        
-        # Load ONLY training profiler data
-        profiler_train = (
-            scan
-            .filter(pl.col("timestamp") < train_cutoff)
-            .collect()
-            .to_pandas(use_pyarrow_extension_array=True)
-        )
-        
-        if 'ts_int' not in profiler_train.columns:
-            profiler_train['ts_int'] = profiler_train['timestamp'].astype(np.int64)
-
-        # 3. CONFIGURE STRATEGY
+        # 2. Prepare the Flat Configuration Dictionary
+        # We copy the config to avoid mutating the Ray object store reference
         run_config = config.copy()
-        for k, v in run_config.items():
-            if isinstance(v, (np.generic)): run_config[k] = v.item()
 
+        for k, v in run_config.items():
+            if isinstance(v, (np.generic)):
+                run_config[k] = v.item()
+
+        # UNPACK SIZING TUPLE: ("fixed_pct", 0.05) -> mode="fixed_pct", val=0.05
+        # This handles the complex search space definition in your tuning runner.
         sizing_param = run_config.get('sizing')
+        
+        # Defaults
         run_config['sizing_mode'] = 'fixed'
         run_config['fixed_size'] = 10.0
-        
-        if isinstance(sizing_param, tuple):
-             mode, val = sizing_param
-             run_config['sizing_mode'] = mode
-             if mode == 'kelly': run_config['kelly_fraction'] = float(val)
-             elif mode == 'fixed_pct': run_config['fixed_size'] = float(val)
-             elif mode == 'fixed': run_config['fixed_size'] = float(val)
+        run_config['kelly_fraction'] = 0.1
 
-        # 4. INITIALIZE ENGINE (Lightweight)
-        # We pass None for event_log because we will read from disk later
+        if isinstance(sizing_param, tuple):
+            mode, val = sizing_param
+            run_config['sizing_mode'] = mode
+            
+            if mode == 'kelly':
+                run_config['kelly_fraction'] = float(val)
+            elif mode == 'fixed_pct':
+                # Treat 'fixed_size' as the percentage value (e.g. 0.05)
+                run_config['fixed_size'] = float(val)
+            elif mode == 'fixed':
+                # Treat 'fixed_size' as Cash Amount (e.g. 10.0 USDC)
+                run_config['fixed_size'] = float(val)
+        
+        # Ensure other optional keys exist with safe defaults if Ray didn't provide them
+        run_config.setdefault('stop_loss', None)
+        run_config.setdefault('use_smart_exit', False)
+        run_config.setdefault('smart_exit_ratio', 0.5)
+        run_config.setdefault('edge_threshold', 0.05)
+
+        # 3. Initialize Engine with direct references
+        # Note: 'priors' defaults to empty dict if None
         engine = FastBacktestEngine(
-            None, # <--- CRITICAL: Do not pass massive DF here
-            profiler_train, 
+            event_log, 
+            profiler_data, 
             nlp_cache, 
             priors if priors else {}
         )
         
-        # Inject the data path so the engine knows where to find files
-        engine.data_path = data_path
-        engine.train_cutoff = train_cutoff
-        
-        # 5. EXECUTE
+        # 4. Run Execution
+        # We pass the fully processed 'run_config' which now has flat keys
         results = engine.run_walk_forward(run_config)
         
-        # Scoring
+        # 5. Scoring Logic
         ret = results.get('total_return', 0.0)
         dd = results.get('max_drawdown', 0.0)
+        
+        # Protect against div/0
         effective_dd = dd if dd > 0.0001 else 0.0001
+        
         smart_score = ret / (effective_dd + 0.01)
         results['smart_score'] = smart_score
         
-        del engine, profiler_train
+        # Cleanup to prevent RAM explosion in Ray
+        del engine
+        import gc
         gc.collect()
         
         return results
         
     except Exception as e:
+        # Log error but return bad score to keep optimization running
         print(f"Trial Failed: {e}")
         traceback.print_exc()
         return {'smart_score': -99.0}
+
 
 if __name__ == "__main__":
     try:
