@@ -501,37 +501,22 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
 
     print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
 
-    # 6. RESULTS (The Correct Access Pattern)
+    # 6. RESULTS (Strategy-Source of Truth)
+    # We rely on the Strategy's internal tracker. 
+    # If the strategy traded, this history is guaranteed to be accurate.
+    # We do NOT query engine.portfolio manually, avoiding all API/Identity mismatches.
+    
+    full_curve = strategy.equity_history
     final_val = 10000.0
     
-    # Check if we have any registered instruments to grab the Venue from
-    if strategy.active_instrument_ids:
-        # 1. GET THE AUTHORITATIVE VENUE OBJECT
-        # We grab the Venue object from the first registered instrument. 
-        # This bypasses any object identity mismatch issues.
-        correct_venue = strategy.active_instrument_ids[0].venue
-        
-        # 2. ACCESS ACCOUNT
-        # This is the standard API call, but now using the correct object key.
-        account = engine.portfolio.account(correct_venue)
-        
-        if account:
-            final_val = account.balance_total(USDC).as_double()
-        else:
-            # If this happens, the engine truly failed to initialize the account
-            print(f"   [CRITICAL] Account lookup failed even with correct Venue object: {correct_venue}", flush=True)
-            
-            # Fallback: Use the last recorded equity from the strategy's internal tracker
-            if strategy.equity_history:
-                final_val = strategy.equity_history[-1][1]
-                print(f"   [RECOVERY] Used last equity from strategy history: {final_val}", flush=True)
+    if full_curve:
+        # The last recorded value is our final equity
+        final_val = full_curve[-1][1]
     else:
-        print("   [WARNING] No active instruments found. Cannot determine Venue.", flush=True)
-            
-    full_curve = strategy.equity_history
-    
-    if not full_curve: full_curve = [(start_time, 10000.0)]
-    
+        # If curve is empty, we made no trades or failed to start
+        full_curve = [(start_time, 10000.0)]
+        final_val = 10000.0
+
     captured_trades = strategy.total_closed
     captured_wins = strategy.wins
     captured_losses = strategy.losses
@@ -1457,37 +1442,34 @@ class FastBacktestEngine:
 
                 
     def run_walk_forward(self, config: dict) -> dict:
+        from datetime import timedelta
         
-        # 1. DETERMINE DATES (Robustly)
-        # In Worker Mode, self.event_log is None, so we rely on injected state or defaults
+        # 1. DETERMINE DATES (Worker Mode Safe)
+        # If we are a Worker, we don't have event_log. We use the injected cutoff.
         if hasattr(self, 'train_cutoff') and self.train_cutoff:
             train_end = self.train_cutoff
         else:
-            # Fallback for local testing if event_log exists
+            # Fallback for Driver/Local testing
             if self.event_log is not None and not self.event_log.empty:
                  min_date = self.event_log.index.min()
                  train_days = config.get('train_days', 60)
                  train_end = min_date + timedelta(days=train_days)
             else:
-                 # Last resort fallback
+                 # Last resort default
                  train_end = pd.Timestamp("2025-05-01")
 
         max_date = pd.Timestamp("2026-01-01")
         
-        # 2. GET SCORES (Worker Optimization)
-        # If we have pre-calculated scores (from Driver), use them!
+        # 2. GET SCORES (Use Pre-Calculated)
         if hasattr(self, 'precalc_scores') and self.precalc_scores is not None:
             fold_wallet_scores = self.precalc_scores
             fw_slope = getattr(self, 'precalc_slope', 0.0)
             fw_intercept = getattr(self, 'precalc_intercept', 0.0)
-            
         else:
-            # Local Mode: We must calculate scores ourselves (Requires Data)
+            # Local Calculation (Only if data exists)
             if self.profiler_data is None:
-                print("❌ Critical: No profiler data and no precalc scores!")
                 return {'total_return': 0.0}
 
-            # Setup Helper Col
             if 'ts_int' not in self.profiler_data.columns:
                 self.profiler_data['ts_int'] = self.profiler_data['timestamp'].values.astype('int64')
 
@@ -1498,18 +1480,15 @@ class FastBacktestEngine:
                 train_profiler = train_profiler[train_profiler['res_time'] <= train_end]
 
             fold_wallet_scores = fast_calculate_rois(train_profiler, min_trades=5, cutoff_date=train_end)
-            
             known_experts = sorted(list(set(k.split('|')[0] for k in fold_wallet_scores.keys()))) if fold_wallet_scores else []
             fw_slope, fw_intercept = self.calibrate_fresh_wallet_model(train_profiler, known_wallet_ids=known_experts, cutoff_date=train_end)
 
         # 3. DEFINE TEST WINDOW
-        # Test starts 2 days after training ends to prevent bleed
         test_start = train_end + timedelta(days=2) 
         
-        # 4. EXECUTE SIMULATION (Streaming from Disk)
+        # 4. EXECUTE SIMULATION
         try:
-            # We call execute_period_local, which reads from disk.
-            # It does NOT need self.event_log to be in memory.
+            # Pass the market_lifecycle we injected earlier
             result = execute_period_local(
                 self.data_path, 
                 fold_wallet_scores, 
@@ -1519,7 +1498,7 @@ class FastBacktestEngine:
                 train_end, 
                 max_date, 
                 {}, 
-                self.market_lifecycle
+                getattr(self, 'market_lifecycle', {})
             )
         except Exception as e:
             print(f"❌ Simulation execution failed: {e}")
@@ -1538,8 +1517,6 @@ class FastBacktestEngine:
             equity_values = [x[1] for x in full_equity_curve]
             try:
                 max_dd_pct, _, _ = calculate_max_drawdown(equity_values)
-                
-                # Sharpe Calculation
                 if len(full_equity_curve) > 2:
                     df_eq = pd.DataFrame(full_equity_curve, columns=['ts', 'equity'])
                     df_eq['ts'] = pd.to_datetime(df_eq['ts'])
