@@ -2768,6 +2768,9 @@ def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutof
         wallet_scores = ray.get(wallet_scores)
     if isinstance(fw_params, ray.ObjectRef):
         slope, intercept = ray.get(fw_params)
+    else:
+        # Fallback: It's already the tuple (slope, intercept)
+        slope, intercept = fw_params
         
     # 2. Setup Config
     config_str = json.dumps(config, sort_keys=True, default=str)
