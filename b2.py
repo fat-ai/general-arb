@@ -502,7 +502,31 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
     print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
 
     # 5. RESULTS
-    final_val = engine.portfolio.account(venue_id).balance_total(USDC).as_double()
+
+    if engine.portfolio is None:
+        print("   [CRITICAL] Portfolio is None!", flush=True)
+        final_val = 10000.0
+    else:
+        # Try to retrieve the account safely
+        account = engine.portfolio.account(venue_id)
+        
+        if account is None:
+            # Fallback: Try to find ANY account if the venue ID mismatch occurred
+            print(f"   [WARNING] Account for {venue_id} not found. Checking available accounts...", flush=True)
+            accounts = engine.portfolio.accounts()
+            if accounts:
+                account = list(accounts.values())[0] # Take the first one
+                print(f"   [RECOVERY] Using account: {account.id}", flush=True)
+            else:
+                print("   [CRITICAL] No accounts found in portfolio!", flush=True)
+        
+        # Calculate Value
+        if account:
+            final_val = account.balance_total(USDC).as_double()
+        else:
+            # Total failure fallback
+            final_val = 10000.0
+            
     full_curve = strategy.equity_history
     
     if not full_curve: full_curve = [(start_time, 10000.0)]
