@@ -477,6 +477,9 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
             local_wallet_lookup.update(lookup)
             
             if ticks:
+                if not hasattr(engine, '_has_printed_ticks'):
+                    print(f"   [Engine DEBUG] First batch generated {len(ticks)} ticks. Sample: {ticks[0]}", flush=True)
+                    engine._has_printed_ticks = True
                 local_wallet_lookup.clear()
                 local_wallet_lookup.update(lookup)
                 engine.add_data(ticks)
@@ -1119,6 +1122,13 @@ class PolymarketNautilusStrategy(Strategy):
         self.equity_history.append((now_ts, total_equity))
         
     def on_trade_tick(self, tick: TradeTick):
+        
+        if not hasattr(self, '_debug_tick_count'): self._debug_tick_count = 0
+        self._debug_tick_count += 1
+        if self._debug_tick_count <= 5:
+            print(f"[STRATEGY DEBUG] Rx TradeTick: {tick.instrument_id} Price={tick.price} Size={tick.size}", flush=True)
+
+        # 1. M
         # 1. Metadata Retrieval
         tid_val = tick.trade_id.value
         
@@ -2723,6 +2733,7 @@ class TuningRunner:
             ])
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
+            chunk_lazy = chunk_lazy.sort("timestamp")
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
