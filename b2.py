@@ -478,6 +478,7 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
                 
             chunk_df['contract_id'] = chunk_df['contract_id'].astype('category')
             chunk_df['wallet_id'] = chunk_df['wallet_id'].astype('category')
+            
             # 5. Process & Feed Engine
             ticks, lookup = process_data_chunk((
                 chunk_df, inst_map, 0, local_liquidity, 0.000001,
@@ -2751,30 +2752,33 @@ class TuningRunner:
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
-              
+        
                 chunk_df = chunk_df.with_columns([
                     pl.col("contract_id").cast(pl.String),
-                    pl.col("wallet_id").cast(pl.String)
+                    pl.col("wallet_id").cast(pl.String),
+                    pl.col("event_type").cast(pl.String),
+                    pl.col("entity_type").cast(pl.String)
                 ])
                 
                 # Write to Partitioned Parquet
                 base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
                 chunk_df.select(base_cols).write_parquet(
                     dataset_dir / f"events_{i}.parquet",
-                    compression='snappy'
+                    compression='snappy',
+                    use_pyarrow=True 
                 )
                 
                 prof_cols = ["timestamp", "wallet_id", "entity_type", "contract_id", "usdc_vol", "tokens", "bet_price", "outcome", "res_time"]
                 chunk_df.filter(pl.col("event_type") == "TRADE").select(prof_cols).rename({"contract_id": "market_id"}).write_parquet(
                     dataset_dir / f"profiler_{i}.parquet",
-                    compression='snappy'
+                    compression='snappy',
+                    use_pyarrow=True
                 )
                 
             print(f" Done ({chunk_df.height} rows) -> Disk.")
             del chunk_df, trades_slice, joined
             gc.collect()
 
-        # RETURN THE PATH, NOT THE DATAFRAME
         log.info(f"✅ Data successfully prepared in {dataset_dir}")
         return dataset_dir
         
