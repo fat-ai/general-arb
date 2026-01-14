@@ -1831,7 +1831,7 @@ class TuningRunner:
                 wallet_scores=wallet_scores_ref,
                 fw_params=params_ref,
                 train_cutoff=train_cutoff, # Pass the date too
-                market_lifecycle=lifecycle_ref,
+                market_lifecycle=lifecycle_ref
             ),
             config=search_space,
             metric="smart_score",
