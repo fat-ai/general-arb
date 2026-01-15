@@ -467,7 +467,9 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
             
             chunk_df = batch.to_pandas()
             if chunk_df.empty: continue
-
+                
+            chunk_df.rename(columns={'usdc_vol': 'trade_volume', 'tokens': 'size'}, inplace=True)
+            
             # --- CRITICAL FIX START ---
             # 1. Force strict Nanosecond conversion immediately
             # If the integer value is small (e.g. 1.7e15), it is Microseconds. Scale it.
@@ -2770,7 +2772,12 @@ class TuningRunner:
                 ])
                 
                 # Write to Partitioned Parquet
-                base_cols = ["timestamp", "contract_id", "event_type", "liquidity", "p_market_all", "is_sell", "wallet_id"]
+                base_cols = [
+                    "timestamp", "contract_id", "event_type", "liquidity", 
+                    "p_market_all", "is_sell", "wallet_id", 
+                    "usdc_vol", "tokens" 
+                ]
+                
                 chunk_df.select(base_cols).write_parquet(
                     dataset_dir / f"events_{i}.parquet",
                     compression='snappy',
