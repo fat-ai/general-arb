@@ -170,7 +170,10 @@ def plot_performance(full_equity_curve, trades_count):
 # --- HELPERS ---def process_data_chunk(args):
 def process_data_chunk(args):
     """
-    Fixed Version: Correctly uses String IDs for Trade Lookup.
+    STRICT COMPLIANCE VERSION.
+    1. Timestamps -> Nanoseconds (Multiplies by 1,000 if detected as Microseconds).
+    2. Prices/Sizes -> Scaled Integers (passed to Nautilus constructors).
+    3. IDs -> Strings.
     """
     import numpy as np
     import pandas as pd
@@ -189,10 +192,10 @@ def process_data_chunk(args):
     prices = df_chunk['p_market_all'].fillna(0.0).values
     vols = df_chunk['trade_volume'].fillna(0.0).values
     
-    # Fallback for Size
     if 'size' in df_chunk.columns:
         sizes = df_chunk['size'].fillna(0.0).values
     else:
+        # Avoid division by zero
         safe_prices = np.where(prices < 0.000001, 1.0, prices)
         sizes = vols / safe_prices
 
@@ -201,7 +204,7 @@ def process_data_chunk(args):
     
     if not valid_mask.any(): return [], {}
 
-    # Subset the arrays
+    # Subset
     subset_insts = mapped_insts[valid_mask].values
     subset_prices = prices[valid_mask]
     subset_sizes = sizes[valid_mask]
@@ -211,6 +214,16 @@ def process_data_chunk(args):
     subset_wallet_ids = df_chunk['wallet_id'].values[valid_mask].astype(str)
     
     num_rows = len(subset_insts)
+
+    # --- CRITICAL FIX: TIMESTAMP SCALING ---
+    # Nautilus requires Nanoseconds (19 digits). Pandas usually gives Microseconds (16 digits).
+    # If we feed micros, the date is interpreted as 1970, and the engine drops it.
+    if num_rows > 0:
+        max_ts = np.max(subset_ts)
+        # Threshold: Year 2001 in microseconds is 1,000,000,000,000,000 (16 digits)
+        # If timestamp is ~16 digits, it's micros. Multiply by 1,000 to get nanos.
+        if max_ts < 2_000_000_000_000_000: 
+             subset_ts = subset_ts * 1000
 
     # 4. Liquidity & Spread Logic
     dynamic_liquidity = np.maximum(1000.0, subset_vols * 50.0)
@@ -222,7 +235,6 @@ def process_data_chunk(args):
     
     bids[subset_is_sell] = subset_prices[subset_is_sell] - calculated_spreads[subset_is_sell]
     asks[subset_is_sell] = subset_prices[subset_is_sell] 
-    
     asks[~subset_is_sell] = subset_prices[~subset_is_sell] + calculated_spreads[~subset_is_sell]
     bids[~subset_is_sell] = subset_prices[~subset_is_sell] 
 
@@ -256,36 +268,40 @@ def process_data_chunk(args):
         if calc_mask.any():
             log_vols = np.log1p(subset_vols[calc_mask])
             calc_vals = fw_intercept + (fw_slope * log_vols)
-            vols_m = subset_vols[calc_mask]
-            calc_vals = np.where(vols_m > 2000.0, np.maximum(calc_vals, 0.06),
-                        np.where(vols_m > 500.0, np.maximum(calc_vals, 0.02), calc_vals))
-            scores[calc_mask] = calc_vals
+            scores[calc_mask] = np.maximum(0.0, calc_vals) # Simple floor
 
-    # 7. Object Creation
+    # 7. Preparation for Loop
     results = []
     chunk_lookup = {}
-    
     indices = np.arange(start_idx, start_idx + num_rows)
-
     tr_id_strs = [f"{ts}-{i}" for ts, i in zip(subset_ts, indices)]
 
-    _Price = Price
-    _Quantity = Quantity
-    _QuoteTick = QuoteTick
-    _TradeTick = TradeTick
-    _TradeId = TradeId
-    _Agg_SELLER = AggressorSide.SELLER
-    _Agg_BUYER = AggressorSide.BUYER
+    # NAUTILUS SCALARS
+    # Price Precision 6 -> Multiplier 1,000,000
+    # Size Precision 4  -> Multiplier 10,000
+    PRICE_PRECISION = 6
+    SIZE_PRECISION = 4
+    PRICE_MULT = 10 ** PRICE_PRECISION
+    SIZE_MULT = 10 ** SIZE_PRECISION
 
-    PRICE_MULT = 1_000_000.0
-    SIZE_MULT = 10_000.0
-
+    # Convert to Scaled Integers (Vectorized)
     bids_int = np.round(bids * PRICE_MULT).astype(np.int64)
     asks_int = np.round(asks * PRICE_MULT).astype(np.int64)
     trds_int = np.round(subset_prices * PRICE_MULT).astype(np.int64)
     depth_int = np.round(depth_vals * SIZE_MULT).astype(np.int64)
     sizes_int = np.round(subset_sizes * SIZE_MULT).astype(np.int64)
 
+    # Localize Classes for Loop Speed
+    _QuoteTick = QuoteTick
+    _TradeTick = TradeTick
+    _TradeId = TradeId
+    _Price = Price
+    _Quantity = Quantity
+    _Agg_SELLER = AggressorSide.SELLER
+    _Agg_BUYER = AggressorSide.BUYER
+
+    # 8. THE LOOP
+    # We iterate over lists (faster than numpy scalar access in loop)
     iterator = zip(
         subset_insts, subset_ts.tolist(), 
         bids_int.tolist(), asks_int.tolist(), trds_int.tolist(), 
@@ -295,17 +311,24 @@ def process_data_chunk(args):
 
     for inst, ts, bid_i, ask_i, trd_i, depth_i, size_i, is_sell, score, tr_id in iterator:
         
-        p_bid = _Price(bid_i, 6)
-        p_ask = _Price(ask_i, 6)
-        p_trd = _Price(trd_i, 6)
-        s_depth = _Quantity(depth_i, 4)
-        s_trd = _Quantity(size_i, 4)
+        # --- STRICT TYPING ---
+        # Ensure we pass Python 'int', not numpy types
+        ts_py = int(ts)
+        
+        # Create Objects using Scaled Integers
+        p_bid = _Price(int(bid_i), PRICE_PRECISION)
+        p_ask = _Price(int(ask_i), PRICE_PRECISION)
+        p_trd = _Price(int(trd_i), PRICE_PRECISION)
+        
+        s_depth = _Quantity(int(depth_i), SIZE_PRECISION)
+        s_trd = _Quantity(int(size_i), SIZE_PRECISION)
 
+        # Create Ticks
         results.append(_QuoteTick(
             instrument_id=inst,
             bid_price=p_bid, ask_price=p_ask,
-            bid_size=s_depth, ask_size=s_depth, # Fixed typo (s_depth vs s_bid)
-            ts_event=ts, ts_init=ts
+            bid_size=s_depth, ask_size=s_depth,
+            ts_event=ts_py, ts_init=ts_py
         ))
 
         results.append(_TradeTick(
@@ -313,17 +336,14 @@ def process_data_chunk(args):
             price=p_trd,
             size=s_trd,
             aggressor_side=_Agg_SELLER if is_sell else _Agg_BUYER,
-            trade_id=_TradeId(tr_id), # Passed as String
-            ts_event=ts, ts_init=ts
+            trade_id=_TradeId(tr_id),
+            ts_event=ts_py, ts_init=ts_py
         ))
         
-        # Key is String -> Matches tick.trade_id.value in strategy
         chunk_lookup[tr_id] = (score, is_sell)
 
-    return results, chunk_lookup
+    return results, chunk_lookup    
     
-    
-# --- GLOBAL FUNCTION (Not inside a class) ---
 def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercept, start_time, end_time, known_liquidity_ignored, market_lifecycle):
     """
     True Streaming Execution.
@@ -445,49 +465,55 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
         # This guarantees we never hold a massive dataframe in RAM
         for batch in parquet_file.iter_batches(batch_size=50000):
             
-            # 1. Convert Batch to Pandas (Tiny footprint ~50MB)
             chunk_df = batch.to_pandas()
-            
             if chunk_df.empty: continue
 
-            # 2. Essential Conversions
+            # --- CRITICAL FIX START ---
+            # 1. Force strict Nanosecond conversion immediately
+            # If the integer value is small (e.g. 1.7e15), it is Microseconds. Scale it.
+            
+            # First, cast to int64 to get the raw value
             chunk_df['ts_int'] = chunk_df['timestamp'].astype(np.int64)
             
-            # 3. Filter Start Date (Fast Int Comparison)
+            # Detect Microseconds (16 digits) vs Nanoseconds (19 digits)
+            # Threshold: Year 2001 in microseconds is 1e15. Year 2286 in nanoseconds is 1e19.
+            # If max value < 2e16, it's definitely Microseconds.
+            if chunk_df['ts_int'].max() < 20_000_000_000_000_000:
+                chunk_df['ts_int'] = chunk_df['ts_int'] * 1000
+                
+            # Now 'ts_int' is strictly Nanoseconds ($10^18$).
+            # --- CRITICAL FIX END ---
+
+            # 2. Filter using aligned units
             chunk_df = chunk_df[chunk_df['ts_int'] >= start_ns]
             if chunk_df.empty: continue
             
-            # 4. Filter Contracts
+            # Filter Contracts
             chunk_df = chunk_df[chunk_df['contract_id'].isin(valid_cids)]
             if chunk_df.empty: continue
 
             if 'p_market_all' in chunk_df.columns:
                 chunk_df['p_market_all'] = chunk_df['p_market_all'].astype(float)
-                
+
+            # Optimization
             chunk_df['contract_id'] = chunk_df['contract_id'].astype('category')
             chunk_df['wallet_id'] = chunk_df['wallet_id'].astype('category')
-            
-            # 5. Process & Feed Engine
+
+            # Process (Timestamps are now correct, so we can remove the fix inside this function if we want,
+            # but leaving it there as a safety net is fine)
             ticks, lookup = process_data_chunk((
                 chunk_df, inst_map, 0, local_liquidity, 0.000001,
                 wallet_scores, float(fw_slope), float(fw_intercept)
             ))
             
-            local_wallet_lookup.update(lookup)
-            
             if ticks:
-                if not hasattr(engine, '_has_printed_ticks'):
-                    print(f"   [Engine DEBUG] First batch generated {len(ticks)} ticks. Sample: {ticks[0]}", flush=True)
-                    engine._has_printed_ticks = True
                 local_wallet_lookup.clear()
                 local_wallet_lookup.update(lookup)
                 engine.add_data(ticks)
-                engine.run() # Consume & Clear Memory Immediately
+                engine.run() 
             
-            # 6. Explicit Delete
             del chunk_df, ticks, lookup
             
-        # End of File
         gc.collect()
 
     print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
