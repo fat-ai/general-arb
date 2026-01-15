@@ -266,7 +266,7 @@ def process_data_chunk(args):
     chunk_lookup = {}
     
     indices = np.arange(start_idx, start_idx + num_rows)
-    # [FIX] Generate Unique String IDs
+
     tr_id_strs = [f"{ts}-{i}" for ts, i in zip(subset_ts, indices)]
 
     _Price = Price
@@ -286,7 +286,6 @@ def process_data_chunk(args):
     depth_int = np.round(depth_vals * SIZE_MULT).astype(np.int64)
     sizes_int = np.round(subset_sizes * SIZE_MULT).astype(np.int64)
 
-    # [FIX] Use tr_id_strs in the iterator
     iterator = zip(
         subset_insts, subset_ts.tolist(), 
         bids_int.tolist(), asks_int.tolist(), trds_int.tolist(), 
@@ -2283,7 +2282,6 @@ class TuningRunner:
 
                     tid = None; mult = 0
                     
-                    # 1e6 FIX APPLIED
                     if m_int in valid_token_ints:
                         tid = m_int; mult = 1
                         val_usdc = float(r['takerAmountFilled']) / 1e6
@@ -2733,7 +2731,7 @@ class TuningRunner:
             ])
     
             chunk_lazy = pl.concat([ev_trades, m_new, m_res], how="diagonal")
-            chunk_lazy = chunk_lazy.sort("timestamp")
+            chunk_lazy = chunk_lazy.sort("timestamp", "contract_id", "wallet_id")
             chunk_df = chunk_lazy.collect(engine="streaming")
             
             if chunk_df.height > 0:
