@@ -215,9 +215,6 @@ def process_data_chunk(args):
     
     num_rows = len(subset_insts)
 
-    # --- CRITICAL FIX: TIMESTAMP SCALING ---
-    # Nautilus requires Nanoseconds (19 digits). Pandas usually gives Microseconds (16 digits).
-    # If we feed micros, the date is interpreted as 1970, and the engine drops it.
     if num_rows > 0:
         max_ts = np.max(subset_ts)
         # Threshold: Year 2001 in microseconds is 1,000,000,000,000,000 (16 digits)
