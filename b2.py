@@ -467,7 +467,6 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
                 
             chunk_df.rename(columns={'usdc_vol': 'trade_volume', 'tokens': 'size'}, inplace=True)
             
-            # --- CRITICAL FIX START ---
             # 1. Force strict Nanosecond conversion immediately
             # If the integer value is small (e.g. 1.7e15), it is Microseconds. Scale it.
             
@@ -481,7 +480,6 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
                 chunk_df['ts_int'] = chunk_df['ts_int'] * 1000
                 
             # Now 'ts_int' is strictly Nanoseconds ($10^18$).
-            # --- CRITICAL FIX END ---
 
             # 2. Filter using aligned units
             chunk_df = chunk_df[chunk_df['ts_int'] >= start_ns]
@@ -518,9 +516,6 @@ def execute_period_local(data_path, wallet_scores, config, fw_slope, fw_intercep
     print(f"   [Engine] Run Complete. Trades: {strategy.total_closed}", flush=True)
 
     # 6. RESULTS (Strategy-Source of Truth)
-    # We rely on the Strategy's internal tracker. 
-    # If the strategy traded, this history is guaranteed to be accurate.
-    # We do NOT query engine.portfolio manually, avoiding all API/Identity mismatches.
     
     full_curve = strategy.equity_history
     final_val = 10000.0
