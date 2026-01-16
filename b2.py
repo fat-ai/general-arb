@@ -1492,7 +1492,6 @@ class FastBacktestEngine:
             fw_slope = getattr(self, 'precalc_slope', 0.0)
             fw_intercept = getattr(self, 'precalc_intercept', 0.0)
         else:
-            # Local Calculation (Only if data exists)
             if self.profiler_data is None:
                 return {'total_return': 0.0}
 
@@ -1514,7 +1513,6 @@ class FastBacktestEngine:
         
         # 4. EXECUTE SIMULATION
         try:
-            # Pass the market_lifecycle we injected earlier
             result = execute_period_local(
                 self.data_path, 
                 fold_wallet_scores, 
@@ -1576,8 +1574,6 @@ class TuningRunner:
         self.spill_dir.mkdir(parents=True, exist_ok=True)
         
         if ray.is_initialized(): ray.shutdown()
-        
-        # In b.py -> TuningRunner -> __init__
         
         try:
             import psutil
@@ -1769,7 +1765,6 @@ class TuningRunner:
         market_lifecycle = {}
         for _, row in lifecycle_df.iterrows():
             cid = str(row['contract_id'])
-            # Ensure safe timestamp conversion
             start_ns = row['created_at'].value if pd.notna(row['created_at']) else 0
             end_ns = row['resolution_timestamp'].value if pd.notna(row['resolution_timestamp']) else np.iinfo(np.int64).max
             
@@ -1801,7 +1796,7 @@ class TuningRunner:
         
         log.info(f"⚙️ AUTO-CONFIG: Data={total_days}d -> Train={safe_train}d, Test={safe_test}d")
 
-        # 3. PRE-CALCULATE WALLET SCORES (The OOM Fix)
+        # 3. PRE-CALCULATE WALLET SCORES
         # We do this ONCE here, instead of inside every worker.
         print("🧠 Pre-calculating wallet scores (Bias-Free)...")
         
@@ -1810,13 +1805,9 @@ class TuningRunner:
         # Load minimal data for scoring
         profiler_scan = pl.scan_parquet(dataset_dir_path / "profiler_*.parquet")
         
-        # CRITICAL FIX FOR LOOKAHEAD BIAS:
-        # We must ONLY learn from markets that RESOLVED before the training cutoff.
-        # Previously, we filtered by 'timestamp' (trade time), which allowed us to
-        # see the outcome of trades that hadn't resolved yet in the simulation.
         profiler_train = (
             profiler_scan
-            .filter(pl.col("res_time") < train_cutoff) # <--- STRICT BIAS FILTER
+            .filter(pl.col("res_time") < train_cutoff)
             .collect()
             .to_pandas(use_pyarrow_extension_array=True)
         )
@@ -1825,7 +1816,6 @@ class TuningRunner:
             profiler_train['ts_int'] = profiler_train['timestamp'].astype(np.int64)
 
         # Calculate Scores
-        # We pass cutoff_date=None because we already strictly filtered the data above
         wallet_scores = fast_calculate_rois(profiler_train, min_trades=5)
         
         # Calculate Fresh Wallet Params
@@ -1862,10 +1852,9 @@ class TuningRunner:
             tune.with_parameters(
                 ray_backtest_wrapper,
                 data_dir=dataset_dir_str,
-                # PASS PRE-CALCULATED OBJECTS
                 wallet_scores=wallet_scores_ref,
                 fw_params=params_ref,
-                train_cutoff=train_cutoff, # Pass the date too
+                train_cutoff=train_cutoff,
                 market_lifecycle=lifecycle_ref
             ),
             config=search_space,
@@ -2140,7 +2129,6 @@ class TuningRunner:
         # Calculate final binary payout (1.0 or 0.0) based on which token index won
         def final_payout(row):
             winning_idx = int(round(row['outcome']))
-            # If the market outcome matches this token's index, this token pays out $1.0
             return 1.0 if row['token_index'] == winning_idx else 0.0
 
         df['outcome'] = df.apply(final_payout, axis=1)
@@ -2205,9 +2193,6 @@ class TuningRunner:
                     print(f" [T-{t_id}] Req Offset {offset}...", end="", flush=True)
                     all_market_trades.extend(data)
                     print(f" [T-{t_id}] {resp.status_code} ", end="", flush=True)
-                    # --- CRITICAL FIX: Check Time, Not Count ---
-                    # Check the timestamp of the last trade in this batch
-                    # If the last trade is older than our cutoff, we have enough data.
                     last_trade = data[-1]
                     
                     # Gamma uses 'timestamp' (seconds) or 'time' (iso string)
@@ -2667,7 +2652,7 @@ class TuningRunner:
         if dataset_dir.exists(): shutil.rmtree(dataset_dir)
         dataset_dir.mkdir(exist_ok=True)
         
-        # 2. FIXED CHUNK SIZE (30 Days)
+        # 2. FIXED CHUNK SIZE (7 Days)
         CHUNK_DAYS = 7
         
         start_ts = pd.Timestamp(FIXED_START_DATE).tz_localize(None)
@@ -2854,9 +2839,9 @@ def ray_backtest_wrapper(config, data_dir, wallet_scores, fw_params, train_cutof
         engine.precalc_slope = slope
         engine.precalc_intercept = intercept
         engine.market_lifecycle = market_lifecycle
+        
         # 4. EXECUTE
         results = engine.run_walk_forward(run_config)
-        
         ret = results.get('total_return', 0.0)
         dd = results.get('max_drawdown', 0.0)
         effective_dd = dd if dd > 0.0001 else 0.0001
