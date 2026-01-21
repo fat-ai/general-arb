@@ -10,11 +10,11 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (Polynomial Diagnostic) ---")
+    print("--- Fresh Wallet Calibration (Binned + Regular OLS) ---")
     
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
-    output_file = 'model_params_poly.json'
+    output_file = 'model_params_final.json'
     BATCH_SIZE = 500_000 
 
     # 1. Load Outcomes
@@ -53,13 +53,15 @@ def main():
         low_memory=True
     )
 
-    # 3. Incremental Process (Same logic that worked)
+    # 3. Incremental Process (First Bets Only)
     global_first_bets = pl.DataFrame(
         schema={
             "wallet_id": pl.String, 
             "ts_date": pl.Datetime, 
             "roi": pl.Float64, 
-            "log_vol": pl.Float64
+            "usdc_vol": pl.Float64,
+            "log_vol": pl.Float64,
+            "won_bet": pl.Boolean
         }
     )
     
@@ -78,7 +80,7 @@ def main():
         total_rows += len(chunk)
         
         if batch_idx % 10 == 0:
-            print(f"   Batch {batch_idx} | Rows: {total_rows:,} | Unique: {global_first_bets.height:,}...", end='\r')
+            print(f"   Batch {batch_idx} | Rows: {total_rows:,} | Unique First Bets: {global_first_bets.height:,}...", end='\r')
 
         chunk = chunk.with_columns([
             pl.col('contract_id').str.strip_chars(),
@@ -95,20 +97,27 @@ def main():
         joined = joined.filter(pl.col('usdc_vol') >= 1.0)
         if joined.height == 0: continue
 
-        price_no = (1.0 - joined['bet_price']).clip(lower_bound=0.01)
-        outcome_no = (1.0 - joined['outcome'])
+        # --- ROI Calculation ---
+        safe_price = joined['bet_price'].clip(0.01, 0.99)
         is_long = joined['tokens'] > 0
-        long_roi = (joined['outcome'] - joined['bet_price']) / joined['bet_price']
-        short_roi = (outcome_no - price_no) / price_no
-        final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 3.0)
+        won_bet = (is_long & (joined['outcome'] > 0.5)) | ((~is_long) & (joined['outcome'] < 0.5))
+
+        long_roi = (joined['outcome'] - safe_price) / safe_price
+        short_roi = (safe_price - joined['outcome']) / (1.0 - safe_price)
+        
+        final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 5.0)
         log_vol = joined['usdc_vol'].log1p()
 
-        joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
+        joined = joined.with_columns([
+            final_roi.alias('roi'), 
+            log_vol.alias('log_vol'),
+            won_bet.alias('won_bet')
+        ])
 
         chunk_firsts = (
             joined.sort("ts_date")
                   .unique(subset=["wallet_id"], keep="first")
-                  .select(["wallet_id", "ts_date", "roi", "log_vol"])
+                  .select(["wallet_id", "ts_date", "roi", "usdc_vol", "log_vol", "won_bet"])
         )
         
         if global_first_bets.height > 0:
@@ -127,71 +136,69 @@ def main():
 
     print(f"\n✅ Scan complete. Found {global_first_bets.height} unique first bets.")
 
-    # 4. POLYNOMIAL DIAGNOSTICS
-    print("Running Polynomial Regression...")
+    # Convert to Pandas for Analysis
     df = global_first_bets.to_pandas()
-    
     if len(df) < 100:
         print("❌ Not enough data.")
         return
 
-    # A. Setup Data
+    # 4. BINNING ANALYSIS
+    print("\n📊 VOLUME BUCKET ANALYSIS")
+    bins = [0, 10, 50, 100, 500, 1000, 5000, 10000, 100000, float('inf')]
+    labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k", "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
+    
+    df['vol_bin'] = pd.cut(df['usdc_vol'], bins=bins, labels=labels)
+    
+    stats = df.groupby('vol_bin', observed=True).agg(
+        Count=('roi', 'count'),
+        Mean_ROI=('roi', 'mean'),
+        Win_Rate=('won_bet', 'mean')
+    )
+    
+    print("="*65)
+    print(f"{'VOLUME BUCKET':<12} | {'COUNT':<8} | {'WIN RATE':<8} | {'MEAN ROI':<8}")
+    print("-" * 65)
+    for bin_name, row in stats.iterrows():
+        print(f"{bin_name:<12} | {int(row['Count']):<8} | {row['Win_Rate']:.1%}    | {row['Mean_ROI']:.2%}")
+    print("="*65)
+
+    # 5. REGULAR OLS REGRESSION
+    print("\n📉 RUNNING REGULAR OLS REGRESSION...")
+    
+    # We regress ROI (Y) against Log Volume (X)
     X = df['log_vol'].values
     y = df['roi'].values
-    weights = df['log_vol'].values # Still weight by volume to reduce noise
     
-    # B. Fit Linear (Baseline)
-    model_lin = sm.WLS(y, sm.add_constant(X), weights=weights)
-    res_lin = model_lin.fit()
+    # Add constant for intercept
+    X_const = sm.add_constant(X)
     
-    # C. Fit Polynomial (The Curve)
-    # X_poly has 2 columns: [log_vol, log_vol^2]
-    X_poly = np.column_stack((X, X**2))
-    model_poly = sm.WLS(y, sm.add_constant(X_poly), weights=weights)
-    res_poly = model_poly.fit()
+    # Standard OLS (Not Weighted)
+    model_ols = sm.OLS(y, X_const)
+    results_ols = model_ols.fit()
     
-    b0, b1, b2 = res_poly.params
-    
-    print("\n" + "="*40)
-    print("🔍 DIAGNOSTIC REPORT")
-    print("="*40)
-    print(f"Linear Slope:      {res_lin.params[1]:.6f}")
-    print(f"Linear Intercept:  {res_lin.params[0]:.6f}")
-    print(f"Linear R²:         {res_lin.rsquared:.6f}")
-    print("-" * 40)
-    print(f"Poly Term (b1):    {b1:.6f}")
-    print(f"Squared Term (b2): {b2:.6f}")
-    print(f"Poly Intercept:    {b0:.6f}")
-    print(f"Poly R²:           {res_poly.rsquared:.6f}")
-    
-    # D. Calculate Peak
-    # Vertex x = -b1 / (2*b2)
-    peak_msg = "None"
-    if b2 < 0: # Concave down (A hump exists)
-        peak_log = -b1 / (2 * b2)
-        peak_usd = np.expm1(peak_log)
-        
-        # Check if peak is within realistic data range
-        min_log, max_log = X.min(), X.max()
-        if min_log <= peak_log <= max_log:
-            peak_msg = f"LogVol {peak_log:.2f} (~${peak_usd:,.2f})"
-        else:
-            peak_msg = f"Theoretical peak at ${peak_usd:,.2f} (Outside data range)"
-            
-    print("-" * 40)
-    print(f"🏆 OPTIMAL FIRST BET SIZE: {peak_msg}")
-    print("="*40)
+    print(f"OLS Slope:     {results_ols.params[1]:.8f}")
+    print(f"OLS Intercept: {results_ols.params[0]:.8f}")
+    print(f"OLS R²:        {results_ols.rsquared:.6f}")
+    print(f"P-Value:       {results_ols.pvalues[1]:.6f}")
 
-    # Save Results
+    # 6. SAVE RESULTS
     results = {
-        "linear": {"slope": res_lin.params[1], "intercept": res_lin.params[0]},
-        "poly": {"b0": b0, "b1": b1, "b2": b2},
-        "optimal_size_usd": float(np.expm1(-b1 / (2*b2))) if b2 < 0 else None
+        "ols_params": {
+            "slope": results_ols.params[1],
+            "intercept": results_ols.params[0],
+            "r_squared": results_ols.rsquared
+        },
+        "buckets": stats.to_dict('index')
     }
     
+    def convert_keys(obj):
+        if isinstance(obj, dict):
+            return {str(k): convert_keys(v) for k, v in obj.items()}
+        return obj
+
     with open(output_file, 'w') as f:
-        json.dump(results, f, indent=4)
-    print(f"Saved details to {output_file}")
+        json.dump(convert_keys(results), f, indent=4)
+    print(f"\n✅ Saved detailed stats to {output_file}")
 
 if __name__ == "__main__":
     main()
