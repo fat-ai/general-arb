@@ -12,12 +12,16 @@ def main():
     outcomes_path = 'market_outcomes.parquet'
     output_file = 'model_params.json'
 
-    # 1. Load Outcomes (Small enough for memory)
+    # 1. Load Outcomes (Correcting Column Name)
     print(f"Loading outcomes from {outcomes_path}...")
     try:
         q_outcomes = (
             pl.scan_parquet(outcomes_path)
-            .select(['contract_id', 'outcome'])
+            # FIX: Select 'final_outcome' and rename it to 'outcome'
+            .select([
+                pl.col('contract_id'),
+                pl.col('final_outcome').alias('outcome')
+            ])
             .with_columns(pl.col('contract_id').cast(pl.String).str.strip_chars())
             .unique(subset=['contract_id'], keep='last')
         )
@@ -45,7 +49,7 @@ def main():
     # 3. Join and Apply Logic (Lazy Execution)
     print("Processing data stream (Filtering, ROI Calc, Aggregation)...")
     
-    # ROI Logic (Same as before)
+    # ROI Logic
     price_no_expr = (1.0 - pl.col('bet_price')).clip(lower_bound=0.01)
     outcome_no_expr = (1.0 - pl.col('outcome'))
     
@@ -76,7 +80,8 @@ def main():
     # 4. Execute Streaming
     print("🚀 Executing Streaming Pipeline...")
     try:
-        wallet_stats_pl = pipeline.collect(streaming=True)
+        # FIX: Updated from streaming=True to engine="streaming"
+        wallet_stats_pl = pipeline.collect(engine="streaming")
         print(f"✅ Aggregated stats for {len(wallet_stats_pl)} wallets.")
     except Exception as e:
         print(f"❌ Stream processing failed: {e}")
@@ -99,7 +104,6 @@ def main():
             y = qualified_wallets['mean_roi'].values
             
             # WEIGHTS: We use Log Volume as the weight.
-            # This forces the model to prioritize fitting the high-volume wallets.
             weights = qualified_wallets['mean_log_vol'].values
 
             # Statsmodels requires adding a constant manually for the intercept
@@ -115,7 +119,7 @@ def main():
             # Validate (Basic sanity checks)
             if np.isfinite(slope) and np.isfinite(intercept):
                 if slope > 0:
-                    # Clamp intercept to keep small bets neutral (same logic as before)
+                    # Clamp intercept to keep small bets neutral
                     final_intercept = max(-0.10, min(0.10, intercept))
                     final_slope = slope
                     
