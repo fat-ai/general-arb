@@ -6,6 +6,8 @@ from pathlib import Path
 CACHE_DIR = Path("live_paper_cache")
 STATE_FILE = Path("paper_state.json")
 AUDIT_FILE = Path("trades_audit.jsonl")
+TRADES_FILE = Path("gamma_trades_stream.csv")
+OUTCOMES_FILE = Path("market_outcomes.parquet")
 
 # Ensure cache directory exists immediately
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
