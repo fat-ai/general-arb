@@ -10,11 +10,11 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (Binned + Regular OLS) ---")
+    print("--- Fresh Wallet Calibration (Audit Version) ---")
     
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
-    output_file = 'model_params_final.json'
+    output_file = 'model_params_audit.json'
     BATCH_SIZE = 500_000 
 
     # 1. Load Outcomes
@@ -61,7 +61,8 @@ def main():
             "roi": pl.Float64, 
             "usdc_vol": pl.Float64,
             "log_vol": pl.Float64,
-            "won_bet": pl.Boolean
+            "won_bet": pl.Boolean,
+            "bet_price": pl.Float64 # Added for audit
         }
     )
     
@@ -98,6 +99,7 @@ def main():
         if joined.height == 0: continue
 
         # --- ROI Calculation ---
+        # Clip price to avoid infinity, but keep it realistic
         safe_price = joined['bet_price'].clip(0.01, 0.99)
         is_long = joined['tokens'] > 0
         won_bet = (is_long & (joined['outcome'] > 0.5)) | ((~is_long) & (joined['outcome'] < 0.5))
@@ -117,7 +119,7 @@ def main():
         chunk_firsts = (
             joined.sort("ts_date")
                   .unique(subset=["wallet_id"], keep="first")
-                  .select(["wallet_id", "ts_date", "roi", "usdc_vol", "log_vol", "won_bet"])
+                  .select(["wallet_id", "ts_date", "roi", "usdc_vol", "log_vol", "won_bet", "bet_price"])
         )
         
         if global_first_bets.height > 0:
@@ -142,63 +144,59 @@ def main():
         print("❌ Not enough data.")
         return
 
-    # 4. BINNING ANALYSIS
-    print("\n📊 VOLUME BUCKET ANALYSIS")
+    # 4. BINNING ANALYSIS (AUDIT)
+    print("\n📊 VOLUME BUCKET ANALYSIS (AUDIT)")
     bins = [0, 10, 50, 100, 500, 1000, 5000, 10000, 100000, float('inf')]
     labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k", "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
     
     df['vol_bin'] = pd.cut(df['usdc_vol'], bins=bins, labels=labels)
     
+    # ADDING MEDIAN ROI AND MEAN PRICE
     stats = df.groupby('vol_bin', observed=True).agg(
         Count=('roi', 'count'),
+        Win_Rate=('won_bet', 'mean'),
         Mean_ROI=('roi', 'mean'),
-        Win_Rate=('won_bet', 'mean')
+        Median_ROI=('roi', 'median'),
+        Mean_Price=('bet_price', 'mean')
     )
     
-    print("="*65)
-    print(f"{'VOLUME BUCKET':<12} | {'COUNT':<8} | {'WIN RATE':<8} | {'MEAN ROI':<8}")
-    print("-" * 65)
+    print("="*95)
+    print(f"{'BUCKET':<10} | {'COUNT':<6} | {'WIN%':<6} | {'MEAN ROI':<9} | {'MEDIAN ROI':<10} | {'AVG PRICE':<9}")
+    print("-" * 95)
     for bin_name, row in stats.iterrows():
-        print(f"{bin_name:<12} | {int(row['Count']):<8} | {row['Win_Rate']:.1%}    | {row['Mean_ROI']:.2%}")
-    print("="*65)
+        print(f"{bin_name:<10} | {int(row['Count']):<6} | {row['Win_Rate']:.1%}  | {row['Mean_ROI']:>7.2%}   | {row['Median_ROI']:>8.2%}   | {row['Mean_Price']:>7.3f}")
+    print("="*95)
 
-    # 5. REGULAR OLS REGRESSION
+    # 5. OLS REGRESSION
     print("\n📉 RUNNING REGULAR OLS REGRESSION...")
-    
-    # We regress ROI (Y) against Log Volume (X)
     X = df['log_vol'].values
     y = df['roi'].values
-    
-    # Add constant for intercept
     X_const = sm.add_constant(X)
-    
-    # Standard OLS (Not Weighted)
     model_ols = sm.OLS(y, X_const)
     results_ols = model_ols.fit()
     
-    print(f"OLS Slope:     {results_ols.params[1]:.8f}")
-    print(f"OLS Intercept: {results_ols.params[0]:.8f}")
-    print(f"OLS R²:        {results_ols.rsquared:.6f}")
+    slope = results_ols.params[1]
+    intercept = results_ols.params[0]
+    
+    print(f"OLS Slope:     {slope:.8f}")
+    print(f"OLS Intercept: {intercept:.8f}")
     print(f"P-Value:       {results_ols.pvalues[1]:.6f}")
 
     # 6. SAVE RESULTS
     results = {
-        "ols_params": {
-            "slope": results_ols.params[1],
-            "intercept": results_ols.params[0],
-            "r_squared": results_ols.rsquared
-        },
+        "ols": {"slope": slope, "intercept": intercept},
         "buckets": stats.to_dict('index')
     }
     
-    def convert_keys(obj):
+    # Helper to clean keys
+    def clean_keys(obj):
         if isinstance(obj, dict):
-            return {str(k): convert_keys(v) for k, v in obj.items()}
+            return {str(k): clean_keys(v) for k, v in obj.items()}
         return obj
 
     with open(output_file, 'w') as f:
-        json.dump(convert_keys(results), f, indent=4)
-    print(f"\n✅ Saved detailed stats to {output_file}")
+        json.dump(clean_keys(results), f, indent=4)
+    print(f"\n✅ Saved audit stats to {output_file}")
 
 if __name__ == "__main__":
     main()
