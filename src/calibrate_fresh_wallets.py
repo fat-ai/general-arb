@@ -16,8 +16,7 @@ def main():
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
     output_file = 'model_params.json'
-    BATCH_SIZE = 500_000 
-
+    
     # 1. Load Outcomes
     print(f"Loading outcomes from {outcomes_path}...")
     try:
@@ -55,8 +54,8 @@ def main():
         ignore_errors=True # Skip bad lines instead of crashing
     )
     
-    # Create the batch iterator
-    batch_iter = lazy_reader.collect_batches(batch_size=BATCH_SIZE)
+    # FIX: Remove batch_size argument (Polars determines it automatically)
+    batch_iter = lazy_reader.collect_batches()
 
     # 3. Process Batches
     partial_first_bets = []
@@ -70,9 +69,9 @@ def main():
             batch_idx += 1
             total_rows += len(chunk)
             
-            # Print progress every 10 batches (5M rows)
+            # Print progress
             if batch_idx % 10 == 0:
-                print(f"   Processing batch {batch_idx} ({total_rows:,} rows)...", end='\r')
+                print(f"   Processing batch {batch_idx} (Total rows: {total_rows:,})...", end='\r')
 
             # Standard Cleaning & Join
             chunk = chunk.with_columns([
@@ -82,12 +81,11 @@ def main():
                 pl.col('price').alias('bet_price'),
                 pl.col('user').alias('wallet_id'),
                 
-                # OPTIMIZATION: Convert timestamp to Datetime immediately to save RAM
-                # (Assumes ISO8601 or standard format. If this fails, it becomes null, which is fine)
+                # OPTIMIZATION: Convert timestamp to Datetime immediately
                 pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
             ])
 
-            # Drop rows where timestamp failed to parse (if any)
+            # Drop rows where timestamp failed to parse
             chunk = chunk.drop_nulls(subset=['ts_date'])
 
             joined = chunk.join(df_outcomes, on='contract_id', how='inner')
@@ -110,7 +108,6 @@ def main():
             joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
 
             # Keep ONLY the First Bet in this Chunk
-            # Using 'ts_date' (int64 underneath) is much faster/lighter than sorting Strings
             first_in_chunk = (
                 joined.sort("ts_date")
                       .unique(subset=["wallet_id"], keep="first")
@@ -119,8 +116,7 @@ def main():
             
             partial_first_bets.append(first_in_chunk)
             
-            # MEMORY COMPACTION (Frequent: Every 5 batches / 2.5M rows)
-            # We increased frequency to prevent memory spikes
+            # MEMORY COMPACTION
             if len(partial_first_bets) >= 5:
                 compacted = (
                     pl.concat(partial_first_bets)
@@ -132,7 +128,6 @@ def main():
 
     except Exception as e:
         print(f"\n❌ Reader crashed at {total_rows} rows: {e}")
-        # Proceed with what we have so far
         pass
 
     print(f"\n✅ Scan complete. Processed {total_rows:,} rows.")
@@ -172,7 +167,6 @@ def main():
             print(f"   Raw Slope: {slope:.6f}")
             
             if np.isfinite(slope) and np.isfinite(intercept):
-                # Clamp intercept for safety, but keep slope if positive
                 if slope > 0:
                     final_intercept = max(-0.10, min(0.10, intercept))
                     final_slope = slope
