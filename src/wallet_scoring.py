@@ -104,17 +104,21 @@ def fast_calculate_rois(profiler_data, min_trades: int = 1, cutoff_date=None):
         return result
 
 def fetch_gamma_market_outcomes():
-    """
-    Fetches market outcomes (0 or 1) from Polymarket API.
-    Returns a Polars DataFrame.
-    """
+    # CACHE CONFIGURATION
+    cache_file = "market_outcomes.parquet"
+    
+    # 1. CHECK CACHE FIRST
+    if os.path.exists(cache_file):
+        print(f"✅ Found cached outcomes in '{cache_file}'. Loading...")
+        return pl.read_parquet(cache_file)
+
     print("Fetching market outcomes from Polymarket API...")
     all_rows = []
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
-    # Fetch both states (closed/active)
+    # Fetch both states
     for state in ["false", "true"]: 
         offset = 0
         print(f"   Fetching closed={state}...", end=" ", flush=True)
@@ -137,6 +141,7 @@ def fetch_gamma_market_outcomes():
 
     if not all_rows: return pl.DataFrame()
 
+    # Pandas processing (same as before)
     df = pd.DataFrame(all_rows)
 
     def extract_tokens(row):
@@ -144,7 +149,6 @@ def fetch_gamma_market_outcomes():
         if isinstance(raw, str):
             try: raw = json.loads(raw)
             except: pass
-        
         if isinstance(raw, list):
             clean_tokens = []
             for t in raw:
@@ -163,11 +167,8 @@ def fetch_gamma_market_outcomes():
     def derive_outcome(row):
         val = row.get('outcome')
         if pd.notna(val):
-            try:
-                f = float(str(val).replace('"', '').strip())
-                return f
+            try: return float(str(val).replace('"', '').strip())
             except: pass
-        
         prices = row.get('outcomePrices')
         if prices:
             try:
@@ -182,14 +183,12 @@ def fetch_gamma_market_outcomes():
     df['outcome'] = df.apply(derive_outcome, axis=1)
     df = df.dropna(subset=['outcome'])
 
-    # Explode to map individual tokens to win/loss
     df['contract_id_list'] = df['contract_id'].str.split(',')
     df['market_row_id'] = df.index 
     df = df.explode('contract_id_list')
     df['token_index'] = df.groupby('market_row_id').cumcount()
     df['contract_id'] = df['contract_id_list'].str.strip()
     
-    # Logic: 1.0 if token index matches winning index, else 0.0
     def final_payout(row):
         winning_idx = int(round(row['outcome']))
         return 1.0 if row['token_index'] == winning_idx else 0.0
@@ -199,8 +198,12 @@ def fetch_gamma_market_outcomes():
     # Normalize ID logic
     df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
     
-    # Convert to Polars for the merge
+    # Convert to Polars
     pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
+    
+    # 2. SAVE TO CACHE
+    print(f"Saving {pl_outcomes.height} outcomes to cache...")
+    pl_outcomes.write_parquet(cache_file)
     
     return pl_outcomes
     
@@ -223,21 +226,26 @@ def main():
         print("⚠️ Warning: Could not fetch market outcomes.")
         return
 
-    print(f"Scanning 80GB CSV '{csv_file}' using Lazy Streaming...")
+    print(f"Scanning '{csv_file}' using Lazy Streaming...")
     
-    # 2. LAZY LOAD: This does NOT read the file yet. It just prepares the plan.
-    # We use 'scan_csv' instead of 'read_csv'.
-    q_trades = pl.scan_csv(csv_file)
+    q_trades = pl.scan_csv(
+        csv_file,
+        schema_overrides={
+            "contract_id": pl.String,
+            "user": pl.String
+        }
+    )
     
     # Normalize IDs inside the Query Plan
     q_trades = q_trades.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
     )
-    
+
+    # 3. JOIN & CALCULATE
     q_joined = (
         q_trades
         .join(pl_outcomes.lazy(), on="contract_id", how="inner")
-        .filter(pl.col("price").is_between(0.001, 0.999))
+        .filter(pl.col("price").is_between(0.01, 0.99))
         .with_columns([
             pl.when(pl.col("outcomeTokensAmount") > 0)
             .then((pl.col("final_outcome") - pl.col("price")) / pl.col("price"))
@@ -245,32 +253,46 @@ def main():
                 ((1.0 - pl.col("final_outcome")) - (1.0 - pl.col("price"))) / 
                 (1.0 - pl.col("price")).clip(0.01, 1.0)
             )
+            .clip(-1.0, float('inf')) 
             .alias("roi")
-            .clip(-1.0, float('inf'))
         ])
         .group_by("user")
         .agg([
-            pl.col("roi").mean().alias("mean_roi"),
+            # 1. Sum of Net Profit
+            pl.col("roi").sum().alias("total_net_roi"),
+            
+            # 2. Sum of Pain (Absolute value of losses)
+            pl.col("roi").filter(pl.col("roi") < 0).sum().abs().alias("total_loss_pain"),
+            
+            # 3. Trade Count
             pl.col("roi").len().alias("trade_count")
         ])
-        .filter(pl.col("trade_count") >= 1)
+        .filter(pl.col("trade_count") >= 20)
+        .with_columns([
+            # Step A: Calculate Efficiency (Gain-to-Pain)
+            (pl.col("total_net_roi") / (pl.col("total_loss_pain") + 0.1)).alias("efficiency_score"),
+            
+            # Step B: Calculate Volume Reward (Log10)
+            # 100 trades -> 2.0x boost
+            # 1000 trades -> 3.0x boost
+            (pl.col("trade_count").log(10)).alias("volume_boost")
+        ])
         .with_columns(
-            (pl.col("mean_roi") * pl.col("trade_count").log()).alias("weighted_score")
+            # Step C: Combine them
+            (pl.col("efficiency_score") * pl.col("volume_boost")).alias("weighted_score")
         )
     )
 
     print("Executing streaming calculation (this may take a while)...")
     
-    # 4. EXECUTE STREAMING
-    # .collect(streaming=True) processes the CSV in small chunks, never loading 80GB at once.
-    results_df = q_joined.collect(streaming=True)
+    results_df = q_joined.collect(engine="streaming")
 
     print(f"✅ Calculation complete. Found {results_df.height} scored wallets.")
 
     final_dict = {}
     for row in results_df.iter_rows(named=True):
         key = f"{row['user']}|default_topic"
-        final_dict[key] = row['mean_roi']
+        final_dict[key] = row['weighted_score'] 
 
     with open(output_file, "w") as f:
         json.dump(final_dict, f, indent=2)
