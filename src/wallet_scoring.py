@@ -5,6 +5,7 @@ import json
 import requests
 import os
 import gc
+import sys
 from requests.adapters import HTTPAdapter, Retry
 
 # ==========================================
@@ -104,26 +105,25 @@ def fetch_gamma_market_outcomes():
     return pl_outcomes
 
 # ==========================================
-# 2. MAIN EXECUTION (MANUAL BATCHING)
+# 2. CHUNK PROCESSOR
 # ==========================================
 
 def process_chunk(df_chunk, outcomes_df):
     """
     Calculates stats for a single chunk of data.
-    Returns a small DataFrame with partial sums per user.
     """
-    # 1. Normalize IDs
+    # Normalize IDs
     df_chunk = df_chunk.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
     )
     
-    # 2. Join (Safe because chunk is small)
+    # Join
     joined = df_chunk.join(outcomes_df, on="contract_id", how="inner")
     
     if joined.height == 0:
         return None
 
-    # 3. Calculate ROI & Stats
+    # Aggregate
     stats = (
         joined
         .filter(pl.col("price").is_between(0.01, 0.99))
@@ -146,99 +146,117 @@ def process_chunk(df_chunk, outcomes_df):
     )
     return stats
 
+# ==========================================
+# 3. MAIN EXECUTION (DISK FLUSH STRATEGY)
+# ==========================================
+
 def main():
     csv_file = "gamma_trades_stream.csv"
+    temp_file = "temp_intermediate_stats.csv"
     output_file = "wallet_scores.json"
 
     if not os.path.exists(csv_file):
         print(f"❌ Error: File '{csv_file}' not found.")
         return
 
-    # 1. Load Outcomes (Small)
+    # 1. Load Outcomes
     outcomes = fetch_gamma_market_outcomes()
     
-    print(f"🚀 Starting Manual Batch Processing on '{csv_file}'...")
-    print("   (This method is OOM-proof but relies on disk speed)")
+    # 2. Reset Temp File
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
 
-    # 2. Initialize Batch Reader
-    # Batch size 1,000,000 rows is roughly ~150MB RAM. Very safe.
+    # Initialize Header in Temp File
+    # We create a dummy dataframe just to write the header
+    pl.DataFrame({"user": [], "net_roi": [], "pain": [], "count": []}).write_csv(temp_file)
+
+    print(f"🚀 Starting DISK-BUFFERED processing on '{csv_file}'...")
+    print(f"   (Intermediate results will be flushed to '{temp_file}')")
+
+    # 3. Batch Reader
+    # Reduced batch size to 500k to be extremely safe with per-step RAM
     reader = pl.read_csv_batched(
         csv_file, 
-        batch_size=1_000_000,
+        batch_size=500_000, 
         schema_overrides={"contract_id": pl.String, "user": pl.String},
         low_memory=True
     )
     
-    partial_results = []
     chunks_processed = 0
+    total_rows_processed = 0
     
-    # 3. Process Chunks Loop
     while True:
-        batches = reader.next_batches(1) # Fetch 1 batch at a time
-        if not batches:
-            break
-        
-        chunk = batches[0]
-        chunks_processed += 1
-        
-        # Process the chunk
-        agg_chunk = process_chunk(chunk, outcomes)
-        
-        if agg_chunk is not None:
-            partial_results.append(agg_chunk)
+        try:
+            batches = reader.next_batches(1)
+            if not batches: break
             
-        # Optional: Print progress every 10 chunks (~10M rows)
-        if chunks_processed % 10 == 0:
-            print(f"   Processed chunk {chunks_processed}...", end='\r')
+            chunk = batches[0]
+            chunks_processed += 1
+            total_rows_processed += chunk.height
             
-            # OPTIMIZATION: Compact the list periodically to prevent it growing too large
-            if len(partial_results) > 50:
-                compacted = pl.concat(partial_results).group_by("user").agg([
-                    pl.col("net_roi").sum(),
-                    pl.col("pain").sum(),
-                    pl.col("count").sum()
-                ])
-                partial_results = [compacted]
-                gc.collect()
+            # Process
+            agg_chunk = process_chunk(chunk, outcomes)
+            
+            # Flush to Disk
+            if agg_chunk is not None and agg_chunk.height > 0:
+                with open(temp_file, "a") as f:
+                    agg_chunk.write_csv(f, include_header=False)
+            
+            # CLEANUP: Aggressively free memory
+            del chunk
+            del agg_chunk
+            gc.collect()
 
-    print(f"\n✅ All chunks read. Finalizing scores...")
+            if chunks_processed % 10 == 0:
+                print(f"   Processed {chunks_processed} chunks (~{total_rows_processed//1_000_000}M rows)...", end='\r')
+                
+        except Exception as e:
+            print(f"\n❌ Error processing chunk {chunks_processed}: {e}")
+            break
+
+    print(f"\n✅ Scan complete. Loading intermediate stats from disk...")
 
     # 4. Final Aggregation
-    if not partial_results:
-        print("⚠️ No valid trades found.")
-        return
-
-    final_df = (
-        pl.concat(partial_results)
-        .group_by("user")
-        .agg([
-            pl.col("net_roi").sum(),
-            pl.col("pain").sum(),
-            pl.col("count").sum()
-        ])
-        .filter(pl.col("count") >= 20)
-        .with_columns([
-            # Gain-to-Pain Calculation
-            (pl.col("net_roi") / (pl.col("pain") + 0.1)).alias("efficiency"),
-            # Volume Boost (Log10)
-            (pl.col("count").log(10)).alias("boost")
-        ])
-        .with_columns(
-            (pl.col("efficiency") * pl.col("boost")).alias("weighted_score")
+    # Load the temp file (which is now a clean, small CSV of partial sums)
+    try:
+        final_df = (
+            pl.read_csv(temp_file, has_header=True)
+            .group_by("user")
+            .agg([
+                pl.col("net_roi").sum(),
+                pl.col("pain").sum(),
+                pl.col("count").sum()
+            ])
+            .filter(pl.col("count") >= 20)
+            .with_columns([
+                # Gain-to-Pain Calculation
+                (pl.col("net_roi") / (pl.col("pain") + 0.1)).alias("efficiency"),
+                # Volume Boost (Log10)
+                (pl.col("count").log(10)).alias("boost")
+            ])
+            .with_columns(
+                (pl.col("efficiency") * pl.col("boost")).alias("weighted_score")
+            )
         )
-    )
 
-    print(f"✅ Calculation complete. Scored {final_df.height} wallets.")
+        print(f"✅ Calculation complete. Scored {final_df.height} wallets.")
 
-    final_dict = {}
-    for row in final_df.iter_rows(named=True):
-        key = f"{row['user']}|default_topic"
-        final_dict[key] = row['weighted_score'] 
+        final_dict = {}
+        for row in final_df.iter_rows(named=True):
+            key = f"{row['user']}|default_topic"
+            final_dict[key] = row['weighted_score'] 
 
-    with open(output_file, "w") as f:
-        json.dump(final_dict, f, indent=2)
-    
-    print(f"Saved results to {output_file}")
+        with open(output_file, "w") as f:
+            json.dump(final_dict, f, indent=2)
+        
+        print(f"Saved results to {output_file}")
+        
+        # Cleanup temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    except Exception as e:
+        print(f"❌ Error during final aggregation: {e}")
 
 if __name__ == "__main__":
     main()
