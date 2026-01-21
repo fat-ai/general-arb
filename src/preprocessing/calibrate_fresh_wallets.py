@@ -10,11 +10,11 @@ import warnings
 warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (Incremental Deduplication) ---")
+    print("--- Fresh Wallet Calibration (Polynomial Diagnostic) ---")
     
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
-    output_file = 'model_params.json'
+    output_file = 'model_params_poly.json'
     BATCH_SIZE = 500_000 
 
     # 1. Load Outcomes
@@ -39,7 +39,6 @@ def main():
         print(f"❌ Error: File '{trades_path}' not found.")
         return
 
-    # We revert to read_csv_batched because it gives us strict control over memory
     reader = pl.read_csv_batched(
         trades_path,
         batch_size=BATCH_SIZE,
@@ -54,8 +53,7 @@ def main():
         low_memory=True
     )
 
-    # 3. Incremental Process
-    # We hold ONLY the unique first bets found so far.
+    # 3. Incremental Process (Same logic that worked)
     global_first_bets = pl.DataFrame(
         schema={
             "wallet_id": pl.String, 
@@ -68,7 +66,7 @@ def main():
     total_rows = 0
     batch_idx = 0
     
-    print("🚀 Starting Stream (Incremental First Bet Logic)...")
+    print("🚀 Starting Stream...")
     
     while True:
         batches = reader.next_batches(1)
@@ -80,9 +78,8 @@ def main():
         total_rows += len(chunk)
         
         if batch_idx % 10 == 0:
-            print(f"   Batch {batch_idx} | Rows: {total_rows:,} | Unique Wallets: {global_first_bets.height:,}...", end='\r')
+            print(f"   Batch {batch_idx} | Rows: {total_rows:,} | Unique: {global_first_bets.height:,}...", end='\r')
 
-        # --- A. Process Chunk ---
         chunk = chunk.with_columns([
             pl.col('contract_id').str.strip_chars(),
             pl.col('tradeAmount').alias('usdc_vol'),
@@ -91,42 +88,28 @@ def main():
             pl.col('user').alias('wallet_id'),
             pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
         ])
-
-        # Filter null dates immediately
         chunk = chunk.drop_nulls(subset=['ts_date'])
 
-        # Join & Filter
         joined = chunk.join(df_outcomes, on='contract_id', how='inner')
         if joined.height == 0: continue
-
         joined = joined.filter(pl.col('usdc_vol') >= 1.0)
         if joined.height == 0: continue
 
-        # Calc ROI
         price_no = (1.0 - joined['bet_price']).clip(lower_bound=0.01)
         outcome_no = (1.0 - joined['outcome'])
         is_long = joined['tokens'] > 0
-        
         long_roi = (joined['outcome'] - joined['bet_price']) / joined['bet_price']
         short_roi = (outcome_no - price_no) / price_no
-        
         final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 3.0)
         log_vol = joined['usdc_vol'].log1p()
 
         joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
 
-        # --- B. Isolate First Bets in Chunk ---
         chunk_firsts = (
             joined.sort("ts_date")
                   .unique(subset=["wallet_id"], keep="first")
                   .select(["wallet_id", "ts_date", "roi", "log_vol"])
         )
-        
-        # --- C. Incremental Merge (The Magic Step) ---
-        # 1. Stack the new candidates on top of our existing global list
-        # 2. Sort by Date
-        # 3. Unique by Wallet (Keep First)
-        # This keeps 'global_first_bets' minimal at all times.
         
         if global_first_bets.height > 0:
              global_first_bets = pl.concat([global_first_bets, chunk_firsts])
@@ -139,56 +122,76 @@ def main():
             .unique(subset=["wallet_id"], keep="first")
         )
         
-        # --- D. Aggressive Cleanup ---
         del chunk, joined, chunk_firsts
-        # Force GC every 5 batches to prevent fragmentation creep
-        if batch_idx % 5 == 0:
-            gc.collect()
+        if batch_idx % 5 == 0: gc.collect()
 
     print(f"\n✅ Scan complete. Found {global_first_bets.height} unique first bets.")
 
-    # 5. Run WLS Regression
-    print("Running WLS regression...")
-    qualified_wallets = global_first_bets.to_pandas()
+    # 4. POLYNOMIAL DIAGNOSTICS
+    print("Running Polynomial Regression...")
+    df = global_first_bets.to_pandas()
     
-    final_slope = 0.0
-    final_intercept = 0.0
+    if len(df) < 100:
+        print("❌ Not enough data.")
+        return
 
-    if len(qualified_wallets) >= 10:
-        try:
-            X = qualified_wallets['log_vol'].values
-            y = qualified_wallets['roi'].values
-            weights = qualified_wallets['log_vol'].values 
-            
-            X_with_const = sm.add_constant(X)
-            model = sm.WLS(y, X_with_const, weights=weights)
-            results = model.fit()
-            
-            intercept, slope = results.params
-            print(f"   (R-squared: {results.rsquared:.4f})")
-            print(f"   Raw Slope: {slope:.6f}")
-            
-            if np.isfinite(slope) and np.isfinite(intercept):
-                if slope > 0:
-                    final_intercept = max(-0.10, min(0.10, intercept))
-                    final_slope = slope
-        except Exception as e:
-            print(f"Regression failed: {e}")
-    else:
-        print("❌ Not enough wallets found.")
-
-    results_json = {"slope": float(final_slope), "intercept": float(final_intercept)}
+    # A. Setup Data
+    X = df['log_vol'].values
+    y = df['roi'].values
+    weights = df['log_vol'].values # Still weight by volume to reduce noise
+    
+    # B. Fit Linear (Baseline)
+    model_lin = sm.WLS(y, sm.add_constant(X), weights=weights)
+    res_lin = model_lin.fit()
+    
+    # C. Fit Polynomial (The Curve)
+    # X_poly has 2 columns: [log_vol, log_vol^2]
+    X_poly = np.column_stack((X, X**2))
+    model_poly = sm.WLS(y, sm.add_constant(X_poly), weights=weights)
+    res_poly = model_poly.fit()
+    
+    b0, b1, b2 = res_poly.params
     
     print("\n" + "="*40)
-    print("CALIBRATION RESULTS (FIRST BETS)")
+    print("🔍 DIAGNOSTIC REPORT")
     print("="*40)
-    print(f"Slope:     {final_slope:.6f}")
-    print(f"Intercept: {final_intercept:.6f}")
+    print(f"Linear Slope:      {res_lin.params[1]:.6f}")
+    print(f"Linear Intercept:  {res_lin.params[0]:.6f}")
+    print(f"Linear R²:         {res_lin.rsquared:.6f}")
+    print("-" * 40)
+    print(f"Poly Term (b1):    {b1:.6f}")
+    print(f"Squared Term (b2): {b2:.6f}")
+    print(f"Poly Intercept:    {b0:.6f}")
+    print(f"Poly R²:           {res_poly.rsquared:.6f}")
+    
+    # D. Calculate Peak
+    # Vertex x = -b1 / (2*b2)
+    peak_msg = "None"
+    if b2 < 0: # Concave down (A hump exists)
+        peak_log = -b1 / (2 * b2)
+        peak_usd = np.expm1(peak_log)
+        
+        # Check if peak is within realistic data range
+        min_log, max_log = X.min(), X.max()
+        if min_log <= peak_log <= max_log:
+            peak_msg = f"LogVol {peak_log:.2f} (~${peak_usd:,.2f})"
+        else:
+            peak_msg = f"Theoretical peak at ${peak_usd:,.2f} (Outside data range)"
+            
+    print("-" * 40)
+    print(f"🏆 OPTIMAL FIRST BET SIZE: {peak_msg}")
     print("="*40)
+
+    # Save Results
+    results = {
+        "linear": {"slope": res_lin.params[1], "intercept": res_lin.params[0]},
+        "poly": {"b0": b0, "b1": b1, "b2": b2},
+        "optimal_size_usd": float(np.expm1(-b1 / (2*b2))) if b2 < 0 else None
+    }
     
     with open(output_file, 'w') as f:
-        json.dump(results_json, f, indent=4)
-    print(f"✅ Saved results to {output_file}")
+        json.dump(results, f, indent=4)
+    print(f"Saved details to {output_file}")
 
 if __name__ == "__main__":
     main()
