@@ -7,11 +7,10 @@ import os
 import gc
 import warnings
 
-# Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def main():
-    print("--- Fresh Wallet Calibration (Strict: < 5 Trades Only) ---")
+    print("--- Fresh Wallet Calibration (Strict: FIRST BET ONLY) ---")
     
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
@@ -40,7 +39,7 @@ def main():
         print(f"❌ Error: File '{trades_path}' not found.")
         return
 
-    # Use robust batch reader
+    # ADDED 'timestamp' to schema so we can find the first trade
     reader = pl.read_csv_batched(
         trades_path,
         batch_size=BATCH_SIZE,
@@ -49,16 +48,17 @@ def main():
             "user": pl.String,
             "tradeAmount": pl.Float64,
             "outcomeTokensAmount": pl.Float64,
-            "price": pl.Float64
+            "price": pl.Float64,
+            "timestamp": pl.String 
         },
         low_memory=True
     )
 
     # 3. Process Batches
-    partial_stats = []
+    partial_first_bets = []
     total_rows = 0
     
-    print("🚀 Starting Map-Reduce Loop...")
+    print("🚀 Starting Stream (Finding First Bets)...")
     
     while True:
         batches = reader.next_batches(1)
@@ -68,13 +68,14 @@ def main():
         chunk = batches[0]
         total_rows += len(chunk)
 
-        # Standard Cleaning & Join Logic
+        # Standard Cleaning & Join
         chunk = chunk.with_columns([
             pl.col('contract_id').str.strip_chars(),
             pl.col('tradeAmount').alias('usdc_vol'),
             pl.col('outcomeTokensAmount').alias('tokens'),
             pl.col('price').alias('bet_price'),
-            pl.col('user').alias('wallet_id')
+            pl.col('user').alias('wallet_id'),
+            pl.col('timestamp') # Keep timestamp
         ])
 
         joined = chunk.join(df_outcomes, on='contract_id', how='inner')
@@ -96,50 +97,49 @@ def main():
 
         joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
 
-        # Aggregate
-        agg_chunk = joined.group_by('wallet_id').agg([
-            pl.col('roi').sum().alias('sum_roi'),
-            pl.col('log_vol').sum().alias('sum_log_vol'),
-            pl.len().alias('count')
-        ])
-        partial_stats.append(agg_chunk)
+        # --- KEY CHANGE: Keep ONLY the First Bet in this Chunk ---
+        # 1. Sort chunk by timestamp
+        # 2. Group by wallet_id and take the first row
+        # This reduces 500k rows to just "1 row per active wallet in this chunk"
+        first_in_chunk = (
+            joined.sort("timestamp")
+                  .unique(subset=["wallet_id"], keep="first")
+                  .select(["wallet_id", "timestamp", "roi", "log_vol"])
+        )
         
-        # Memory Compaction
-        if len(partial_stats) >= 10:
+        partial_first_bets.append(first_in_chunk)
+        
+        # --- MEMORY COMPACTION ---
+        # Every 10 batches, merge our lists to ensure we don't hold duplicate wallets.
+        # We merge all known "first bets" and keep only the absolute earliest timestamp.
+        if len(partial_first_bets) >= 10:
             print(f"   [Compacting memory] Processed {total_rows:,} rows...", end='\r')
-            compacted = pl.concat(partial_stats).group_by('wallet_id').agg([
-                pl.col('sum_roi').sum(), pl.col('sum_log_vol').sum(), pl.col('count').sum()
-            ])
-            partial_stats = [compacted]
+            compacted = (
+                pl.concat(partial_first_bets)
+                .sort("timestamp")
+                .unique(subset=["wallet_id"], keep="first")
+            )
+            partial_first_bets = [compacted]
             gc.collect()
 
     print(f"\n✅ Scan complete. Processed {total_rows:,} rows.")
 
-    # 4. Final Reduce & Filtering
-    if not partial_stats:
+    # 4. Final Reduce (Get Absolute First Bets)
+    if not partial_first_bets:
         print("❌ No valid trades found.")
         return
 
-    final_df = pl.concat(partial_stats).group_by('wallet_id').agg([
-        pl.col('sum_roi').sum(), pl.col('sum_log_vol').sum(), pl.col('count').sum()
-    ])
-    
-    # --- CRITICAL FIX IS HERE ---
-    # We calculate means, but then we STRICTLY FILTER for "Fresh" wallets.
-    # Definition: Count < 5 (Wallets with 1, 2, 3, or 4 trades only).
-    # This automatically removes all Market Makers, Bots, and Experts.
-    
-    final_df = final_df.with_columns([
-        (pl.col('sum_roi') / pl.col('count')).alias('mean_roi'),
-        (pl.col('sum_log_vol') / pl.col('count')).alias('mean_log_vol')
-    ]).filter(
-        (pl.col('count') >= 1) & 
-        (pl.col('count') < 5)    # <--- THE FRESH WALLET FILTER
+    # Final merge of all chunks
+    final_df = (
+        pl.concat(partial_first_bets)
+        .sort("timestamp")
+        .unique(subset=["wallet_id"], keep="first")
     )
+    
+    print(f"Found {final_df.height} unique wallets (First Bets Isolated).")
 
-    print(f"Filtered down to {final_df.height} FRESH wallets (Active < 5 times).")
-
-    print("Running WLS regression...")
+    # 5. Run WLS Regression
+    print("Running WLS regression on First Bets...")
     qualified_wallets = final_df.to_pandas()
     
     final_slope = 0.0
@@ -147,9 +147,9 @@ def main():
 
     if len(qualified_wallets) >= 10:
         try:
-            X = qualified_wallets['mean_log_vol'].values
-            y = qualified_wallets['mean_roi'].values
-            weights = qualified_wallets['mean_log_vol'].values 
+            X = qualified_wallets['log_vol'].values
+            y = qualified_wallets['roi'].values
+            weights = qualified_wallets['log_vol'].values 
             
             X_with_const = sm.add_constant(X)
             model = sm.WLS(y, X_with_const, weights=weights)
@@ -160,19 +160,19 @@ def main():
             print(f"   Raw Slope: {slope:.6f}")
             
             if np.isfinite(slope) and np.isfinite(intercept):
-                # We apply the logic: if slope is positive, we keep it.
+                # Clamp intercept for safety, but keep slope if positive
                 if slope > 0:
                     final_intercept = max(-0.10, min(0.10, intercept))
                     final_slope = slope
         except Exception as e:
             print(f"Regression failed: {e}")
     else:
-        print("❌ Not enough fresh wallets found for regression.")
+        print("❌ Not enough wallets found for regression.")
 
     results_json = {"slope": float(final_slope), "intercept": float(final_intercept)}
     
     print("\n" + "="*40)
-    print("CALIBRATION RESULTS")
+    print("CALIBRATION RESULTS (FIRST BETS)")
     print("="*40)
     print(f"Slope:     {final_slope:.6f}")
     print(f"Intercept: {final_intercept:.6f}")
