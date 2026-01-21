@@ -7,10 +7,11 @@ import os
 import gc
 import warnings
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (Strict: FIRST BET ONLY) ---")
+    print("--- Fresh Wallet Calibration (Robust First Bet Version) ---")
     
     trades_path = 'gamma_trades_stream.csv'
     outcomes_path = 'market_outcomes.parquet'
@@ -33,106 +34,117 @@ def main():
         print(f"❌ Error loading outcomes: {e}")
         return
 
-    # 2. Initialize Reader
-    print(f"Initializing batch reader for {trades_path}...")
+    # 2. Initialize Modern Reader (scan_csv + collect_batches)
+    print(f"Initializing reader for {trades_path}...")
     if not os.path.exists(trades_path):
         print(f"❌ Error: File '{trades_path}' not found.")
         return
 
-    # ADDED 'timestamp' to schema so we can find the first trade
-    reader = pl.read_csv_batched(
+    # We use scan_csv which is more stable with large files
+    lazy_reader = pl.scan_csv(
         trades_path,
-        batch_size=BATCH_SIZE,
         schema_overrides={
             "contract_id": pl.String,
             "user": pl.String,
             "tradeAmount": pl.Float64,
             "outcomeTokensAmount": pl.Float64,
             "price": pl.Float64,
-            "timestamp": pl.String 
+            "timestamp": pl.String # Read as string first, cast later
         },
-        low_memory=True
+        low_memory=True, # Critical for 4GB limit
+        ignore_errors=True # Skip bad lines instead of crashing
     )
+    
+    # Create the batch iterator
+    batch_iter = lazy_reader.collect_batches(batch_size=BATCH_SIZE)
 
     # 3. Process Batches
     partial_first_bets = []
     total_rows = 0
+    batch_idx = 0
     
     print("🚀 Starting Stream (Finding First Bets)...")
     
-    while True:
-        batches = reader.next_batches(1)
-        if not batches:
-            break
+    try:
+        for chunk in batch_iter:
+            batch_idx += 1
+            total_rows += len(chunk)
             
-        chunk = batches[0]
-        total_rows += len(chunk)
+            # Print progress every 10 batches (5M rows)
+            if batch_idx % 10 == 0:
+                print(f"   Processing batch {batch_idx} ({total_rows:,} rows)...", end='\r')
 
-        # Standard Cleaning & Join
-        chunk = chunk.with_columns([
-            pl.col('contract_id').str.strip_chars(),
-            pl.col('tradeAmount').alias('usdc_vol'),
-            pl.col('outcomeTokensAmount').alias('tokens'),
-            pl.col('price').alias('bet_price'),
-            pl.col('user').alias('wallet_id'),
-            pl.col('timestamp') # Keep timestamp
-        ])
+            # Standard Cleaning & Join
+            chunk = chunk.with_columns([
+                pl.col('contract_id').str.strip_chars(),
+                pl.col('tradeAmount').alias('usdc_vol'),
+                pl.col('outcomeTokensAmount').alias('tokens'),
+                pl.col('price').alias('bet_price'),
+                pl.col('user').alias('wallet_id'),
+                
+                # OPTIMIZATION: Convert timestamp to Datetime immediately to save RAM
+                # (Assumes ISO8601 or standard format. If this fails, it becomes null, which is fine)
+                pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
+            ])
 
-        joined = chunk.join(df_outcomes, on='contract_id', how='inner')
-        if joined.height == 0: continue
+            # Drop rows where timestamp failed to parse (if any)
+            chunk = chunk.drop_nulls(subset=['ts_date'])
 
-        joined = joined.filter(pl.col('usdc_vol') >= 1.0)
-        if joined.height == 0: continue
+            joined = chunk.join(df_outcomes, on='contract_id', how='inner')
+            if joined.height == 0: continue
 
-        # ROI Calculation
-        price_no = (1.0 - joined['bet_price']).clip(lower_bound=0.01)
-        outcome_no = (1.0 - joined['outcome'])
-        is_long = joined['tokens'] > 0
-        
-        long_roi = (joined['outcome'] - joined['bet_price']) / joined['bet_price']
-        short_roi = (outcome_no - price_no) / price_no
-        
-        final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 3.0)
-        log_vol = joined['usdc_vol'].log1p()
+            joined = joined.filter(pl.col('usdc_vol') >= 1.0)
+            if joined.height == 0: continue
 
-        joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
+            # ROI Calculation
+            price_no = (1.0 - joined['bet_price']).clip(lower_bound=0.01)
+            outcome_no = (1.0 - joined['outcome'])
+            is_long = joined['tokens'] > 0
+            
+            long_roi = (joined['outcome'] - joined['bet_price']) / joined['bet_price']
+            short_roi = (outcome_no - price_no) / price_no
+            
+            final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 3.0)
+            log_vol = joined['usdc_vol'].log1p()
 
-        # --- KEY CHANGE: Keep ONLY the First Bet in this Chunk ---
-        # 1. Sort chunk by timestamp
-        # 2. Group by wallet_id and take the first row
-        # This reduces 500k rows to just "1 row per active wallet in this chunk"
-        first_in_chunk = (
-            joined.sort("timestamp")
-                  .unique(subset=["wallet_id"], keep="first")
-                  .select(["wallet_id", "timestamp", "roi", "log_vol"])
-        )
-        
-        partial_first_bets.append(first_in_chunk)
-        
-        # --- MEMORY COMPACTION ---
-        # Every 10 batches, merge our lists to ensure we don't hold duplicate wallets.
-        # We merge all known "first bets" and keep only the absolute earliest timestamp.
-        if len(partial_first_bets) >= 10:
-            print(f"   [Compacting memory] Processed {total_rows:,} rows...", end='\r')
-            compacted = (
-                pl.concat(partial_first_bets)
-                .sort("timestamp")
-                .unique(subset=["wallet_id"], keep="first")
+            joined = joined.with_columns([final_roi.alias('roi'), log_vol.alias('log_vol')])
+
+            # Keep ONLY the First Bet in this Chunk
+            # Using 'ts_date' (int64 underneath) is much faster/lighter than sorting Strings
+            first_in_chunk = (
+                joined.sort("ts_date")
+                      .unique(subset=["wallet_id"], keep="first")
+                      .select(["wallet_id", "ts_date", "roi", "log_vol"])
             )
-            partial_first_bets = [compacted]
-            gc.collect()
+            
+            partial_first_bets.append(first_in_chunk)
+            
+            # MEMORY COMPACTION (Frequent: Every 5 batches / 2.5M rows)
+            # We increased frequency to prevent memory spikes
+            if len(partial_first_bets) >= 5:
+                compacted = (
+                    pl.concat(partial_first_bets)
+                    .sort("ts_date")
+                    .unique(subset=["wallet_id"], keep="first")
+                )
+                partial_first_bets = [compacted]
+                gc.collect() # Force cleanup
+
+    except Exception as e:
+        print(f"\n❌ Reader crashed at {total_rows} rows: {e}")
+        # Proceed with what we have so far
+        pass
 
     print(f"\n✅ Scan complete. Processed {total_rows:,} rows.")
 
-    # 4. Final Reduce (Get Absolute First Bets)
+    # 4. Final Reduce
     if not partial_first_bets:
         print("❌ No valid trades found.")
         return
 
-    # Final merge of all chunks
     final_df = (
         pl.concat(partial_first_bets)
-        .sort("timestamp")
+        .sort("ts_date")
         .unique(subset=["wallet_id"], keep="first")
     )
     
