@@ -4,112 +4,17 @@ import numpy as np
 import json
 import requests
 import os
+import gc
 from requests.adapters import HTTPAdapter, Retry
 
 # ==========================================
-# 1. HELPERS
+# 1. FETCH OUTCOMES (Cached)
 # ==========================================
-
-def normalize_contract_id(id_str):
-    """Single source of truth for ID normalization"""
-    return str(id_str).strip().lower().replace('0x', '')
-
-def fast_calculate_rois(profiler_data, min_trades: int = 1, cutoff_date=None):
-    """
-    OPTIMIZED: Uses Polars for 10x speedup on grouping/aggregating massive datasets.
-    Falls back to Pandas if Polars is missing.
-    """
-    # 1. Try Polars (Fast Path)
-    try:
-        import polars as pl
-        
-        # Convert efficiently (zero-copy if possible)
-        df = pl.from_pandas(profiler_data)
-        
-        # Filter by Date
-        if cutoff_date:
-            # Ensure cutoff is compatible with Polars types
-            time_col = 'res_time' if 'res_time' in df.columns else 'timestamp'
-            df = df.filter(pl.col(time_col) < cutoff_date)
-            
-        # Filter Valid Trades
-        # Note: Polars `is_between` is inclusive by default
-        df = df.filter(
-            pl.col('outcome').is_not_null() &
-            pl.col('bet_price').is_between(0.01, 0.99)
-        )
-        
-        if df.height == 0:
-            return {}
-
-        # Vectorized ROI Calculation (Atomic)
-        # We calculate everything in one expression context for speed
-        stats = (
-            df.with_columns([
-                # Logic: Long vs Short ROI
-                pl.when(pl.col('tokens') > 0)
-                  .then((pl.col('outcome') - pl.col('bet_price')) / pl.col('bet_price'))
-                  .otherwise(
-                      # Short Logic: (Outcome_No - Price_No) / Price_No
-                      # Outcome_No = 1 - Outcome, Price_No = 1 - Price
-                      ((1.0 - pl.col('outcome')) - (1.0 - pl.col('bet_price'))) / 
-                      (1.0 - pl.col('bet_price').clip(0.01, 1.0)) 
-                  )
-                  .clip(-1.0, 3.0) # Clip outliers immediately
-                  .alias('roi')
-            ])
-            .group_by(['wallet_id', 'entity_type'])
-            .agg([
-                pl.col('roi').mean().alias('mean'),
-                pl.col('roi').len().alias('count') # .len() is fast count
-            ])
-            .filter(pl.col('count') >= min_trades)
-        )
-        
-        # Fast Dictionary Construction
-        keys = (stats['wallet_id'] + "|" + stats['entity_type']).to_list()
-        vals = stats['mean'].to_list()
-        return dict(zip(keys, vals))
-
-    except ImportError:
-        # 2. Pandas Fallback (Slow Path - Original Logic)
-        if profiler_data.empty: return {}
-        
-        valid = profiler_data.dropna(subset=['outcome', 'bet_price', 'wallet_id']).copy()
-        
-        if cutoff_date is not None:
-            time_col = 'res_time' if 'res_time' in valid.columns else 'timestamp'
-            valid = valid[valid[time_col] < cutoff_date]
-            
-        valid = valid[valid['bet_price'].between(0.01, 0.99)] 
-        
-        long_mask = valid['tokens'] > 0
-        valid.loc[long_mask, 'raw_roi'] = (valid.loc[long_mask, 'outcome'] - valid.loc[long_mask, 'bet_price']) / valid.loc[long_mask, 'bet_price']
-        
-        short_mask = valid['tokens'] < 0
-        price_no = 1.0 - valid.loc[short_mask, 'bet_price']
-        outcome_no = 1.0 - valid.loc[short_mask, 'outcome']
-        price_no = price_no.clip(lower=0.01)
-        valid.loc[short_mask, 'raw_roi'] = (outcome_no - price_no) / price_no
-        
-        valid['raw_roi'] = valid['raw_roi'].clip(-1.0, 3.0)
-        
-        stats = valid.groupby(['wallet_id', 'entity_type'])['raw_roi'].agg(['mean', 'count'])
-        qualified = stats[stats['count'] >= min_trades]
-        
-        result = {}
-        for (wallet, entity), row in qualified.iterrows():
-            result[f"{wallet}|{entity}"] = row['mean']
-            
-        return result
-
 def fetch_gamma_market_outcomes():
-    # CACHE CONFIGURATION
     cache_file = "market_outcomes.parquet"
     
-    # 1. CHECK CACHE FIRST
     if os.path.exists(cache_file):
-        print(f"✅ Found cached outcomes in '{cache_file}'. Loading...")
+        print(f"✅ Found cached outcomes. Loading...")
         return pl.read_parquet(cache_file)
 
     print("Fetching market outcomes from Polymarket API...")
@@ -118,7 +23,6 @@ def fetch_gamma_market_outcomes():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
-    # Fetch both states
     for state in ["false", "true"]: 
         offset = 0
         print(f"   Fetching closed={state}...", end=" ", flush=True)
@@ -141,7 +45,6 @@ def fetch_gamma_market_outcomes():
 
     if not all_rows: return pl.DataFrame()
 
-    # Pandas processing (same as before)
     df = pd.DataFrame(all_rows)
 
     def extract_tokens(row):
@@ -194,57 +97,35 @@ def fetch_gamma_market_outcomes():
         return 1.0 if row['token_index'] == winning_idx else 0.0
 
     df['final_outcome'] = df.apply(final_payout, axis=1)
-    
-    # Normalize ID logic
     df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
     
-    # Convert to Polars
     pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
-    
-    # 2. SAVE TO CACHE
-    print(f"Saving {pl_outcomes.height} outcomes to cache...")
     pl_outcomes.write_parquet(cache_file)
-    
     return pl_outcomes
-    
+
 # ==========================================
-# 2. MAIN EXECUTION
+# 2. MAIN EXECUTION (MANUAL BATCHING)
 # ==========================================
 
-def main():
-    csv_file = "gamma_trades_stream.csv"
-    output_file = "wallet_scores.json"
-
-    if not os.path.exists(csv_file):
-        print(f"❌ Error: File '{csv_file}' not found.")
-        return
-
-    # 1. Fetch small outcome table (Memory Safe)
-    pl_outcomes = fetch_gamma_market_outcomes()
-    
-    if pl_outcomes.height == 0:
-        print("⚠️ Warning: Could not fetch market outcomes.")
-        return
-
-    print(f"Scanning '{csv_file}' using Lazy Streaming...")
-    
-    q_trades = pl.scan_csv(
-        csv_file,
-        schema_overrides={
-            "contract_id": pl.String,
-            "user": pl.String
-        }
-    )
-    
-    # Normalize IDs inside the Query Plan
-    q_trades = q_trades.with_columns(
+def process_chunk(df_chunk, outcomes_df):
+    """
+    Calculates stats for a single chunk of data.
+    Returns a small DataFrame with partial sums per user.
+    """
+    # 1. Normalize IDs
+    df_chunk = df_chunk.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
     )
+    
+    # 2. Join (Safe because chunk is small)
+    joined = df_chunk.join(outcomes_df, on="contract_id", how="inner")
+    
+    if joined.height == 0:
+        return None
 
-    # 3. JOIN & CALCULATE
-    q_joined = (
-        q_trades
-        .join(pl_outcomes.lazy(), on="contract_id", how="inner")
+    # 3. Calculate ROI & Stats
+    stats = (
+        joined
         .filter(pl.col("price").is_between(0.01, 0.99))
         .with_columns([
             pl.when(pl.col("outcomeTokensAmount") > 0)
@@ -258,39 +139,99 @@ def main():
         ])
         .group_by("user")
         .agg([
-            # 1. Sum of Net Profit
-            pl.col("roi").sum().alias("total_net_roi"),
-            
-            # 2. Sum of Pain (Absolute value of losses)
-            pl.col("roi").filter(pl.col("roi") < 0).sum().abs().alias("total_loss_pain"),
-            
-            # 3. Trade Count
-            pl.col("roi").len().alias("trade_count")
+            pl.col("roi").sum().alias("net_roi"),
+            pl.col("roi").filter(pl.col("roi") < 0).sum().abs().alias("pain"),
+            pl.col("roi").len().alias("count")
         ])
-        .filter(pl.col("trade_count") >= 20)
-        .with_columns([
-            # Step A: Calculate Efficiency (Gain-to-Pain)
-            (pl.col("total_net_roi") / (pl.col("total_loss_pain") + 0.1)).alias("efficiency_score"),
+    )
+    return stats
+
+def main():
+    csv_file = "gamma_trades_stream.csv"
+    output_file = "wallet_scores.json"
+
+    if not os.path.exists(csv_file):
+        print(f"❌ Error: File '{csv_file}' not found.")
+        return
+
+    # 1. Load Outcomes (Small)
+    outcomes = fetch_gamma_market_outcomes()
+    
+    print(f"🚀 Starting Manual Batch Processing on '{csv_file}'...")
+    print("   (This method is OOM-proof but relies on disk speed)")
+
+    # 2. Initialize Batch Reader
+    # Batch size 1,000,000 rows is roughly ~150MB RAM. Very safe.
+    reader = pl.read_csv_batched(
+        csv_file, 
+        batch_size=1_000_000,
+        schema_overrides={"contract_id": pl.String, "user": pl.String},
+        low_memory=True
+    )
+    
+    partial_results = []
+    chunks_processed = 0
+    
+    # 3. Process Chunks Loop
+    while True:
+        batches = reader.next_batches(1) # Fetch 1 batch at a time
+        if not batches:
+            break
+        
+        chunk = batches[0]
+        chunks_processed += 1
+        
+        # Process the chunk
+        agg_chunk = process_chunk(chunk, outcomes)
+        
+        if agg_chunk is not None:
+            partial_results.append(agg_chunk)
             
-            # Step B: Calculate Volume Reward (Log10)
-            # 100 trades -> 2.0x boost
-            # 1000 trades -> 3.0x boost
-            (pl.col("trade_count").log(10)).alias("volume_boost")
+        # Optional: Print progress every 10 chunks (~10M rows)
+        if chunks_processed % 10 == 0:
+            print(f"   Processed chunk {chunks_processed}...", end='\r')
+            
+            # OPTIMIZATION: Compact the list periodically to prevent it growing too large
+            if len(partial_results) > 50:
+                compacted = pl.concat(partial_results).group_by("user").agg([
+                    pl.col("net_roi").sum(),
+                    pl.col("pain").sum(),
+                    pl.col("count").sum()
+                ])
+                partial_results = [compacted]
+                gc.collect()
+
+    print(f"\n✅ All chunks read. Finalizing scores...")
+
+    # 4. Final Aggregation
+    if not partial_results:
+        print("⚠️ No valid trades found.")
+        return
+
+    final_df = (
+        pl.concat(partial_results)
+        .group_by("user")
+        .agg([
+            pl.col("net_roi").sum(),
+            pl.col("pain").sum(),
+            pl.col("count").sum()
+        ])
+        .filter(pl.col("count") >= 20)
+        .with_columns([
+            # Gain-to-Pain Calculation
+            (pl.col("net_roi") / (pl.col("pain") + 0.1)).alias("efficiency"),
+            # Volume Boost (Log10)
+            (pl.col("count").log(10)).alias("boost")
         ])
         .with_columns(
-            # Step C: Combine them
-            (pl.col("efficiency_score") * pl.col("volume_boost")).alias("weighted_score")
+            (pl.col("efficiency") * pl.col("boost")).alias("weighted_score")
         )
     )
 
-    print("Executing streaming calculation (this may take a while)...")
-    
-    results_df = q_joined.collect(engine="streaming")
-
-    print(f"✅ Calculation complete. Found {results_df.height} scored wallets.")
+    print(f"✅ Calculation complete. Scored {final_df.height} wallets.")
 
     final_dict = {}
-    for row in results_df.iter_rows(named=True):
+    for row in final_df.iter_rows(named=True):
         key = f"{row['user']}|default_topic"
         final_dict[key] = row['weighted_score'] 
 
