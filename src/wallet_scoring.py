@@ -167,32 +167,41 @@ def main():
         os.remove(temp_file)
 
     # Initialize Header in Temp File
-    # We create a dummy dataframe just to write the header
     pl.DataFrame({"user": [], "net_roi": [], "pain": [], "count": []}).write_csv(temp_file)
 
     print(f"🚀 Starting DISK-BUFFERED processing on '{csv_file}'...")
     print(f"   (Intermediate results will be flushed to '{temp_file}')")
 
-    # 3. Batch Reader
-    # Reduced batch size to 500k to be extremely safe with per-step RAM
-    reader = pl.read_csv_batched(
-        csv_file, 
-        batch_size=500_000, 
-        schema_overrides={"contract_id": pl.String, "user": pl.String},
-        low_memory=True
-    )
-    
+    # 3. MANUAL SLICING LOOP (Replaces read_csv_batched)
+    # We scan the file once to get the total length, then slice it in chunks.
+    try:
+        # Get total row count efficiently
+        total_rows = pl.scan_csv(csv_file).select(pl.len()).collect().item()
+        print(f"   Total rows to process: {total_rows:,}")
+    except Exception as e:
+        print(f"   Could not determine file length: {e}")
+        return
+
+    chunk_size = 500_000
+    current_offset = 0
     chunks_processed = 0
-    total_rows_processed = 0
-    
-    while True:
+
+    while current_offset < total_rows:
         try:
-            batches = reader.next_batches(1)
-            if not batches: break
+            # Lazy Scan -> Slice -> Collect
+            # This reads ONLY the specific chunk from disk
+            chunk = pl.scan_csv(
+                csv_file,
+                schema_overrides={"contract_id": pl.String, "user": pl.String},
+                low_memory=True
+            ).slice(current_offset, chunk_size).collect()
             
-            chunk = batches[0]
+            if chunk.height == 0:
+                break
+            
+            # Update counters
+            current_offset += chunk.height
             chunks_processed += 1
-            total_rows_processed += chunk.height
             
             # Process
             agg_chunk = process_chunk(chunk, outcomes)
@@ -202,22 +211,21 @@ def main():
                 with open(temp_file, "a") as f:
                     agg_chunk.write_csv(f, include_header=False)
             
-            # CLEANUP: Aggressively free memory
+            # CLEANUP
             del chunk
             del agg_chunk
             gc.collect()
 
             if chunks_processed % 10 == 0:
-                print(f"   Processed {chunks_processed} chunks (~{total_rows_processed//1_000_000}M rows)...", end='\r')
+                print(f"   Processed {current_offset:,} / {total_rows:,} rows...", end='\r')
                 
         except Exception as e:
-            print(f"\n❌ Error processing chunk {chunks_processed}: {e}")
+            print(f"\n❌ Error processing chunk at offset {current_offset}: {e}")
             break
 
     print(f"\n✅ Scan complete. Loading intermediate stats from disk...")
 
     # 4. Final Aggregation
-    # Load the temp file (which is now a clean, small CSV of partial sums)
     try:
         final_df = (
             pl.read_csv(temp_file, has_header=True)
@@ -251,7 +259,6 @@ def main():
         
         print(f"Saved results to {output_file}")
         
-        # Cleanup temp file
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
