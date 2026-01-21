@@ -12,12 +12,11 @@ def main():
     outcomes_path = 'market_outcomes.parquet'
     output_file = 'model_params.json'
 
-    # 1. Load Outcomes (Correcting Column Name)
+    # 1. Load Outcomes
     print(f"Loading outcomes from {outcomes_path}...")
     try:
         q_outcomes = (
             pl.scan_parquet(outcomes_path)
-            # FIX: Select 'final_outcome' and rename it to 'outcome'
             .select([
                 pl.col('contract_id'),
                 pl.col('final_outcome').alias('outcome')
@@ -29,20 +28,28 @@ def main():
         print(f"❌ Error loading outcomes: {e}")
         return
 
-    # 2. Setup Lazy Scan for Trades
+    # 2. Setup Lazy Scan for Trades (FIXED SCHEMA)
     print(f"Configuring lazy scan for {trades_path}...")
     if not os.path.exists(trades_path):
         print(f"❌ Error: File '{trades_path}' not found.")
         return
 
+    # FIX: We use 'schema_overrides' to force IDs to be read as Strings.
+    # This prevents Polars from crashing on huge uint256 integers.
     q_trades = (
-        pl.scan_csv(trades_path)
+        pl.scan_csv(
+            trades_path,
+            schema_overrides={
+                "contract_id": pl.String,
+                "user": pl.String
+            }
+        )
         .select([
-            pl.col('contract_id').cast(pl.String).str.strip_chars(),
+            pl.col('contract_id').str.strip_chars(),
             pl.col('tradeAmount').cast(pl.Float64).alias('usdc_vol'),
             pl.col('outcomeTokensAmount').cast(pl.Float64).alias('tokens'),
             pl.col('price').cast(pl.Float64).alias('bet_price'),
-            pl.col('user').cast(pl.String).alias('wallet_id')
+            pl.col('user').alias('wallet_id')
         ])
     )
 
@@ -80,7 +87,6 @@ def main():
     # 4. Execute Streaming
     print("🚀 Executing Streaming Pipeline...")
     try:
-        # FIX: Updated from streaming=True to engine="streaming"
         wallet_stats_pl = pipeline.collect(engine="streaming")
         print(f"✅ Aggregated stats for {len(wallet_stats_pl)} wallets.")
     except Exception as e:
@@ -106,20 +112,15 @@ def main():
             # WEIGHTS: We use Log Volume as the weight.
             weights = qualified_wallets['mean_log_vol'].values
 
-            # Statsmodels requires adding a constant manually for the intercept
             X_with_const = sm.add_constant(X)
             
-            # Fit WLS Model
             model = sm.WLS(y, X_with_const, weights=weights)
             results = model.fit()
             
-            # Extract params (const is index 0, slope is index 1)
             intercept, slope = results.params
             
-            # Validate (Basic sanity checks)
             if np.isfinite(slope) and np.isfinite(intercept):
                 if slope > 0:
-                    # Clamp intercept to keep small bets neutral
                     final_intercept = max(-0.10, min(0.10, intercept))
                     final_slope = slope
                     
