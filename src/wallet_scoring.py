@@ -1,20 +1,20 @@
+import polars as pl
 import pandas as pd
 import numpy as np
 import json
 import requests
 import os
-import sys
 from requests.adapters import HTTPAdapter, Retry
 
 # ==========================================
-# 1. HELPERS FROM SOURCE (b2.py)
+# 1. HELPERS
 # ==========================================
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
 
-def fast_calculate_rois(profiler_data, min_trades: int = 20, cutoff_date=None):
+def fast_calculate_rois(profiler_data, min_trades: int = 1, cutoff_date=None):
     """
     OPTIMIZED: Uses Polars for 10x speedup on grouping/aggregating massive datasets.
     Falls back to Pandas if Polars is missing.
@@ -105,8 +105,8 @@ def fast_calculate_rois(profiler_data, min_trades: int = 20, cutoff_date=None):
 
 def fetch_gamma_market_outcomes():
     """
-    Extracts strictly the outcome logic from _fetch_gamma_markets in b2.py.
-    Necessary because the CSV does not contain market results (Win/Loss).
+    Fetches market outcomes (0 or 1) from Polymarket API.
+    Returns a Polars DataFrame.
     """
     print("Fetching market outcomes from Polymarket API...")
     all_rows = []
@@ -114,7 +114,7 @@ def fetch_gamma_market_outcomes():
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
-    # Fetch both states (closed/active) to ensure we get historical resolution data
+    # Fetch both states (closed/active)
     for state in ["false", "true"]: 
         offset = 0
         print(f"   Fetching closed={state}...", end=" ", flush=True)
@@ -122,9 +122,7 @@ def fetch_gamma_market_outcomes():
             params = {"limit": 500, "offset": offset, "closed": state}
             try:
                 resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
-                if resp.status_code != 200: 
-                    print(f"[Error {resp.status_code}]", end=" ")
-                    break
+                if resp.status_code != 200: break
                 
                 rows = resp.json()
                 if not rows: break
@@ -133,16 +131,14 @@ def fetch_gamma_market_outcomes():
                 offset += len(rows)
                 if len(rows) < 500: break 
                 print(".", end="", flush=True)
-            except Exception as e:
-                print(f"[Exc: {e}]", end=" ")
+            except Exception:
                 break
         print(f" Done.")
 
-    if not all_rows: return pd.DataFrame()
+    if not all_rows: return pl.DataFrame()
 
     df = pd.DataFrame(all_rows)
 
-    # 1. EXTRACT TOKENS (Logic from b2.py)
     def extract_tokens(row):
         raw = row.get('clobTokenIds') or row.get('tokens')
         if isinstance(raw, str):
@@ -164,7 +160,6 @@ def fetch_gamma_market_outcomes():
     df['contract_id'] = df.apply(extract_tokens, axis=1)
     df = df.dropna(subset=['contract_id'])
 
-    # 2. DERIVE OUTCOME (Logic from b2.py)
     def derive_outcome(row):
         val = row.get('outcome')
         if pd.notna(val):
@@ -187,23 +182,28 @@ def fetch_gamma_market_outcomes():
     df['outcome'] = df.apply(derive_outcome, axis=1)
     df = df.dropna(subset=['outcome'])
 
-    # 3. CALCULATE PAYOUT PER TOKEN ID
-    # Explode logic from b2.py to map Token ID -> 1.0 (Win) or 0.0 (Loss)
+    # Explode to map individual tokens to win/loss
     df['contract_id_list'] = df['contract_id'].str.split(',')
     df['market_row_id'] = df.index 
     df = df.explode('contract_id_list')
     df['token_index'] = df.groupby('market_row_id').cumcount()
     df['contract_id'] = df['contract_id_list'].str.strip()
     
+    # Logic: 1.0 if token index matches winning index, else 0.0
     def final_payout(row):
         winning_idx = int(round(row['outcome']))
         return 1.0 if row['token_index'] == winning_idx else 0.0
 
     df['final_outcome'] = df.apply(final_payout, axis=1)
     
-    # Return minimal map: ID -> Outcome (1.0 or 0.0)
-    return df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id'])
-
+    # Normalize ID logic
+    df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
+    
+    # Convert to Polars for the merge
+    pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
+    
+    return pl_outcomes
+    
 # ==========================================
 # 2. MAIN EXECUTION
 # ==========================================
@@ -216,47 +216,64 @@ def main():
         print(f"❌ Error: File '{csv_file}' not found.")
         return
 
-    print(f"Loading trades from {csv_file}...")
-    # Load trades
-    df_trades = pd.read_csv(csv_file)
+    # 1. Fetch small outcome table (Memory Safe)
+    pl_outcomes = fetch_gamma_market_outcomes()
     
-    # Normalize ID for joining
-    df_trades['contract_id'] = df_trades['contract_id'].apply(normalize_contract_id)
-
-    # Fetch outcomes to determine ROI
-    df_outcomes = fetch_gamma_market_outcomes()
-    df_outcomes['contract_id'] = df_outcomes['contract_id'].apply(normalize_contract_id)
-
-    print("Merging trades with market outcomes...")
-    merged = pd.merge(df_trades, df_outcomes, on='contract_id', how='inner')
-    
-    if merged.empty:
-        print("⚠️ Warning: No overlapping markets found between trades and API data.")
+    if pl_outcomes.height == 0:
+        print("⚠️ Warning: Could not fetch market outcomes.")
         return
 
-    # Map columns to what fast_calculate_rois expects
-    # b2.py mapping:
-    #   user -> wallet_id
-    #   price -> bet_price
-    #   outcomeTokensAmount -> tokens
-    #   final_outcome -> outcome
+    print(f"Scanning 80GB CSV '{csv_file}' using Lazy Streaming...")
     
-    merged['wallet_id'] = merged['user']
-    merged['bet_price'] = merged['price']
-    merged['tokens'] = merged['outcomeTokensAmount']
-    merged['outcome'] = merged['final_outcome']
+    # 2. LAZY LOAD: This does NOT read the file yet. It just prepares the plan.
+    # We use 'scan_csv' instead of 'read_csv'.
+    q_trades = pl.scan_csv(csv_file)
     
-    # Set entity_type to 'default_topic' to match the key format used in b2.py execution
-    merged['entity_type'] = 'default_topic'
+    # Normalize IDs inside the Query Plan
+    q_trades = q_trades.with_columns(
+        pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
+    )
+    
+    q_joined = (
+        q_trades
+        .join(pl_outcomes.lazy(), on="contract_id", how="inner")
+        .filter(pl.col("price").is_between(0.001, 0.999))
+        .with_columns([
+            pl.when(pl.col("outcomeTokensAmount") > 0)
+            .then((pl.col("final_outcome") - pl.col("price")) / pl.col("price"))
+            .otherwise(
+                ((1.0 - pl.col("final_outcome")) - (1.0 - pl.col("price"))) / 
+                (1.0 - pl.col("price")).clip(0.01, 1.0)
+            )
+            .alias("roi")
+            .clip(-1.0, float('inf'))
+        ])
+        .group_by("user")
+        .agg([
+            pl.col("roi").mean().alias("mean_roi"),
+            pl.col("roi").len().alias("trade_count")
+        ])
+        .filter(pl.col("trade_count") >= 1)
+        .with_columns(
+            (pl.col("mean_roi") * pl.col("trade_count").log()).alias("weighted_score")
+        )
+    )
 
-    print("Calculating Wallet Scores...")
-    # Run the exact logic function
-    scores = fast_calculate_rois(merged, min_trades=20) # Default from function definition
-
-    print(f"✅ Calculation complete. Found {len(scores)} scored wallets.")
+    print("Executing streaming calculation (this may take a while)...")
     
+    # 4. EXECUTE STREAMING
+    # .collect(streaming=True) processes the CSV in small chunks, never loading 80GB at once.
+    results_df = q_joined.collect(streaming=True)
+
+    print(f"✅ Calculation complete. Found {results_df.height} scored wallets.")
+
+    final_dict = {}
+    for row in results_df.iter_rows(named=True):
+        key = f"{row['user']}|default_topic"
+        final_dict[key] = row['mean_roi']
+
     with open(output_file, "w") as f:
-        json.dump(scores, f, indent=2)
+        json.dump(final_dict, f, indent=2)
     
     print(f"Saved results to {output_file}")
 
