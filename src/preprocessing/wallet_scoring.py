@@ -312,7 +312,7 @@ def main():
             ])
             .filter(
                 (pl.col("total_trades") >= 2) & 
-                (pl.col("total_invested") > 10.0) 
+                (pl.col("total_invested") > 100.0) 
             )
             .with_columns([
                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
