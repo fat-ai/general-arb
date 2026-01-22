@@ -291,29 +291,35 @@ class LiveTrader:
     # --- EXECUTION HELPERS ---
 
     async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
-        # 1. Wait for Liquidity
+        token_id = str(token_id)
+        
+        # --- NEW GUARD: Prevent "Machine Gun" Buying ---
+        # Check if we already hold a position in this specific token
+        if token_id in self.persistence.state["positions"]:
+            # Optional: You could allow adding to position up to a max limit, 
+            # but for now, let's just stop it from spamming.
+            # log.info(f"🛡️ Skipping Buy: Already hold position in {token_id}")
+            return
+        # -----------------------------------------------
+
+        # 1. Wait for Liquidity (Active Polling)
         book = None
-        for i in range(10): # increased to 10s
-            book = self.ws_books.get(str(token_id)) # Ensure string key
-            
-            if book and book.get('asks'):
-                break
+        for i in range(5):
+            book = self.ws_books.get(token_id)
+            if book and book.get('asks'): break
             
             if i == 0:
-                log.info(f"⏳ Cold Start: Waiting for book data on {token_id}...")
+                log.info(f"⏳ Cold Start: Waiting for {token_id}...")
                 tokens = self.metadata.fpmm_to_tokens.get(fpmm)
-                if tokens: 
+                if tokens:
                     self.sub_manager.add_speculative(tokens)
-            
+                    self.sub_manager.dirty = True 
             await asyncio.sleep(1.0)
         
         # 2. Final Validation
-        book = self.ws_books.get(str(token_id))
+        book = self.ws_books.get(token_id)
         if not book or not book.get('asks'): 
-            # DEBUG: Why did we fail?
-            keys_sample = list(self.ws_books.keys())[:3]
-            log.warning(f"❌ Missed Opportunity: {token_id}")
-            log.warning(f"   Debug: We have {len(self.ws_books)} books. Sample Keys: {keys_sample}")
+            log.warning(f"❌ Missed Opportunity: No Liquidity for {token_id}")
             return
 
         # 3. Execute
@@ -321,10 +327,11 @@ class LiveTrader:
             token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
         )
         
-        if success and reset_tracker_key:
-             
+        if success:
+             # Logic to update mandatory subs
              open_pos = list(self.persistence.state["positions"].keys())
              self.sub_manager.set_mandatory(open_pos)
+            
             
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
