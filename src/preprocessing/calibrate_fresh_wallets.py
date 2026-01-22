@@ -24,7 +24,6 @@ def main():
         print(f"❌ Error: File '{trades_path}' not found.")
         return
 
-    # specific schema to read just the timestamp of the first row safely
     try:
         first_row = pl.read_csv(
             trades_path, 
@@ -32,14 +31,13 @@ def main():
             columns=['timestamp'],
             schema_overrides={'timestamp': pl.String}
         )
-        # Parse the first timestamp found
         data_start_date = pd.to_datetime(first_row['timestamp'][0])
         print(f"📅 Data Stream Starts: {data_start_date}")
     except Exception as e:
         print(f"❌ Error reading first row: {e}")
         return
 
-    # 1. Load Outcomes (With Date Filter)
+    # 1. Load Outcomes
     print(f"Loading and filtering outcomes from {outcomes_path}...")
     try:
         df_outcomes = (
@@ -47,22 +45,16 @@ def main():
             .select([
                 pl.col('contract_id').cast(pl.String).str.strip_chars(),
                 pl.col('final_outcome').cast(pl.Float64).alias('outcome'),
-                pl.col('createdAt').cast(pl.Datetime).alias('market_start')
+                # Ensure column name matches your parquet schema (e.g., 'startDate', 'created_at')
+                pl.col('startDate').cast(pl.Datetime).alias('market_start') 
             ])
-            # FILTER: Only keep markets that started AFTER our data stream began
             .filter(pl.col('market_start') >= data_start_date)
             .unique(subset=['contract_id'], keep='last')
             .collect()
         )
         print(f"✅ Loaded {df_outcomes.height} valid markets (started after {data_start_date}).")
-        
-        if df_outcomes.height == 0:
-            print("⚠️ Warning: No markets met the date criteria. Check your timestamps.")
-            return
-
     except Exception as e:
         print(f"❌ Error loading outcomes: {e}")
-        print("💡 Hint: Does your parquet file have a 'startDate' column?")
         return
 
     # 2. Initialize Reader
@@ -81,10 +73,7 @@ def main():
         low_memory=True
     )
 
-    # 3. Incremental Process (First Bets Only)
-    # OPTIMIZATION: Use a list instead of repeated concat
     chunks_list = [] 
-    
     total_rows = 0
     batch_idx = 0
     
@@ -98,50 +87,73 @@ def main():
         chunk = batches[0]
         batch_idx += 1
         total_rows += len(chunk)
-        
-        # Parse Dates & Rename
+
+        # 3. Processing with Strict "Outlay" Logic
         chunk = chunk.with_columns([
             pl.col('contract_id').str.strip_chars(),
-            pl.col('tradeAmount').alias('usdc_vol'),
             pl.col('outcomeTokensAmount').alias('tokens'),
             pl.col('price').alias('bet_price'),
             pl.col('user').alias('wallet_id'),
-            # strict=False allows safe failure, but we drop nulls immediately after
             pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
         ])
         chunk = chunk.drop_nulls(subset=['ts_date'])
 
-        # JOIN: This implicitly filters out trades from old markets
-        # because df_outcomes only contains "new" markets now.
+        # Filter out markets that started before our data stream
         joined = chunk.join(df_outcomes, on='contract_id', how='inner')
-        
-        if joined.height == 0: 
-            continue
-            
-        joined = joined.filter(pl.col('usdc_vol') >= 1.0)
-        
-        if joined.height == 0: 
-            continue
+        if joined.height == 0: continue
 
-        # --- ROI Calculation ---
+        # --- KEY UPDATE: True Cost Basis (Outlay) ---
+        # 1. Clip price for safety
         safe_price = joined['bet_price'].clip(0.01, 0.99)
+        
+        # 2. Determine trade direction (Positive tokens = Buy/Long, Negative = Sell/Short)
         is_long = joined['tokens'] > 0
-        won_bet = (is_long & (joined['outcome'] > 0.5)) | ((~is_long) & (joined['outcome'] < 0.5))
 
+        # 3. Calculate "Risk Volume" (The actual Outlay)
+        # Long:  Outlay = tradeAmount (Price * Tokens)
+        # Short: Outlay = |Tokens| * (1 - Price)
+        #        (Because you mint for $1, sell for $Price. Net Cost = $1 - $Price)
+        
+        risk_vol = pl.when(is_long)\
+                     .then(joined['tradeAmount'])\
+                     .otherwise(joined['tokens'].abs() * (1.0 - safe_price))
+
+        # Filter: Ignore micro-bets (< $1 risk)
+        joined = joined.with_columns(risk_vol.alias('risk_vol'))
+        joined = joined.filter(pl.col('risk_vol') >= 1.0)
+        
+        if joined.height == 0: continue
+
+        # 4. ROI Calculation (Matching your Outlay/Payout Logic)
+        
+        # LONG ROI: (Payout - Price) / Price
         long_roi = (joined['outcome'] - safe_price) / safe_price
+        
+        # SHORT ROI: 
+        # Outlay = (1 - Price)
+        # Payout = (1 - Outcome)  <-- If Outcome is 1 (Yes), Payout is 0. If Outcome is 0 (No), Payout is 1.
+        # ROI = (Payout - Outlay) / Outlay
+        #     = ((1 - Outcome) - (1 - Price)) / (1 - Price)
+        #     = (Price - Outcome) / (1 - Price)
+        # Note: This is mathematically identical to (Price - Outcome) / (1 - Price)
         short_roi = (safe_price - joined['outcome']) / (1.0 - safe_price)
         
         final_roi = pl.when(is_long).then(long_roi).otherwise(short_roi).clip(-1.0, 5.0)
-        log_vol = joined['usdc_vol'].log1p()
+        
+        # Log of the RISK VOLUME (not the raw trade amount)
+        log_vol = joined['risk_vol'].log1p()
+        
+        # Win/Loss Flag
+        # Short wins if outcome < 0.5
+        won_bet = (is_long & (joined['outcome'] > 0.5)) | ((~is_long) & (joined['outcome'] < 0.5))
 
-        # Select only needed columns to save RAM
         joined = joined.with_columns([
             final_roi.alias('roi'), 
             log_vol.alias('log_vol'),
             won_bet.alias('won_bet')
-        ]).select(["wallet_id", "ts_date", "roi", "usdc_vol", "log_vol", "won_bet", "bet_price"])
+        ]).select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
 
-        # Local Dedup: Keep first trade per wallet in this batch
+        # Deduplicate locally
         chunk_firsts = (
             joined.sort("ts_date")
                   .unique(subset=["wallet_id"], keep="first")
@@ -158,10 +170,7 @@ def main():
         print("❌ No valid trades found.")
         return
 
-    # FAST CONCAT
     global_first_bets = pl.concat(chunks_list)
-    
-    # GLOBAL DEDUP: Resolve the true "first bet" across all batches
     global_first_bets = (
         global_first_bets
         .sort("ts_date")
@@ -170,18 +179,17 @@ def main():
 
     print(f"✅ Scan complete. Found {global_first_bets.height} unique first bets.")
 
-    # Convert to Pandas for Analysis
     df = global_first_bets.to_pandas()
     if len(df) < 100:
         print("❌ Not enough data.")
         return
 
-    # 4. BINNING ANALYSIS (AUDIT)
-    print("\n📊 VOLUME BUCKET ANALYSIS (AUDIT)")
+    # 4. BINNING ANALYSIS (AUDIT) - Using Risk Volume
+    print("\n📊 VOLUME BUCKET ANALYSIS (Based on Outlay/Risk)")
     bins = [0, 10, 50, 100, 500, 1000, 5000, 10000, 100000, float('inf')]
     labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k", "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
     
-    df['vol_bin'] = pd.cut(df['usdc_vol'], bins=bins, labels=labels)
+    df['vol_bin'] = pd.cut(df['risk_vol'], bins=bins, labels=labels)
     
     stats = df.groupby('vol_bin', observed=True).agg(
         Count=('roi', 'count'),
@@ -213,7 +221,6 @@ def main():
     print(f"OLS Intercept: {intercept:.8f}")
     print(f"P-Value:       {results_ols.pvalues[1]:.6f}")
 
-    # 6. SAVE RESULTS
     results = {
         "ols": {"slope": slope, "intercept": intercept},
         "buckets": stats.to_dict('index')
