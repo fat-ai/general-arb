@@ -124,7 +124,6 @@ class SubscriptionManager:
         if not self.dirty or not websocket: return
         
         async with self.lock:
-            # Start with mandatory (active positions)
             final_list = list(self.mandatory_subs)
             
             # Fill remaining slots with speculative markets
@@ -132,12 +131,12 @@ class SubscriptionManager:
             if slots_left > 0:
                 final_list.extend(list(self.speculative_subs)[:slots_left])
             
-            payload = {"type": "Market", "assets_ids": final_list}
+            # CORRECT PAYLOAD: "market" channel
+            payload = {"type": "market", "assets_ids": final_list}
             try:
                 await websocket.send(json.dumps(payload))
                 self.dirty = False
             except Exception:
-                # Connection likely dropped; main loop will handle reconnect
                 pass
 
 
