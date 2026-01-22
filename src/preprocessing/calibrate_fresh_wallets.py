@@ -49,7 +49,7 @@ def main():
             .select([
                 pl.col('contract_id').cast(pl.String).str.strip_chars(),
                 pl.col('final_outcome').cast(pl.Float64).alias('outcome'),
-                pl.col('startDate').cast(pl.Datetime).alias('market_start') # Ensure this matches your parquet schema
+                pl.col('createdAt').cast(pl.Datetime).alias('market_start')
             ])
             # FILTER: Only keep markets that started AFTER our data stream began
             .filter(pl.col('market_start') >= data_start_date)
