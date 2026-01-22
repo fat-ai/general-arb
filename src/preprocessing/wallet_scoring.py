@@ -311,7 +311,7 @@ def main():
                 pl.col("trade_count").sum().alias("total_trades")
             ])
             .filter(
-                (pl.col("total_trades") >= 20) & 
+                (pl.col("total_trades") >= 2) & 
                 (pl.col("total_invested") > 10.0) 
             )
             .with_columns([
