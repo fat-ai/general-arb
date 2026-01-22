@@ -9,17 +9,27 @@ import sys
 import time
 from requests.adapters import HTTPAdapter, Retry
 
+# Force unbuffered output at the system level
+sys.stdout.reconfigure(line_buffering=True)
+
 # ==========================================
 # 1. FETCH OUTCOMES (Cached)
 # ==========================================
 def fetch_gamma_market_outcomes():
     cache_file = "market_outcomes.parquet"
     
-    if os.path.exists(cache_file):
-        print(f"✅ Found cached outcomes. Loading...")
-        return pl.read_parquet(cache_file)
+    # Debug print to confirm function entry
+    print(f"DEBUG: Checking for cache file '{cache_file}'...", flush=True)
 
-    print("Fetching market outcomes from Polymarket API...")
+    if os.path.exists(cache_file):
+        try:
+            print(f"✅ Found cached outcomes. Loading...", flush=True)
+            return pl.read_parquet(cache_file)
+        except Exception as e:
+            print(f"⚠️ Cache file seems corrupt ({e}). Deleting and re-fetching.", flush=True)
+            os.remove(cache_file)
+
+    print("Fetching market outcomes from Polymarket API...", flush=True)
     all_rows = []
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
@@ -43,10 +53,11 @@ def fetch_gamma_market_outcomes():
                 print(".", end="", flush=True)
             except Exception:
                 break
-        print(f" Done.")
+        print(f" Done.", flush=True)
 
     if not all_rows: return pl.DataFrame()
 
+    print("Processing market outcome logic...", flush=True)
     df = pd.DataFrame(all_rows)
 
     def extract_tokens(row):
@@ -102,6 +113,8 @@ def fetch_gamma_market_outcomes():
     df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
     
     pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
+    
+    print(f"Saving {pl_outcomes.height} outcomes to cache...", flush=True)
     pl_outcomes.write_parquet(cache_file)
     return pl_outcomes
 
@@ -110,10 +123,6 @@ def fetch_gamma_market_outcomes():
 # ==========================================
 
 def process_chunk(df_chunk, outcomes_df):
-    """
-    Input: Polars DataFrame Chunk
-    Output: Aggregated Stats
-    """
     # Normalize IDs
     df_chunk = df_chunk.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
@@ -149,16 +158,18 @@ def process_chunk(df_chunk, outcomes_df):
     return stats
 
 # ==========================================
-# 3. MAIN EXECUTION (SEQUENTIAL STREAMING)
+# 3. MAIN EXECUTION
 # ==========================================
 
 def main():
+    print("DEBUG: Script initialized. Starting main()...", flush=True)
+    
     csv_file = "gamma_trades_stream.csv"
     temp_file = "temp_intermediate_stats.csv"
     output_file = "wallet_scores.json"
 
     if not os.path.exists(csv_file):
-        print(f"❌ Error: File '{csv_file}' not found.")
+        print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
     # 1. Load Outcomes
@@ -171,17 +182,15 @@ def main():
     # Initialize Header in Temp File
     pl.DataFrame({"user": [], "net_roi": [], "pain": [], "count": []}).write_csv(temp_file)
 
-    print(f"🚀 Starting FAST SEQUENTIAL processing on '{csv_file}'...")
-    print(f"   (Using Pandas iterator for reading, Polars for math)")
+    print(f"🚀 Starting FAST SEQUENTIAL processing on '{csv_file}'...", flush=True)
+    print(f"   (Using Pandas iterator for reading, Polars for math)", flush=True)
 
     # 3. PANDAS SEQUENTIAL READER
-    # We use Pandas to strictly read 500k lines at a time sequentially.
-    # This prevents the "re-reading" problem of random access slicing.
     chunk_size = 500_000
     chunks_processed = 0
     start_time = time.time()
     
-    # Specifying dtypes forces Pandas to be memory efficient and not guess
+    # Using Pandas to read sequentially (safest way to avoid OOM or slow seeking)
     reader = pd.read_csv(
         csv_file,
         chunksize=chunk_size,
@@ -191,17 +200,17 @@ def main():
             "price": float,
             "outcomeTokensAmount": float
         },
-        usecols=["contract_id", "user", "price", "outcomeTokensAmount"] # Only load useful cols
+        usecols=["contract_id", "user", "price", "outcomeTokensAmount"]
     )
 
     for pd_chunk in reader:
         try:
             chunks_processed += 1
             
-            # Convert Pandas Chunk -> Polars Chunk (Fast, Zero-Copy if possible)
+            # Convert to Polars
             pl_chunk = pl.from_pandas(pd_chunk)
             
-            # Process using our Polars Logic
+            # Process
             agg_chunk = process_chunk(pl_chunk, outcomes)
             
             # Flush to Disk
@@ -209,7 +218,7 @@ def main():
                 with open(temp_file, "a") as f:
                     agg_chunk.write_csv(f, include_header=False)
             
-            # CLEANUP
+            # Cleanup
             del pd_chunk
             del pl_chunk
             del agg_chunk
@@ -220,13 +229,13 @@ def main():
                 elapsed = time.time() - start_time
                 rows_done = chunks_processed * chunk_size
                 rows_per_sec = rows_done / elapsed
-                print(f"   Processed {chunks_processed} chunks (~{rows_done/1_000_000:.1f}M rows) | Speed: {rows_per_sec/1000:.0f}k rows/sec...", end='\r')
+                print(f"   Processed {chunks_processed} chunks (~{rows_done/1_000_000:.1f}M rows) | Speed: {rows_per_sec/1000:.0f}k rows/sec...", end='\r', flush=True)
                 
         except Exception as e:
-            print(f"\n❌ Error processing chunk {chunks_processed}: {e}")
+            print(f"\n❌ Error processing chunk {chunks_processed}: {e}", flush=True)
             continue
 
-    print(f"\n✅ Scan complete. Loading intermediate stats from disk...")
+    print(f"\n✅ Scan complete. Loading intermediate stats from disk...", flush=True)
 
     # 4. Final Aggregation
     try:
@@ -250,7 +259,7 @@ def main():
             )
         )
 
-        print(f"✅ Calculation complete. Scored {final_df.height} wallets.")
+        print(f"✅ Calculation complete. Scored {final_df.height} wallets.", flush=True)
 
         final_dict = {}
         for row in final_df.iter_rows(named=True):
@@ -260,13 +269,13 @@ def main():
         with open(output_file, "w") as f:
             json.dump(final_dict, f, indent=2)
         
-        print(f"Saved results to {output_file}")
+        print(f"Saved results to {output_file}", flush=True)
         
         if os.path.exists(temp_file):
             os.remove(temp_file)
 
     except Exception as e:
-        print(f"❌ Error during final aggregation: {e}")
+        print(f"❌ Error during final aggregation: {e}", flush=True)
 
 if __name__ == "__main__":
     main()
