@@ -220,38 +220,49 @@ class LiveTrader:
             await asyncio.sleep(5)
 
     async def _process_batch(self, trades):
-        # 1. Initialize stats collector
         batch_scores = []
+        skipped_counts = {"not_usdc": 0, "no_fpmm": 0, "no_tokens": 0}
 
         for t in trades:
-            # --- Normalize Trade Data ---
-            maker_asset = t['makerAssetId']
-            taker_asset = t['takerAssetId']
+            # 1. Normalize & Case-Insensitive Check
+            maker_asset = t['makerAssetId'].lower()
+            taker_asset = t['takerAssetId'].lower()
+            target_usdc = USDC_ADDRESS.lower() # Ensure config const is lower
+            
             token_id = None
             usdc_vol = 0.0
             wallet = t['taker'] 
             direction = 0
             
-            if maker_asset == USDC_ADDRESS:
+            # Check if this is a valid trade (One side MUST be USDC)
+            if maker_asset == target_usdc:
                 token_id = taker_asset
                 usdc_vol = float(t['makerAmountFilled']) / 1e6 
                 direction = -1.0 # Selling Token
-            elif taker_asset == USDC_ADDRESS:
+            elif taker_asset == target_usdc:
                 token_id = maker_asset
                 usdc_vol = float(t['takerAmountFilled']) / 1e6
                 direction = 1.0 # Buying Token
             else:
+                skipped_counts["not_usdc"] += 1
                 continue 
 
-            # --- Resolve Metadata ---
+            # 2. Resolve Metadata (Debug Logging enabled)
             fpmm = self.metadata.token_to_fpmm.get(str(token_id))
-            if not fpmm: continue 
+            if not fpmm: 
+                # OPTIONAL: Uncomment to see exactly which tokens are failing
+                # log.warning(f"⚠️ Unknown Token: {token_id} (Not in {len(self.metadata.token_to_fpmm)} loaded mkts)")
+                skipped_counts["no_fpmm"] += 1
+                continue 
             
             tokens = self.metadata.fpmm_to_tokens.get(fpmm)
-            if not tokens: continue
+            if not tokens: 
+                skipped_counts["no_tokens"] += 1
+                continue
+            
             is_yes_token = (str(token_id) == tokens[1])
 
-            # --- Process Signal ---
+            # 3. Process Signal
             new_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
                 token_id=token_id, 
@@ -262,10 +273,10 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
-            # 2. COLLECT STATS (Store Abs Score, Real Score, and Market ID)
+            # Store stats
             batch_scores.append((abs(new_weight), new_weight, fpmm))
 
-            # --- Actions ---
+            # 4. Actions
             if CONFIG['use_smart_exit']:
                 await self._check_smart_exits_for_market(fpmm, new_weight)
 
@@ -273,21 +284,20 @@ class LiveTrader:
             
             if action == 'SPECULATE':
                 self.sub_manager.add_speculative(tokens)
-            
             elif action == 'BUY':
                 self.signal_engine.trackers[fpmm]['weight'] = 0.0
                 target_token = tokens[1] if new_weight > 0 else tokens[0] 
                 await self._attempt_exec(target_token, fpmm)
 
-        # 3. LOG TOP 3 SCORES
+        # LOGGING
         if batch_scores:
-            # Sort by absolute weight (magnitude) descending
             batch_scores.sort(key=lambda x: x[0], reverse=True)
             top_3 = batch_scores[:3]
-            
-            # Format a clean log message
             msg_parts = [f"Mkt {item[2][:6]}..: {item[1]:.1f}" for item in top_3]
-            log.info(f"📊 Batch Top Heat: {' | '.join(msg_parts)}")
+            log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
+        else:
+            # If nothing happened, tell us WHY
+            log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
     async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
         """Iterates over held positions in this market and checks for reversal exits."""
