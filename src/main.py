@@ -96,36 +96,101 @@ class LiveTrader:
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
 
     async def _ws_processor_loop(self):
-        """Parses messages off the queue to update local order books."""
+        """
+        Parses messages off the queue to update local order books.
+        Handles both 'book' (Snapshot) and 'price_change' (Delta) events.
+        """
         while self.running:
             msg = await self.ws_queue.get()
             try:
                 data = json.loads(msg)
                 
-                if isinstance(data, list):
-                    for item in data:
-                        # Check for Order Book Snapshot/Update format
-                        # Polymarket often sends 'bids' and 'asks' in the message
-                        if 'asset_id' in item and ('bids' in item or 'asks' in item):
-                            aid = item['asset_id']
+                # Handle batch messages (sometimes they come as a list)
+                items = data if isinstance(data, list) else [data]
+
+                for item in items:
+                    event_type = item.get("event_type", "")
+                    asset_id = item.get("asset_id")
+
+                    # 1. SNAPSHOT (Initial Load)
+                    if event_type == "book" and asset_id:
+                        # Convert to float for sorting/math, keep as list of [price, size]
+                        bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
+                        asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
+                        
+                        self.ws_books[asset_id] = {
+                            'bids': sorted(bids, key=lambda x: x[0], reverse=True), # High to Low
+                            'asks': sorted(asks, key=lambda x: x[0])  # Low to High
+                        }
+                        
+                        # Check Stops immediately on snapshot
+                        if asks:
+                            asyncio.create_task(self._check_stop_loss(asset_id, asks[0][0]))
+
+                    # 2. DELTA UPDATE (Price Change)
+                    elif event_type == "price_change":
+                        # price_change events often contain a list of changes
+                        changes = item.get("price_changes", [])
+                        if not changes: continue
+
+                        for change in changes:
+                            c_aid = change.get("asset_id")
+                            if not c_aid: continue
                             
-                            # Initialize if missing
-                            if aid not in self.ws_books:
-                                self.ws_books[aid] = {'bids': [], 'asks': []}
+                            # Initialize book if we missed the snapshot (rare but possible)
+                            if c_aid not in self.ws_books:
+                                self.ws_books[c_aid] = {'bids': [], 'asks': []}
+
+                            side = change.get("side") # "BUY" or "SELL"
+                            price = float(change.get("price", 0))
+                            new_size = float(change.get("size", 0))
                             
-                            # Update Book (Simple Snapshot overwrite for simplicity)
-                            # In a full prod environment, you might merge updates, but snapshots are safer
-                            if 'bids' in item: self.ws_books[aid]['bids'] = item['bids']
-                            if 'asks' in item: self.ws_books[aid]['asks'] = item['asks']
+                            target_list = 'bids' if side == "BUY" else 'asks'
                             
-                            # Get Mark Price (Mid or Last) for Stop Checks
-                            best_ask = float(item['asks'][0][0]) if item.get('asks') else 0
-                            if best_ask > 0:
-                                asyncio.create_task(self._check_stop_loss(aid, best_ask))
-            except Exception:
-                pass
+                            self._update_book_level(self.ws_books[c_aid][target_list], price, new_size, side)
+
+                        # Check Stops after update
+                        # We use the asset_id from the last change in the batch
+                        last_aid = changes[-1].get("asset_id")
+                        if last_aid and self.ws_books.get(last_aid, {}).get('asks'):
+                            best_ask = self.ws_books[last_aid]['asks'][0][0]
+                            asyncio.create_task(self._check_stop_loss(last_aid, best_ask))
+
+            except Exception as e:
+                log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
+
+    def _update_book_level(self, book_list: List[List[float]], price: float, size: float, side: str):
+        """
+        Updates a specific price level in the book list.
+        If size is 0, removes the level.
+        Maintains sort order: Bids (Desc), Asks (Asc).
+        """
+        # 1. Check if price level exists
+        found_idx = -1
+        for i, (p, s) in enumerate(book_list):
+            if p == price:
+                found_idx = i
+                break
+        
+        # 2. Update logic
+        if size == 0:
+            if found_idx != -1:
+                book_list.pop(found_idx)
+        else:
+            if found_idx != -1:
+                book_list[found_idx][1] = size # Update size
+            else:
+                book_list.append([price, size]) # Add new level
+                
+                # 3. Re-sort
+                # Optimization: Could insert at correct index to avoid full sort, 
+                # but Python's Timsort is efficient for mostly-sorted data.
+                if side == "BUY":
+                    book_list.sort(key=lambda x: x[0], reverse=True) # Descending
+                else:
+                    book_list.sort(key=lambda x: x[0]) # Ascending
 
     # --- SIGNAL LOOPS ---
 
