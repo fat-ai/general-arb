@@ -203,6 +203,7 @@ class LiveTrader:
                 new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
                 if new_trades:
+                    log.info(f"👀 Scanned {len(new_trades)} new trades... (Waiting for whales)")
                     unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
                     if unique_trades:
