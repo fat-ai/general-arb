@@ -224,34 +224,41 @@ class LiveTrader:
         skipped_counts = {"not_usdc": 0, "no_fpmm": 0, "no_tokens": 0}
 
         for t in trades:
-            # 1. Normalize & Case-Insensitive Check
-            maker_asset = t['makerAssetId'].lower()
-            taker_asset = t['takerAssetId'].lower()
-            target_usdc = USDC_ADDRESS.lower() # Ensure config const is lower
+            # 1. Normalize Data
+            # The subgraph often returns USDC as "0" or "0x0"
+            maker_asset = str(t['makerAssetId']).lower()
+            taker_asset = str(t['takerAssetId']).lower()
+            target_usdc = USDC_ADDRESS.lower()
             
+            # Helper to check if an asset is USDC (matches "0", "0x0", or the real address)
+            def is_usdc(a): return a in ["0", "0x0", target_usdc]
+
             token_id = None
             usdc_vol = 0.0
             wallet = t['taker'] 
             direction = 0
             
             # Check if this is a valid trade (One side MUST be USDC)
-            if maker_asset == target_usdc:
+            if is_usdc(maker_asset):
                 token_id = taker_asset
+                # Convert from atomic units (6 decimals)
                 usdc_vol = float(t['makerAmountFilled']) / 1e6 
-                direction = -1.0 # Selling Token
-            elif taker_asset == target_usdc:
+                direction = -1.0 # Selling Token (Maker gave USDC, so Taker Sold Token)
+            elif is_usdc(taker_asset):
                 token_id = maker_asset
                 usdc_vol = float(t['takerAmountFilled']) / 1e6
-                direction = 1.0 # Buying Token
+                direction = 1.0 # Buying Token (Taker gave USDC)
             else:
                 skipped_counts["not_usdc"] += 1
                 continue 
 
-            # 2. Resolve Metadata (Debug Logging enabled)
+            # 2. Resolve Metadata
+            # Token IDs from subgraph are usually decimal strings (e.g. "12345...").
+            # Gamma API also uses decimal strings.
             fpmm = self.metadata.token_to_fpmm.get(str(token_id))
+            
             if not fpmm: 
-                # OPTIONAL: Uncomment to see exactly which tokens are failing
-                # log.warning(f"⚠️ Unknown Token: {token_id} (Not in {len(self.metadata.token_to_fpmm)} loaded mkts)")
+                # If lookup failed, the market might be closed or inactive
                 skipped_counts["no_fpmm"] += 1
                 continue 
             
@@ -273,7 +280,7 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
-            # Store stats
+            # Store stats for logging
             batch_scores.append((abs(new_weight), new_weight, fpmm))
 
             # 4. Actions
@@ -296,7 +303,6 @@ class LiveTrader:
             msg_parts = [f"Mkt {item[2][:6]}..: {item[1]:.1f}" for item in top_3]
             log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
         else:
-            # If nothing happened, tell us WHY
             log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
     async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
