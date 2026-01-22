@@ -181,7 +181,7 @@ def process_chunk_universal(df_chunk, outcomes_df):
 # ==========================================
 
 def main():
-    print("DEBUG: Starting Universal Mint Logic Script...", flush=True)
+    print("DEBUG: Starting Robust PnL Script...", flush=True)
     
     csv_file = "gamma_trades_stream.csv"
     temp_file = "temp_universal_stats.csv"
@@ -191,27 +191,71 @@ def main():
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
-    # --- A. DETECT START DATE ---
-    print("👀 Peeking at CSV to determine start date...", flush=True)
+    # --- STEP A: ROBUST DATE DETECTION ---
+    print("👀 Detecting true start date (checking first and last rows)...", flush=True)
     try:
-        first_row = pd.read_csv(csv_file, nrows=1)
-        start_ts_str = first_row['timestamp'].iloc[0]
-        print(f"   Data starts at: {start_ts_str}", flush=True)
-    except Exception as e:
-        print(f"❌ Could not read start date: {e}", flush=True)
-        return
+        # 1. Read First Row
+        df_head = pd.read_csv(csv_file, nrows=1)
+        ts_head = pd.to_datetime(df_head['timestamp'].iloc[0])
+        
+        # 2. Read Last Row (Seek to end)
+        import mmap
+        with open(csv_file, "rb") as f:
+            # Memory map the file, size 0 means whole file
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                # Find the last newline
+                end_pos = mm.rfind(b'\n', 0, mm.size() - 1)
+                if end_pos != -1:
+                    # Find the newline before that
+                    start_pos = mm.rfind(b'\n', 0, end_pos)
+                    if start_pos != -1:
+                        mm.seek(start_pos + 1)
+                        last_line = mm.read(end_pos - start_pos - 1).decode('utf-8')
+                    else:
+                        mm.seek(0)
+                        last_line = mm.read(end_pos).decode('utf-8')
+                else:
+                    # One line file
+                    mm.seek(0)
+                    last_line = mm.read().decode('utf-8')
 
-    # --- B. FETCH RELEVANT MARKETS ---
+        # Parse last line manually (assuming standard CSV format)
+        # We assume 'timestamp' is the 2nd column (index 1) based on standard gamma/goldsky format
+        # Adjust index if your CSV structure is different
+        last_line_split = last_line.split(',')
+        if len(last_line_split) > 1:
+             # Try to parse the timestamp column (usually col 1 or 2)
+             # Based on previous code: 'id', 'timestamp' ... so index 1
+             ts_tail_str = last_line_split[1].replace('"', '') 
+             ts_tail = pd.to_datetime(ts_tail_str)
+        else:
+             ts_tail = ts_head # Fallback
+
+        # 3. Pick the EARLIEST of the two
+        min_date = min(ts_head, ts_tail)
+        
+        print(f"   Head Date: {ts_head}", flush=True)
+        print(f"   Tail Date: {ts_tail}", flush=True)
+        print(f"   ✅ True Data Start: {min_date}", flush=True)
+        
+        # Convert back to string for the filter function
+        start_ts_str = min_date.isoformat()
+
+    except Exception as e:
+        print(f"⚠️ Could not detect start date (Error: {e}). Defaulting to Head.", flush=True)
+        start_ts_str = df_head['timestamp'].iloc[0]
+
+    # --- STEP B: Fetch Markets ---
+    # Pass the robust minimum date
     outcomes = fetch_filtered_outcomes(start_ts_str)
     
     if outcomes.height == 0:
-        print("⚠️ No valid markets found (or API failed). Exiting.", flush=True)
+        print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
-    # --- C. PROCESS TRADES (SEQUENTIAL) ---
+    # --- STEP C: Process Trades ---
     if os.path.exists(temp_file): os.remove(temp_file)
     
-    # Initialize Temp CSV
     pl.DataFrame({
         "user": [], "contract_id": [], 
         "tokens_yes": [], "cost_buy_yes": [],
@@ -225,7 +269,6 @@ def main():
     chunks_processed = 0
     start_time = time.time()
     
-    # Pandas Iterator for safe sequential reading
     reader = pd.read_csv(
         csv_file,
         chunksize=chunk_size,
@@ -257,7 +300,7 @@ def main():
 
     print(f"\n✅ Scan complete. Finalizing Scores...", flush=True)
 
-    # --- D. FINAL CALCULATION ---
+    # --- STEP D: Final Calculation (Same as before) ---
     try:
         final_stats = (
             pl.scan_csv(temp_file)
@@ -271,24 +314,12 @@ def main():
             ])
             .join(outcomes.lazy(), on="contract_id", how="inner")
             .with_columns([
-                # 1. Calculate Implicit Cost of NO tokens (Shorts)
-                # Cost = (Tokens No * 1.00) - Cash from Sell
                 (pl.col("tokens_no") - pl.col("cash_from_sell")).alias("cost_buy_no"),
-                
-                # 2. Calculate Final Portfolio Value
-                # Value = (Yes * Outcome) + (No * (1 - Outcome))
-                (
-                    (pl.col("tokens_yes") * pl.col("final_outcome")) + 
-                    (pl.col("tokens_no") * (1.0 - pl.col("final_outcome")))
-                ).alias("residual_value")
+                ((pl.col("tokens_yes") * pl.col("final_outcome")) + 
+                 (pl.col("tokens_no") * (1.0 - pl.col("final_outcome")))).alias("residual_value")
             ])
             .with_columns([
-                # Invested Capital = Cost Yes + Cost No
                 (pl.col("cost_buy_yes") + pl.col("cost_buy_no")).alias("invested"),
-                
-                # Net PnL = Final Value - Invested Capital
-                # (Note: This automatically handles hedging. If I spent $0.60 on Yes and $0.40 on No, 
-                # Invested=$1.00. Value=$1.00. PnL=$0.00).
                 (pl.col("residual_value") - (pl.col("cost_buy_yes") + pl.col("cost_buy_no"))).alias("pnl")
             ])
             .group_by("user")
@@ -299,13 +330,10 @@ def main():
             ])
             .filter(
                 (pl.col("total_trades") >= 20) & 
-                (pl.col("total_invested") > 10.0) # Filter dust
+                (pl.col("total_invested") > 10.0)
             )
             .with_columns([
-                # ROI = Total PnL / Total Capital Cycled
                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                
-                # Volume Boost
                 pl.col("total_trades").log(10).alias("vol_boost")
             ])
             .with_columns([
@@ -329,6 +357,7 @@ def main():
 
     except Exception as e:
         print(f"❌ Error during final aggregation: {e}", flush=True)
+
 
 if __name__ == "__main__":
     main()
