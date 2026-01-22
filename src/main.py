@@ -336,7 +336,7 @@ class LiveTrader:
         """
         # 1. Wait for Liquidity (The "Patient" Check)
         book = None
-        for i in range(5): # Try 5 times (5 seconds total)
+        for i in range(30): # Try 30 times (30 seconds total)
             book = self.ws_books.get(token_id)
             
             # If we have a book with actual liquidity, we are good to go
