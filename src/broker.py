@@ -40,9 +40,10 @@ class PersistenceManager:
                 log.error(f"State load error: {e}")
 
     async def save_async(self):
-        """Non-blocking save to disk."""
+        import copy
+        state_snapshot = copy.deepcopy(self.state)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, self._save_sync)
+        await loop.run_in_executor(self._executor, self._save_sync, state_snapshot)
 
     def _save_sync(self):
         """Actual file writing logic (runs in thread)."""
