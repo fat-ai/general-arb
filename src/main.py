@@ -28,7 +28,8 @@ class LiveTrader:
         self.signal_engine = SignalEngine()
         
         # Runtime State
-        self.ws_prices: Dict[str, float] = {}
+        # CHANGE: We now store full order books, not just single prices
+        self.ws_books: Dict[str, Dict] = {} 
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
         self.running = True
@@ -38,16 +39,16 @@ class LiveTrader:
         print("\n🚀 STARTING LIVE PAPER TRADER")
         validate_config()
         
-        # Load heavy data before starting loops
+        # Load heavy data
         self.scorer.load()
         await self.metadata.refresh()
         
-        # Register Signal Handlers for graceful shutdown
+        # Register Signal Handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-        # Start all parallel loops
+        # Start loops
         await asyncio.gather(
             self._ws_ingestion_loop(),
             self._ws_processor_loop(),
@@ -60,8 +61,10 @@ class LiveTrader:
         log.info("🛑 Shutting down...")
         self.running = False
         await self.persistence.save_async()
-        # Cancel all tasks in the current loop (optional but clean)
-        asyncio.get_running_loop().stop()
+        try:
+            asyncio.get_running_loop().stop()
+        except:
+            pass
 
     # --- WEBSOCKET LOOPS ---
 
@@ -76,13 +79,13 @@ class LiveTrader:
                     
                     while self.running:
                         # Send subscriptions if changed
+                        # NOTE: Ensure SubscriptionManager sends the correct payload type for books!
                         await self.sub_manager.sync(websocket)
                         
                         try:
                             msg = await asyncio.wait_for(websocket.recv(), timeout=10.0)
                             await self.ws_queue.put(msg)
                         except asyncio.TimeoutError:
-                            # Send a ping or just continue to check connection
                             continue
                         except websockets.ConnectionClosed:
                             log.warning("WS Connection Closed")
@@ -93,20 +96,32 @@ class LiveTrader:
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
 
     async def _ws_processor_loop(self):
-        """Parses messages off the queue to update prices and check stops."""
+        """Parses messages off the queue to update local order books."""
         while self.running:
             msg = await self.ws_queue.get()
             try:
                 data = json.loads(msg)
+                
                 if isinstance(data, list):
                     for item in data:
-                        if 'price' in item:
+                        # Check for Order Book Snapshot/Update format
+                        # Polymarket often sends 'bids' and 'asks' in the message
+                        if 'asset_id' in item and ('bids' in item or 'asks' in item):
                             aid = item['asset_id']
-                            px = float(item['price'])
-                            self.ws_prices[aid] = px
                             
-                            # Check Stop Loss / Take Profit immediately on price update
-                            asyncio.create_task(self._check_stop_loss(aid, px))
+                            # Initialize if missing
+                            if aid not in self.ws_books:
+                                self.ws_books[aid] = {'bids': [], 'asks': []}
+                            
+                            # Update Book (Simple Snapshot overwrite for simplicity)
+                            # In a full prod environment, you might merge updates, but snapshots are safer
+                            if 'bids' in item: self.ws_books[aid]['bids'] = item['bids']
+                            if 'asks' in item: self.ws_books[aid]['asks'] = item['asks']
+                            
+                            # Get Mark Price (Mid or Last) for Stop Checks
+                            best_ask = float(item['asks'][0][0]) if item.get('asks') else 0
+                            if best_ask > 0:
+                                asyncio.create_task(self._check_stop_loss(aid, best_ask))
             except Exception:
                 pass
             finally:
@@ -120,31 +135,25 @@ class LiveTrader:
         
         while self.running:
             try:
-                # Fetch trades (abstracted in data.py)
                 new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
                 if new_trades:
-                    # Filter already processed trades
                     unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
                     if unique_trades:
                         await self._process_batch(unique_trades)
                         
-                        # Update state
                         for t in unique_trades: self.seen_trade_ids.add(t['id'])
                         last_ts = int(unique_trades[-1]['timestamp'])
 
-                        # Memory management for ID set
                         if len(self.seen_trade_ids) > 10000:
                             self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
-            
             except Exception as e:
                 log.error(f"Signal Loop Error: {e}")
                 
             await asyncio.sleep(5)
 
     async def _process_batch(self, trades):
-        """The core logic glue."""
         for t in trades:
             # 1. Normalize Trade Data
             maker_asset = t['makerAssetId']
@@ -157,11 +166,11 @@ class LiveTrader:
             if maker_asset == USDC_ADDRESS:
                 token_id = taker_asset
                 usdc_vol = float(t['makerAmountFilled']) / 1e6 
-                direction = -1.0 # Selling Token (Buying USDC)
+                direction = -1.0 # Selling Token
             elif taker_asset == USDC_ADDRESS:
                 token_id = maker_asset
                 usdc_vol = float(t['takerAmountFilled']) / 1e6
-                direction = 1.0 # Buying Token (Selling USDC)
+                direction = 1.0 # Buying Token
             else:
                 continue 
 
@@ -173,7 +182,7 @@ class LiveTrader:
             if not tokens: continue
             is_yes_token = (str(token_id) == tokens[1])
 
-            # 3. Process Signal via Strategy Engine
+            # 3. Process Signal
             new_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
                 token_id=token_id, 
@@ -184,29 +193,22 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
-            # 4. Check for Actions
-            
-            # A. Check Smart Exit (on existing positions in this market)
+            # 4. Actions
             if CONFIG['use_smart_exit']:
                 await self._check_smart_exits_for_market(fpmm, new_weight)
 
-            # B. Check Entry
             action = TradeLogic.check_entry_signal(new_weight)
             
             if action == 'SPECULATE':
                 self.sub_manager.add_speculative(tokens)
             
             elif action == 'BUY':
-                # Reset signal after splash to prevent double buying
                 self.signal_engine.trackers[fpmm]['weight'] = 0.0
-                
-                # Determine target token based on signal direction
-                target_token = tokens[1] if new_weight > 0 else tokens[0] # YES if pos, NO if neg
+                target_token = tokens[1] if new_weight > 0 else tokens[0] 
                 await self._attempt_exec(target_token, fpmm)
 
     async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
         """Iterates over held positions in this market and checks for reversal exits."""
-        # Find positions belonging to this market
         relevant_positions = [
             (tid, p) for tid, p in self.persistence.state["positions"].items() 
             if p.get("market_fpmm") == fpmm_id
@@ -222,25 +224,28 @@ class LiveTrader:
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
             
             if should_exit:
-                price = self.ws_prices.get(pos_token, 0)
-                if price > 0:
+                # Retrieve book to sell
+                book = self.ws_books.get(pos_token)
+                if book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
-                    await self.broker.execute_market_order(pos_token, "SELL", price, 0, fpmm_id)
-
+                    await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=book)
 
     # --- EXECUTION HELPERS ---
 
     async def _attempt_exec(self, token_id, fpmm):
-        price = self.ws_prices.get(token_id)
-        # Safety: Don't buy if price is missing or extreme
-        if not price or not (0.02 < price < 0.98): return
+        # Retrieve full book
+        book = self.ws_books.get(token_id)
+        if not book: return
         
+        # Check basic liquidity presence
+        if not book.get('asks'): return
+        
+        # Pass book to broker for VWAP execution
         success = await self.broker.execute_market_order(
-            token_id, "BUY", price, CONFIG['fixed_size'], fpmm
+            token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
         )
         
         if success:
-            # Ensure we subscribe to our new position
             open_pos = list(self.persistence.state["positions"].keys())
             self.sub_manager.set_mandatory(open_pos)
 
@@ -252,31 +257,29 @@ class LiveTrader:
         pnl = (price - avg) / avg
         
         if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
-            log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
-            success = await self.broker.execute_market_order(
-                token_id, "SELL", price, 0, pos['market_fpmm']
-            )
-            if success:
-                open_pos = list(self.persistence.state["positions"].keys())
-                self.sub_manager.set_mandatory(open_pos)
+            book = self.ws_books.get(token_id)
+            if book:
+                log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
+                success = await self.broker.execute_market_order(
+                    token_id, "SELL", 0, pos['market_fpmm'], current_book=book
+                )
+                if success:
+                    open_pos = list(self.persistence.state["positions"].keys())
+                    self.sub_manager.set_mandatory(open_pos)
 
     # --- MAINTENANCE ---
 
     async def _maintenance_loop(self):
-        """Periodic cleanup."""
         while self.running:
-            await asyncio.sleep(3600) # Hourly
+            await asyncio.sleep(3600)
             await self.metadata.refresh()
-            
-            # Prune old signal trackers
             self.signal_engine.cleanup()
             
-            # Prune prices for assets we don't care about anymore
+            # Prune books we don't need
             active = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
-            self.ws_prices = {k: v for k, v in self.ws_prices.items() if k in active}
+            self.ws_books = {k: v for k, v in self.ws_books.items() if k in active}
 
     async def _risk_monitor_loop(self):
-        """Safety switch for drawdown."""
         while self.running:
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             equity = self.persistence.calculate_equity()
