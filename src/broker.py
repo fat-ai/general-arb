@@ -1,15 +1,16 @@
 import os
 import json
 import time
+import copy
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional
+from typing import Dict, Tuple, Optional
 
 # Import configuration and constants
 from config import CONFIG, STATE_FILE
 
-# Initialize loggers (They rely on setup_logging() being called in main.py)
+# Initialize loggers
 log = logging.getLogger("PaperGold")
 audit_log = logging.getLogger("TradeAudit")
 
@@ -40,24 +41,27 @@ class PersistenceManager:
                 log.error(f"State load error: {e}")
 
     async def save_async(self):
-        import copy
-        state_snapshot = copy.deepcopy(self.state)
+        """Non-blocking save to disk with Thread Safety fix."""
         loop = asyncio.get_running_loop()
+        # Create a snapshot in the main thread to avoid Race Conditions during write
+        state_snapshot = copy.deepcopy(self.state)
         await loop.run_in_executor(self._executor, self._save_sync, state_snapshot)
 
-    def _save_sync(self):
+    def _save_sync(self, state_snapshot):
         """Actual file writing logic (runs in thread)."""
         try:
             # Atomic write: write to temp file then rename
             temp = STATE_FILE.with_suffix(".tmp")
             with open(temp, "w") as f:
-                json.dump(self.state, f, indent=4)
+                json.dump(state_snapshot, f, indent=4)
             os.replace(temp, STATE_FILE)
         except Exception as e:
             log.error(f"State save error: {e}")
 
     def calculate_equity(self) -> float:
         """Returns total value: Cash + Value of all positions."""
+        # Note: This uses avg_price for estimation. For strict accuracy, 
+        # one could pass current market prices here, but this is sufficient for risk checks.
         pos_val = sum(p['qty'] * p['avg_price'] for p in self.state['positions'].values())
         return self.state['cash'] + pos_val
 
@@ -65,97 +69,164 @@ class PersistenceManager:
 class PaperBroker:
     """
     Simulates an exchange broker. 
-    Validates orders against current cash/risk limits and executes them by updating the state.
+    Validates orders against current cash/risk limits and executes them 
+    using Volume Weighted Average Price (VWAP) from the order book.
     """
     def __init__(self, persistence: PersistenceManager):
         self.pm = persistence
         self.lock = asyncio.Lock()
 
-    async def execute_market_order(self, token_id: str, side: str, price: float, 
-                                   usdc_amount: float, fpmm_id: str) -> bool:
+    def calculate_vwap_execution(self, side: str, amount: float, book: Dict) -> Tuple[float, float]:
         """
-        Executes a Buy or Sell order.
+        Walks the order book to calculate the real fill price.
         
         Args:
-            token_id: The asset ID to trade.
-            side: "BUY" or "SELL".
-            price: Current market price.
-            usdc_amount: Amount of cash to spend (BUY) or value is derived (SELL).
-            fpmm_id: Market ID for tracking/audit.
+            side: 'BUY' or 'SELL'
+            amount: For BUY, this is USDC to spend. For SELL, this is Tokens to sell.
+            book: Dictionary with 'bids' and 'asks' lists of [price, size].
             
         Returns:
-            bool: True if trade succeeded, False if rejected/failed.
+            (average_price, quantity_filled)
         """
+        # Select the side we are taking liquidity from
+        if side == "BUY":
+            # Taking from ASKS (Sellers): Sort Lowest price first
+            orders = sorted(book.get('asks', []), key=lambda x: float(x[0]))
+        else:
+            # Taking from BIDS (Buyers): Sort Highest price first
+            orders = sorted(book.get('bids', []), key=lambda x: float(x[0]), reverse=True)
+
+        if not orders:
+            return 0.0, 0.0
+
+        remaining_amt = amount
+        total_value = 0.0
+        total_qty = 0.0 # Tokens accumulated
+        
+        for price_str, size_str in orders:
+            p = float(price_str)
+            s = float(size_str)
+            
+            if side == "BUY":
+                # We are spending USDC.
+                level_cost = p * s
+                
+                if level_cost >= remaining_amt:
+                    # Fill the rest here
+                    qty_bought = remaining_amt / p
+                    total_qty += qty_bought
+                    total_value += remaining_amt
+                    remaining_amt = 0
+                    break
+                else:
+                    # Eat this entire level
+                    total_qty += s
+                    total_value += level_cost
+                    remaining_amt -= level_cost
+
+            elif side == "SELL":
+                # We are selling Tokens.
+                if s >= remaining_amt:
+                    # Sell all remaining tokens here
+                    total_value += (remaining_amt * p)
+                    total_qty += remaining_amt 
+                    remaining_amt = 0
+                    break
+                else:
+                    # Sell as much as we can at this level
+                    total_value += (s * p)
+                    total_qty += s
+                    remaining_amt -= s
+
+        if total_qty == 0: return 0.0, 0.0
+        
+        # VWAP Calculation
+        avg_price = total_value / total_qty
+        
+        return avg_price, total_qty
+
+    async def execute_market_order(self, token_id: str, side: str, 
+                                   usdc_amount: float, fpmm_id: str, 
+                                   current_book: Dict) -> bool:
+        """
+        Executes a Buy or Sell order using Order Book depth.
+        """
+        if not current_book:
+            log.warning(f"❌ Execution failed: No Order Book data for {token_id}")
+            return False
+
         async with self.lock:
             state = self.pm.state
-            qty = 0.0
             
+            # --- DETERMINE AMOUNT TO TRADE ---
+            calc_amount = usdc_amount
+            if side == "SELL":
+                # For SELLS, we sell the specific quantity we own
+                pos = state["positions"].get(token_id)
+                if not pos: 
+                    log.warning(f"❌ Sell failed: No position found for {token_id}")
+                    return False
+                calc_amount = pos["qty"]
+
+            # --- CALCULATE EXECUTION ---
+            vwap_price, filled_qty = self.calculate_vwap_execution(side, calc_amount, current_book)
+            
+            if vwap_price <= 0 or filled_qty == 0:
+                log.warning(f"❌ Execution failed: Insufficient liquidity for {token_id}")
+                return False
+
             # --- BUY LOGIC ---
             if side == "BUY":
-                # 1. Risk Check: Max Positions
+                # 1. Risk Check
                 if token_id not in state["positions"] and len(state["positions"]) >= CONFIG["max_positions"]:
-                    log.warning(f"🚫 REJECTED {token_id}: Max positions ({CONFIG['max_positions']}) reached.")
                     return False
                     
-                # 2. Check Funds
-                cost = usdc_amount
+                cost = filled_qty * vwap_price
                 if state["cash"] < cost:
-                    log.warning(f"❌ Rejected {token_id}: Insufficient Cash (${state['cash']:.2f} < ${cost:.2f})")
+                    log.warning(f"❌ Rejected {token_id}: Insufficient Cash")
                     return False
                 
-                # 3. Calculate Quantity
-                qty = usdc_amount / price
-                
-                # 4. Update State (Average Entry Price logic)
+                # 2. Update State
                 state["cash"] -= cost
                 pos = state["positions"].get(token_id, {"qty": 0.0, "avg_price": 0.0, "market_fpmm": fpmm_id})
                 
-                total_val = (pos["qty"] * pos["avg_price"]) + cost
-                new_qty = pos["qty"] + qty
+                # Weighted Average Entry Price
+                prev_total_cost = pos["qty"] * pos["avg_price"]
+                new_total_cost = prev_total_cost + cost
+                new_total_qty = pos["qty"] + filled_qty
                 
-                pos["qty"] = new_qty
-                pos["avg_price"] = total_val / new_qty
+                pos["qty"] = new_total_qty
+                pos["avg_price"] = new_total_cost / new_total_qty
                 pos["market_fpmm"] = fpmm_id
                 state["positions"][token_id] = pos
                 
-                log.info(f"🟢 BUY {qty:.2f} {token_id} @ {price:.3f} | Cost: ${cost:.2f}")
+                log.info(f"🟢 BUY {filled_qty:.2f} {token_id} @ {vwap_price:.3f} | Cost: ${cost:.2f}")
 
             # --- SELL LOGIC ---
             elif side == "SELL":
-                pos = state["positions"].get(token_id)
-                if not pos:
-                    log.warning(f"❌ Sell failed: No position found for {token_id}")
-                    return False
-                
-                # In this simplified broker, we sell the entire position
-                qty_to_sell = pos["qty"]
-                proceeds = qty_to_sell * price
+                proceeds = filled_qty * vwap_price # Here filled_qty should equal calc_amount (our pos)
                 
                 # Update State
                 state["cash"] += proceeds
-                pnl = proceeds - (qty_to_sell * pos["avg_price"])
+                pos = state["positions"][token_id]
+                pnl = proceeds - (filled_qty * pos["avg_price"])
                 del state["positions"][token_id]
                 
-                log.info(f"🔴 SELL {qty_to_sell:.2f} {token_id} @ {price:.3f} | PnL: ${pnl:.2f}")
-                qty = qty_to_sell
+                log.info(f"🔴 SELL {filled_qty:.2f} {token_id} @ {vwap_price:.3f} | PnL: ${pnl:.2f}")
 
             # --- AUDIT & SAVE ---
             equity = self.pm.calculate_equity()
-            
-            # Record High Water Mark
             if equity > state.get("highest_equity", 0):
                 state["highest_equity"] = equity
 
-            # Persist to disk
             await self.pm.save_async()
 
-            # Write to Audit Log (JSONL format)
             audit_record = {
                 "ts": time.time(),
                 "side": side,
                 "token": token_id,
-                "price": price,
-                "qty": qty,
+                "price": vwap_price,
+                "qty": filled_qty,
                 "equity": equity,
                 "fpmm": fpmm_id
             }
