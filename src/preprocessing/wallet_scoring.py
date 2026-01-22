@@ -6,6 +6,7 @@ import requests
 import os
 import gc
 import sys
+import time
 from requests.adapters import HTTPAdapter, Retry
 
 # ==========================================
@@ -105,12 +106,13 @@ def fetch_gamma_market_outcomes():
     return pl_outcomes
 
 # ==========================================
-# 2. CHUNK PROCESSOR
+# 2. CHUNK PROCESSOR (Polars)
 # ==========================================
 
 def process_chunk(df_chunk, outcomes_df):
     """
-    Calculates stats for a single chunk of data.
+    Input: Polars DataFrame Chunk
+    Output: Aggregated Stats
     """
     # Normalize IDs
     df_chunk = df_chunk.with_columns(
@@ -147,7 +149,7 @@ def process_chunk(df_chunk, outcomes_df):
     return stats
 
 # ==========================================
-# 3. MAIN EXECUTION (DISK FLUSH STRATEGY)
+# 3. MAIN EXECUTION (SEQUENTIAL STREAMING)
 # ==========================================
 
 def main():
@@ -169,42 +171,38 @@ def main():
     # Initialize Header in Temp File
     pl.DataFrame({"user": [], "net_roi": [], "pain": [], "count": []}).write_csv(temp_file)
 
-    print(f"🚀 Starting DISK-BUFFERED processing on '{csv_file}'...")
-    print(f"   (Intermediate results will be flushed to '{temp_file}')")
+    print(f"🚀 Starting FAST SEQUENTIAL processing on '{csv_file}'...")
+    print(f"   (Using Pandas iterator for reading, Polars for math)")
 
-    # 3. MANUAL SLICING LOOP (Replaces read_csv_batched)
-    # We scan the file once to get the total length, then slice it in chunks.
-    try:
-        # Get total row count efficiently
-        total_rows = pl.scan_csv(csv_file).select(pl.len()).collect().item()
-        print(f"   Total rows to process: {total_rows:,}")
-    except Exception as e:
-        print(f"   Could not determine file length: {e}")
-        return
-
+    # 3. PANDAS SEQUENTIAL READER
+    # We use Pandas to strictly read 500k lines at a time sequentially.
+    # This prevents the "re-reading" problem of random access slicing.
     chunk_size = 500_000
-    current_offset = 0
     chunks_processed = 0
+    start_time = time.time()
+    
+    # Specifying dtypes forces Pandas to be memory efficient and not guess
+    reader = pd.read_csv(
+        csv_file,
+        chunksize=chunk_size,
+        dtype={
+            "contract_id": str,
+            "user": str,
+            "price": float,
+            "outcomeTokensAmount": float
+        },
+        usecols=["contract_id", "user", "price", "outcomeTokensAmount"] # Only load useful cols
+    )
 
-    while current_offset < total_rows:
+    for pd_chunk in reader:
         try:
-            # Lazy Scan -> Slice -> Collect
-            # This reads ONLY the specific chunk from disk
-            chunk = pl.scan_csv(
-                csv_file,
-                schema_overrides={"contract_id": pl.String, "user": pl.String},
-                low_memory=True
-            ).slice(current_offset, chunk_size).collect()
-            
-            if chunk.height == 0:
-                break
-            
-            # Update counters
-            current_offset += chunk.height
             chunks_processed += 1
             
-            # Process
-            agg_chunk = process_chunk(chunk, outcomes)
+            # Convert Pandas Chunk -> Polars Chunk (Fast, Zero-Copy if possible)
+            pl_chunk = pl.from_pandas(pd_chunk)
+            
+            # Process using our Polars Logic
+            agg_chunk = process_chunk(pl_chunk, outcomes)
             
             # Flush to Disk
             if agg_chunk is not None and agg_chunk.height > 0:
@@ -212,16 +210,21 @@ def main():
                     agg_chunk.write_csv(f, include_header=False)
             
             # CLEANUP
-            del chunk
+            del pd_chunk
+            del pl_chunk
             del agg_chunk
             gc.collect()
 
+            # Progress Feedback
             if chunks_processed % 10 == 0:
-                print(f"   Processed {current_offset:,} / {total_rows:,} rows...", end='\r')
+                elapsed = time.time() - start_time
+                rows_done = chunks_processed * chunk_size
+                rows_per_sec = rows_done / elapsed
+                print(f"   Processed {chunks_processed} chunks (~{rows_done/1_000_000:.1f}M rows) | Speed: {rows_per_sec/1000:.0f}k rows/sec...", end='\r')
                 
         except Exception as e:
-            print(f"\n❌ Error processing chunk at offset {current_offset}: {e}")
-            break
+            print(f"\n❌ Error processing chunk {chunks_processed}: {e}")
+            continue
 
     print(f"\n✅ Scan complete. Loading intermediate stats from disk...")
 
