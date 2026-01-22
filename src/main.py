@@ -35,7 +35,7 @@ class LiveTrader:
         self.reconnect_delay = 1
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER V11 (Modular)")
+        print("\n🚀 STARTING LIVE PAPER TRADER")
         validate_config()
         
         # Load heavy data before starting loops
