@@ -3,7 +3,6 @@ import json
 import time
 import signal
 import logging
-import websockets
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
