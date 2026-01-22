@@ -95,7 +95,7 @@ def main():
         # This prevents the "Length Mismatch" error by keeping everything aligned.
         
         joined = joined.with_columns([
-            pl.col('bet_price').clip(0.01, 0.99).alias('safe_price'),
+            pl.col('bet_price').clip(0.001, 0.999).alias('safe_price'),
             (pl.col('tokens') > 0).alias('is_long')
         ])
 
@@ -121,7 +121,7 @@ def main():
         # Short ROI: (Price - Outcome) / (1 - Price)
         short_roi = (pl.col('safe_price') - pl.col('outcome')) / (1.0 - pl.col('safe_price'))
         
-        final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi).clip(-1.0, 5.0)
+        final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi)
         
         # Win/Loss Flag
         won_bet = (pl.col('is_long') & (pl.col('outcome') > 0.5)) | \
