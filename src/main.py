@@ -322,8 +322,7 @@ class LiveTrader:
         )
         
         if success and reset_tracker_key:
-             if reset_tracker_key in self.signal_engine.trackers:
-                self.signal_engine.trackers[reset_tracker_key]['weight'] = 0.0
+             
              open_pos = list(self.persistence.state["positions"].keys())
              self.sub_manager.set_mandatory(open_pos)
             
