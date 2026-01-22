@@ -78,14 +78,23 @@ class LiveTrader:
                     self.sub_manager.dirty = True
                     
                     while self.running:
+                        # 1. Debug Logging for Subscriptions
+                        if self.sub_manager.dirty:
+                             # Peek at what we are about to send
+                             queued = list(self.sub_manager.speculative_subs)[-3:]
+                             log.info(f"📤 Sending Subscription Update... (Includes: {queued})")
+
                         # Send subscriptions if changed
-                        # NOTE: Ensure SubscriptionManager sends the correct payload type for books!
                         await self.sub_manager.sync(websocket)
                         
                         try:
-                            msg = await asyncio.wait_for(websocket.recv(), timeout=10.0)
-                            await self.ws_queue.put(msg)
+                            # CRITICAL FIX: Reduce timeout to 0.5s so we don't block subscriptions
+                            msg = await asyncio.wait_for(websocket.recv(), timeout=0.5)
+                            if msg: # Ignore empty heartbeats
+                                await self.ws_queue.put(msg)
+                                
                         except asyncio.TimeoutError:
+                            # This is good! It means we can loop back and check for new subs
                             continue
                         except websockets.ConnectionClosed:
                             log.warning("WS Connection Closed")
@@ -96,65 +105,55 @@ class LiveTrader:
                 self.reconnect_delay = min(self.reconnect_delay * 2, 60)
 
     async def _ws_processor_loop(self):
-        """
-        Parses messages off the queue to update local order books.
-        Handles both 'book' (Snapshot) and 'price_change' (Delta) events.
-        """
         while self.running:
             msg = await self.ws_queue.get()
             try:
-                data = json.loads(msg)
+                # Handle Heartbeats/Empty strings gracefully
+                if not msg: continue
                 
-                # Handle batch messages (sometimes they come as a list)
+                try:
+                    data = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue # Skip non-json heartbeats
+                
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
                     event_type = item.get("event_type", "")
                     asset_id = item.get("asset_id")
 
-                    # 1. SNAPSHOT (Initial Load)
+                    # DEBUG: Catch Errors
+                    if event_type == "error":
+                        log.error(f"🚨 WS ERROR: {item}")
+
+                    # 1. SNAPSHOT
                     if event_type == "book" and asset_id:
-                        # Convert to float for sorting/math, keep as list of [price, size]
                         bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
                         asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
                         
                         self.ws_books[asset_id] = {
-                            'bids': sorted(bids, key=lambda x: x[0], reverse=True), # High to Low
-                            'asks': sorted(asks, key=lambda x: x[0])  # Low to High
+                            'bids': sorted(bids, key=lambda x: x[0], reverse=True),
+                            'asks': sorted(asks, key=lambda x: x[0])
                         }
-                        
-                        # Check Stops immediately on snapshot
-                        if asks:
-                            asyncio.create_task(self._check_stop_loss(asset_id, asks[0][0]))
+                        # DEBUG: Log that we actually got it
+                        log.info(f"📘 Book Snapshot Saved: {asset_id[:10]}... | Asks: {len(asks)}")
 
-                    # 2. DELTA UPDATE (Price Change)
+                    # 2. DELTA UPDATE
                     elif event_type == "price_change":
-                        # price_change events often contain a list of changes
                         changes = item.get("price_changes", [])
-                        if not changes: continue
-
                         for change in changes:
                             c_aid = change.get("asset_id")
                             if not c_aid: continue
                             
-                            # Initialize book if we missed the snapshot (rare but possible)
+                            # Auto-create book if missing (Polymarket sometimes sends deltas before snapshot)
                             if c_aid not in self.ws_books:
                                 self.ws_books[c_aid] = {'bids': [], 'asks': []}
 
-                            side = change.get("side") # "BUY" or "SELL"
+                            side = change.get("side")
                             price = float(change.get("price", 0))
                             new_size = float(change.get("size", 0))
-                            
                             target_list = 'bids' if side == "BUY" else 'asks'
-                            
                             self._update_book_level(self.ws_books[c_aid][target_list], price, new_size, side)
-
-                        # Check Stops after update
-                        # We use the asset_id from the last change in the batch
-                        last_aid = changes[-1].get("asset_id")
-                        if last_aid and self.ws_books.get(last_aid, {}).get('asks'):
-                            best_ask = self.ws_books[last_aid]['asks'][0][0]
-                            asyncio.create_task(self._check_stop_loss(last_aid, best_ask))
 
             except Exception as e:
                 log.error(f"WS Parse Error: {e}")
