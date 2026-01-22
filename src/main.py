@@ -11,46 +11,54 @@ from config import CONFIG, WS_URL, USDC_ADDRESS, setup_logging, validate_config
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
 from strategy import WalletScorer, SignalEngine, TradeLogic
+from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
 
 class LiveTrader:
     def __init__(self):
-        # 1. Initialize Components
         self.persistence = PersistenceManager()
         self.broker = PaperBroker(self.persistence)
         self.metadata = MarketMetadata()
         self.sub_manager = SubscriptionManager()
-        
-        # Strategy Components
         self.scorer = WalletScorer()
         self.signal_engine = SignalEngine()
         
-        # Runtime State
-        # CHANGE: We now store full order books, not just single prices
         self.ws_books: Dict[str, Dict] = {} 
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
         self.running = True
-        self.reconnect_delay = 1
+        
+        # The new Threaded Client
+        self.ws_client = None
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER")
+        print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
         validate_config()
-        
-        # Load heavy data
         self.scorer.load()
         await self.metadata.refresh()
         
-        # Register Signal Handlers
+        # Initialize the Threaded WS Client
+        # We pass a lambda to bridge the Sync Thread -> Async Queue
         loop = asyncio.get_running_loop()
+        def bridge_callback(msg):
+            loop.call_soon_threadsafe(self.ws_queue.put_nowait, msg)
+
+        # Initial clean URL (remove wss:// prefix if library adds it, but WSApp needs full url)
+        # The example used "wss://ws-subscriptions-clob.polymarket.com"
+        target_url = "wss://ws-subscriptions-clob.polymarket.com" 
+        
+        self.ws_client = PolymarketWS(target_url, [], bridge_callback)
+        self.ws_client.start_thread()
+
+        # Signal Handlers
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
-        # Start loops
+        # Start Async Loops
         await asyncio.gather(
-            self._ws_ingestion_loop(),
+            self._subscription_monitor_loop(), # Replaces ingestion loop
             self._ws_processor_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
@@ -60,141 +68,91 @@ class LiveTrader:
     async def shutdown(self):
         log.info("🛑 Shutting down...")
         self.running = False
+        if self.ws_client: self.ws_client.running = False
         await self.persistence.save_async()
         try:
             asyncio.get_running_loop().stop()
-        except:
-            pass
+        except: pass
 
-    # --- WEBSOCKET LOOPS ---
+    # --- LOOPS ---
 
-    async def _ws_ingestion_loop(self):
-        """Maintains the connection to Polymarket WS with Browser Headers."""
-        # Headers to look like a real browser (Bypasses Cloudflare filtering)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Origin": "https://polymarket.com",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
+    async def _subscription_monitor_loop(self):
+        """Watches for changes in subscriptions and pushes them to the threaded client."""
         while self.running:
-            try:
-                # ADDED: extra_headers=headers
-                async with websockets.connect(WS_URL, extra_headers=headers) as websocket:
-                    log.info(f"⚡ Websocket Connected (Masked as Chrome).")
-                    self.reconnect_delay = 1
-                    self.sub_manager.dirty = True
+            if self.sub_manager.dirty:
+                async with self.sub_manager.lock:
+                    final_list = list(self.sub_manager.mandatory_subs)
+                    slots_left = CONFIG['max_ws_subs'] - len(final_list)
+                    if slots_left > 0:
+                        final_list.extend(list(self.sub_manager.speculative_subs)[:slots_left])
                     
-                    while self.running:
-                        # Debug: Print what we are sending
-                        if self.sub_manager.dirty:
-                             queued = list(self.sub_manager.speculative_subs)[-3:]
-                             log.info(f"📤 Sending Subscription Update... (Includes: {queued})")
-
-                        await self.sub_manager.sync(websocket)
-                        
-                        try:
-                            # Keep the timeout short to allow subscription updates
-                            msg = await asyncio.wait_for(websocket.recv(), timeout=0.5)
-                            if msg: 
-                                await self.ws_queue.put(msg)
-                                
-                        except asyncio.TimeoutError:
-                            continue
-                        except websockets.ConnectionClosed:
-                            log.warning("WS Connection Closed")
-                            break 
-            except Exception as e:
-                log.error(f"WS Error: {e}")
-                await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
+                    # Push update to the thread
+                    if self.ws_client:
+                        self.ws_client.update_subscriptions(final_list)
+                    
+                    self.sub_manager.dirty = False
+            await asyncio.sleep(1.0)
 
     async def _ws_processor_loop(self):
+        """Parses messages off the queue (bridged from thread)."""
         while self.running:
             msg = await self.ws_queue.get()
             try:
-                # Handle Heartbeats/Empty strings gracefully
                 if not msg: continue
-                
-                try:
-                    data = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue # Skip non-json heartbeats
-                
+                # Handle PONGs or junk
+                if msg == "PONG": continue
+
+                try: data = json.loads(msg)
+                except: continue
+
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
                     event_type = item.get("event_type", "")
                     asset_id = item.get("asset_id")
 
-                    # DEBUG: Catch Errors
-                    if event_type == "error":
-                        log.error(f"🚨 WS ERROR: {item}")
-
-                    # 1. SNAPSHOT
                     if event_type == "book" and asset_id:
                         bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
                         asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
+                        self.ws_books[asset_id] = {'bids': bids, 'asks': asks}
                         
-                        self.ws_books[asset_id] = {
-                            'bids': sorted(bids, key=lambda x: x[0], reverse=True),
-                            'asks': sorted(asks, key=lambda x: x[0])
-                        }
-                        # DEBUG: Log that we actually got it
-                        log.info(f"📘 Book Snapshot Saved: {asset_id[:10]}... | Asks: {len(asks)}")
+                        # LOG SUCCESS
+                        if len(asks) > 0:
+                            log.info(f"📘 Book Received: {asset_id} | Asks: {len(asks)}")
 
-                    # 2. DELTA UPDATE
                     elif event_type == "price_change":
+                        # (Same logic as before)
                         changes = item.get("price_changes", [])
                         for change in changes:
                             c_aid = change.get("asset_id")
-                            if not c_aid: continue
-                            
-                            # Auto-create book if missing (Polymarket sometimes sends deltas before snapshot)
                             if c_aid not in self.ws_books:
                                 self.ws_books[c_aid] = {'bids': [], 'asks': []}
-
                             side = change.get("side")
-                            price = float(change.get("price", 0))
-                            new_size = float(change.get("size", 0))
-                            target_list = 'bids' if side == "BUY" else 'asks'
-                            self._update_book_level(self.ws_books[c_aid][target_list], price, new_size, side)
+                            p = float(change.get("price", 0))
+                            s = float(change.get("size", 0))
+                            
+                            lst = self.ws_books[c_aid]['bids'] if side == "BUY" else self.ws_books[c_aid]['asks']
+                            self._update_book_level(lst, p, s, side)
 
             except Exception as e:
                 log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
 
-    def _update_book_level(self, book_list: List[List[float]], price: float, size: float, side: str):
-        """
-        Updates a specific price level in the book list.
-        If size is 0, removes the level.
-        Maintains sort order: Bids (Desc), Asks (Asc).
-        """
-        # 1. Check if price level exists
+    def _update_book_level(self, book_list, price, size, side):
+        # (Same helper logic as previous version)
         found_idx = -1
         for i, (p, s) in enumerate(book_list):
             if p == price:
                 found_idx = i
                 break
-        
-        # 2. Update logic
         if size == 0:
-            if found_idx != -1:
-                book_list.pop(found_idx)
+            if found_idx != -1: book_list.pop(found_idx)
         else:
-            if found_idx != -1:
-                book_list[found_idx][1] = size # Update size
+            if found_idx != -1: book_list[found_idx][1] = size
             else:
-                book_list.append([price, size]) # Add new level
-                
-                # 3. Re-sort
-                # Optimization: Could insert at correct index to avoid full sort, 
-                # but Python's Timsort is efficient for mostly-sorted data.
-                if side == "BUY":
-                    book_list.sort(key=lambda x: x[0], reverse=True) # Descending
-                else:
-                    book_list.sort(key=lambda x: x[0]) # Ascending
+                book_list.append([price, size])
+                book_list.sort(key=lambda x: x[0], reverse=(side=="BUY"))
 
     # --- SIGNAL LOOPS ---
 
