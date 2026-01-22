@@ -292,9 +292,8 @@ class LiveTrader:
             if action == 'SPECULATE':
                 self.sub_manager.add_speculative(tokens)
             elif action == 'BUY':
-                self.signal_engine.trackers[fpmm]['weight'] = 0.0
                 target_token = tokens[1] if new_weight > 0 else tokens[0] 
-                await self._attempt_exec(target_token, fpmm)
+                await self._attempt_exec(target_token, fpmm, reset_tracker_key=fpmm)
 
         # LOGGING
         if batch_scores:
@@ -330,20 +329,48 @@ class LiveTrader:
 
     # --- EXECUTION HELPERS ---
 
-    async def _attempt_exec(self, token_id, fpmm):
-        # Retrieve full book
+    async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
+        """
+        Attempts to execute a trade. 
+        If the Order Book is missing (Cold Start), it waits up to 5s for data.
+        """
+        # 1. Wait for Liquidity (The "Patient" Check)
+        book = None
+        for i in range(5): # Try 5 times (5 seconds total)
+            book = self.ws_books.get(token_id)
+            
+            # If we have a book with actual liquidity, we are good to go
+            if book and book.get('asks'):
+                break
+            
+            # If missing, ensure we are subscribed and wait
+            if i == 0:
+                log.info(f"⏳ Cold Start: Waiting for book data on {token_id}...")
+                tokens = self.metadata.fpmm_to_tokens.get(fpmm)
+                if tokens: 
+                    self.sub_manager.add_speculative(tokens)
+                    # Trigger immediate sync
+                    if not self.ws_queue.empty(): await asyncio.sleep(0.1) 
+            
+            await asyncio.sleep(1.0)
+        
+        # 2. Final Validation
         book = self.ws_books.get(token_id)
-        if not book: return
-        
-        # Check basic liquidity presence
-        if not book.get('asks'): return
-        
-        # Pass book to broker for VWAP execution
+        if not book or not book.get('asks'): 
+            log.warning(f"❌ Missed Opportunity: No Liquidity found for {token_id} after waiting.")
+            return
+
+        # 3. Execute VWAP Order
         success = await self.broker.execute_market_order(
             token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
         )
         
+        # 4. Handle Success
         if success:
+            # CRITICAL: Only reset the signal heat if we actually bought!
+            if reset_tracker_key and reset_tracker_key in self.signal_engine.trackers:
+                self.signal_engine.trackers[reset_tracker_key]['weight'] = 0.0
+                
             open_pos = list(self.persistence.state["positions"].keys())
             self.sub_manager.set_mandatory(open_pos)
 
