@@ -175,6 +175,20 @@ class PaperBroker:
                 log.warning(f"❌ Execution failed: Insufficient liquidity for {token_id}")
                 return False
 
+            # ==========================================================
+            # 🛡️ PRICE GUARD (NEW ADDITION)
+            # ==========================================================
+            # Prevent Buying expensive "sure things" (> 0.95)
+            if side == "BUY" and vwap_price > 0.95:
+                log.warning(f"🛡️ SKIPPED BUY: Price {vwap_price:.3f} is too high (Max: 0.95)")
+                return False
+
+            # Prevent Panic Selling for dust (< 0.05)
+            if side == "SELL" and vwap_price < 0.05:
+                log.warning(f"🛡️ SKIPPED SELL: Price {vwap_price:.3f} is too low (Min: 0.05)")
+                return False
+            # ==========================================================
+
             # --- BUY LOGIC ---
             if side == "BUY":
                 # 1. Risk Check
