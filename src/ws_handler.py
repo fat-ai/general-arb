@@ -8,15 +8,15 @@ log = logging.getLogger("PaperGold")
 
 class PolymarketWS:
     def __init__(self, url, assets_ids, on_message_callback):
+        # Strict adherence to documentation URL structure
         self.url = f"{url}/ws/market"
         self.assets_ids = assets_ids
         self.on_message_callback = on_message_callback
         self.ws = None
-        self.wst = None # Thread
+        self.wst = None
         self.running = True
 
     def on_message(self, ws, message):
-        # Pass the message back to the main bot
         if self.on_message_callback:
             self.on_message_callback(message)
 
@@ -24,21 +24,24 @@ class PolymarketWS:
         log.error(f"WS Error: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
-        log.warning("WS Closed. Reconnecting...")
+        log.warning(f"WS Closed. Reconnecting...")
 
     def on_open(self, ws):
-        log.info("⚡ Websocket Connected (Threaded).")
-        # Standard subscription payload from the example
+        log.info("⚡ Websocket Connected.")
+        
+        # FIXED: Always send the initial handshake, even if list is empty.
+        # This registers the connection type with the server.
         payload = {
             "assets_ids": self.assets_ids, 
             "type": "market"
         }
         ws.send(json.dumps(payload))
         
-        # Start the PING thread exactly as shown in example
+        # Start PING thread (from example)
         threading.Thread(target=self.ping, args=(ws,), daemon=True).start()
 
     def ping(self, ws):
+        """Sends literal 'PING' string every 10s as per docs."""
         while self.running and ws.sock and ws.sock.connected:
             try:
                 ws.send("PING")
@@ -47,11 +50,14 @@ class PolymarketWS:
                 break
 
     def update_subscriptions(self, assets_ids):
-        """Allows the main bot to update the list dynamically."""
+        """Uses 'operation': 'subscribe' as per documentation."""
         self.assets_ids = assets_ids
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            # Polymarket supports "subscribe" operation for updates
-            payload = {"assets_ids": assets_ids, "type": "market"}
+            payload = {
+                "assets_ids": assets_ids, 
+                "type": "market",
+                "operation": "subscribe" 
+            }
             try:
                 self.ws.send(json.dumps(payload))
                 log.info(f"📤 Sent Subscription Update ({len(assets_ids)} assets)")
@@ -59,8 +65,7 @@ class PolymarketWS:
                 log.error(f"Failed to update subs: {e}")
 
     def run(self):
-        # Disable the library's noisy logging
-        # websocket.enableTrace(True) 
+        # No extra headers. Just standard connection.
         self.ws = WebSocketApp(
             self.url,
             on_message=self.on_message,
