@@ -7,10 +7,10 @@ import os
 import gc
 import sys
 import time
-from dateutil import parser
+import mmap
 from requests.adapters import HTTPAdapter, Retry
 
-# Force unbuffered output so you see prints immediately in Docker
+# Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 
 # ==========================================
@@ -50,9 +50,7 @@ def fetch_filtered_outcomes(min_timestamp_str):
 
     df = pd.DataFrame(all_rows)
 
-    # --- DATE FILTERING ---
-    # Crucial: Discard markets created before our data starts.
-    # Otherwise, closing an old position looks like opening a new short.
+    # Date Filtering
     print(f"   Filtering markets created before {min_timestamp_str}...", flush=True)
     try:
         cutoff_dt = pd.to_datetime(min_timestamp_str, utc=True)
@@ -103,15 +101,13 @@ def fetch_filtered_outcomes(min_timestamp_str):
     df['outcome'] = df.apply(derive_outcome, axis=1)
     df = df.dropna(subset=['outcome'])
 
-    # Map Token IDs to Outcome (0 or 1)
+    # Map Outcomes
     df['contract_id_list'] = df['contract_id'].str.split(',')
     df['market_row_id'] = df.index 
     df = df.explode('contract_id_list')
     df['token_index'] = df.groupby('market_row_id').cumcount()
     df['contract_id'] = df['contract_id_list'].str.strip()
     
-    # Polymarket Standard: Index 0 is "No", Index 1 is "Yes" (usually).
-    # Winning Index gets 1.0, Losing gets 0.0
     def final_payout(row):
         winning_idx = int(round(row['outcome']))
         return 1.0 if row['token_index'] == winning_idx else 0.0
@@ -119,7 +115,6 @@ def fetch_filtered_outcomes(min_timestamp_str):
     df['final_outcome'] = df.apply(final_payout, axis=1)
     df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
     
-    # Save ID -> Payout
     pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
     pl_outcomes.write_parquet(cache_file)
     return pl_outcomes
@@ -129,20 +124,13 @@ def fetch_filtered_outcomes(min_timestamp_str):
 # ==========================================
 
 def process_chunk_universal(df_chunk, outcomes_df):
-    """
-    Implements the "Sell = Mint + Sell" logic.
-    Buy = Acquire "Yes" Token.
-    Sell = Acquire "No" Token (Cost = 1.00 - Price).
-    """
-    # Normalize
+    # Normalize IDs
     df_chunk = df_chunk.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
     )
     
-    # Filter valid price range
-    df_chunk = df_chunk.filter(pl.col("price").is_between(0.01, 0.99))
+    df_chunk = df_chunk.filter(pl.col("price").is_between(0.001, 0.999))
     
-    # Join (Drops trades for old markets we filtered out)
     joined = df_chunk.join(outcomes_df, on="contract_id", how="inner")
     
     if joined.height == 0:
@@ -157,17 +145,9 @@ def process_chunk_universal(df_chunk, outcomes_df):
     stats = (
         joined.group_by(["user", "contract_id"])
         .agg([
-            # --- 1. BUY SIDE (Positive outcomeTokensAmount) ---
-            # User buys 'YES' tokens.
-            # Invested = Price * Size
-            # Asset = YES Tokens
             pl.col("size").filter(pl.col("outcomeTokensAmount") > 0).sum().fill_null(0).alias("tokens_yes"),
             pl.col("cash_value").filter(pl.col("outcomeTokensAmount") > 0).sum().fill_null(0).alias("cost_buy_yes"),
             
-            # --- 2. SELL SIDE (Negative outcomeTokensAmount) ---
-            # User Mints (Cost 1.00) and Sells YES (Rev Price).
-            # Net Effect: User buys 'NO' tokens at (1.00 - Price).
-            # Asset = NO Tokens
             pl.col("size").filter(pl.col("outcomeTokensAmount") < 0).sum().fill_null(0).alias("tokens_no"),
             pl.col("cash_value").filter(pl.col("outcomeTokensAmount") < 0).sum().fill_null(0).alias("cash_from_sell"),
             
@@ -181,7 +161,7 @@ def process_chunk_universal(df_chunk, outcomes_df):
 # ==========================================
 
 def main():
-    print("DEBUG: Starting Robust PnL Script...", flush=True)
+    print("DEBUG: Starting Universal Mint Logic Script...", flush=True)
     
     csv_file = "gamma_trades_stream.csv"
     temp_file = "temp_universal_stats.csv"
@@ -191,7 +171,7 @@ def main():
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
-    # --- STEP A: ROBUST DATE DETECTION ---
+    # --- A. DETECT START DATE ---
     print("👀 Detecting true start date (checking first and last rows)...", flush=True)
     try:
         # 1. Read First Row
@@ -199,14 +179,10 @@ def main():
         ts_head = pd.to_datetime(df_head['timestamp'].iloc[0])
         
         # 2. Read Last Row (Seek to end)
-        import mmap
         with open(csv_file, "rb") as f:
-            # Memory map the file, size 0 means whole file
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                # Find the last newline
                 end_pos = mm.rfind(b'\n', 0, mm.size() - 1)
                 if end_pos != -1:
-                    # Find the newline before that
                     start_pos = mm.rfind(b'\n', 0, end_pos)
                     if start_pos != -1:
                         mm.seek(start_pos + 1)
@@ -215,47 +191,37 @@ def main():
                         mm.seek(0)
                         last_line = mm.read(end_pos).decode('utf-8')
                 else:
-                    # One line file
                     mm.seek(0)
                     last_line = mm.read().decode('utf-8')
 
-        # Parse last line manually (assuming standard CSV format)
-        # We assume 'timestamp' is the 2nd column (index 1) based on standard gamma/goldsky format
-        # Adjust index if your CSV structure is different
         last_line_split = last_line.split(',')
         if len(last_line_split) > 1:
-             # Try to parse the timestamp column (usually col 1 or 2)
-             # Based on previous code: 'id', 'timestamp' ... so index 1
              ts_tail_str = last_line_split[1].replace('"', '') 
              ts_tail = pd.to_datetime(ts_tail_str)
         else:
-             ts_tail = ts_head # Fallback
+             ts_tail = ts_head 
 
-        # 3. Pick the EARLIEST of the two
         min_date = min(ts_head, ts_tail)
-        
         print(f"   Head Date: {ts_head}", flush=True)
         print(f"   Tail Date: {ts_tail}", flush=True)
         print(f"   ✅ True Data Start: {min_date}", flush=True)
-        
-        # Convert back to string for the filter function
         start_ts_str = min_date.isoformat()
 
     except Exception as e:
         print(f"⚠️ Could not detect start date (Error: {e}). Defaulting to Head.", flush=True)
         start_ts_str = df_head['timestamp'].iloc[0]
 
-    # --- STEP B: Fetch Markets ---
-    # Pass the robust minimum date
+    # --- B. FETCH MARKETS ---
     outcomes = fetch_filtered_outcomes(start_ts_str)
     
     if outcomes.height == 0:
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
-    # --- STEP C: Process Trades ---
+    # --- C. PROCESS TRADES ---
     if os.path.exists(temp_file): os.remove(temp_file)
     
+    # Initialize Temp CSV
     pl.DataFrame({
         "user": [], "contract_id": [], 
         "tokens_yes": [], "cost_buy_yes": [],
@@ -300,10 +266,21 @@ def main():
 
     print(f"\n✅ Scan complete. Finalizing Scores...", flush=True)
 
-    # --- STEP D: Final Calculation (Same as before) ---
+    # --- D. FINAL CALCULATION (With Type Forcing) ---
     try:
+        # Define Schema to prevent Type Errors during scan
+        schema_map = {
+            "user": pl.String,
+            "contract_id": pl.String,
+            "tokens_yes": pl.Float64,
+            "cost_buy_yes": pl.Float64,
+            "tokens_no": pl.Float64,
+            "cash_from_sell": pl.Float64,
+            "trade_count": pl.Int64
+        }
+
         final_stats = (
-            pl.scan_csv(temp_file)
+            pl.scan_csv(temp_file, schema_overrides=schema_map)
             .group_by(["user", "contract_id"])
             .agg([
                 pl.col("tokens_yes").sum(),
@@ -314,9 +291,14 @@ def main():
             ])
             .join(outcomes.lazy(), on="contract_id", how="inner")
             .with_columns([
+                # 1. Calculate Implicit Cost of NO tokens (Shorts)
                 (pl.col("tokens_no") - pl.col("cash_from_sell")).alias("cost_buy_no"),
-                ((pl.col("tokens_yes") * pl.col("final_outcome")) + 
-                 (pl.col("tokens_no") * (1.0 - pl.col("final_outcome")))).alias("residual_value")
+                
+                # 2. Calculate Final Portfolio Value
+                (
+                    (pl.col("tokens_yes") * pl.col("final_outcome")) + 
+                    (pl.col("tokens_no") * (1.0 - pl.col("final_outcome")))
+                ).alias("residual_value")
             ])
             .with_columns([
                 (pl.col("cost_buy_yes") + pl.col("cost_buy_no")).alias("invested"),
@@ -330,7 +312,7 @@ def main():
             ])
             .filter(
                 (pl.col("total_trades") >= 20) & 
-                (pl.col("total_invested") > 10.0)
+                (pl.col("total_invested") > 10.0) 
             )
             .with_columns([
                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
@@ -357,7 +339,6 @@ def main():
 
     except Exception as e:
         print(f"❌ Error during final aggregation: {e}", flush=True)
-
 
 if __name__ == "__main__":
     main()
