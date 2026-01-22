@@ -45,10 +45,7 @@ def main():
             .select([
                 pl.col('contract_id').cast(pl.String).str.strip_chars(),
                 pl.col('final_outcome').cast(pl.Float64).alias('outcome'),
-                # Ensure column name matches your parquet schema (e.g., 'startDate', 'created_at')
-                pl.col('createdAt').cast(pl.Datetime).alias('market_start') 
             ])
-            .filter(pl.col('market_start') >= data_start_date)
             .unique(subset=['contract_id'], keep='last')
             .collect()
         )
