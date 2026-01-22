@@ -14,7 +14,7 @@ def main():
     print("--- Fresh Wallet Calibration (Audit Version) ---")
     
     trades_path = 'gamma_trades_stream.csv'
-    outcomes_path = 'market_outcomes.parquet'
+    outcomes_path = 'market_outcomes_filtered.parquet'
     output_file = 'model_params_audit.json'
     BATCH_SIZE = 500_000 
 
