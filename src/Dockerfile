@@ -2,21 +2,22 @@
 FROM python:3.11-slim
 
 # Set environment variables
-# PYTHONUNBUFFERED=1 ensures logs are printed immediately to the console
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Set the working directory inside the container
 WORKDIR /app
 
-# Install dependencies first (better caching)
+# 1. Install dependencies
+# We copy requirements first to leverage Docker layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
-COPY . .
+# 2. Copy ONLY the application source code
+# This explicitly grabs only the 5 python files and ignores everything else (like the CSV)
+COPY main.py broker.py config.py data.py strategy.py ./
 
-# Create the cache directory defined in config.py to ensure permissions are correct
+# 3. Create the cache directory (required by config.py)
 RUN mkdir -p live_paper_cache
 
 # Run the application
