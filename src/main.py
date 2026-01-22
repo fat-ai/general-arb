@@ -330,50 +330,42 @@ class LiveTrader:
     # --- EXECUTION HELPERS ---
 
     async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
-        """
-        Attempts to execute a trade. 
-        If the Order Book is missing (Cold Start), it waits up to 5s for data.
-        """
-        # 1. Wait for Liquidity (The "Patient" Check)
+        # 1. Wait for Liquidity
         book = None
-        for i in range(30): # Try 30 times (30 seconds total)
-            book = self.ws_books.get(token_id)
+        for i in range(10): # increased to 10s
+            book = self.ws_books.get(str(token_id)) # Ensure string key
             
-            # If we have a book with actual liquidity, we are good to go
             if book and book.get('asks'):
                 break
             
-            # If missing, ensure we are subscribed and wait
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for book data on {token_id}...")
                 tokens = self.metadata.fpmm_to_tokens.get(fpmm)
                 if tokens: 
                     self.sub_manager.add_speculative(tokens)
-                    # Trigger immediate sync
-                    if not self.ws_queue.empty(): await asyncio.sleep(0.1) 
             
             await asyncio.sleep(1.0)
         
         # 2. Final Validation
-        book = self.ws_books.get(token_id)
+        book = self.ws_books.get(str(token_id))
         if not book or not book.get('asks'): 
-            log.warning(f"❌ Missed Opportunity: No Liquidity found for {token_id} after waiting.")
+            # DEBUG: Why did we fail?
+            keys_sample = list(self.ws_books.keys())[:3]
+            log.warning(f"❌ Missed Opportunity: {token_id}")
+            log.warning(f"   Debug: We have {len(self.ws_books)} books. Sample Keys: {keys_sample}")
             return
 
-        # 3. Execute VWAP Order
+        # 3. Execute
         success = await self.broker.execute_market_order(
             token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
         )
         
-        # 4. Handle Success
-        if success:
-            # CRITICAL: Only reset the signal heat if we actually bought!
-            if reset_tracker_key and reset_tracker_key in self.signal_engine.trackers:
+        if success and reset_tracker_key:
+             if reset_tracker_key in self.signal_engine.trackers:
                 self.signal_engine.trackers[reset_tracker_key]['weight'] = 0.0
-                
-            open_pos = list(self.persistence.state["positions"].keys())
-            self.sub_manager.set_mandatory(open_pos)
-
+             open_pos = list(self.persistence.state["positions"].keys())
+             self.sub_manager.set_mandatory(open_pos)
+            
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
         if not pos: return
