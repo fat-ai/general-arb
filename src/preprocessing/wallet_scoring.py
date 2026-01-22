@@ -316,7 +316,7 @@ def main():
             )
             .with_columns([
                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                pl.col("total_trades").log(10).alias("vol_boost")
+                (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
             ])
             .with_columns([
                 (pl.col("roi") * pl.col("vol_boost")).alias("score")
