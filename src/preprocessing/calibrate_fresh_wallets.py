@@ -42,8 +42,6 @@ def main():
     # 1. Load Outcomes (With Date Filter)
     print(f"Loading and filtering outcomes from {outcomes_path}...")
     try:
-        # Note: We assume 'startDate' exists in your parquet. 
-        # If it's named 'created_at' or 'open_time', please update the column name below.
         df_outcomes = (
             pl.scan_parquet(outcomes_path)
             .select([
