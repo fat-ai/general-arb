@@ -69,32 +69,37 @@ class LiveTrader:
     # --- WEBSOCKET LOOPS ---
 
     async def _ws_ingestion_loop(self):
-        """Maintains the connection to Polymarket WS."""
+        """Maintains the connection to Polymarket WS with Browser Headers."""
+        # Headers to look like a real browser (Bypasses Cloudflare filtering)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Origin": "https://polymarket.com",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
         while self.running:
             try:
-                async with websockets.connect(WS_URL) as websocket:
-                    log.info(f"⚡ Websocket Connected.")
+                # ADDED: extra_headers=headers
+                async with websockets.connect(WS_URL, extra_headers=headers) as websocket:
+                    log.info(f"⚡ Websocket Connected (Masked as Chrome).")
                     self.reconnect_delay = 1
                     self.sub_manager.dirty = True
                     
                     while self.running:
-                        # 1. Debug Logging for Subscriptions
+                        # Debug: Print what we are sending
                         if self.sub_manager.dirty:
-                             # Peek at what we are about to send
                              queued = list(self.sub_manager.speculative_subs)[-3:]
                              log.info(f"📤 Sending Subscription Update... (Includes: {queued})")
 
-                        # Send subscriptions if changed
                         await self.sub_manager.sync(websocket)
                         
                         try:
-                            # CRITICAL FIX: Reduce timeout to 0.5s so we don't block subscriptions
+                            # Keep the timeout short to allow subscription updates
                             msg = await asyncio.wait_for(websocket.recv(), timeout=0.5)
-                            if msg: # Ignore empty heartbeats
+                            if msg: 
                                 await self.ws_queue.put(msg)
                                 
                         except asyncio.TimeoutError:
-                            # This is good! It means we can loop back and check for new subs
                             continue
                         except websockets.ConnectionClosed:
                             log.warning("WS Connection Closed")
