@@ -220,8 +220,11 @@ class LiveTrader:
             await asyncio.sleep(5)
 
     async def _process_batch(self, trades):
+        # 1. Initialize stats collector
+        batch_scores = []
+
         for t in trades:
-            # 1. Normalize Trade Data
+            # --- Normalize Trade Data ---
             maker_asset = t['makerAssetId']
             taker_asset = t['takerAssetId']
             token_id = None
@@ -240,7 +243,7 @@ class LiveTrader:
             else:
                 continue 
 
-            # 2. Resolve Metadata
+            # --- Resolve Metadata ---
             fpmm = self.metadata.token_to_fpmm.get(str(token_id))
             if not fpmm: continue 
             
@@ -248,7 +251,7 @@ class LiveTrader:
             if not tokens: continue
             is_yes_token = (str(token_id) == tokens[1])
 
-            # 3. Process Signal
+            # --- Process Signal ---
             new_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
                 token_id=token_id, 
@@ -259,7 +262,10 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
-            # 4. Actions
+            # 2. COLLECT STATS (Store Abs Score, Real Score, and Market ID)
+            batch_scores.append((abs(new_weight), new_weight, fpmm))
+
+            # --- Actions ---
             if CONFIG['use_smart_exit']:
                 await self._check_smart_exits_for_market(fpmm, new_weight)
 
@@ -273,6 +279,16 @@ class LiveTrader:
                 target_token = tokens[1] if new_weight > 0 else tokens[0] 
                 await self._attempt_exec(target_token, fpmm)
 
+        # 3. LOG TOP 3 SCORES
+        if batch_scores:
+            # Sort by absolute weight (magnitude) descending
+            batch_scores.sort(key=lambda x: x[0], reverse=True)
+            top_3 = batch_scores[:3]
+            
+            # Format a clean log message
+            msg_parts = [f"Mkt {item[2][:6]}..: {item[1]:.1f}" for item in top_3]
+            log.info(f"📊 Batch Top Heat: {' | '.join(msg_parts)}")
+            
     async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
         """Iterates over held positions in this market and checks for reversal exits."""
         relevant_positions = [
