@@ -441,15 +441,35 @@ class LiveTrader:
 
     async def _risk_monitor_loop(self):
         while self.running:
-            high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
-            equity = self.persistence.calculate_equity()
+            # 1. Build a simple dict of current prices from the Order Books
+            # We use the Best Bid (Liquidation Value) as the true price
+            live_prices = {}
+            for token_id, book in self.ws_books.items():
+                if book.get('bids'):
+                    live_prices[token_id] = book['bids'][0][0] # Best Bid Price
             
+            # 2. Pass live prices to calculate REAL equity
+            equity = self.persistence.calculate_equity(current_prices=live_prices)
+            
+            # 3. Check Drawdown
+            high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
+            
+            # Update High Water Mark if we are at a new peak
+            if equity > high_water:
+                self.persistence.state["highest_equity"] = equity
+                # Optional: Save state occasionally if new high
+                # await self.persistence.save_async()
+
             if high_water > 0:
                 drawdown = (high_water - equity) / high_water
                 if drawdown > CONFIG['max_drawdown']:
-                    log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded.")
+                    log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded. Equity: ${equity:.2f}")
                     self.running = False
                     return 
+            
+            # Debug Log (Optional: See your PnL moving)
+            log.info(f"💰 Equity: ${equity:.2f} | Drawdown: {drawdown:.1%}")
+            
             await asyncio.sleep(60)
 
 if __name__ == "__main__":
