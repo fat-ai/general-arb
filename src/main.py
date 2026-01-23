@@ -149,11 +149,11 @@ class LiveTrader:
                                 self.ws_books[c_aid] = {'bids': [], 'asks': [], 'best_bid': 0.0, 'best_ask': 0.0}
 
                             # A. Update the Order Book (Incremental)
-                            side = change.get("side", "SELL")
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
                             
                             target_list = self.ws_books[c_aid]['bids'] if p == float(change['best_bid']) else self.ws_books[c_aid]['asks']
+                            side = "SELL" if p == float(change['best_bid']) else "BUY"
                             self._update_book_level(target_list, p, s, side)
                             
                             if 'best_bid' in change:
