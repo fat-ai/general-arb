@@ -38,6 +38,16 @@ class LiveTrader:
         validate_config()
         self.scorer.load()
         await self.metadata.refresh()
+
+        if self.persistence.state["positions"]:
+            existing_tokens = list(self.persistence.state["positions"].keys())
+            log.info(f"♻️ Restoring subscriptions for {len(existing_tokens)} held positions...")
+            
+            # 2. Tell Subscription Manager these are MANDATORY
+            self.sub_manager.set_mandatory(existing_tokens)
+            
+            # 3. Mark dirty so the monitor loop sends them to the socket immediately
+            self.sub_manager.dirty = True
         
         # Initialize the Threaded WS Client
         # We pass a lambda to bridge the Sync Thread -> Async Queue
