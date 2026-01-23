@@ -31,7 +31,7 @@ CONFIG = {
     "take_profit": 1000.0,
     "preheat_threshold": 0.5,
     "max_ws_subs": 500,
-    "max_positions": 20,
+    "max_positions": 1000,
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
     "use_smart_exit": True, 
