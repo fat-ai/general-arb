@@ -7,7 +7,7 @@ import requests
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
-from config import CONFIG, WS_URL, USDC_ADDRESS, setup_logging, validate_config
+from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, setup_logging, validate_config
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
 from strategy import WalletScorer, SignalEngine, TradeLogic
@@ -214,61 +214,103 @@ class LiveTrader:
         book_list.sort(key=lambda x: x[0], reverse=(side == "BUY"))
 
     async def _resolution_monitor_loop(self):
-        """Checks if any held positions have resolved."""
-        log.info("⚖️ Resolution Monitor Started")
+        """Checks if any held positions have resolved using Batched API calls."""
+        log.info("⚖️ Resolution Monitor Started (Batched Mode)")
         
         while self.running:
-            # 1. Get all held Token IDs
-            # We copy keys to avoid errors if the dict changes while iterating
-            held_tokens = list(self.persistence.state["positions"].keys())
-            
-            if not held_tokens:
+            # 1. Snapshot current positions
+            positions = self.persistence.state["positions"]
+            if not positions:
                 await asyncio.sleep(60)
                 continue
 
-            for token_id in held_tokens:
-                pos = self.persistence.state["positions"][token_id]
-                fpmm_id = pos.get('market_fpmm')
-                
-                if not fpmm_id: continue
+            # 2. Group held tokens by their Market ID (FPMM)
+            # Map Structure: { "0xmarket_id": ["token_id_1", "token_id_2"] }
+            # We use lower() for keys to ensure case-insensitive matching with API
+            market_map = {}
+            for token_id, pos in positions.items():
+                fpmm = pos.get('market_fpmm')
+                if fpmm:
+                    market_map.setdefault(fpmm.lower(), []).append(token_id)
 
-                # 2. Fetch Market Status via Gamma API (Polymarket's Data Layer)
-                # We use a direct HTTP request because this is low-frequency (once/min)
-                url = f"https://gamma-api.polymarket.com/markets/{fpmm_id}"
+            unique_fpmms = list(market_map.keys())
+            if not unique_fpmms:
+                await asyncio.sleep(60)
+                continue
+            
+            # 3. Process in chunks of 20 to respect URL length limits
+            chunk_size = 20
+            redeemed_any = False
+            
+            for i in range(0, len(unique_fpmms), chunk_size):
+                batch = unique_fpmms[i : i + chunk_size]
+                
+                # Construct Explicit URL: .../markets?id=A,B,C
+                # Manual formatting ensures commas are not double-encoded by requests
+                ids_str = ",".join(batch)
+                url = f"{GAMMA_API_URL}?id={ids_str}"
+                
                 try:
+                    # Blocking Request in Thread
                     resp = await asyncio.to_thread(requests.get, url)
-                    if resp.status_code != 200: continue
+                    
+                    if resp.status_code != 200: 
+                        log.warning(f"Resolution Batch Failed ({resp.status_code})")
+                        continue
                     
                     data = resp.json()
+                    # Ensure we handle list/dict responses robustly
+                    markets_data = data if isinstance(data, list) else [data]
                     
-                    # 3. Check if Resolved
-                    if data.get('closed'):
-                        # Market is done! Who won?
-                        tokens = data.get('tokens', [])
-                        payout = 0.0
-                        
-                        # Find our token in the result list
-                        for t in tokens:
-                            if t.get('tokenId') == str(token_id):
-                                # If this token is marked 'winner', it's worth $1.00
-                                if t.get('winner'): 
-                                    payout = 1.0
-                                break
-                        
-                        # 4. Execute Redemption
-                        log.info(f"⚖️ Market Resolved: {data.get('question')}")
-                        await self.broker.redeem_position(token_id, payout)
-                        
-                        # Update mandatory subs since we removed a position
-                        open_pos = list(self.persistence.state["positions"].keys())
-                        self.sub_manager.set_mandatory(open_pos)
+                    # 4. Iterate through returned markets
+                    for mkt in markets_data:
+                        # Check if Closed/Resolved
+                        if mkt.get('closed'):
+                            # API ID Fallback
+                            fpmm_id = mkt.get('id') or mkt.get('fpmm') or mkt.get('conditionId')
+                            if not fpmm_id: continue
+                            
+                            fpmm_id = fpmm_id.lower()
+                            if fpmm_id not in market_map: continue
+
+                            # 5. Determine Payout Logic
+                            # "tokens" list contains: [{'tokenId': '...', 'winner': True}, ...]
+                            outcome_tokens = mkt.get('tokens', [])
+                            
+                            # Create a fast lookup for winners
+                            # { "token_id_str": is_winner_bool }
+                            winner_map = {
+                                str(t.get('tokenId')): t.get('winner', False) 
+                                for t in outcome_tokens
+                            }
+
+                            # 6. Redeem OUR held tokens for this market
+                            held_tokens_in_market = market_map[fpmm_id]
+                            
+                            for my_token in held_tokens_in_market:
+                                # Payout is 1.0 if winner, else 0.0
+                                is_winner = winner_map.get(str(my_token), False)
+                                payout = 1.0 if is_winner else 0.0
+                                
+                                log.info(f"⚖️ Market Resolved: {mkt.get('question')}")
+                                await self.broker.redeem_position(my_token, payout)
+                                redeemed_any = True
 
                 except Exception as e:
-                    log.error(f"Resolution Check Failed: {e}")
+                    log.error(f"Resolution Batch Error: {e}")
+                
+                # Small delay between batches to be polite to the API
+                await asyncio.sleep(0.5)
             
-            # Wait 60 seconds before checking again
-            await asyncio.sleep(60)
+            # 7. Update subscriptions if we redeemed anything
+            # (We only do this once per loop to be efficient)
+            if redeemed_any:
+                 open_pos = list(self.persistence.state["positions"].keys())
+                 self.sub_manager.set_mandatory(open_pos)
 
+            # Wait 60 seconds before next full scan
+            await asyncio.sleep(60)
+            
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
