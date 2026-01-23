@@ -113,67 +113,73 @@ class LiveTrader:
                     data = json.loads(msg)
                 except: continue
 
+                # Polymarket sometimes sends a list, sometimes a dict
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
                     event_type = item.get("event_type", "")
                     
-                    # --- 1. HANDLE SNAPSHOTS ---
+                    # --- 1. HANDLE SNAPSHOTS (THE FIX) ---
                     if event_type == "book":
                         asset_id = item.get("asset_id")
                         if asset_id:
-                            # Parse full book
+                            # Parse lists
                             bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
                             asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
                             
-                            # Store Book + Initialize Stats
+                            # CRITICAL: Force correct sort order immediately
+                            # Bids: Highest Price First (Index 0 = Liquidation Value)
+                            bids.sort(key=lambda x: x[0], reverse=True)
+                            # Asks: Lowest Price First (Index 0 = Buy Cost)
+                            asks.sort(key=lambda x: x[0], reverse=False)
+                            
+                            # Initialize pointers
                             best_bid = bids[0][0] if bids else 0.0
                             best_ask = asks[0][0] if asks else 0.0
                             
                             self.ws_books[asset_id] = {
                                 'bids': bids, 
                                 'asks': asks,
-                                'best_bid': best_bid, # <--- NEW: Store Authoritative Price
+                                'best_bid': best_bid, 
                                 'best_ask': best_ask
                             }
 
                     # --- 2. HANDLE PRICE CHANGES ---
                     elif event_type == "price_change":
-                        changes = item.get("price_changes", [])
+                        changes = item.get("price_changes", []) or item.get("changes", [])
                         for change in changes:
                             c_aid = change.get("asset_id")
                             if not c_aid: continue
 
-                            # Initialize if missing
                             if c_aid not in self.ws_books:
-                                # Start with explicit 0.0 pointers
                                 self.ws_books[c_aid] = {'bids': [], 'asks': [], 'best_bid': 0.0, 'best_ask': 0.0}
 
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
                             
-                            # FIX 1: Use explicit side from Polymarket API (Reliable)
-                            # Do not guess based on price comparisons.
+                            # Use explicit side from API (Standard in new API)
+                            # Fallback to "BUY" if missing to prevent crash, but strictly it should be there.
                             raw_side = change.get("side", "").upper()
 
-                            # FIX 2: Route to correct list & Pass explicit side for sorting
-                            # Passing "BUY" triggers reverse=True (Desc Sort) in _update_book_level
-                            # Passing "SELL" triggers reverse=False (Asc Sort) in _update_book_level
+                            # A. Update the correct list
                             if raw_side == "BUY":
                                 self._update_book_level(self.ws_books[c_aid]['bids'], p, s, "BUY")
                             elif raw_side == "SELL":
                                 self._update_book_level(self.ws_books[c_aid]['asks'], p, s, "SELL")
 
-                            # FIX 3: Manually recalculate Best Bid/Ask from the Source of Truth (The List)
-                            # This ensures the 'best_bid' key read by the Risk Monitor is never stale.
-                            if self.ws_books[c_aid]['bids']:
-                                # With Sort Fixed: Index 0 is the Highest Bid (Liquidation Value)
+                            # B. Update Best Pointers
+                            # 1. Prefer API value (New Schema)
+                            if 'best_bid' in change:
+                                self.ws_books[c_aid]['best_bid'] = float(change['best_bid'])
+                            # 2. Fallback to local calculation
+                            elif self.ws_books[c_aid]['bids']:
                                 self.ws_books[c_aid]['best_bid'] = self.ws_books[c_aid]['bids'][0][0]
                             else:
                                 self.ws_books[c_aid]['best_bid'] = 0.0
 
-                            if self.ws_books[c_aid]['asks']:
-                                # With Sort Fixed: Index 0 is the Lowest Ask (Buy Price)
+                            if 'best_ask' in change:
+                                self.ws_books[c_aid]['best_ask'] = float(change['best_ask'])
+                            elif self.ws_books[c_aid]['asks']:
                                 self.ws_books[c_aid]['best_ask'] = self.ws_books[c_aid]['asks'][0][0]
                             else:
                                 self.ws_books[c_aid]['best_ask'] = 0.0
@@ -182,20 +188,30 @@ class LiveTrader:
                 log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
-                
+
     def _update_book_level(self, book_list, price, size, side):
+        """
+        Updates a specific price level in the list and ensures correct sorting.
+        """
         found_idx = -1
         for i, (p, s) in enumerate(book_list):
             if p == price:
                 found_idx = i
                 break
+        
         if size == 0:
-            if found_idx != -1: book_list.pop(found_idx)
+            if found_idx != -1: 
+                book_list.pop(found_idx)
         else:
-            if found_idx != -1: book_list[found_idx][1] = size
+            if found_idx != -1: 
+                book_list[found_idx][1] = size
             else:
                 book_list.append([price, size])
-                book_list.sort(key=lambda x: x[0], reverse=(side=="BUY"))
+        
+        # Always re-sort to ensure list integrity
+        # BUY (Bids) -> Reverse=True (Desc)
+        # SELL (Asks) -> Reverse=False (Asc)
+        book_list.sort(key=lambda x: x[0], reverse=(side == "BUY"))
 
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved."""
@@ -484,29 +500,24 @@ class LiveTrader:
 
     async def _risk_monitor_loop(self):
         while self.running:
-            # 1. Build a simple dict of current prices from the Order Books
-            # We use the Best Bid (Liquidation Value) as the true price
             live_prices = {}
             for token_id, book in self.ws_books.items():
-                if 'best_bid' in book:
-                    live_prices[token_id] = book['best_bid']
-                elif book.get('bids'):
-                    print("no best bid found")
-                    print(f"taking {book['bids'][0][0]}")
-                    print(f"not {book['bids'][1][0]}")
-                    live_prices[token_id] = book['bids'][0][0] # Best Bid Price
+                bids = book.get('bids', [])
+                if bids:
+                    # SAFETY: Do not trust index [0] or 'best_bid' key. 
+                    # Find the Max Bid manually. This prevents 'Dust Value' bugs forever.
+                    best_price = max(bids, key=lambda x: x[0])[0]
+                    live_prices[token_id] = best_price
+                else:
+                    live_prices[token_id] = 0.0
             
-            # 2. Pass live prices to calculate REAL equity
+            # Pass live prices to calculate REAL equity
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             
-            # 3. Check Drawdown
+            # High Water Mark Logic
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
-            
-            # Update High Water Mark if we are at a new peak
             if equity > high_water:
                 self.persistence.state["highest_equity"] = equity
-                # Optional: Save state occasionally if new high
-                # await self.persistence.save_async()
 
             if high_water > 0:
                 drawdown = (high_water - equity) / high_water
@@ -515,11 +526,10 @@ class LiveTrader:
                     self.running = False
                     return 
             
-            # Debug Log (Optional: See your PnL moving)
             log.info(f"💰 Equity: ${equity:.2f} | Drawdown: {drawdown:.1%}")
             
             await asyncio.sleep(60)
-
+            
 if __name__ == "__main__":
     trader = LiveTrader()
     try:
