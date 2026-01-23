@@ -475,8 +475,8 @@ class LiveTrader:
                     live_prices[token_id] = book['best_bid']
                 elif book.get('bids'):
                     print("no best bid found")
-                    print(f"taking {book['bids'][0][0]")
-                    print(f"not {book['bids'][1][0]")
+                    print(f"taking {book['bids'][0][0]}")
+                    print(f"not {book['bids'][1][0]}")
                     live_prices[token_id] = book['bids'][0][0] # Best Bid Price
             
             # 2. Pass live prices to calculate REAL equity
