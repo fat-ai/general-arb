@@ -4,10 +4,12 @@ import time
 import signal
 import logging
 import requests
+import csv
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, setup_logging, validate_config
+from reporting import generate_institutional_report
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
 from strategy import WalletScorer, SignalEngine, TradeLogic
@@ -72,7 +74,8 @@ class LiveTrader:
             self._ws_processor_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
-            self._risk_monitor_loop()
+            self._risk_monitor_loop(),
+            self._reporting_loop()
         )
 
     async def shutdown(self):
@@ -592,33 +595,60 @@ class LiveTrader:
                 await self.metadata.refresh()
                 last_metadata_refresh = time.time()
 
-    async def _risk_monitor_loop(self):
+    async def _reporting_loop(self):
+        """Generates and prints the institutional report every 5 minutes."""
         while self.running:
+            await asyncio.sleep(60) # Wait 1 minutes
+            
+            # Run in thread to avoid blocking the event loop with Pandas math
+            report_str = await asyncio.to_thread(generate_institutional_report)
+            if report_str:
+                print(f"\n{report_str}\n")
+
+    async def _risk_monitor_loop(self):
+        # Initialize CSV header if file doesn't exist
+        if not EQUITY_FILE.exists():
+            with open(EQUITY_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp", "equity", "cash", "invested", "drawdown"])
+
+        while self.running:
+            # 1. Live Pricing (Safe Logic)
             live_prices = {}
             for token_id, book in self.ws_books.items():
                 bids = book.get('bids', [])
                 if bids:
-                    # SAFETY: Do not trust index [0] or 'best_bid' key. 
-                    # Find the Max Bid manually. This prevents 'Dust Value' bugs forever.
                     best_price = max(bids, key=lambda x: x[0])[0]
                     live_prices[token_id] = best_price
                 else:
                     live_prices[token_id] = 0.0
             
-            # Pass live prices to calculate REAL equity
             equity = self.persistence.calculate_equity(current_prices=live_prices)
+            cash = self.persistence.state["cash"]
+            invested = equity - cash
             
-            # High Water Mark Logic
+            # 2. High Water Mark & Drawdown
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             if equity > high_water:
                 self.persistence.state["highest_equity"] = equity
 
+            drawdown = 0.0
             if high_water > 0:
-                drawdown = (high_water - equity) / high_water
-                if drawdown > CONFIG['max_drawdown']:
-                    log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded. Equity: ${equity:.2f}")
-                    self.running = False
-                    return 
+                drawdown = (equity - high_water) / high_water # Negative value
+
+            # 3. 📝 LOGGING TO CSV (The Time Series)
+            try:
+                with open(EQUITY_FILE, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([int(time.time()), round(equity, 2), round(cash, 2), round(invested, 2), round(drawdown, 4)])
+            except Exception as e:
+                log.error(f"Equity Log Error: {e}")
+
+            # Risk Safety Check
+            if abs(drawdown) > CONFIG['max_drawdown']:
+                log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded.")
+                self.running = False
+                return 
             
             log.info(f"💰 Equity: ${equity:.2f} | Drawdown: {drawdown:.1%}")
             
