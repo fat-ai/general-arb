@@ -205,7 +205,9 @@ class PaperBroker:
                 log.warning(f"🛡️ SKIPPED SELL: Price {vwap_price:.3f} is too low (Min: 0.05)")
                 return False
             # ==========================================================
-
+            
+            realized_pnl = 0.0
+            
             # --- BUY LOGIC ---
             if side == "BUY":
                 # 1. Risk Check
@@ -259,17 +261,14 @@ class PaperBroker:
                 "price": vwap_price,
                 "qty": filled_qty,
                 "equity": equity,
-                "fpmm": fpmm_id
+                "fpmm": fpmm_id,
+                "pnl": realized_pnl if side == "SELL" else 0.0
             }
             audit_log.info(json.dumps(audit_record))
             
             return True
 
     async def redeem_position(self, token_id, payout_price):
-        """
-        Simulates redeeming a position after market resolution.
-        payout_price: 1.0 (Winner) or 0.0 (Loser)
-        """
         async with self.lock:
             state = self.pm.state
             pos = state["positions"].get(token_id)
@@ -278,19 +277,28 @@ class PaperBroker:
             qty = pos['qty']
             proceeds = qty * payout_price
             
-            # 1. Credit Cash
             state["cash"] += proceeds
             
-            # 2. Calculate PnL for logs
+            # CAPTURE PnL
             cost_basis = qty * pos['avg_price']
             pnl = proceeds - cost_basis
+            fpmm = pos.get('market_fpmm', 'unknown')
             
-            # 3. Remove Position
             del state["positions"][token_id]
-            
-            # 4. Save
             await self.pm.save_async()
             
             status = "🎉 WINNER" if payout_price > 0 else "💀 LOSER"
-            
             log.info(f"{status} | Redeemed {qty:.2f} {token_id} @ ${payout_price:.2f} | PnL: ${pnl:.2f}")
+
+            audit_record = {
+                "ts": time.time(),
+                "side": "REDEEM",
+                "token": token_id,
+                "price": payout_price,
+                "qty": qty,
+                "equity": self.pm.calculate_equity(), 
+                "fpmm": fpmm,
+                "pnl": pnl
+            }
+            
+            audit_log.info(json.dumps(audit_record))
