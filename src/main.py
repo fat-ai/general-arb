@@ -376,6 +376,29 @@ class LiveTrader:
             return
 
         # 3. Execute
+        trade_size = CONFIG['fixed_size'] # Default fallback
+        
+        if CONFIG.get('use_percentage_staking'):
+            try:
+                # 1. Get Total Equity (Cash + Position Value)
+                total_equity = self.persistence.calculate_equity()
+                
+                # 2. Calculate Stake
+                calculated_stake = total_equity * CONFIG['percentage_stake']
+                
+                # 3. Safety Floor (Don't bet less than $2.00)
+                trade_size = max(2.0, calculated_stake)
+                
+                # 4. Cash Check
+                available_cash = self.persistence.state["cash"]
+                if trade_size > available_cash:
+                    log.warning(f"⚠️ Insufficient Cash for % Stake. Need ${trade_size:.2f}, Available: ${available_cash:.2f}")
+                    return 
+                    
+            except Exception as e:
+                log.error(f"Sizing Calculation Failed: {e}. Reverting to fixed size.")
+                trade_size = CONFIG['fixed_size']
+                
         success = await self.broker.execute_market_order(
             token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
         )
