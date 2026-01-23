@@ -104,53 +104,69 @@ class LiveTrader:
             await asyncio.sleep(1.0)
 
     async def _ws_processor_loop(self):
-        """Parses messages off the queue (bridged from thread)."""
+        """Parses messages and captures authoritative price data."""
         while self.running:
             msg = await self.ws_queue.get()
             try:
-                if not msg: continue
-                # Handle PONGs or junk
-                if msg == "PONG": continue
-
-                try: data = json.loads(msg)
+                if not msg or msg == "PONG": continue
+                try: 
+                    data = json.loads(msg)
                 except: continue
 
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
                     event_type = item.get("event_type", "")
-                    asset_id = item.get("asset_id")
+                    
+                    # --- 1. HANDLE SNAPSHOTS ---
+                    if event_type == "book":
+                        asset_id = item.get("asset_id")
+                        if asset_id:
+                            # Parse full book
+                            bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
+                            asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
+                            
+                            # Store Book + Initialize Stats
+                            best_bid = bids[0][0] if bids else 0.0
+                            best_ask = asks[0][0] if asks else 0.0
+                            
+                            self.ws_books[asset_id] = {
+                                'bids': bids, 
+                                'asks': asks,
+                                'best_bid': best_bid, # <--- NEW: Store Authoritative Price
+                                'best_ask': best_ask
+                            }
 
-                    if event_type == "book" and asset_id:
-                        bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
-                        asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
-                        self.ws_books[asset_id] = {'bids': bids, 'asks': asks}
-                        
-                        # LOG SUCCESS
-                        if len(asks) > 0:
-                            log.info(f"📘 Book Received: {asset_id} | Asks: {len(asks)}")
-
+                    # --- 2. HANDLE PRICE CHANGES ---
                     elif event_type == "price_change":
-                        # (Same logic as before)
                         changes = item.get("price_changes", [])
                         for change in changes:
                             c_aid = change.get("asset_id")
+                            if not c_aid: continue
+
+                            # Initialize if missing (Safe because we will set best_bid below)
                             if c_aid not in self.ws_books:
-                                self.ws_books[c_aid] = {'bids': [], 'asks': []}
-                            side = change.get("side")
+                                self.ws_books[c_aid] = {'bids': [], 'asks': [], 'best_bid': 0.0, 'best_ask': 0.0}
+
+                            # A. Update the Order Book (Incremental)
+                            side = change.get("side", "SELL")
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
                             
-                            lst = self.ws_books[c_aid]['bids'] if side == "BUY" else self.ws_books[c_aid]['asks']
-                            self._update_book_level(lst, p, s, side)
+                            target_list = self.ws_books[c_aid]['bids'] if p == float(change['best_bid'] else self.ws_books[c_aid]['asks']
+                            self._update_book_level(target_list, p, s, side)
+                            
+                            if 'best_bid' in change:
+                                self.ws_books[c_aid]['best_bid'] = float(change['best_bid'])
+                            if 'best_ask' in change:
+                                self.ws_books[c_aid]['best_ask'] = float(change['best_ask'])
 
             except Exception as e:
                 log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
-
+                
     def _update_book_level(self, book_list, price, size, side):
-        # (Same helper logic as previous version)
         found_idx = -1
         for i, (p, s) in enumerate(book_list):
             if p == price:
