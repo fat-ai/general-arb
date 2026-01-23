@@ -8,6 +8,7 @@ STATE_FILE = Path("paper_state.json")
 AUDIT_FILE = Path("trades_audit.jsonl")
 TRADES_FILE = Path("gamma_trades_stream.csv")
 OUTCOMES_FILE = Path("market_outcomes.parquet")
+EQUITY_FILE = Path("equity_curve.csv")
 
 # Ensure cache directory exists immediately
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
