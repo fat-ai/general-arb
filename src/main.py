@@ -153,7 +153,7 @@ class LiveTrader:
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
                             
-                            target_list = self.ws_books[c_aid]['bids'] if p == float(change['best_bid'] else self.ws_books[c_aid]['asks']
+                            target_list = self.ws_books[c_aid]['bids'] if p == float(change['best_bid']) else self.ws_books[c_aid]['asks']
                             self._update_book_level(target_list, p, s, side)
                             
                             if 'best_bid' in change:
