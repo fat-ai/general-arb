@@ -3,6 +3,7 @@ import json
 import time
 import signal
 import logging
+import requests
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
@@ -152,6 +153,62 @@ class LiveTrader:
             else:
                 book_list.append([price, size])
                 book_list.sort(key=lambda x: x[0], reverse=(side=="BUY"))
+
+    async def _resolution_monitor_loop(self):
+        """Checks if any held positions have resolved."""
+        log.info("⚖️ Resolution Monitor Started")
+        
+        while self.running:
+            # 1. Get all held Token IDs
+            # We copy keys to avoid errors if the dict changes while iterating
+            held_tokens = list(self.persistence.state["positions"].keys())
+            
+            if not held_tokens:
+                await asyncio.sleep(60)
+                continue
+
+            for token_id in held_tokens:
+                pos = self.persistence.state["positions"][token_id]
+                fpmm_id = pos.get('market_fpmm')
+                
+                if not fpmm_id: continue
+
+                # 2. Fetch Market Status via Gamma API (Polymarket's Data Layer)
+                # We use a direct HTTP request because this is low-frequency (once/min)
+                url = f"https://gamma-api.polymarket.com/markets/{fpmm_id}"
+                try:
+                    resp = await asyncio.to_thread(requests.get, url)
+                    if resp.status_code != 200: continue
+                    
+                    data = resp.json()
+                    
+                    # 3. Check if Resolved
+                    if data.get('closed'):
+                        # Market is done! Who won?
+                        tokens = data.get('tokens', [])
+                        payout = 0.0
+                        
+                        # Find our token in the result list
+                        for t in tokens:
+                            if t.get('tokenId') == str(token_id):
+                                # If this token is marked 'winner', it's worth $1.00
+                                if t.get('winner'): 
+                                    payout = 1.0
+                                break
+                        
+                        # 4. Execute Redemption
+                        log.info(f"⚖️ Market Resolved: {data.get('question')}")
+                        await self.broker.redeem_position(token_id, payout)
+                        
+                        # Update mandatory subs since we removed a position
+                        open_pos = list(self.persistence.state["positions"].keys())
+                        self.sub_manager.set_mandatory(open_pos)
+
+                except Exception as e:
+                    log.error(f"Resolution Check Failed: {e}")
+            
+            # Wait 60 seconds before checking again
+            await asyncio.sleep(60)
 
     # --- SIGNAL LOOPS ---
 
