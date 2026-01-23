@@ -489,14 +489,66 @@ class LiveTrader:
     # --- MAINTENANCE ---
 
     async def _maintenance_loop(self):
+        """
+        Runs every 60s to prune inactive subscriptions and ensure we don't
+        hit the WebSocket subscription limit with stale markets.
+        """
+        # Initialize timestamp for hourly tasks
+        last_metadata_refresh = time.time()
+
         while self.running:
-            await asyncio.sleep(3600)
-            await self.metadata.refresh()
-            self.signal_engine.cleanup()
+            # 1. Run Maintenance every 60 seconds (High Frequency)
+            await asyncio.sleep(60)
+
+            # --- A. PRUNE SIGNALS & SUBSCRIPTIONS ---
+            # 1. Remove trackers that haven't had a trade in 10 minutes (600s)
+            # This updates self.signal_engine.trackers in place
+            self.signal_engine.cleanup(max_age_seconds=600)
             
-            # Prune books we don't need
-            active = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
-            self.ws_books = {k: v for k, v in self.ws_books.items() if k in active}
+            # 2. Get the list of currently "Hot" Markets (FPMM IDs)
+            active_fpmms = set(self.signal_engine.trackers.keys())
+
+            # 3. Prune Subscription Manager (Thread-Safe)
+            async with self.sub_manager.lock:
+                to_remove = []
+                
+                # Identify speculative tokens that belong to "Cold" markets
+                # We iterate over a copy (list) to allow modification
+                for token_id in list(self.sub_manager.speculative_subs):
+                    # Find which market this token belongs to
+                    fpmm = self.metadata.token_to_fpmm.get(token_id)
+                    
+                    # If market is unknown OR no longer in the active signal list -> Prune
+                    if not fpmm or fpmm not in active_fpmms:
+                        to_remove.append(token_id)
+                
+                # Execute Removal
+                if to_remove:
+                    for t in to_remove:
+                        self.sub_manager.speculative_subs.discard(t)
+                    
+                    # Mark dirty so the Subscription Monitor pushes the update to WebSocket
+                    self.sub_manager.dirty = True
+                    log.info(f"🧹 Pruned {len(to_remove)} cold subscriptions (Inactive > 10m)")
+
+            # --- B. CLEAN MEMORY (Order Books) ---
+            # Drop order book data for assets we are no longer subscribed to
+            # This prevents RAM usage from growing indefinitely
+            active_tokens = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
+            
+            # Efficiently remove keys from ws_books
+            dropped_books = [k for k in self.ws_books if k not in active_tokens]
+            for k in dropped_books:
+                del self.ws_books[k]
+                
+            if dropped_books:
+                log.debug(f"🗑️ Released memory for {len(dropped_books)} stale order books.")
+
+            # --- C. METADATA REFRESH (Hourly) ---
+            # Only hit the Gamma API once per hour to save bandwidth
+            if time.time() - last_metadata_refresh > 3600:
+                await self.metadata.refresh()
+                last_metadata_refresh = time.time()
 
     async def _risk_monitor_loop(self):
         while self.running:
