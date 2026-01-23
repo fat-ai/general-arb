@@ -350,11 +350,7 @@ class LiveTrader:
     async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
         token_id = str(token_id)
         
-        # --- NEW GUARD: Prevent "Machine Gun" Buying ---
-        # Check if we already hold a position in this specific token
         if token_id in self.persistence.state["positions"]:
-            # Optional: You could allow adding to position up to a max limit, 
-            # but for now, let's just stop it from spamming.
             # log.info(f"🛡️ Skipping Buy: Already hold position in {token_id}")
             return
         # -----------------------------------------------
