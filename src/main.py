@@ -471,7 +471,12 @@ class LiveTrader:
             # We use the Best Bid (Liquidation Value) as the true price
             live_prices = {}
             for token_id, book in self.ws_books.items():
-                if book.get('bids'):
+                if 'best_bid' in book:
+                    live_prices[token_id] = book['best_bid']
+                elif book.get('bids'):
+                    print("no best bid found")
+                    print(f"taking {book['bids'][0][0]")
+                    print(f"not {book['bids'][1][0]")
                     live_prices[token_id] = book['bids'][0][0] # Best Bid Price
             
             # 2. Pass live prices to calculate REAL equity
