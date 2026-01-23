@@ -144,22 +144,39 @@ class LiveTrader:
                             c_aid = change.get("asset_id")
                             if not c_aid: continue
 
-                            # Initialize if missing (Safe because we will set best_bid below)
+                            # Initialize if missing
                             if c_aid not in self.ws_books:
+                                # Start with explicit 0.0 pointers
                                 self.ws_books[c_aid] = {'bids': [], 'asks': [], 'best_bid': 0.0, 'best_ask': 0.0}
 
-                            # A. Update the Order Book (Incremental)
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
                             
-                            target_list = self.ws_books[c_aid]['bids'] if p == float(change['best_bid']) else self.ws_books[c_aid]['asks']
-                            side = "SELL" if p == float(change['best_bid']) else "BUY"
-                            self._update_book_level(target_list, p, s, side)
-                            
-                            if 'best_bid' in change:
-                                self.ws_books[c_aid]['best_bid'] = float(change['best_bid'])
-                            if 'best_ask' in change:
-                                self.ws_books[c_aid]['best_ask'] = float(change['best_ask'])
+                            # FIX 1: Use explicit side from Polymarket API (Reliable)
+                            # Do not guess based on price comparisons.
+                            raw_side = change.get("side", "").upper()
+
+                            # FIX 2: Route to correct list & Pass explicit side for sorting
+                            # Passing "BUY" triggers reverse=True (Desc Sort) in _update_book_level
+                            # Passing "SELL" triggers reverse=False (Asc Sort) in _update_book_level
+                            if raw_side == "BUY":
+                                self._update_book_level(self.ws_books[c_aid]['bids'], p, s, "BUY")
+                            elif raw_side == "SELL":
+                                self._update_book_level(self.ws_books[c_aid]['asks'], p, s, "SELL")
+
+                            # FIX 3: Manually recalculate Best Bid/Ask from the Source of Truth (The List)
+                            # This ensures the 'best_bid' key read by the Risk Monitor is never stale.
+                            if self.ws_books[c_aid]['bids']:
+                                # With Sort Fixed: Index 0 is the Highest Bid (Liquidation Value)
+                                self.ws_books[c_aid]['best_bid'] = self.ws_books[c_aid]['bids'][0][0]
+                            else:
+                                self.ws_books[c_aid]['best_bid'] = 0.0
+
+                            if self.ws_books[c_aid]['asks']:
+                                # With Sort Fixed: Index 0 is the Lowest Ask (Buy Price)
+                                self.ws_books[c_aid]['best_ask'] = self.ws_books[c_aid]['asks'][0][0]
+                            else:
+                                self.ws_books[c_aid]['best_ask'] = 0.0
 
             except Exception as e:
                 log.error(f"WS Parse Error: {e}")
