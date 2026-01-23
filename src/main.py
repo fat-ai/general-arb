@@ -400,7 +400,7 @@ class LiveTrader:
                 trade_size = CONFIG['fixed_size']
                 
         success = await self.broker.execute_market_order(
-            token_id, "BUY", CONFIG['fixed_size'], fpmm, current_book=book
+            token_id, "BUY", trade_size, fpmm, current_book=book
         )
         
         if success:
