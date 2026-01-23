@@ -58,12 +58,29 @@ class PersistenceManager:
         except Exception as e:
             log.error(f"State save error: {e}")
 
-    def calculate_equity(self) -> float:
-        """Returns total value: Cash + Value of all positions."""
-        # Note: This uses avg_price for estimation. For strict accuracy, 
-        # one could pass current market prices here, but this is sufficient for risk checks.
-        pos_val = sum(p['qty'] * p['avg_price'] for p in self.state['positions'].values())
-        return self.state['cash'] + pos_val
+    def calculate_equity(self, current_prices=None):
+        """
+        Calculates Total Equity = Cash + Unrealized Value of Positions.
+        
+        Args:
+            current_prices (dict): Optional. A dictionary of {token_id: price} 
+                                   to mark positions to market.
+        """
+        equity = self.state["cash"]
+        
+        for token_id, pos in self.state["positions"].items():
+            qty = pos['qty']
+            
+            # 1. Default to Cost Basis (what we paid)
+            price_to_use = pos['avg_price']
+            
+            # 2. If live price is available, use it (Mark-to-Market)
+            if current_prices and token_id in current_prices:
+                price_to_use = current_prices[token_id]
+                
+            equity += qty * price_to_use
+            
+        return equity
 
 
 class PaperBroker:
