@@ -8,7 +8,7 @@ import csv
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
-from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, setup_logging, validate_config
+from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
 from reporting import generate_institutional_report
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
