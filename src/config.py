@@ -25,8 +25,10 @@ CONFIG = {
     "decay_factor": 0.95,
     "sizing_mode": "fixed",
     "fixed_size": 10.0,
-    "stop_loss": 0.20,
-    "take_profit": 0.50,
+    "use_percentage_staking": True,   # Set to True to use % of equity
+    "percentage_stake": 0.025,
+    "stop_loss": 0.99,
+    "take_profit": 1000.0,
     "preheat_threshold": 0.5,
     "max_ws_subs": 500,
     "max_positions": 20,
