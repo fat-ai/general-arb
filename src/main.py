@@ -328,50 +328,52 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """Polls Goldsky subgraph."""
-        # Start looking 10s back
-        last_ts = int(time.time()) - 10 
-        sleeptime = 1.0
+        """Polls Goldsky subgraph with Session reuse and Crash Protection."""
+        last_ts = int(time.time()) - 60 
+        
         while self.running:
-            # 1. Fetch Data (Single Page)
-            new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
-            
-            if new_trades:
-                # --- WE FOUND DATA ---
-                sleeptime = 1.0
+            try:
+                # 1. Fetch Data
+                new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
-                unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
-                
-                if unique_trades:
-                    await self._process_batch(unique_trades)
+                if new_trades:
+                    # --- PROCESS DATA ---
+                    unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
-                    for t in unique_trades: 
-                        self.seen_trade_ids.add(t['id'])
+                    if unique_trades:
+                        # CRITICAL: If this fails, the try/except block below catches it
+                        # preventing the 'silent death' of the loop.
+                        await self._process_batch(unique_trades)
+                        
+                        for t in unique_trades: 
+                            self.seen_trade_ids.add(t['id'])
+                        
+                        last_ts = int(unique_trades[-1]['timestamp']) + 1
+
+                        if len(self.seen_trade_ids) > 10000:
+                            self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
                     
-                    # Update High Water Mark
-                    last_ts = int(unique_trades[-1]['timestamp']) + 1
+                    # --- CATCH-UP LOGIC ---
+                    if len(new_trades) >= 1000:
+                        # 1.0s wait allows catch-up (1000 trades/sec) but prevents 
+                        # triggering 'Connection Rate' limits.
+                        await asyncio.sleep(1.0)
+                        continue 
 
-                    # Memory Management
-                    if len(self.seen_trade_ids) > 100000:
-                        self.seen_trade_ids = set(list(self.seen_trade_ids)[-50000:])
-                
-                # --- CATCH-UP LOGIC (RESTORED) ---
-                # If we fetched a FULL PAGE (1000), we know there is more data waiting.
-                # Do NOT wait the full 2 seconds.
-                if len(new_trades) >= 1000:
-                    # 0.5s delay = 2 requests/sec = 20 requests/10s.
-                    # This is well below the limit of 50/10s, but fast enough to catch up.
-                    await asyncio.sleep(1.0)
-                    continue # <--- SKIP THE LONG SLEEP, LOOP IMMEDIATELY
-            else:
-                await asyncio.sleep(sleeptime)
-                sleeptime = sleeptime * 2
-            # If we get here, it means either:
-            # 1. We got < 1000 trades (we are at the live edge)
-            # 2. We got 0 trades (market is quiet)
-            # So we can relax and wait the standard polling time.
+                # Standard Pulse (Live Edge)
+                # Lag Guard
+                now = int(time.time())
+                if (now - last_ts) > 300: 
+                    log.info("⏩ Signal scanner lagging. Jumping to live edge...")
+                    last_ts = now - 60
 
-            await asyncio.sleep(5.0)
+                await asyncio.sleep(2.0)
+
+            except Exception as e:
+                # This prevents the "Silent Death". 
+                # If an error occurs, we log it, wait, and RETRY.
+                log.error(f"⚠️ Signal Loop Exception: {e}")
+                await asyncio.sleep(5.0)
 
     async def _process_batch(self, trades):
         batch_scores = []
