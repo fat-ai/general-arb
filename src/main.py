@@ -34,7 +34,7 @@ class LiveTrader:
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.running = True
-
+        self.trade_queue = asyncio.Queue()
         server_thread = threading.Thread(target=start_server, daemon=True)
         server_thread.start()
         log.info("👂 Webhook Server started. Listening for Goldsky data...")
@@ -44,36 +44,6 @@ class LiveTrader:
 
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
-        validate_config()
-        self.scorer.load()
-        await self.metadata.refresh()
-
-        if self.persistence.state["positions"]:
-            existing_tokens = list(self.persistence.state["positions"].keys())
-            log.info(f"♻️ Restoring subscriptions for {len(existing_tokens)} held positions...")
-            
-            # 2. Tell Subscription Manager these are MANDATORY
-            self.sub_manager.set_mandatory(existing_tokens)
-            
-            # 3. Mark dirty so the monitor loop sends them to the socket immediately
-            self.sub_manager.dirty = True
-        
-        # Initialize the Threaded WS Client
-        # We pass a lambda to bridge the Sync Thread -> Async Queue
-        loop = asyncio.get_running_loop()
-        def bridge_callback(msg):
-            loop.call_soon_threadsafe(self.ws_queue.put_nowait, msg)
-
-        # Initial clean URL (remove wss:// prefix if library adds it, but WSApp needs full url)
-        # The example used "wss://ws-subscriptions-clob.polymarket.com"
-        target_url = "wss://ws-subscriptions-clob.polymarket.com" 
-        
-        self.ws_client = PolymarketWS(target_url, [], bridge_callback)
-        self.ws_client.start_thread()
-
-        # Signal Handlers
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.shutdown()))
 
         # Start Async Loops
         await asyncio.gather(
@@ -697,8 +667,41 @@ class LiveTrader:
             await asyncio.sleep(60)
             
 if __name__ == "__main__":
+    # --- NEW SERVER ARCHITECTURE ---
+    # 1. Initialize the Web Server
+    app = FastAPI()
+    
+    # 2. Initialize the Trader (Global Instance)
     trader = LiveTrader()
-    try:
-        asyncio.run(trader.start())
-    except KeyboardInterrupt:
-        pass
+    
+    # 3. Define the Startup Event
+    # This tells the Server: "When you wake up, start the Bot immediately."
+    @app.on_event("startup")
+    async def start_trading_system():
+        log.info("🚀 SERVER STARTED: Launching Trading Bot in background...")
+        # This runs your trader.start() loop in the background without blocking the server
+        asyncio.create_task(trader.start())
+    
+    # 4. Define the Webhook Endpoint
+    # This receives data from Goldsky and pushes it directly into the Bot
+    @app.post("/webhook")
+    async def receive_goldsky_data(request: Request):
+        try:
+            payload = await request.json()
+            
+            # Goldsky Validation: Check if it's an INSERT operation
+            if payload.get("op") == "INSERT":
+                trade_data = payload.get("data")
+                
+                if trade_data:
+                    # Direct injection into the bot's internal logic
+                    # We assume your _signal_loop is reading from this same queue
+                    # Note: We need to make sure your LiveTrader has a 'trade_queue'
+                    await trader.trade_queue.put(trade_data)
+                    return {"status": "processed"}
+                    
+        except Exception as e:
+            log.error(f"Webhook Error: {e}")
+            return {"status": "error"}
+            
+        return {"status": "ignored"}
