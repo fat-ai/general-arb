@@ -146,14 +146,15 @@ session.headers.update({
 })
 
 class RateLimitException(Exception):
-    def __init__(self, message, retry_after=5):
+    def __init__(self, message, retry_after=30):
         super().__init__(message)
         self.retry_after = retry_after
 
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    Fetches trades and INSPECTS HEADERS to prevent guessing.
+    Fetches trades with HARD WAF protection.
     """
+    # Low complexity request to stay under the radar
     query = f"""
     {{
       orderFilledEvents(
@@ -169,27 +170,24 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     try:
         resp = session.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
         
-        # --- DEBUG: PRINT THE TRUTH ---
-        # This will show us exactly what Goldsky thinks of us.
-        # Look for 'x-ratelimit-remaining' in your logs.
-        limit_rem = resp.headers.get("x-ratelimit-remaining", "?")
-        limit_reset = resp.headers.get("x-ratelimit-reset", "?")
-        if limit_rem != "?":
-             log.debug(f"📡 API Status | Remaining: {limit_rem} | Reset in: {limit_reset}s")
-
         if resp.status_code == 200:
             return resp.json().get('data', {}).get('orderFilledEvents', [])
         
         elif resp.status_code == 429:
-            # Check if server tells us how long to wait
-            retry_raw = resp.headers.get("Retry-After", "10")
+            # WAF TRAP: Server often sends 'Retry-After: 0'. DO NOT BELIEVE IT.
+            retry_raw = resp.headers.get("Retry-After", "30")
             try:
                 retry_after = int(retry_raw)
+                # FORCE minimum 30s penalty to exit the "Sin Bin"
+                if retry_after < 30: retry_after = 30
             except:
-                retry_after = 10
-                
-            log.warning(f"⛔ Rate Limit Hit (Remaining: {limit_rem}). Server says wait {retry_after}s.")
-            raise RateLimitException("Goldsky 429", retry_after=retry_after)
+                retry_after = 30
+            
+            # Log who is blocking us
+            server = resp.headers.get("Server", "Unknown")
+            log.warning(f"⛔ Rate Limit by {server}. Enforcing {retry_after}s Penalty.")
+            
+            raise RateLimitException("WAF Limit", retry_after=retry_after)
             
         else:
             log.error(f"❌ Subgraph Error: {resp.status_code}")
