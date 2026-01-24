@@ -142,8 +142,8 @@ class SubscriptionManager:
 
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    Fetches trades with a hard speed limit.
-    Max Speed: ~3 requests/second (Safe for 50req/10s limit).
+    Fetches trades with aggressive 429 handling.
+    If Rate Limited, it PAUSES and RETRIES until successful.
     """
     all_trades = []
     current_ts = min_timestamp
@@ -152,12 +152,6 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     max_pages = 10
     
     while page_count < max_pages:
-        # ---------------------------------------------------------
-        # 🛑 HARD LIMIT: Sleep 0.3s BEFORE every request
-        # This guarantees we never exceed ~33 requests per 10s.
-        # ---------------------------------------------------------
-        time.sleep(0.3)
-        
         query = f"""
         {{
           orderFilledEvents(
@@ -171,34 +165,57 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
         }}
         """
         
+        # --- RETRY LOOP ---
+        # We stay in this loop until we get a 200 OK or a fatal error.
+        success = False
+        while not success:
+            # 1. Base Throttle (Safety First)
+            time.sleep(0.5) 
+            
+            try:
+                resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=15)
+                
+                # CASE A: SUCCESS
+                if resp.status_code == 200:
+                    success = True # Exit the retry loop
+                    
+                # CASE B: RATE LIMIT (The Problem Solver)
+                elif resp.status_code == 429:
+                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing 20s before retry...")
+                    time.sleep(20) # Forced long wait
+                    continue # Retry the exact same request
+                
+                # CASE C: OTHER ERROR
+                else:
+                    log.error(f"❌ Subgraph Fatal Error: {resp.status_code}")
+                    return all_trades # Fatal, return what we have
+
+            except Exception as e:
+                log.error(f"❌ Connection Error: {e}")
+                time.sleep(5)
+                # Retry on connection errors too
+        
+        # --- PROCESS DATA (Only runs after 200 OK) ---
         try:
-            resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
-            
-            if resp.status_code != 200:
-                log.error(f"Subgraph Error {resp.status_code}")
-                break
-                
             data = resp.json().get('data', {}).get('orderFilledEvents', [])
+        except:
+            data = []
             
-            if not data:
-                break
-            
-            all_trades.extend(data)
-            page_count += 1
-            
-            if len(data) < 1000:
-                break
-            
-            # Pagination Logic
-            last_ts = int(data[-1]['timestamp'])
-            if last_ts > current_ts:
-                current_ts = last_ts
-                skip = 0
-            else:
-                skip += 1000
-                
-        except Exception as e:
-            log.error(f"Pagination Error: {e}")
+        if not data:
             break
-            
+        
+        all_trades.extend(data)
+        page_count += 1
+        
+        if len(data) < 1000:
+            break
+        
+        # Pagination Logic
+        last_ts = int(data[-1]['timestamp'])
+        if last_ts > current_ts:
+            current_ts = last_ts
+            skip = 0
+        else:
+            skip += 1000
+
     return all_trades
