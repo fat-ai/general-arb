@@ -15,7 +15,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- EXTERNAL SERVICES ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cmkshv53h0fgr01xfdq8phsh7/subgraphs/my-poly-book/1.0.0/gn"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
