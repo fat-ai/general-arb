@@ -303,44 +303,35 @@ class LiveTrader:
 
     async def _signal_loop(self):
         """
-        Polls the thread-safe queue for new trades.
+        Polls the internal queue for new trades.
         """
-        log.info("⚡ Signal Loop: Monitoring Webhook Queue...")
+        log.info("⚡ Signal Loop: Waiting for Webhook Data...")
         
         while self.running:
+            # FIX: Use 'self.trade_queue' instead of 'trade_queue'
+            raw_trade = await self.trade_queue.get()
+            
             try:
-                # 1. Check Queue (Non-blocking)
-                # We loop until the queue is empty
-                while not trade_queue.empty():
-                    raw_trade = trade_queue.get_nowait()
-                    
-                    # Update stats
-                    self.stats['processed_count'] += 1
-                    self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
+                self.stats['processed_count'] += 1
+                self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
 
-                    # 2. Normalize Data
-                    trade = {
-                        'id': raw_trade.get('id'),
-                        'timestamp': int(raw_trade.get('timestamp', 0)),
-                        'maker': raw_trade.get('maker'),
-                        'taker': raw_trade.get('taker'),
-                        'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
-                        'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
-                        'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or 0),
-                        'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or 0),
-                    }
-                    
-                    # 3. Process
-                    await self._process_batch([trade])
+                # Normalize Data
+                trade = {
+                    'id': raw_trade.get('id'),
+                    'timestamp': int(raw_trade.get('timestamp', 0)),
+                    'maker': raw_trade.get('maker'),
+                    'taker': raw_trade.get('taker'),
+                    'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
+                    'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
+                    'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or 0),
+                    'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or 0),
+                }
                 
-                # If queue is empty, sleep briefly to save CPU
-                await asyncio.sleep(0.1)
-
-            except queue.Empty:
-                await asyncio.sleep(0.1)
+                # Process
+                await self._process_batch([trade])
+                
             except Exception as e:
                 log.error(f"❌ Processing Error: {e}")
-                await asyncio.sleep(1)
                 
     async def _process_batch(self, trades):
         batch_scores = []
@@ -681,24 +672,31 @@ async def start_trading_system():
     
 # 4. Define the Webhook Endpoint
 # This receives data from Goldsky and pushes it directly into the Bot
-@app.post("/webhook")    
+@app.post("/webhook")
 async def receive_goldsky_data(request: Request):
-        try:
-            payload = await request.json()
+    try:
+        # Get the JSON payload
+        payload = await request.json()
+        
+        # 1. Handle Lists (Goldsky often sends a batch of events)
+        if isinstance(payload, list):
+            events = payload
+        else:
+            events = [payload]
             
-            # Goldsky Validation: Check if it's an INSERT operation
-            if payload.get("op") == "INSERT":
-                trade_data = payload.get("data")
-                
+        # 2. Process every event in the batch
+        count = 0
+        for event in events:
+            # Goldsky structure: { "op": "INSERT", "data": { ... } }
+            if event.get("op") == "INSERT":
+                trade_data = event.get("data")
                 if trade_data:
-                    # Direct injection into the bot's internal logic
-                    # We assume your _signal_loop is reading from this same queue
-                    # Note: We need to make sure your LiveTrader has a 'trade_queue'
+                    # Push to the bot's queue
                     await trader.trade_queue.put(trade_data)
-                    return {"status": "processed"}
+                    count += 1
                     
-        except Exception as e:
-            log.error(f"Webhook Error: {e}")
-            return {"status": "error"}
-            
-        return {"status": "ignored"}
+        return {"status": "processed", "count": count}
+                
+    except Exception as e:
+        log.error(f"Webhook Error: {e}")
+        return {"status": "error"}
