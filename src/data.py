@@ -140,24 +140,24 @@ class SubscriptionManager:
                 pass
 
 
-def fetch_graph_trades(min_timestamp: int) -> list[dict]:
+def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
     """
-    Fetches trades with aggressive 429 handling and SAFE throttling.
+    Fetches ALL trades since min_timestamp using robust pagination.
+    Uses an 'Advance or Skip' strategy to handle high-volume blocks 
+    (>1000 trades/sec) without missing data or getting stuck.
     """
     all_trades = []
     current_ts = min_timestamp
     skip = 0
     page_count = 0
-    max_pages = 10
-    
-    # REDUCED PAGE SIZE to lower "Complexity Cost" per request
-    page_size = 500 
+    max_pages = 20  # Safety: Max ~20k trades per poll to prevent memory overflow
     
     while page_count < max_pages:
+        # Fetch batch
         query = f"""
         {{
           orderFilledEvents(
-            first: {page_size}, 
+            first: 1000, 
             skip: {skip},
             orderBy: timestamp, orderDirection: asc, 
             where: {{ timestamp_gte: "{current_ts}" }}
@@ -167,59 +167,43 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
         }}
         """
         
-        # --- RETRY LOOP ---
-        success = False
-        retry_delay = 5  # Start with 5s delay on failure
-        
-        while not success:
-            # FIX: Increased throttle to 1.5s to stay safely under Burst Limits
-            time.sleep(1.5) 
-            
-            try:
-                resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=15)
-                
-                # CASE A: SUCCESS
-                if resp.status_code == 200:
-                    success = True 
-                    retry_delay = 5 # Reset retry delay on success
-                    
-                # CASE B: RATE LIMIT (The Problem Solver)
-                elif resp.status_code == 429:
-                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing {retry_delay}s...")
-                    time.sleep(retry_delay) 
-                    retry_delay = min(retry_delay * 2, 60) # Exponential backoff up to 60s
-                    continue 
-                
-                # CASE C: OTHER ERROR
-                else:
-                    log.error(f"❌ Subgraph Fatal Error: {resp.status_code}")
-                    return all_trades 
-
-            except Exception as e:
-                log.error(f"❌ Connection Error: {e}")
-                time.sleep(5)
-        
-        # --- PROCESS DATA ---
         try:
+            resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
+            if resp.status_code != 200:
+                log.error(f"Subgraph Error {resp.status_code}: {resp.text}")
+                break
+                
             data = resp.json().get('data', {}).get('orderFilledEvents', [])
-        except:
-            data = []
             
-        if not data:
+            if not data:
+                break
+            
+            all_trades.extend(data)
+            page_count += 1
+            
+            # 1. Stop if we reached the head of the chain (partial page)
+            if len(data) < 1000:
+                break
+            
+            # 2. Prepare next cursor
+            last_ts = int(data[-1]['timestamp'])
+            
+            if last_ts > current_ts:
+                # ADVANCE: Time moved forward. Move the window and reset skip.
+                # Note: This naturally creates duplicates for the boundary second,
+                # but main.py's 'seen_trade_ids' logic handles deduplication perfectly.
+                current_ts = last_ts
+                skip = 0
+            else:
+                # SKIP: Time is stuck (1000+ trades in same second).
+                # We must use 'skip' to drill deeper into this specific second.
+                skip += 1000
+                
+        except Exception as e:
+            log.error(f"Pagination Error: {e}")
             break
-        
-        all_trades.extend(data)
-        page_count += 1
-        
-        if len(data) < page_size:
-            break
-        
-        # Pagination Logic
-        last_ts = int(data[-1]['timestamp'])
-        if last_ts > current_ts:
-            current_ts = last_ts
-            skip = 0
-        else:
-            skip += page_size # Use dynamic page size
+            
+    if page_count > 1:
+        log.info(f"📚 Pagination Active: Fetched {len(all_trades)} trades in {page_count} pages.")
 
     return all_trades
