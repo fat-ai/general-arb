@@ -440,6 +440,8 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
+            self.stats['scores'].append(new_weight)
+            
             # Store stats for logging
             batch_scores.append((abs(new_weight), new_weight, fpmm))
 
