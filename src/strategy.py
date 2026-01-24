@@ -75,8 +75,8 @@ class SignalEngine:
         """
         # 1. Get Score
         score = scorer.get_score(wallet, usdc_vol)
-        if score <= 0:
-            return self.get_signal(fpmm)
+        #if score <= 0:
+        #    return self.get_signal(fpmm)
 
         # 2. Initialize Tracker if new
         if fpmm not in self.trackers:
@@ -85,14 +85,14 @@ class SignalEngine:
         tracker = self.trackers[fpmm]
         
         # 3. Apply Time Decay (Exponential)
-        self._apply_decay(tracker)
+        #self._apply_decay(tracker)
         
         # 4. Calculate Impact
         # Formula: Volume * (1 + log-scaled Skill)
         # Higher skill = exponentially higher impact, capped at 10x multiplier
-        raw_skill = max(0.0, score / 5.0) 
-        skill_multiplier = 1.0 + min(math.log1p(raw_skill * 100) * 2.0, 10.0)
-        raw_impact = usdc_vol * skill_multiplier
+        #raw_skill = max(0.0, score / 5.0) 
+        #skill_multiplier = 1.0 + min(math.log1p(raw_skill * 100) * 2.0, 10.0)
+        raw_impact = usdc_vol * score
         
         # 5. Apply Direction (Buying YES = +Impact, Buying NO = -Impact)
         final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction
