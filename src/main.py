@@ -8,7 +8,6 @@ import requests
 import csv
 import queue
 from typing import Dict, List, Set
-from webhook_server import start_server, trade_queue
 from fastapi import FastAPI, Request
 
 # --- MODULE IMPORTS ---
@@ -37,9 +36,6 @@ class LiveTrader:
         self.pending_orders: Set[str] = set()
         self.running = True
         self.trade_queue = asyncio.Queue()
-        server_thread = threading.Thread(target=start_server, daemon=True)
-        server_thread.start()
-        log.info("👂 Webhook Server started. Listening for Goldsky data...")
         
         # The new Threaded Client
         self.ws_client = None
