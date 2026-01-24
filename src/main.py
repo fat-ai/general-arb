@@ -365,7 +365,7 @@ class LiveTrader:
                     continue # <--- SKIP THE LONG SLEEP, LOOP IMMEDIATELY
             else:
                 await asyncio.sleep(sleeptime)
-                sleeptime = sleptime * 2
+                sleeptime = sleeptime * 2
             # If we get here, it means either:
             # 1. We got < 1000 trades (we are at the live edge)
             # 2. We got 0 trades (market is quiet)
