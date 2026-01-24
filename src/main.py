@@ -36,6 +36,12 @@ class LiveTrader:
         self.pending_orders: Set[str] = set()
         self.running = True
         self.trade_queue = asyncio.Queue()
+        self.stats = {
+            'processed_count': 0,
+            'last_trade_time': 'Waiting...',
+            'triggers_count': 0,
+            'scores': []  # <--- NEW: List to hold scores for the last 30s
+        }
         
         # The new Threaded Client
         self.ws_client = None
@@ -50,7 +56,8 @@ class LiveTrader:
             self._signal_loop(),
             self._maintenance_loop(),
             self._risk_monitor_loop(),
-            self._reporting_loop()
+            self._reporting_loop(),
+            self._monitor_loop()
         )
 
     async def shutdown(self):
@@ -90,6 +97,45 @@ class LiveTrader:
                     
                     self.sub_manager.dirty = False
             await asyncio.sleep(1.0)
+
+    async def _monitor_loop(self):
+        """
+        Prints a detailed Traffic Report with Top 3 Scores every 30 seconds.
+        """
+        while self.running:
+            await asyncio.sleep(30) # Wait 30 seconds
+            
+            # 1. Retrieve Data
+            count = self.stats['processed_count']
+            last_seen = self.stats['last_trade_time']
+            triggers = self.stats['triggers_count']
+            scores = self.stats['scores']
+            
+            # 2. Find Top 3 Scores
+            # Sort descending (highest first) and take the first 3
+            top_3 = sorted(scores, reverse=True)[:3]
+            
+            # Format them nicely (e.g., "0.85, 0.72, 0.65")
+            if top_3:
+                top_scores_str = ", ".join([f"{s:.4f}" for s in top_3])
+            else:
+                top_scores_str = "None"
+
+            # 3. Create the Log Message
+            if count > 0:
+                log.info(
+                    f"📊 REPORT (30s): Analyzed {count} trades | "
+                    f"Last: {last_seen} | "
+                    f"🏆 Top Scores: [{top_scores_str}] | "
+                    f"🎯 Triggers: {triggers}"
+                )
+            else:
+                log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...")
+            
+            # 4. Reset counters for the next window
+            self.stats['processed_count'] = 0
+            self.stats['triggers_count'] = 0
+            self.stats['scores'] = []  # Clear the scores list
 
     async def _ws_processor_loop(self):
         """Parses messages and captures authoritative price data."""
