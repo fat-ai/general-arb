@@ -328,8 +328,8 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """Polls Goldsky with Strict Header Adherence."""
-        from data import RateLimitException # Ensure this import exists
+        """Polls Goldsky with Mandatory WAF Backoff."""
+        from data import RateLimitException
         
         last_ts = int(time.time()) - 60 
         
@@ -339,7 +339,6 @@ class LiveTrader:
                 new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
                 if new_trades:
-                    # Deduplicate & Process
                     unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
                     if unique_trades:
@@ -347,32 +346,26 @@ class LiveTrader:
                         for t in unique_trades: self.seen_trade_ids.add(t['id'])
                         last_ts = int(unique_trades[-1]['timestamp']) + 1
                         
-                        # Prune Memory
                         if len(self.seen_trade_ids) > 10000:
                             self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
                     
-                    # --- CATCH-UP LOGIC ---
-                    # If we got a full page (1000), we are behind.
-                    # We sleep 1.0s (not 0ms) to respect the "Burst Limit".
-                    # 1000 trades / 1.0s = catch up speed of 60,000 trades/min.
+                    # Catch-Up: Safe pacing (1.0s)
                     if len(new_trades) >= 1000:
                         await asyncio.sleep(1.0)
                         continue
 
-                # Normal Pulse (Live Edge)
+                # Normal Pulse
                 now = int(time.time())
                 if (now - last_ts) > 300: 
                     log.info("⏩ Signal scanner lagging. Jumping to live edge...")
                     last_ts = now - 60
 
-                # Standard Wait: 2.0s is safe (0.5 req/s vs 5.0 req/s limit)
                 await asyncio.sleep(2.0)
 
             except RateLimitException as e:
-                # RESPOND TO THE SERVER
-                wait_time = e.retry_after + 1 # Add 1s buffer
-                log.warning(f"⏳ Backing off for {wait_time}s...")
-                await asyncio.sleep(wait_time)
+                # STOP EVERYTHING. Wait 30s to clear the IP flag.
+                log.warning(f"⏳ Penalty Box: Waiting {e.retry_after}s...")
+                await asyncio.sleep(e.retry_after)
 
             except Exception as e:
                 log.error(f"⚠️ Signal Loop Error: {e}")
