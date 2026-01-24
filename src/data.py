@@ -198,6 +198,8 @@ def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
                 # SKIP: Time is stuck (1000+ trades in same second).
                 # We must use 'skip' to drill deeper into this specific second.
                 skip += 1000
+
+            await asyncio.sleep(1)
                 
         except Exception as e:
             log.error(f"Pagination Error: {e}")
