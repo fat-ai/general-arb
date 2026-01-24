@@ -415,9 +415,9 @@ class LiveTrader:
             if action == 'SPECULATE':
                 self.sub_manager.add_speculative(tokens)
             elif action == 'BUY':
-                if target_token not in self.pending_orders:
-                    self.pending_orders.add(target_token)
-                    asyncio.create_task(self._execute_task(target_token, fpmm, "BUY", None))
+                if token_id not in self.pending_orders:
+                    self.pending_orders.add(token_id)
+                    asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
 
         # LOGGING
         if batch_scores:
