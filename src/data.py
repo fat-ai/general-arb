@@ -145,9 +145,14 @@ session.headers.update({
     "Content-Type": "application/json",
 })
 
+class RateLimitException(Exception):
+    def __init__(self, message, retry_after=5):
+        super().__init__(message)
+        self.retry_after = retry_after
+
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    Fetches trades using a persistent session.
+    Fetches trades and INSPECTS HEADERS to prevent guessing.
     """
     query = f"""
     {{
@@ -162,18 +167,36 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
     
     try:
-        # Use the global 'session' object instead of 'requests'
         resp = session.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
         
+        # --- DEBUG: PRINT THE TRUTH ---
+        # This will show us exactly what Goldsky thinks of us.
+        # Look for 'x-ratelimit-remaining' in your logs.
+        limit_rem = resp.headers.get("x-ratelimit-remaining", "?")
+        limit_reset = resp.headers.get("x-ratelimit-reset", "?")
+        if limit_rem != "?":
+             log.debug(f"📡 API Status | Remaining: {limit_rem} | Reset in: {limit_reset}s")
+
         if resp.status_code == 200:
             return resp.json().get('data', {}).get('orderFilledEvents', [])
+        
         elif resp.status_code == 429:
-            log.warning("⛔ Goldsky Rate Limit (429).")
-            return [] 
+            # Check if server tells us how long to wait
+            retry_raw = resp.headers.get("Retry-After", "10")
+            try:
+                retry_after = int(retry_raw)
+            except:
+                retry_after = 10
+                
+            log.warning(f"⛔ Rate Limit Hit (Remaining: {limit_rem}). Server says wait {retry_after}s.")
+            raise RateLimitException("Goldsky 429", retry_after=retry_after)
+            
         else:
             log.error(f"❌ Subgraph Error: {resp.status_code}")
             return []
             
+    except RateLimitException:
+        raise
     except Exception as e:
         log.error(f"❌ Connection Error: {e}")
         return []
