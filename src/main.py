@@ -331,13 +331,15 @@ class LiveTrader:
         """Polls Goldsky subgraph."""
         # Start looking 10s back
         last_ts = int(time.time()) - 10 
-        
+        sleeptime = 1.0
         while self.running:
             # 1. Fetch Data (Single Page)
             new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
             
             if new_trades:
                 # --- WE FOUND DATA ---
+                sleeptime = 1.0
+                
                 unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                 
                 if unique_trades:
@@ -350,8 +352,8 @@ class LiveTrader:
                     last_ts = int(unique_trades[-1]['timestamp']) + 1
 
                     # Memory Management
-                    if len(self.seen_trade_ids) > 10000:
-                        self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
+                    if len(self.seen_trade_ids) > 100000:
+                        self.seen_trade_ids = set(list(self.seen_trade_ids)[-50000:])
                 
                 # --- CATCH-UP LOGIC (RESTORED) ---
                 # If we fetched a FULL PAGE (1000), we know there is more data waiting.
@@ -359,21 +361,17 @@ class LiveTrader:
                 if len(new_trades) >= 1000:
                     # 0.5s delay = 2 requests/sec = 20 requests/10s.
                     # This is well below the limit of 50/10s, but fast enough to catch up.
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.0)
                     continue # <--- SKIP THE LONG SLEEP, LOOP IMMEDIATELY
-
+            else:
+                await asyncio.sleep(sleeptime)
+                sleeptime = sleptime * 2
             # If we get here, it means either:
             # 1. We got < 1000 trades (we are at the live edge)
             # 2. We got 0 trades (market is quiet)
             # So we can relax and wait the standard polling time.
-            
-            # Lag Guard: If we are somehow way behind, jump forward
-            now = int(time.time())
-            if (now - last_ts) > 300: 
-                log.info("⏩ Signal scanner lagging. Jumping to live edge...")
-                last_ts = now - 60
 
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(5.0)
 
     async def _process_batch(self, trades):
         batch_scores = []
