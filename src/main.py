@@ -667,6 +667,7 @@ trader = LiveTrader()
 @app.on_event("startup")
 async def start_trading_system():
     log.info("🚀 SERVER STARTED: Launching Trading Bot in background...")
+    logging.getLogger("uvicorn.access").disabled = True
     # This runs your trader.start() loop in the background without blocking the server
     asyncio.create_task(trader.start())
     
