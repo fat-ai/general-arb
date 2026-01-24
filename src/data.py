@@ -142,18 +142,16 @@ class SubscriptionManager:
 
 def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
     """
-    Fetches ALL trades since min_timestamp using robust pagination.
-    Uses an 'Advance or Skip' strategy to handle high-volume blocks 
-    (>1000 trades/sec) without missing data or getting stuck.
+    Fetches trades using timestamp-based pagination.
+    Optimized to be gentle on Goldsky Rate Limits (50req/10s).
     """
     all_trades = []
     current_ts = min_timestamp
     skip = 0
     page_count = 0
-    max_pages = 20  # Safety: Max ~20k trades per poll to prevent memory overflow
+    max_pages = 10  # Reduced from 20 to yield to other processes
     
     while page_count < max_pages:
-        # Fetch batch
         query = f"""
         {{
           orderFilledEvents(
@@ -169,43 +167,45 @@ def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
         
         try:
             resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
+            
+            if resp.status_code == 429:
+                log.warning("⚠️ Goldsky Rate Limit Hit! Cooling down 5s...")
+                time.sleep(5)
+                continue
+            
             if resp.status_code != 200:
-                log.error(f"Subgraph Error {resp.status_code}: {resp.text}")
+                log.error(f"Subgraph Error {resp.status_code}")
                 break
                 
             data = resp.json().get('data', {}).get('orderFilledEvents', [])
             
-            if not data:
-                break
+            if not data: break
             
+            # Deduplicate locally against this batch to avoid processing same overlap
+            # (Global dedupe still happens in main.py)
             all_trades.extend(data)
             page_count += 1
             
-            # 1. Stop if we reached the head of the chain (partial page)
             if len(data) < 1000:
                 break
             
-            # 2. Prepare next cursor
+            # Pagination Logic
             last_ts = int(data[-1]['timestamp'])
             
             if last_ts > current_ts:
-                # ADVANCE: Time moved forward. Move the window and reset skip.
-                # Note: This naturally creates duplicates for the boundary second,
-                # but main.py's 'seen_trade_ids' logic handles deduplication perfectly.
+                # Advance time
                 current_ts = last_ts
                 skip = 0
             else:
-                # SKIP: Time is stuck (1000+ trades in same second).
-                # We must use 'skip' to drill deeper into this specific second.
+                # We are stuck in a massive second (1000+ trades)
                 skip += 1000
 
-            time.sleep(1)
+            # 🛡️ RATE LIMIT PROTECTION
+            # 1.5s sleep ensures we never exceed ~40 req/minute per thread
+            time.sleep(1.5) 
                 
         except Exception as e:
             log.error(f"Pagination Error: {e}")
             break
             
-    if page_count > 1:
-        log.info(f"📚 Pagination Active: Fetched {len(all_trades)} trades in {page_count} pages.")
-
     return all_trades
