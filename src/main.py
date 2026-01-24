@@ -328,59 +328,54 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """Polls Goldsky subgraph for new trades with Dynamic Backoff."""
-        # Start looking 60s back
+        """Polls Goldsky subgraph."""
         last_ts = int(time.time()) - 60 
         
-        # Exponential Backoff State
-        base_sleep = 5
-        current_sleep = base_sleep
-        max_sleep = 20  # Max sleep if market is dead
-
         while self.running:
-            try:
-                # 1. Update the search window if we are lagging too far behind
-                # If we haven't seen a trade in 5 mins, don't query the whole 5 mins.
-                # Just jump to 'Now - 60s' to catch up and reduce query load.
+            start_time = time.time()
+            
+            # 1. Fetch Data (Single Page)
+            # Run in thread to prevent blocking async loop
+            new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
+            
+            if new_trades:
+                # --- WE FOUND DATA ---
+                # Filter duplicates
+                unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
+                
+                if unique_trades:
+                    await self._process_batch(unique_trades)
+                    
+                    # Track IDs
+                    for t in unique_trades: self.seen_trade_ids.add(t['id'])
+                    
+                    # Update High Water Mark
+                    last_ts = int(unique_trades[-1]['timestamp']) + 1
+
+                    # Prune ID cache
+                    if len(self.seen_trade_ids) > 10000:
+                        self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
+                
+                # LOGIC FIX:
+                # If we received a full batch (1000), there might be more immediately available.
+                # Do NOT sleep long. Sleep tiny amount just to be polite.
+                if len(new_trades) >= 1000:
+                    await asyncio.sleep(0.5) 
+                    continue # Loop immediately to fetch next page
+                
+                # If partial batch, we are at the live edge. Normal sleep.
+                await asyncio.sleep(5)
+
+            else:
+                # --- NO DATA / ERROR ---
+                # Check if we are too far behind (Fast Forward Guard)
                 now = int(time.time())
-                if (now - last_ts) > 300: 
-                    log.info("⏩ Fast-forwarding signal scanner to live edge...")
+                if (now - last_ts) > 300:
+                    log.info("⏩ Signal scanner lagging. Jumping to live edge...")
                     last_ts = now - 60
-
-                # 2. Run the fetch in a thread
-                new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
-                if new_trades:
-                    # MARKET IS ACTIVE
-                    # Reset sleep to be fast
-                    current_sleep = base_sleep
-                    
-                    log.info(f"👀 Scanned {len(new_trades)} new trades... (Waiting for whales)")
-                    unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
-                    
-                    if unique_trades:
-                        await self._process_batch(unique_trades)
-                        
-                        for t in unique_trades: 
-                            self.seen_trade_ids.add(t['id'])
-                        
-                        # Update timestamp to the very last trade found
-                        last_ts = int(unique_trades[-1]['timestamp']) + 1
-
-                        # Memory Management for ID set
-                        if len(self.seen_trade_ids) > 10000:
-                            self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
-                else:
-                    # MARKET IS QUIET
-                    # Increase sleep time slightly to save API credits (Backoff)
-                    current_sleep = min(current_sleep + 2, max_sleep)
-                    
-            except Exception as e:
-                log.error(f"Signal Loop Error: {e}")
-                current_sleep = 10  # Safety sleep on crash
-                
-            # Dynamic Sleep
-            await asyncio.sleep(current_sleep)
+                # Sleep and retry
+                await asyncio.sleep(5)
 
     async def _process_batch(self, trades):
         batch_scores = []
