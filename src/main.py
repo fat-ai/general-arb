@@ -32,6 +32,10 @@ class LiveTrader:
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.running = True
+
+        server_thread = threading.Thread(target=start_server, daemon=True)
+        server_thread.start()
+        log.info("👂 Webhook Server started. Listening for Goldsky data...")
         
         # The new Threaded Client
         self.ws_client = None
@@ -328,49 +332,35 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """Polls Goldsky with Mandatory WAF Backoff."""
-        from data import RateLimitException
-        
-        last_ts = int(time.time()) - 5
+        """
+        New Loop: Waits for trades to arrive in the queue.
+        """
+        log.info("⚡ Signal Loop: Ready to process incoming trades.")
         
         while self.running:
+            # 1. Wait for the next trade (This pauses until data arrives)
+            raw_trade = await trade_queue.get()
+            
             try:
-                # 1. Fetch Data
-                new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
+                # 2. Convert keys to match what your bot expects
+                # (Goldsky sometimes sends snake_case, we convert to camelCase if needed)
+                trade = {
+                    'id': raw_trade.get('id'),
+                    'timestamp': int(raw_trade.get('timestamp', 0)),
+                    'maker': raw_trade.get('maker'),
+                    'taker': raw_trade.get('taker'),
+                    'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
+                    'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
+                    'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or raw_trade.get('makerAmountFilled') or 0),
+                    'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or raw_trade.get('takerAmountFilled') or 0),
+                }
+
+                # 3. Process the trade (Reuse your existing logic)
+                # We wrap it in a list because your processor expects a batch
+                await self._process_batch([trade])
                 
-                if new_trades:
-                    unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
-                    
-                    if unique_trades:
-                        print(f"Processing {len(unique_trades)} new trades from Goldsky API")
-                        await self._process_batch(unique_trades)
-                        for t in unique_trades: self.seen_trade_ids.add(t['id'])
-                        last_ts = int(unique_trades[-1]['timestamp'])
-                        
-                        if len(self.seen_trade_ids) > 10000:
-                            self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
-                    
-                    # Catch-Up: Safe pacing (1.0s)
-                    if len(new_trades) >= 1000:
-                        await asyncio.sleep(2.0)
-                        continue
-
-                # Normal Pulse
-                now = int(time.time())
-                if (now - last_ts) > 300: 
-                    log.info("⏩ Signal scanner lagging. Jumping to live edge...")
-                    last_ts = now - 60
-
-                await asyncio.sleep(5.0)
-
-            except RateLimitException as e:
-                # STOP EVERYTHING. Wait 30s to clear the IP flag.
-                log.warning(f"⏳ Penalty Box: Waiting {e.retry_after}s...")
-                await asyncio.sleep(e.retry_after)
-
             except Exception as e:
-                log.error(f"⚠️ Signal Loop Error: {e}")
-                await asyncio.sleep(5.0)
+                log.error(f"❌ Error processing webhook trade: {e}")
 
     async def _process_batch(self, trades):
         batch_scores = []
