@@ -6,6 +6,7 @@ import signal
 import logging
 import requests
 import csv
+import queue
 from webhook_server import start_server, trade_queue
 from typing import Dict, List, Set
 
@@ -335,35 +336,45 @@ class LiveTrader:
 
     async def _signal_loop(self):
         """
-        New Loop: Waits for trades to arrive in the queue.
+        Polls the thread-safe queue for new trades.
         """
-        log.info("⚡ Signal Loop: Ready to process incoming trades.")
+        log.info("⚡ Signal Loop: Monitoring Webhook Queue...")
         
         while self.running:
-            # 1. Wait for the next trade (This pauses until data arrives)
-            raw_trade = await trade_queue.get()
-            
             try:
-                # 2. Convert keys to match what your bot expects
-                # (Goldsky sometimes sends snake_case, we convert to camelCase if needed)
-                trade = {
-                    'id': raw_trade.get('id'),
-                    'timestamp': int(raw_trade.get('timestamp', 0)),
-                    'maker': raw_trade.get('maker'),
-                    'taker': raw_trade.get('taker'),
-                    'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
-                    'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
-                    'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or raw_trade.get('makerAmountFilled') or 0),
-                    'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or raw_trade.get('takerAmountFilled') or 0),
-                }
+                # 1. Check Queue (Non-blocking)
+                # We loop until the queue is empty
+                while not trade_queue.empty():
+                    raw_trade = trade_queue.get_nowait()
+                    
+                    # Update stats
+                    self.stats['processed_count'] += 1
+                    self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
 
-                # 3. Process the trade (Reuse your existing logic)
-                # We wrap it in a list because your processor expects a batch
-                await self._process_batch([trade])
+                    # 2. Normalize Data
+                    trade = {
+                        'id': raw_trade.get('id'),
+                        'timestamp': int(raw_trade.get('timestamp', 0)),
+                        'maker': raw_trade.get('maker'),
+                        'taker': raw_trade.get('taker'),
+                        'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
+                        'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
+                        'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or 0),
+                        'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or 0),
+                    }
+                    
+                    # 3. Process
+                    await self._process_batch([trade])
                 
-            except Exception as e:
-                log.error(f"❌ Error processing webhook trade: {e}")
+                # If queue is empty, sleep briefly to save CPU
+                await asyncio.sleep(0.1)
 
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                log.error(f"❌ Processing Error: {e}")
+                await asyncio.sleep(1)
+                
     async def _process_batch(self, trades):
         batch_scores = []
         skipped_counts = {"not_usdc": 0, "no_fpmm": 0, "no_tokens": 0}
