@@ -8,6 +8,7 @@ import requests
 import csv
 import queue
 from typing import Dict, List, Set
+from fastapi import FastAPI, Request
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
