@@ -331,7 +331,7 @@ class LiveTrader:
         """Polls Goldsky with Mandatory WAF Backoff."""
         from data import RateLimitException
         
-        last_ts = int(time.time()) - 60 
+        last_ts = int(time.time()) - 5
         
         while self.running:
             try:
@@ -344,14 +344,14 @@ class LiveTrader:
                     if unique_trades:
                         await self._process_batch(unique_trades)
                         for t in unique_trades: self.seen_trade_ids.add(t['id'])
-                        last_ts = int(unique_trades[-1]['timestamp']) + 1
+                        last_ts = int(unique_trades[-1]['timestamp'])
                         
                         if len(self.seen_trade_ids) > 10000:
                             self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
                     
                     # Catch-Up: Safe pacing (1.0s)
                     if len(new_trades) >= 1000:
-                        await asyncio.sleep(3.0)
+                        await asyncio.sleep(2.0)
                         continue
 
                 # Normal Pulse
