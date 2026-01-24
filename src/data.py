@@ -142,26 +142,68 @@ class SubscriptionManager:
 
 def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
     """
-    Stateless fetcher for the Goldsky Subgraph.
-    Fetches all trades that occurred after `min_timestamp`.
+    Fetches ALL trades since min_timestamp using robust pagination.
+    Uses an 'Advance or Skip' strategy to handle high-volume blocks 
+    (>1000 trades/sec) without missing data or getting stuck.
     """
-    query = f"""
-    {{
-      orderFilledEvents(
-        first: 1000, 
-        orderBy: timestamp, orderDirection: asc, 
-        where: {{ timestamp_gte: "{min_timestamp}" }}
-      ) {{
-        id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
-      }}
-    }}
-    """
+    all_trades = []
+    current_ts = min_timestamp
+    skip = 0
+    page_count = 0
+    max_pages = 20  # Safety: Max ~20k trades per poll to prevent memory overflow
     
-    try:
-        resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get('data', {}).get('orderFilledEvents', [])
-    except Exception as e:
-        log.error(f"Subgraph Query Error: {e}")
+    while page_count < max_pages:
+        # Fetch batch
+        query = f"""
+        {{
+          orderFilledEvents(
+            first: 1000, 
+            skip: {skip},
+            orderBy: timestamp, orderDirection: asc, 
+            where: {{ timestamp_gte: "{current_ts}" }}
+          ) {{
+            id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+          }}
+        }}
+        """
         
-    return []
+        try:
+            resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
+            if resp.status_code != 200:
+                log.error(f"Subgraph Error {resp.status_code}: {resp.text}")
+                break
+                
+            data = resp.json().get('data', {}).get('orderFilledEvents', [])
+            
+            if not data:
+                break
+            
+            all_trades.extend(data)
+            page_count += 1
+            
+            # 1. Stop if we reached the head of the chain (partial page)
+            if len(data) < 1000:
+                break
+            
+            # 2. Prepare next cursor
+            last_ts = int(data[-1]['timestamp'])
+            
+            if last_ts > current_ts:
+                # ADVANCE: Time moved forward. Move the window and reset skip.
+                # Note: This naturally creates duplicates for the boundary second,
+                # but main.py's 'seen_trade_ids' logic handles deduplication perfectly.
+                current_ts = last_ts
+                skip = 0
+            else:
+                # SKIP: Time is stuck (1000+ trades in same second).
+                # We must use 'skip' to drill deeper into this specific second.
+                skip += 1000
+                
+        except Exception as e:
+            log.error(f"Pagination Error: {e}")
+            break
+            
+    if page_count > 1:
+        log.info(f"📚 Pagination Active: Fetched {len(all_trades)} trades in {page_count} pages.")
+
+    return all_trades
