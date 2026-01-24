@@ -142,16 +142,22 @@ class SubscriptionManager:
 
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    Fetches trades using timestamp-based pagination.
-    Optimized to be gentle on Goldsky Rate Limits (50req/10s).
+    Fetches trades with a hard speed limit.
+    Max Speed: ~3 requests/second (Safe for 50req/10s limit).
     """
     all_trades = []
     current_ts = min_timestamp
     skip = 0
     page_count = 0
-    max_pages = 10 
+    max_pages = 10
     
     while page_count < max_pages:
+        # ---------------------------------------------------------
+        # 🛑 HARD LIMIT: Sleep 0.3s BEFORE every request
+        # This guarantees we never exceed ~33 requests per 10s.
+        # ---------------------------------------------------------
+        time.sleep(0.3)
+        
         query = f"""
         {{
           orderFilledEvents(
@@ -168,39 +174,23 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
         try:
             resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
             
-            # 1. Handle Rate Limits (Wait and Retry)
-            if resp.status_code == 429:
-                log.warning("⚠️ Goldsky Rate Limit Hit! Cooling down 5s...")
-                time.sleep(5)
-                continue
-            
-            # 2. Handle System Errors
             if resp.status_code != 200:
                 log.error(f"Subgraph Error {resp.status_code}")
                 break
                 
             data = resp.json().get('data', {}).get('orderFilledEvents', [])
             
-            # 3. Handle Empty Data
             if not data:
-                # Still sleep to prevent hot-looping if we are polling the tip
-                time.sleep(1.5) 
                 break
             
             all_trades.extend(data)
             page_count += 1
             
-            # 🛡️ RATE LIMIT PROTECTION 
-            # MOVED UP: Sleep regardless of whether we break or continue next!
-            time.sleep(1.5) 
-
-            # 4. Check for Partial Page (End of Data)
             if len(data) < 1000:
                 break
             
             # Pagination Logic
             last_ts = int(data[-1]['timestamp'])
-            
             if last_ts > current_ts:
                 current_ts = last_ts
                 skip = 0
@@ -209,7 +199,6 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
                 
         except Exception as e:
             log.error(f"Pagination Error: {e}")
-            time.sleep(1) # Safety sleep on error
             break
             
     return all_trades
