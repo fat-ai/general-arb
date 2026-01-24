@@ -201,9 +201,9 @@ class PaperBroker:
                 return False
 
             # Prevent Panic Selling for dust (< 0.05)
-            if side == "SELL" and vwap_price < 0.05:
-                log.warning(f"🛡️ SKIPPED SELL: Price {vwap_price:.3f} is too low (Min: 0.05)")
-                return False
+            #if side == "SELL" and vwap_price < 0.05:
+            #    log.warning(f"🛡️ SKIPPED SELL: Price {vwap_price:.3f} is too low (Min: 0.05)")
+            #    return False
             # ==========================================================
             
             realized_pnl = 0.0
