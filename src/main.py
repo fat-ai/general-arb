@@ -35,12 +35,12 @@ class LiveTrader:
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.running = True
-        self.trade_queue = asyncio.Queue()
+        self.trade_queue = None
         self.stats = {
             'processed_count': 0,
             'last_trade_time': 'Waiting...',
             'triggers_count': 0,
-            'scores': []  # <--- NEW: List to hold scores for the last 30s
+            'scores': []  
         }
         
         # The new Threaded Client
@@ -48,7 +48,8 @@ class LiveTrader:
 
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
-
+        if self.trade_queue is None:
+            self.trade_queue = asyncio.Queue()
         # Start Async Loops
         await asyncio.gather(
             self._subscription_monitor_loop(), # Replaces ingestion loop
