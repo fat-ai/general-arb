@@ -184,6 +184,8 @@ def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
             # 1. Stop if we reached the head of the chain (partial page)
             if len(data) < 1000:
                 break
+            else:
+                time.sleep(1)
             
             # 2. Prepare next cursor
             last_ts = int(data[-1]['timestamp'])
