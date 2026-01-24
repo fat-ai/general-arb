@@ -342,6 +342,7 @@ class LiveTrader:
                     unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
                     if unique_trades:
+                        print(f"Processing {len(unique_trades)} new trades from Goldsky API")
                         await self._process_batch(unique_trades)
                         for t in unique_trades: self.seen_trade_ids.add(t['id'])
                         last_ts = int(unique_trades[-1]['timestamp'])
