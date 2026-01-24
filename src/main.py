@@ -329,53 +329,51 @@ class LiveTrader:
 
     async def _signal_loop(self):
         """Polls Goldsky subgraph."""
-        last_ts = int(time.time()) - 60 
+        # Start looking 10s back
+        last_ts = int(time.time()) - 10 
         
         while self.running:
-            start_time = time.time()
-            
             # 1. Fetch Data (Single Page)
-            # Run in thread to prevent blocking async loop
             new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
             
             if new_trades:
                 # --- WE FOUND DATA ---
-                # Filter duplicates
                 unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                 
                 if unique_trades:
                     await self._process_batch(unique_trades)
                     
-                    # Track IDs
-                    for t in unique_trades: self.seen_trade_ids.add(t['id'])
+                    for t in unique_trades: 
+                        self.seen_trade_ids.add(t['id'])
                     
                     # Update High Water Mark
                     last_ts = int(unique_trades[-1]['timestamp']) + 1
 
-                    # Prune ID cache
+                    # Memory Management
                     if len(self.seen_trade_ids) > 10000:
                         self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
                 
-                # LOGIC FIX:
-                # If we received a full batch (1000), there might be more immediately available.
-                # Do NOT sleep long. Sleep tiny amount just to be polite.
+                # --- CATCH-UP LOGIC (RESTORED) ---
+                # If we fetched a FULL PAGE (1000), we know there is more data waiting.
+                # Do NOT wait the full 2 seconds.
                 if len(new_trades) >= 1000:
-                    await asyncio.sleep(0.5) 
-                    continue # Loop immediately to fetch next page
-                
-                # If partial batch, we are at the live edge. Normal sleep.
-                await asyncio.sleep(5)
+                    # 0.5s delay = 2 requests/sec = 20 requests/10s.
+                    # This is well below the limit of 50/10s, but fast enough to catch up.
+                    await asyncio.sleep(0.5)
+                    continue # <--- SKIP THE LONG SLEEP, LOOP IMMEDIATELY
 
-            else:
-                # --- NO DATA / ERROR ---
-                # Check if we are too far behind (Fast Forward Guard)
-                now = int(time.time())
-                if (now - last_ts) > 300:
-                    log.info("⏩ Signal scanner lagging. Jumping to live edge...")
-                    last_ts = now - 60
-                
-                # Sleep and retry
-                await asyncio.sleep(5)
+            # If we get here, it means either:
+            # 1. We got < 1000 trades (we are at the live edge)
+            # 2. We got 0 trades (market is quiet)
+            # So we can relax and wait the standard polling time.
+            
+            # Lag Guard: If we are somehow way behind, jump forward
+            now = int(time.time())
+            if (now - last_ts) > 300: 
+                log.info("⏩ Signal scanner lagging. Jumping to live edge...")
+                last_ts = now - 60
+
+            await asyncio.sleep(2.0)
 
     async def _process_batch(self, trades):
         batch_scores = []
