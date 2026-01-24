@@ -142,8 +142,7 @@ class SubscriptionManager:
 
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    Fetches trades with aggressive 429 handling.
-    If Rate Limited, it PAUSES and RETRIES until successful.
+    Fetches trades with aggressive 429 handling and SAFE throttling.
     """
     all_trades = []
     current_ts = min_timestamp
@@ -151,11 +150,14 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     page_count = 0
     max_pages = 10
     
+    # REDUCED PAGE SIZE to lower "Complexity Cost" per request
+    page_size = 500 
+    
     while page_count < max_pages:
         query = f"""
         {{
           orderFilledEvents(
-            first: 1000, 
+            first: {page_size}, 
             skip: {skip},
             orderBy: timestamp, orderDirection: asc, 
             where: {{ timestamp_gte: "{current_ts}" }}
@@ -166,36 +168,38 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
         """
         
         # --- RETRY LOOP ---
-        # We stay in this loop until we get a 200 OK or a fatal error.
         success = False
+        retry_delay = 5  # Start with 5s delay on failure
+        
         while not success:
-            # 1. Base Throttle (Safety First)
-            time.sleep(0.5) 
+            # FIX: Increased throttle to 1.5s to stay safely under Burst Limits
+            time.sleep(1.5) 
             
             try:
                 resp = requests.post(SUBGRAPH_URL, json={'query': query}, timeout=15)
                 
                 # CASE A: SUCCESS
                 if resp.status_code == 200:
-                    success = True # Exit the retry loop
+                    success = True 
+                    retry_delay = 5 # Reset retry delay on success
                     
                 # CASE B: RATE LIMIT (The Problem Solver)
                 elif resp.status_code == 429:
-                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing 20s before retry...")
-                    time.sleep(20) # Forced long wait
-                    continue # Retry the exact same request
+                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing {retry_delay}s...")
+                    time.sleep(retry_delay) 
+                    retry_delay = min(retry_delay * 2, 60) # Exponential backoff up to 60s
+                    continue 
                 
                 # CASE C: OTHER ERROR
                 else:
                     log.error(f"❌ Subgraph Fatal Error: {resp.status_code}")
-                    return all_trades # Fatal, return what we have
+                    return all_trades 
 
             except Exception as e:
                 log.error(f"❌ Connection Error: {e}")
                 time.sleep(5)
-                # Retry on connection errors too
         
-        # --- PROCESS DATA (Only runs after 200 OK) ---
+        # --- PROCESS DATA ---
         try:
             data = resp.json().get('data', {}).get('orderFilledEvents', [])
         except:
@@ -207,7 +211,7 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
         all_trades.extend(data)
         page_count += 1
         
-        if len(data) < 1000:
+        if len(data) < page_size:
             break
         
         # Pagination Logic
@@ -216,6 +220,6 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
             current_ts = last_ts
             skip = 0
         else:
-            skip += 1000
+            skip += page_size # Use dynamic page size
 
     return all_trades
