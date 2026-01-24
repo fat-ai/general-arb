@@ -181,8 +181,8 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
                     
                 # CASE B: RATE LIMIT (The Problem Solver)
                 elif resp.status_code == 429:
-                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing 5s before retry...")
-                    time.sleep(5) # Forced long wait
+                    log.warning(f"⛔ Goldsky 429 (Rate Limit). Pausing 20s before retry...")
+                    time.sleep(20) # Forced long wait
                     continue # Retry the exact same request
                 
                 # CASE C: OTHER ERROR
