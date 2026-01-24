@@ -30,6 +30,7 @@ class LiveTrader:
         self.ws_books: Dict[str, Dict] = {} 
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
+        self.pending_orders: Set[str] = set()
         self.running = True
         
         # The new Threaded Client
@@ -414,8 +415,9 @@ class LiveTrader:
             if action == 'SPECULATE':
                 self.sub_manager.add_speculative(tokens)
             elif action == 'BUY':
-                target_token = tokens[1] if new_weight > 0 else tokens[0] 
-                await self._attempt_exec(target_token, fpmm, reset_tracker_key=fpmm)
+                if target_token not in self.pending_orders:
+                    self.pending_orders.add(target_token)
+                    asyncio.create_task(self._execute_task(target_token, fpmm, "BUY", None))
 
         # LOGGING
         if batch_scores:
@@ -459,11 +461,11 @@ class LiveTrader:
             return
         # -----------------------------------------------
 
-        # 1. Wait for Liquidity (Active Polling)
+        # 1. Wait for Liquidity (Now Non-Blocking safe)
         book = None
         for i in range(5):
             book = self.ws_books.get(token_id)
-            if book and book.get('asks'): break
+            if book and book.get('asks') and book.get('bids'): break
             
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for {token_id}...")
@@ -478,6 +480,14 @@ class LiveTrader:
         if not book or not book.get('asks'): 
             log.warning(f"❌ Missed Opportunity: No Liquidity for {token_id}")
             return
+
+        best_bid = book['bids'][0][0]
+        best_ask = book['asks'][0][0]
+        if best_ask > 0:
+            spread = (best_ask - best_bid) / best_ask
+            if spread > 0.15: # 15% Max Spread
+                log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
+                return
 
         # 3. Execute
         trade_size = CONFIG['fixed_size'] # Default fallback
