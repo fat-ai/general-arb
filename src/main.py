@@ -7,7 +7,6 @@ import logging
 import requests
 import csv
 import queue
-from webhook_server import start_server, trade_queue
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
