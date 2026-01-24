@@ -199,7 +199,7 @@ def fetch_graph_trades(min_timestamp: int) -> List[Dict]:
                 # We must use 'skip' to drill deeper into this specific second.
                 skip += 1000
 
-            await asyncio.sleep(1)
+            time.sleep(1)
                 
         except Exception as e:
             log.error(f"Pagination Error: {e}")
