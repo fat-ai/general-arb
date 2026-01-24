@@ -21,4 +21,5 @@ COPY main.py broker.py config.py data.py strategy.py ./
 RUN mkdir -p live_paper_cache
 
 # Run the application
-CMD ["python", "main.py"]
+# Start the Uvicorn web server listening on all interfaces
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
