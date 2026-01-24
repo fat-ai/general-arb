@@ -351,7 +351,7 @@ class LiveTrader:
                     
                     # Catch-Up: Safe pacing (1.0s)
                     if len(new_trades) >= 1000:
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(3.0)
                         continue
 
                 # Normal Pulse
@@ -360,7 +360,7 @@ class LiveTrader:
                     log.info("⏩ Signal scanner lagging. Jumping to live edge...")
                     last_ts = now - 60
 
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0)
 
             except RateLimitException as e:
                 # STOP EVERYTHING. Wait 30s to clear the IP flag.
