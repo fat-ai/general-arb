@@ -139,19 +139,16 @@ class SubscriptionManager:
             except Exception:
                 pass
 
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Content-Type": "application/json",
+})
 
 def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
-    DUMB FETCHER. No loops. No pagination logic. 
-    Just gets the next batch of data safely.
+    Fetches trades using a persistent session.
     """
-    # Headers to prevent bot detection
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json",
-    }
-    
-    # Request 1000 items (One Page)
     query = f"""
     {{
       orderFilledEvents(
@@ -165,7 +162,8 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
     
     try:
-        resp = requests.post(SUBGRAPH_URL, json={'query': query}, headers=headers, timeout=10)
+        # Use the global 'session' object instead of 'requests'
+        resp = session.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
         
         if resp.status_code == 200:
             return resp.json().get('data', {}).get('orderFilledEvents', [])
