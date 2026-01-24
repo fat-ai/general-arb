@@ -328,7 +328,9 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """Polls Goldsky subgraph with Session reuse and Crash Protection."""
+        """Polls Goldsky with Strict Header Adherence."""
+        from data import RateLimitException # Ensure this import exists
+        
         last_ts = int(time.time()) - 60 
         
         while self.running:
@@ -337,42 +339,43 @@ class LiveTrader:
                 new_trades = await asyncio.to_thread(fetch_graph_trades, last_ts)
                 
                 if new_trades:
-                    # --- PROCESS DATA ---
+                    # Deduplicate & Process
                     unique_trades = [t for t in new_trades if t['id'] not in self.seen_trade_ids]
                     
                     if unique_trades:
-                        # CRITICAL: If this fails, the try/except block below catches it
-                        # preventing the 'silent death' of the loop.
                         await self._process_batch(unique_trades)
-                        
-                        for t in unique_trades: 
-                            self.seen_trade_ids.add(t['id'])
-                        
+                        for t in unique_trades: self.seen_trade_ids.add(t['id'])
                         last_ts = int(unique_trades[-1]['timestamp']) + 1
-
+                        
+                        # Prune Memory
                         if len(self.seen_trade_ids) > 10000:
                             self.seen_trade_ids = set(list(self.seen_trade_ids)[-5000:])
                     
                     # --- CATCH-UP LOGIC ---
+                    # If we got a full page (1000), we are behind.
+                    # We sleep 1.0s (not 0ms) to respect the "Burst Limit".
+                    # 1000 trades / 1.0s = catch up speed of 60,000 trades/min.
                     if len(new_trades) >= 1000:
-                        # 1.0s wait allows catch-up (1000 trades/sec) but prevents 
-                        # triggering 'Connection Rate' limits.
                         await asyncio.sleep(1.0)
-                        continue 
+                        continue
 
-                # Standard Pulse (Live Edge)
-                # Lag Guard
+                # Normal Pulse (Live Edge)
                 now = int(time.time())
                 if (now - last_ts) > 300: 
                     log.info("⏩ Signal scanner lagging. Jumping to live edge...")
                     last_ts = now - 60
 
+                # Standard Wait: 2.0s is safe (0.5 req/s vs 5.0 req/s limit)
                 await asyncio.sleep(2.0)
 
+            except RateLimitException as e:
+                # RESPOND TO THE SERVER
+                wait_time = e.retry_after + 1 # Add 1s buffer
+                log.warning(f"⏳ Backing off for {wait_time}s...")
+                await asyncio.sleep(wait_time)
+
             except Exception as e:
-                # This prevents the "Silent Death". 
-                # If an error occurs, we log it, wait, and RETRY.
-                log.error(f"⚠️ Signal Loop Exception: {e}")
+                log.error(f"⚠️ Signal Loop Error: {e}")
                 await asyncio.sleep(5.0)
 
     async def _process_batch(self, trades):
