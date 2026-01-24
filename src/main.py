@@ -365,7 +365,7 @@ class LiveTrader:
                             self.seen_trade_ids.add(t['id'])
                         
                         # Update timestamp to the very last trade found
-                        last_ts = int(unique_trades[-1]['timestamp'])
+                        last_ts = int(unique_trades[-1]['timestamp']) + 1
 
                         # Memory Management for ID set
                         if len(self.seen_trade_ids) > 10000:
