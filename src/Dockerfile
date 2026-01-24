@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 2. Copy ONLY the application source code
 # This explicitly grabs only the 5 python files and ignores everything else (like the CSV)
-COPY main.py broker.py config.py data.py strategy.py ./
+COPY *.py ./
 
 # 3. Create the cache directory (required by config.py)
 RUN mkdir -p live_paper_cache
