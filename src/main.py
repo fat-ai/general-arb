@@ -20,6 +20,7 @@ from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
+GLOBAL_TRADE_QUEUE = asyncio.Queue()
 
 class LiveTrader:
     def __init__(self):
@@ -112,7 +113,7 @@ class LiveTrader:
             triggers = self.stats['triggers_count']
             scores = self.stats['scores']
 
-            q_size = self.trade_queue.qsize() if self.trade_queue else 0
+            q_size = GLOBAL_TRADE_QUEUE.qsize()
             # 2. Find Top 3 Scores
             # Sort descending (highest first) and take the first 3
             top_3 = sorted(scores, reverse=True)[:3]
@@ -358,7 +359,7 @@ class LiveTrader:
         
         while self.running:
             # FIX: Use 'self.trade_queue' instead of 'trade_queue'
-            raw_trade = await self.trade_queue.get()
+            raw_trade = await GLOBAL_TRADE_QUEUE.get()
             
             try:
                 self.stats['processed_count'] += 1
@@ -727,8 +728,6 @@ async def start_trading_system():
 @app.post("/webhook")
 async def receive_goldsky_data(request: Request):
     try:
-        if trader.trade_queue is None:
-            trader.trade_queue = asyncio.Queue()
             
         # Get the JSON payload
         payload = await request.json()
@@ -738,22 +737,14 @@ async def receive_goldsky_data(request: Request):
             events = payload
         else:
             events = [payload]
-
-        if len(events) > 0:
-            first = events[0]
-            # Print only once every few seconds to avoid spamming too much
-            op_code = first.get("op", "UNKNOWN")
-            log.info(f"🕵️ SPY: Received {len(events)} events. First Op: '{op_code}'")
             
         # 2. Process every event in the batch
         count = 0
         for event in events:
-            # Goldsky structure: { "op": "INSERT", "data": { ... } }
             if event.get("op") == "INSERT":
-                trade_data = event.get("data")
-                if trade_data:
-                    # Push to the bot's queue
-                    await trader.trade_queue.put(trade_data)
+                data = event.get("data")
+                if data:
+                    GLOBAL_TRADE_QUEUE.put_nowait(data)
                     count += 1
                     
         return {"status": "processed", "count": count}
