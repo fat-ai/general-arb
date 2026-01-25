@@ -51,11 +51,10 @@ class LiveTrader:
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
-        self.ws_client = PolymarketWS(self.ws_queue)
+        self.ws_client = PolymarketWS([], self.ws_queue.put_nowait)
+        
         await self.ws_client.start_client() 
-        # ---------------------------------------------------
 
-        # Start Async Loops
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
@@ -63,8 +62,7 @@ class LiveTrader:
             self._maintenance_loop(),
             self._risk_monitor_loop(),
             self._reporting_loop(),
-            self._monitor_loop(),
-            # self._ws_ingestion_loop()  <-- DELETE THIS LINE
+            self._monitor_loop()
         )
 
     async def shutdown(self):
