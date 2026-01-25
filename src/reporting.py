@@ -2,6 +2,7 @@ import time
 import json
 import os
 from pathlib import Path
+from config import EQUITY_FILE
 
 DASHBOARD_PATH = Path("dashboard.html")
 
