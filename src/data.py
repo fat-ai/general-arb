@@ -20,51 +20,72 @@ class MarketMetadata:
         self.token_to_fpmm: Dict[str, str] = {}
 
     async def refresh(self):
-        """Async wrapper to fetch and index all active markets."""
-        log.info("🌍 Refreshing Market Metadata...")
-        loop = asyncio.get_running_loop()
-        try:
-            # Run the blocking request in a separate thread
-            data = await loop.run_in_executor(None, self._fetch_all_pages)
-            if not data:
-                log.error("⚠️ Gamma API returned NO data.")
-                return
-
-            count = 0
-            for m in data:
-                # Polymarket API inconsistencies: sometimes fpmm, sometimes conditionId
-                fpmm = m.get('fpmm', '')
-                if not fpmm: 
-                    fpmm = m.get('conditionId', '')
-                fpmm = fpmm.lower()
+        """
+        Fetches ALL active markets using pagination. 
+        (Fixes the 500-market limit)
+        """
+        log.info("🌍 Refreshing Market Metadata (Paginated)...")
+        
+        # Clear existing mappings
+        self.fpmm_to_tokens.clear()
+        self.token_to_fpmm.clear()
+        
+        url = "https://gamma-api.polymarket.com/markets"
+        limit = 100 # Max safe chunk size
+        offset = 0
+        total_markets = 0
+        
+        while True:
+            params = {
+                "closed": "false",
+                "limit": limit,
+                "offset": offset
+            }
+            
+            try:
+                # Run the blocking request in a thread
+                resp = await asyncio.to_thread(requests.get, url, params=params)
                 
-                if not fpmm: continue
-
-                # Parse tokens
-                raw_tokens = m.get('clobTokenIds') or m.get('tokens')
-                tokens = []
-                if isinstance(raw_tokens, str):
-                    try: tokens = json.loads(raw_tokens)
-                    except: pass
-                elif isinstance(raw_tokens, list):
-                    tokens = raw_tokens
+                if resp.status_code != 200:
+                    log.error(f"Metadata API Error: {resp.status_code}")
+                    break
+                    
+                data = resp.json()
                 
-                # We only care about binary markets (2 outcomes)
-                if not tokens or len(tokens) != 2: continue
+                # If we get an empty list, we are done
+                if not data: 
+                    break
                 
-                clean_tokens = [str(t) for t in tokens]
-                self.fpmm_to_tokens[fpmm] = clean_tokens
+                # Process this batch
+                for mkt in data:
+                    fpmm = mkt.get("id") or mkt.get("fpmm")
+                    tokens = [t.get("tokenId") for t in mkt.get("tokens", [])]
+                    
+                    if fpmm and len(tokens) >= 2:
+                        # Store Mapping
+                        self.fpmm_to_tokens[fpmm] = tokens
+                        for t in tokens:
+                            self.token_to_fpmm[t] = fpmm
+                            
+                count = len(data)
+                total_markets += count
+                # log.info(f"Loaded batch: {count} markets (Total: {total_markets})")
                 
-                # Map both YES and NO tokens back to the Market ID
-                for t in clean_tokens: 
-                    self.token_to_fpmm[t] = fpmm
+                # If we got fewer items than the limit, we reached the end
+                if count < limit:
+                    break
                 
-                count += 1
-
-            log.info(f"✅ Metadata Updated. {count} Markets Indexed.")
+                # Prepare for next page
+                offset += limit
                 
-        except Exception as e:
-            log.error(f"Metadata refresh failed: {e}")
+                # Be polite to the API
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                log.error(f"Metadata Loop Failed: {e}")
+                break
+                
+        log.info(f"✅ Metadata Complete. Indexed {total_markets} Markets ({len(self.token_to_fpmm)} Tokens).")
 
     def _fetch_all_pages(self):
         """Helper to handle API pagination."""
