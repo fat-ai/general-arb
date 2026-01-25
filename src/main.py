@@ -143,7 +143,13 @@ class LiveTrader:
             self.stats['scores'] = []  # Clear the scores list
 
     async def _ws_processor_loop(self):
-        """Parses messages and captures authoritative price data."""
+        """
+        Parses messages:
+        1. Updates Order Books (Existing Logic)
+        2. Captures Trades for Strategy (NEW LOGIC)
+        """
+        log.info("⚡ WS Processor: Ready to route Order Books AND Trades")
+        
         while self.running:
             msg = await self.ws_queue.get()
             try:
@@ -152,38 +158,36 @@ class LiveTrader:
                     data = json.loads(msg)
                 except: continue
 
-                # Polymarket sometimes sends a list, sometimes a dict
                 items = data if isinstance(data, list) else [data]
 
                 for item in items:
                     event_type = item.get("event_type", "")
                     
-                    # --- 1. HANDLE SNAPSHOTS (THE FIX) ---
-                    if event_type == "book":
+                    # --- 1. HANDLE TRADES (NEW) ---
+                    # We catch the 'last_trade_price' event here!
+                    if event_type == "last_trade_price":
+                        adapted = self._adapt_ws_to_goldsky(item)
+                        if adapted:
+                            # Push to the Strategy Queue
+                            await self.trade_queue.put(adapted)
+
+                    # --- 2. HANDLE SNAPSHOTS (Existing) ---
+                    elif event_type == "book":
                         asset_id = item.get("asset_id")
                         if asset_id:
-                            # Parse lists
                             bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
                             asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
-                            
-                            # CRITICAL: Force correct sort order immediately
-                            # Bids: Highest Price First (Index 0 = Liquidation Value)
                             bids.sort(key=lambda x: x[0], reverse=True)
-                            # Asks: Lowest Price First (Index 0 = Buy Cost)
                             asks.sort(key=lambda x: x[0], reverse=False)
-                            
-                            # Initialize pointers
-                            best_bid = bids[0][0] if bids else 0.0
-                            best_ask = asks[0][0] if asks else 0.0
                             
                             self.ws_books[asset_id] = {
                                 'bids': bids, 
                                 'asks': asks,
-                                'best_bid': best_bid, 
-                                'best_ask': best_ask
+                                'best_bid': bids[0][0] if bids else 0.0, 
+                                'best_ask': asks[0][0] if asks else 0.0
                             }
 
-                    # --- 2. HANDLE PRICE CHANGES ---
+                    # --- 3. HANDLE PRICE CHANGES (Existing) ---
                     elif event_type == "price_change":
                         changes = item.get("price_changes", []) or item.get("changes", [])
                         for change in changes:
@@ -195,33 +199,23 @@ class LiveTrader:
 
                             p = float(change.get("price", 0))
                             s = float(change.get("size", 0))
-                            
-                            # Use explicit side from API (Standard in new API)
-                            # Fallback to "BUY" if missing to prevent crash, but strictly it should be there.
                             raw_side = change.get("side", "").upper()
 
-                            # A. Update the correct list
                             if raw_side == "BUY":
                                 self._update_book_level(self.ws_books[c_aid]['bids'], p, s, "BUY")
                             elif raw_side == "SELL":
                                 self._update_book_level(self.ws_books[c_aid]['asks'], p, s, "SELL")
 
-                            # B. Update Best Pointers
-                            # 1. Prefer API value (New Schema)
+                            # Update Best Pointers
                             if 'best_bid' in change:
                                 self.ws_books[c_aid]['best_bid'] = float(change['best_bid'])
-                            # 2. Fallback to local calculation
                             elif self.ws_books[c_aid]['bids']:
                                 self.ws_books[c_aid]['best_bid'] = self.ws_books[c_aid]['bids'][0][0]
-                            else:
-                                self.ws_books[c_aid]['best_bid'] = 0.0
 
                             if 'best_ask' in change:
                                 self.ws_books[c_aid]['best_ask'] = float(change['best_ask'])
                             elif self.ws_books[c_aid]['asks']:
                                 self.ws_books[c_aid]['best_ask'] = self.ws_books[c_aid]['asks'][0][0]
-                            else:
-                                self.ws_books[c_aid]['best_ask'] = 0.0
 
             except Exception as e:
                 log.error(f"WS Parse Error: {e}")
@@ -287,49 +281,31 @@ class LiveTrader:
                 return None
 
             # MAPPING LOGIC:
-            # Your _process_batch logic expects:
-            # - makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
-            # - taker (Wallet Address) -> WS DOES NOT PROVIDE THIS!
-            
-            # We must use a dummy wallet. 
-            # ⚠️ NOTE: This means WalletScorer will effectively be disabled for these trades.
-            dummy_wallet = "0x0000000000000000000000000000000000000000"
-
-            # Determine Assets based on "Side"
             # Side "BUY" = Taker bought Token (Paid USDC)
             # Side "SELL" = Taker sold Token (Got USDC)
             usdc_addr = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # Polygon USDC
+            dummy_wallet = "0x0000000000000000000000000000000000000000"
             
             if side == "BUY":
-                # Taker GIVES USDC, GETS Token
-                # Maker GIVES Token, GETS USDC
                 maker_asset = asset_id
                 taker_asset = usdc_addr
-                
-                # Amounts (approximate based on price)
-                # Maker gave 'size' tokens
-                maker_amt = size * 1e6 # assuming 6 decimals for internal logic
-                # Taker gave 'size * price' USDC
+                maker_amt = size * 1e6 
                 taker_amt = (size * price) * 1e6
-                
             else: # SELL
-                # Taker GIVES Token, GETS USDC
-                # Maker GIVES USDC, GETS Token
                 maker_asset = usdc_addr
                 taker_asset = asset_id
-                
                 maker_amt = (size * price) * 1e6
                 taker_amt = size * 1e6
 
             # Construct the Fake Goldsky Object
             return {
-                'id': f"ws_{timestamp}_{asset_id}", # Fake ID
+                'id': f"ws_{timestamp}_{asset_id}",
                 'timestamp': timestamp,
-                'maker': dummy_wallet, # Maker unknown
-                'taker': dummy_wallet, # Taker unknown (CRITICAL LIMITATION)
+                'maker': dummy_wallet, 
+                'taker': dummy_wallet,
                 'makerAssetId': maker_asset,
                 'takerAssetId': taker_asset,
-                'makerAmountFilled': str(int(maker_amt)), # Logic expects strings often
+                'makerAmountFilled': str(int(maker_amt)),
                 'takerAmountFilled': str(int(taker_amt))
             }
         except Exception as e:
