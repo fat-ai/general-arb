@@ -366,6 +366,8 @@ class LiveTrader:
                 # regardless of which slot it sits in.
                 final_vol_raw = max(amt_a_raw, amt_b_raw)
 
+                print(f"🔍 TRACE_PARSE: Tx={log_item.get('transactionHash')}... | RawVol={final_vol_raw} | Chunk2={amt_a_raw}")
+
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
                     'timestamp': int(time.time()),
@@ -472,6 +474,7 @@ class LiveTrader:
         
         while self.running:
             raw_trade = await self.trade_queue.get()
+            print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
             
             try:
                 self.stats['processed_count'] += 1
