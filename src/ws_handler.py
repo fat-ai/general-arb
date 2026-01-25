@@ -8,9 +8,13 @@ log = logging.getLogger("PaperGold")
 
 class PolymarketWS:
     def __init__(self, url, assets_ids, on_message_callback):
-        # Ensure we don't double-slash the URL if user provided base
+        # Ensure correct URL formatting
         base = url.rstrip('/')
-        self.url = f"{base}/ws/market"
+        if not base.endswith("/ws/market"):
+            self.url = f"{base}/ws/market"
+        else:
+            self.url = base
+            
         self.assets_ids = assets_ids
         self.on_message_callback = on_message_callback
         self.ws = None
@@ -22,34 +26,31 @@ class PolymarketWS:
             self.on_message_callback(message)
 
     def on_error(self, ws, error):
-        log.warning(f"WS Error: {error}")
+        # Filter out noise
+        log.warning(f"WS Connection State: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         log.warning(f"WS Closed ({close_status_code}).")
 
     def on_open(self, ws):
         log.info("⚡ Websocket Connected.")
-        # Immediate subscription on connect
+        # FIX 1: Only send subscription if we actually have items
         if self.assets_ids:
             self.update_subscriptions(self.assets_ids)
+        else:
+            log.info("💤 WS Idle (No assets to subscribe to yet)")
         
-        # Start PING thread
-        threading.Thread(target=self.ping, args=(ws,), daemon=True).start()
-
-    def ping(self, ws):
-        while self.running and ws.sock and ws.sock.connected:
-            try:
-                ws.send("PING")
-                time.sleep(10)
-            except:
-                break
+        # FIX 2: Removed manual "PING" thread (caused disconnects)
 
     def update_subscriptions(self, assets_ids):
-        """Sends the correct subscription payload for CLOB."""
+        """Updates the internal list and sends 'subscribe' op if connected."""
         self.assets_ids = assets_ids 
         
+        # FIX 3: Don't send empty lists
+        if not assets_ids:
+            return
+
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            # CORRECT PAYLOAD (No "operation" field)
             payload = {
                 "assets_ids": assets_ids, 
                 "type": "market"
