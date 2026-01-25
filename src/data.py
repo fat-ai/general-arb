@@ -6,7 +6,7 @@ import requests
 from typing import Dict, List, Set, Any, Optional
 
 # Import configuration
-from config import GAMMA_API_URL, CONFIG
+from config import GAMMA_API_URL, RPC_URL, CONFIG
 
 log = logging.getLogger("PaperGold")
 
@@ -195,7 +195,7 @@ def fetch_graph_trades(min_timestamp: int) -> list[dict]:
     """
     
     try:
-        resp = session.post(SUBGRAPH_URL, json={'query': query}, timeout=10)
+        resp = session.post(RPC_URL, json={'query': query}, timeout=10)
         
         if resp.status_code == 200:
             return resp.json().get('data', {}).get('orderFilledEvents', [])
