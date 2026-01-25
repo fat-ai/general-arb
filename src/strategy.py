@@ -62,17 +62,20 @@ class WalletScorer:
                 log.error(f"Error loading model params: {e}")
 
     def get_score(self, wallet_id: str, volume: float) -> float:
-        """
-        Returns the skill score.
-        """
-        # Normalize input aggressively
+        # Normalize input
         w_id = wallet_id.strip().lower()
         
-        # 1. KNOWN WALLET LOOKUP
+        # [FIX] Check both "0x" and raw versions
+        w_id_no_prefix = w_id[2:] if w_id.startswith("0x") else w_id
+        w_id_with_prefix = w_id if w_id.startswith("0x") else f"0x{w_id}"
+
+        # 1. KNOWN WALLET LOOKUP (Check both keys)
         if w_id in self.wallet_scores:
-            score = self.wallet_scores[w_id]
-            # log.info(f"📜 HIT: {w_id[:6]}... Score: {score:.2f}")
-            return score
+            return self.wallet_scores[w_id]
+        if w_id_no_prefix in self.wallet_scores:
+            return self.wallet_scores[w_id_no_prefix]
+        if w_id_with_prefix in self.wallet_scores:
+             return self.wallet_scores[w_id_with_prefix]
             
         # DEBUG: Log MISSES for significant volume
         # This will tell us if we have a mismatch
