@@ -43,7 +43,6 @@ class LiveTrader:
             'scores': []  
         }
         
-        # The new Threaded Client
         self.ws_client = None
 
     async def start(self):
@@ -75,7 +74,6 @@ class LiveTrader:
             if tokens and len(tokens) >= 2:
                 all_tokens.extend(tokens)
         
-        # --- THE KEY CHANGE: NO LIMITS ---
         print(f"✅ Metadata Loaded. Subscribing to ALL {len(all_tokens)} assets...")
 
         # Force the subscription immediately
@@ -133,9 +131,6 @@ class LiveTrader:
             self.order_books[asset_id]['asks'] = {
                 x['price']: x['size'] for x in item.get('asks', [])
             }
-            
-            # Optional: Log the heat if you want to verify data
-            # log.info(f"📸 Snapshot: {asset_id} | Bids: {len(self.order_books[asset_id]['bids'])}")
 
         except Exception as e:
             log.error(f"Snapshot Error: {e}")
@@ -201,22 +196,20 @@ class LiveTrader:
 
             q_size = self.trade_queue.qsize() if self.trade_queue else -1
             # 2. Find Top 3 Scores
-            # Sort descending (highest first) and take the first 3
             top_3 = sorted(scores, reverse=True)[:3]
             
-            # Format them nicely (e.g., "0.85, 0.72, 0.65")
             if top_3:
                 top_scores_str = ", ".join([f"{s:.4f}" for s in top_3])
             else:
                 top_scores_str = "None"
 
             # 3. Create the Log Message
-            if count > 0 or q_size>0:
+            if count > 0 or q_size > 0:
                 log.info(
                     f"📊 REPORT (30s): Analyzed {count} trades | "
                     f"Last: {last_seen} | "
                     f"🏆 Top Scores: [{top_scores_str}] | "
-                    f"🎯 Triggers: {triggers}"
+                    f"🎯 Triggers: {triggers} | "
                     f"Queue Size: {q_size}"
                 )
             else:
@@ -243,9 +236,6 @@ class LiveTrader:
                 for item in items:
                     event_type = item.get("event_type", "")
                     
-                    # ❌ DELETED: Trade parsing logic (It was anonymous)
-                    
-                    # ✅ KEEP: Order Book Logic
                     if event_type == "book":
                         self._process_snapshot(item)
                     elif event_type == "price_change":
@@ -256,20 +246,18 @@ class LiveTrader:
             finally:
                 self.ws_queue.task_done()
 
-    # --- 2. ADD THE DEANONYMIZER LOOP (The Magic) ---
     async def _poll_subgraph_loop(self):
         """
         Polls the Public Subgraph to get trades WITH Wallet IDs.
         """
-        from config import SUBGRAPH_URL # Ensure this is the new Public URL
+        from config import SUBGRAPH_URL 
         log.info(f"🕵️ STARTING DEANONYMIZER (Source: {SUBGRAPH_URL})")
         
-        last_timestamp = int(time.time()) - 60 # Start from 1 min ago
+        last_timestamp = int(time.time()) - 60 
         
         while self.running:
             try:
                 # 1. Query for RECENT trades (Global feed)
-                # We ask for trades that happened since our last check
                 query = f"""
                 {{
                     transactions(
@@ -280,7 +268,7 @@ class LiveTrader:
                     ) {{
                         id
                         timestamp
-                        user {{ id }}  # <--- THIS IS THE WALLET ID YOU NEED
+                        user {{ id }} 
                         market {{ id }}
                         tradeAmount
                         outcomeIndex
@@ -289,7 +277,6 @@ class LiveTrader:
                 }}
                 """
                 
-                # 2. Execute Request (Standard HTTP Post)
                 resp = await asyncio.to_thread(requests.post, SUBGRAPH_URL, json={'query': query})
                 
                 if resp.status_code == 200:
@@ -297,24 +284,18 @@ class LiveTrader:
                     trades = data.get('transactions', [])
                     
                     if trades:
-                        # Update timestamp to the latest trade we saw
                         last_timestamp = max(int(t['timestamp']) for t in trades)
                         
-                        # 3. Inject into your Pipeline
                         for t in trades:
                             # Normalize to your internal format
-                            wallet_id = t['user']['id'] # "0x123..."
+                            wallet_id = t['user']['id'] 
                             fpmm = t['market']['id']
                             
-                            # Log it to prove we have the ID
-                            # log.info(f"🕵️ DETECTED: {wallet_id[:6]}... traded on {fpmm[:6]}...")
-                            
-                            # Convert to your internal object
                             trade_obj = {
                                 'id': t['id'],
                                 'timestamp': int(t['timestamp']),
-                                'taker': wallet_id, # <--- FINALLY!
-                                'maker': "0x000...", # Maker is less relevant for taker scoring
+                                'taker': wallet_id,
+                                'maker': "0x000...", 
                                 'fpmm': fpmm,
                                 'usdc_vol': float(t['tradeAmount']) / 1e6,
                                 'direction': 1.0 if t['type'] == "Buy" else -1.0
@@ -325,96 +306,19 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"Subgraph Poll Failed: {e}")
             
-            # 4. Wait 1-2 seconds (Public endpoints have rate limits)
+            # Wait 2 seconds (Public endpoints have rate limits)
             await asyncio.sleep(2.0)
-
-    def _adapt_ws_to_goldsky(self, event):
-        """
-        Converts a Polymarket WS 'last_trade_price' event into the 
-        Goldsky Subgraph format your logic expects.
-        """
-        try:
-            # WS Data: {"price": "0.60", "size": "10", "side": "BUY", "asset_id": "..."}
-            price = float(event.get("price", 0))
-            size = float(event.get("size", 0))
-            side = event.get("side", "UNKNOWN") # "BUY" or "SELL"
-            asset_id = event.get("asset_id")
-            timestamp = int(time.time())
-
-            # Skip invalid data
-            if not asset_id or price == 0 or size == 0:
-                return None
-
-            # MAPPING LOGIC:
-            # Side "BUY" = Taker bought Token (Paid USDC)
-            # Side "SELL" = Taker sold Token (Got USDC)
-            usdc_addr = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # Polygon USDC
-            dummy_wallet = "0x0000000000000000000000000000000000000000"
-            
-            if side == "BUY":
-                maker_asset = asset_id
-                taker_asset = usdc_addr
-                maker_amt = size * 1e6 
-                taker_amt = (size * price) * 1e6
-            else: # SELL
-                maker_asset = usdc_addr
-                taker_asset = asset_id
-                maker_amt = (size * price) * 1e6
-                taker_amt = size * 1e6
-
-            # Construct the Fake Goldsky Object
-            return {
-                'id': f"ws_{timestamp}_{asset_id}",
-                'timestamp': timestamp,
-                'maker': dummy_wallet, 
-                'taker': dummy_wallet,
-                'makerAssetId': maker_asset,
-                'takerAssetId': taker_asset,
-                'makerAmountFilled': str(int(maker_amt)),
-                'takerAmountFilled': str(int(taker_amt))
-            }
-        except Exception as e:
-            log.error(f"Adapter Error: {e}")
-            return None
-
-    def _update_book_level(self, book_list, price, size, side):
-        """
-        Updates a specific price level in the list and ensures correct sorting.
-        """
-        found_idx = -1
-        for i, (p, s) in enumerate(book_list):
-            if p == price:
-                found_idx = i
-                break
-        
-        if size == 0:
-            if found_idx != -1: 
-                book_list.pop(found_idx)
-        else:
-            if found_idx != -1: 
-                book_list[found_idx][1] = size
-            else:
-                book_list.append([price, size])
-        
-        # Always re-sort to ensure list integrity
-        # BUY (Bids) -> Reverse=True (Desc)
-        # SELL (Asks) -> Reverse=False (Asc)
-        book_list.sort(key=lambda x: x[0], reverse=(side == "BUY"))
 
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
         log.info("⚖️ Resolution Monitor Started (Batched Mode)")
         
         while self.running:
-            # 1. Snapshot current positions
             positions = self.persistence.state["positions"]
             if not positions:
                 await asyncio.sleep(60)
                 continue
 
-            # 2. Group held tokens by their Market ID (FPMM)
-            # Map Structure: { "0xmarket_id": ["token_id_1", "token_id_2"] }
-            # We use lower() for keys to ensure case-insensitive matching with API
             market_map = {}
             for token_id, pos in positions.items():
                 fpmm = pos.get('market_fpmm')
@@ -426,57 +330,40 @@ class LiveTrader:
                 await asyncio.sleep(60)
                 continue
             
-            # 3. Process in chunks of 20 to respect URL length limits
             chunk_size = 20
             redeemed_any = False
             
             for i in range(0, len(unique_fpmms), chunk_size):
                 batch = unique_fpmms[i : i + chunk_size]
-                
-                # Construct Explicit URL: .../markets?id=A,B,C
-                # Manual formatting ensures commas are not double-encoded by requests
                 ids_str = ",".join(batch)
                 url = f"{GAMMA_API_URL}?id={ids_str}"
                 
                 try:
-                    # Blocking Request in Thread
                     resp = await asyncio.to_thread(requests.get, url)
-                    
                     if resp.status_code != 200: 
                         log.warning(f"Resolution Batch Failed ({resp.status_code})")
                         continue
                     
                     data = resp.json()
-                    # Ensure we handle list/dict responses robustly
                     markets_data = data if isinstance(data, list) else [data]
                     
-                    # 4. Iterate through returned markets
                     for mkt in markets_data:
-                        # Check if Closed/Resolved
                         if mkt.get('closed'):
-                            # API ID Fallback
                             fpmm_id = mkt.get('id') or mkt.get('fpmm') or mkt.get('conditionId')
                             if not fpmm_id: continue
                             
                             fpmm_id = fpmm_id.lower()
                             if fpmm_id not in market_map: continue
 
-                            # 5. Determine Payout Logic
-                            # "tokens" list contains: [{'tokenId': '...', 'winner': True}, ...]
                             outcome_tokens = mkt.get('tokens', [])
-                            
-                            # Create a fast lookup for winners
-                            # { "token_id_str": is_winner_bool }
                             winner_map = {
                                 str(t.get('tokenId')): t.get('winner', False) 
                                 for t in outcome_tokens
                             }
 
-                            # 6. Redeem OUR held tokens for this market
                             held_tokens_in_market = market_map[fpmm_id]
                             
                             for my_token in held_tokens_in_market:
-                                # Payout is 1.0 if winner, else 0.0
                                 is_winner = winner_map.get(str(my_token), False)
                                 payout = 1.0 if is_winner else 0.0
                                 
@@ -487,16 +374,12 @@ class LiveTrader:
                 except Exception as e:
                     log.error(f"Resolution Batch Error: {e}")
                 
-                # Small delay between batches to be polite to the API
                 await asyncio.sleep(0.5)
             
-            # 7. Update subscriptions if we redeemed anything
-            # (We only do this once per loop to be efficient)
             if redeemed_any:
                  open_pos = list(self.persistence.state["positions"].keys())
                  self.sub_manager.set_mandatory(open_pos)
 
-            # Wait 60 seconds before next full scan
             await asyncio.sleep(60)
             
     # --- SIGNAL LOOPS ---
@@ -526,7 +409,6 @@ class LiveTrader:
                     'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or 0),
                 }
                 
-                # Process
                 await self._process_batch([trade])
                 
             except Exception as e:
@@ -538,12 +420,10 @@ class LiveTrader:
 
         for t in trades:
             # 1. Normalize Data
-            # The subgraph often returns USDC as "0" or "0x0"
             maker_asset = str(t['makerAssetId']).lower()
             taker_asset = str(t['takerAssetId']).lower()
             target_usdc = USDC_ADDRESS.lower()
             
-            # Helper to check if an asset is USDC (matches "0", "0x0", or the real address)
             def is_usdc(a): return a in ["0", "0x0", target_usdc]
 
             token_id = None
@@ -551,27 +431,21 @@ class LiveTrader:
             wallet = t['taker'] 
             direction = 0
             
-            # Check if this is a valid trade (One side MUST be USDC)
             if is_usdc(maker_asset):
                 token_id = taker_asset
-                # Convert from atomic units (6 decimals)
                 usdc_vol = float(t['makerAmountFilled']) / 1e6 
-                direction = -1.0 # Selling Token (Maker gave USDC, so Taker Sold Token)
+                direction = -1.0 # Selling
             elif is_usdc(taker_asset):
                 token_id = maker_asset
                 usdc_vol = float(t['takerAmountFilled']) / 1e6
-                direction = 1.0 # Buying Token (Taker gave USDC)
+                direction = 1.0 # Buying
             else:
                 skipped_counts["not_usdc"] += 1
                 continue 
 
-            # 2. Resolve Metadata
-            # Token IDs from subgraph are usually decimal strings (e.g. "12345...").
-            # Gamma API also uses decimal strings.
             fpmm = self.metadata.token_to_fpmm.get(str(token_id))
             
             if not fpmm: 
-                # If lookup failed, the market might be closed or inactive
                 skipped_counts["no_fpmm"] += 1
                 continue 
             
@@ -594,8 +468,6 @@ class LiveTrader:
             )
             
             self.stats['scores'].append(new_weight)
-            
-            # Store stats for logging
             batch_scores.append((abs(new_weight), new_weight, fpmm))
 
             # 4. Actions
@@ -611,7 +483,6 @@ class LiveTrader:
                     self.pending_orders.add(token_id)
                     asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
 
-        # LOGGING
         if batch_scores:
             batch_scores.sort(key=lambda x: x[0], reverse=True)
             top_3 = batch_scores[:3]
@@ -637,7 +508,6 @@ class LiveTrader:
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
             
             if should_exit:
-                # Retrieve book to sell
                 book = self.ws_books.get(pos_token)
                 if book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
@@ -649,7 +519,6 @@ class LiveTrader:
         token_id = str(token_id)
         
         if token_id in self.persistence.state["positions"]:
-            # log.info(f"🛡️ Skipping Buy: Already hold position in {token_id}")
             return
         # -----------------------------------------------
 
@@ -710,7 +579,6 @@ class LiveTrader:
         )
         
         if success:
-             # Logic to update mandatory subs
              open_pos = list(self.persistence.state["positions"].keys())
              self.sub_manager.set_mandatory(open_pos)
             
@@ -738,24 +606,20 @@ class LiveTrader:
     async def _maintenance_loop(self):
         """
         Refreshes market metadata hourly to catch NEW markets.
-        Does NOT prune existing subscriptions anymore.
         """
         last_metadata_refresh = time.time()
 
         while self.running:
             await asyncio.sleep(60)
 
-            # --- ONLY REFRESH METADATA (Hourly) ---
             if time.time() - last_metadata_refresh > 3600:
                 log.info("🌍 Hourly Metadata Refresh...")
                 await self.metadata.refresh()
                 
-                # Add any NEW markets to our subscription list
                 all_tokens = []
                 for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
                     if tokens: all_tokens.extend(tokens)
                 
-                # Update the subscription (this adds new stuff without removing old stuff)
                 self.sub_manager.set_mandatory(all_tokens)
                 self.sub_manager.dirty = True
                 
@@ -764,22 +628,19 @@ class LiveTrader:
     async def _reporting_loop(self):
         """Generates and prints the institutional report every 5 minutes."""
         while self.running:
-            await asyncio.sleep(60) # Wait 1 minutes
+            await asyncio.sleep(60) 
             
-            # Run in thread to avoid blocking the event loop with Pandas math
             report_str = await asyncio.to_thread(generate_institutional_report)
             if report_str:
                 print(f"\n{report_str}\n")
 
     async def _risk_monitor_loop(self):
-        # Initialize CSV header if file doesn't exist
         if not EQUITY_FILE.exists():
             with open(EQUITY_FILE, "w", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["timestamp", "equity", "cash", "invested", "drawdown"])
 
         while self.running:
-            # 1. Live Pricing (Safe Logic)
             live_prices = {}
             for token_id, book in self.ws_books.items():
                 bids = book.get('bids', [])
@@ -793,16 +654,14 @@ class LiveTrader:
             cash = self.persistence.state["cash"]
             invested = equity - cash
             
-            # 2. High Water Mark & Drawdown
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             if equity > high_water:
                 self.persistence.state["highest_equity"] = equity
 
             drawdown = 0.0
             if high_water > 0:
-                drawdown = (equity - high_water) / high_water # Negative value
+                drawdown = (equity - high_water) / high_water 
 
-            # 3. 📝 LOGGING TO CSV (The Time Series)
             try:
                 with open(EQUITY_FILE, "a", newline="") as f:
                     writer = csv.writer(f)
@@ -810,7 +669,6 @@ class LiveTrader:
             except Exception as e:
                 log.error(f"Equity Log Error: {e}")
 
-            # Risk Safety Check
             if abs(drawdown) > CONFIG['max_drawdown']:
                 log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded.")
                 self.running = False
@@ -822,7 +680,6 @@ class LiveTrader:
             
 async def main():
     try:
-        # Create and Start the Trader
         trader = LiveTrader()
         await trader.start()
     except KeyboardInterrupt:
