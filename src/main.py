@@ -30,7 +30,7 @@ class LiveTrader:
         self.scorer = WalletScorer()
         self.signal_engine = SignalEngine()
         
-        self.ws_books: Dict[str, Dict] = {} 
+        self.order_books: Dict[str, Dict] = {}
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
@@ -642,7 +642,7 @@ class LiveTrader:
 
         while self.running:
             live_prices = {}
-            for token_id, book in self.ws_books.items():
+            for token_id, book in self.order_books.items():
                 bids = book.get('bids', [])
                 if bids:
                     best_price = max(bids, key=lambda x: x[0])[0]
