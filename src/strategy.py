@@ -17,11 +17,10 @@ class WalletScorer:
     """
     def __init__(self):
         self.scores_file = Path("wallet_scores.json")
-        self.params_file = Path("model_params_audit.json")
+        self.params_file = Path("model_params.json")
         self.wallet_scores: Dict[str, float] = {}
         
         # Default Fresh Wallet Parameters (Linear Regression)
-        # These will be overwritten if model_params.json exists
         self.slope = 0.05
         self.intercept = 0.01
 
@@ -35,24 +34,28 @@ class WalletScorer:
                     
                     self.wallet_scores = {}
                     for k, v in raw_data.items():
-                        # FIX: Split the key on '|' and take only the wallet address
-                        clean_wallet = k.split('|')[0].lower()
+                        # FIX: Strip suffix AND whitespace
+                        clean_wallet = k.split('|')[0].strip().lower()
                         self.wallet_scores[clean_wallet] = float(v)
                         
                 log.info(f"🧠 Scorer Loaded. Tracking {len(self.wallet_scores)} Known Wallets.")
+                
+                # DEBUG: Print the first 3 keys to verify format
+                sample_keys = list(self.wallet_scores.keys())[:3]
+                log.info(f"🔍 DEBUG: Sample Database Keys: {sample_keys}")
+                
             except Exception as e:
                 log.error(f"Error loading wallet scores: {e}")
         else:
             log.warning(f"⚠️ Score file '{self.scores_file}' not found. Starting with Fresh Wallet logic only.")
 
-        # 2. Load Model Params (Slope/Intercept)
+        # 2. Load Model Params
         if self.params_file.exists():
             try:
                 with open(self.params_file, "r") as f:
                     params = json.load(f)
-                    ols = params.get("ols", {})
-                    self.slope = ols.get("slope", 0.05)
-                    self.intercept = ols.get("intercept", 0.01)
+                    self.slope = params.get("slope", 0.05)
+                    self.intercept = params.get("intercept", 0.01)
                 log.info(f"⚙️ Model Params Loaded: Slope={self.slope}, Intercept={self.intercept}")
             except Exception as e:
                 log.error(f"Error loading model params: {e}")
@@ -61,25 +64,26 @@ class WalletScorer:
         """
         Returns the skill score.
         """
-        # Normalize input
-        w_id = wallet_id.lower()
+        # Normalize input aggressively
+        w_id = wallet_id.strip().lower()
         
         # 1. KNOWN WALLET LOOKUP
         if w_id in self.wallet_scores:
             score = self.wallet_scores[w_id]
-            # log.info(f"📜 KNOWN TRADER: {w_id[:6]}... Score: {score:.2f}")
+            # log.info(f"📜 HIT: {w_id[:6]}... Score: {score:.2f}")
             return score
-        
-        # 2. FRESH WALLET HEURISTIC
-        # If unknown, we estimate based on 'Skin in the Game' (Volume)
-        if volume > 10.0:
-            # Log-Linear: Score = Intercept + (Slope * log(Volume))
-            score = self.intercept + (self.slope * math.log1p(volume))
             
-            # Explicit logging for verification
+        # DEBUG: Log MISSES for significant volume
+        # This will tell us if we have a mismatch
+        if volume > 100: 
+             log.warning(f"⚠️ MISS: Wallet {w_id} not found in DB. (Vol: ${volume:.2f})")
+
+        # 2. FRESH WALLET HEURISTIC
+        # NOTE: If you are testing with < $10 trades, this returns 0.0!
+        if volume > 10.0:
+            score = self.intercept + (self.slope * math.log1p(volume))
             if volume > 1000:
                 log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
-            
             return score
             
         return 0.0
@@ -99,6 +103,7 @@ class SignalEngine:
         # 1. Get Score
         score = scorer.get_score(wallet, usdc_vol)
         
+        # If score is still 0, we can't do anything
         if score == 0.0:
             return self.get_signal(fpmm)
 
@@ -108,15 +113,13 @@ class SignalEngine:
         
         tracker = self.trackers[fpmm]
         
-        # 3. Apply Decay (Fade old signals)
+        # 3. Apply Decay
         self._apply_decay(tracker)
         
         # 4. Calculate Impact
-        # Impact = Volume * Score
         raw_impact = usdc_vol * score
         
         # 5. Apply Direction
-        # If buying YES -> Positive Impact. Buying NO -> Negative Impact.
         final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction
         
         tracker['weight'] += final_impact
@@ -134,12 +137,10 @@ class SignalEngine:
         now = time.time()
         elapsed = now - tracker['last_ts']
         if elapsed > 1.0:
-            # Decay 5% per minute (adjustable in config)
             tracker['weight'] *= math.pow(CONFIG['decay_factor'], elapsed / 60.0)
             tracker['last_ts'] = now
 
     def cleanup(self):
-        """Removes stale trackers (> 1 hour old)"""
         now = time.time()
         to_remove = [k for k, v in self.trackers.items() if now - v['last_ts'] > 3600]
         for k in to_remove:
