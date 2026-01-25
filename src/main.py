@@ -20,7 +20,7 @@ from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
-GLOBAL_TRADE_QUEUE = asyncio.Queue()
+GLOBAL_TRADE_QUEUE = None
 
 class LiveTrader:
     def __init__(self):
@@ -720,6 +720,8 @@ trader = LiveTrader()
 async def start_trading_system():
     log.info("🚀 SERVER STARTED: Launching Trading Bot in background...")
     logging.getLogger("uvicorn.access").disabled = True
+    global GLOBAL_TRADE_QUEUE
+    GLOBAL_TRADE_QUEUE = asyncio.Queue()
     # This runs your trader.start() loop in the background without blocking the server
     asyncio.create_task(trader.start())
     
@@ -731,7 +733,7 @@ async def receive_goldsky_data(request: Request):
             
         # Get the JSON payload
         payload = await request.json()
-        
+        log.info(f"📥 RAW DATA RECEIVED: {str(payload)[:200]}...")
         # 1. Handle Lists (Goldsky often sends a batch of events)
         if isinstance(payload, list):
             events = payload
@@ -741,12 +743,18 @@ async def receive_goldsky_data(request: Request):
         # 2. Process every event in the batch
         count = 0
         for event in events:
-            if event.get("op") == "INSERT":
-                data = event.get("data")
-                if data:
-                    GLOBAL_TRADE_QUEUE.put_nowait(data)
-                    count += 1
-                    
+            # We check "op" but also just grab "data" if it exists, to be safe
+            op = event.get("op", "")
+            data = event.get("data")
+            
+            # LOOSE CHECK: If there is data, take it. 
+            # We can filter stricter later, but let's get data flowing first.
+            if data: 
+                GLOBAL_TRADE_QUEUE.put_nowait(data)
+                count += 1
+            else:
+                log.warning(f"⚠️ Event missing 'data' field: {event}")
+
         return {"status": "processed", "count": count}
                 
     except Exception as e:
