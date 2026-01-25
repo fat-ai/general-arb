@@ -496,12 +496,16 @@ class LiveTrader:
             maker_asset = str(t['makerAssetId']).lower()
             taker_asset = str(t['takerAssetId']).lower()
             target_usdc_hex = USDC_ADDRESS.lower()
-            target_usdc_dec = str(int(target_usdc_hex, 16))
-            
+            try:
+                target_usdc_dec = str(int(target_usdc_hex, 16))
+            except:
+                target_usdc_dec = "0" # Fallback
+
             def is_usdc(a): 
+                # Match against "0" (Polymarket ID), "0x0", Hex, OR Decimal
                 return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
 
-            token_id = None
+            token_id = None            
             usdc_vol = 0.0
             wallet = t['taker'] 
             direction = 0
