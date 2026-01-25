@@ -4,3 +4,4 @@ tabulate
 pandas
 websockets
 numpy
+aiohttp
