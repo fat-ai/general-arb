@@ -92,7 +92,8 @@ class LiveTrader:
             self._maintenance_loop(),
             self._risk_monitor_loop(),
             self._reporting_loop(),
-            self._monitor_loop()
+            self._monitor_loop(),
+            self._dashboard_loop(),
         )
 
     async def shutdown(self):
@@ -183,6 +184,47 @@ class LiveTrader:
                     
                     self.sub_manager.dirty = False
             await asyncio.sleep(1.0)
+
+    async def _dashboard_loop(self):
+        while self.running:
+            await asyncio.sleep(5) # Update fast (every 5s) for HTML dashboard
+            
+            # --- 1. DATA COLLECTION ---
+            for tid, pos in self.persistence.state["positions"].items():
+                if 'trace_price' not in pos: pos['trace_price'] = []
+                
+                # Get Best Bid Price safely
+                price = pos['avg_price']
+                raw_book = self.order_books.get(tid)
+                if raw_book:
+                    # Handle both Dict and List formats safely
+                    bids = raw_book.get('bids')
+                    if isinstance(bids, dict) and bids:
+                        price = float(max(bids.keys(), key=float))
+                    elif isinstance(bids, list) and bids:
+                        price = float(bids[0][0])
+                
+                pos['trace_price'].append(price)
+                if len(pos['trace_price']) > 50: pos['trace_price'].pop(0)
+
+            # --- 2. GENERATE HTML DASHBOARD ---
+            # Create a clean price map
+            live_prices_map = {}
+            for tid, book in self.order_books.items():
+                # Same safe extraction logic
+                bids = book.get('bids')
+                if isinstance(bids, dict) and bids:
+                    live_prices_map[tid] = float(max(bids.keys(), key=float))
+                elif isinstance(bids, list) and bids:
+                    live_prices_map[tid] = float(bids[0][0])
+
+            # Generate HTML
+            from reporting import generate_html_report
+            res = generate_html_report(self.persistence.state, live_prices_map, self.metadata)
+            
+            # Only print log every 60s to keep terminal clean, but update HTML every 5s
+            if self.stats['processed_count'] % 12 == 0: 
+                log.info(res)
 
     async def _monitor_loop(self):
         """
