@@ -54,8 +54,9 @@ class WalletScorer:
             try:
                 with open(self.params_file, "r") as f:
                     params = json.load(f)
-                    self.slope = params.get("slope", 0.05)
-                    self.intercept = params.get("intercept", 0.01)
+                    ols = params["ols"]
+                    self.slope = ols.get("slope", 0.05)
+                    self.intercept = ols.get("intercept", 0.01)
                 log.info(f"⚙️ Model Params Loaded: Slope={self.slope}, Intercept={self.intercept}")
             except Exception as e:
                 log.error(f"Error loading model params: {e}")
