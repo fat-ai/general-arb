@@ -21,65 +21,69 @@ class MarketMetadata:
 
     async def refresh(self):
         """
-        Fetches ALL active markets using pagination. 
-        (Fixes the 500-market limit)
+        Fetches ALL active markets using pagination.
+        Robustly extracts Token IDs (checking multiple field names).
         """
         log.info("🌍 Refreshing Market Metadata (Paginated)...")
         
-        # Clear existing mappings
         self.fpmm_to_tokens.clear()
         self.token_to_fpmm.clear()
         
         url = "https://gamma-api.polymarket.com/markets"
-        limit = 100 # Max safe chunk size
+        limit = 100
         offset = 0
         total_markets = 0
         
         while True:
-            params = {
-                "closed": "false",
-                "limit": limit,
-                "offset": offset
-            }
+            params = {"closed": "false", "limit": limit, "offset": offset}
             
             try:
-                # Run the blocking request in a thread
                 resp = await asyncio.to_thread(requests.get, url, params=params)
-                
                 if resp.status_code != 200:
                     log.error(f"Metadata API Error: {resp.status_code}")
                     break
-                    
+                
                 data = resp.json()
+                if not data: break
                 
-                # If we get an empty list, we are done
-                if not data: 
-                    break
-                
-                # Process this batch
+                # --- DEBUG: Print structure of the first market found ---
+                if total_markets == 0 and len(data) > 0:
+                    first_mkt = data[0]
+                    log.info(f"🔍 DEBUG API STRUCTURE: Keys found: {list(first_mkt.keys())}")
+                    if "clobTokenIds" in first_mkt:
+                        log.info(f"🔍 DEBUG: Found 'clobTokenIds': {first_mkt['clobTokenIds']}")
+                    elif "tokens" in first_mkt:
+                        log.info(f"🔍 DEBUG: Found 'tokens': {first_mkt['tokens']}")
+                # ------------------------------------------------------
+
                 for mkt in data:
-                    fpmm = mkt.get("id") or mkt.get("fpmm")
-                    tokens = [t.get("tokenId") for t in mkt.get("tokens", [])]
+                    fpmm = mkt.get("id") or mkt.get("fpmm") or mkt.get("conditionId")
                     
-                    if fpmm and len(tokens) >= 2:
-                        # Store Mapping
+                    # 1. Try standard CLOB IDs (Preferred)
+                    tokens = mkt.get("clobTokenIds", [])
+                    
+                    # 2. Fallback: Try parsing 'tokens' list of dicts
+                    if not tokens and "tokens" in mkt:
+                        tokens = [t.get("tokenId") for t in mkt["tokens"] if t.get("tokenId")]
+
+                    # 3. Fallback: Try 'outcomeTokenIds' (Older format)
+                    if not tokens:
+                        tokens = mkt.get("outcomeTokenIds", [])
+
+                    # Store if valid
+                    if fpmm and tokens and len(tokens) >= 2:
+                        # Ensure tokens are strings
+                        tokens = [str(t) for t in tokens]
                         self.fpmm_to_tokens[fpmm] = tokens
                         for t in tokens:
                             self.token_to_fpmm[t] = fpmm
                             
                 count = len(data)
                 total_markets += count
-                # log.info(f"Loaded batch: {count} markets (Total: {total_markets})")
                 
-                # If we got fewer items than the limit, we reached the end
-                if count < limit:
-                    break
-                
-                # Prepare for next page
+                if count < limit: break
                 offset += limit
-                
-                # Be polite to the API
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05) # Go fast
                 
             except Exception as e:
                 log.error(f"Metadata Loop Failed: {e}")
