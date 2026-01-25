@@ -485,8 +485,8 @@ class LiveTrader:
                     'taker': raw_trade.get('taker'),
                     'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
                     'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
-                    'makerAmountFilled': float(raw_trade.get('maker_amount_filled') or 0),
-                    'takerAmountFilled': float(raw_trade.get('taker_amount_filled') or 0),
+                    'makerAmountFilled': float(raw_trade.get('makerAmountFilled') or 0),
+                    'takerAmountFilled': float(raw_trade.get('takerAmountFilled') or 0),
                 }
                 
                 await self._process_batch([trade])
