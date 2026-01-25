@@ -22,4 +22,4 @@ RUN mkdir -p live_paper_cache
 
 # Run the application
 # Start the Uvicorn web server listening on all interfaces
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]
