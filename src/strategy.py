@@ -26,14 +26,19 @@ class WalletScorer:
         self.intercept = 0.01
 
     def load(self):
-        """Loads the scoring model and parameters from disk."""
+        """Loads the scoring model and normalizes keys."""
         # 1. Load Scores
         if self.scores_file.exists():
             try:
                 with open(self.scores_file, "r") as f:
                     raw_data = json.load(f)
-                    # CRITICAL: Normalize to lowercase for matching
-                    self.wallet_scores = {k.lower(): float(v) for k, v in raw_data.items()}
+                    
+                    self.wallet_scores = {}
+                    for k, v in raw_data.items():
+                        # FIX: Split the key on '|' and take only the wallet address
+                        clean_wallet = k.split('|')[0].lower()
+                        self.wallet_scores[clean_wallet] = float(v)
+                        
                 log.info(f"🧠 Scorer Loaded. Tracking {len(self.wallet_scores)} Known Wallets.")
             except Exception as e:
                 log.error(f"Error loading wallet scores: {e}")
