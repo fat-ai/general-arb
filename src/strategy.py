@@ -17,7 +17,7 @@ class WalletScorer:
     """
     def __init__(self):
         self.scores_file = Path("wallet_scores.json")
-        self.params_file = Path("model_params.json")
+        self.params_file = Path("model_params_audit.json")
         self.wallet_scores: Dict[str, float] = {}
         
         # Default Fresh Wallet Parameters (Linear Regression)
