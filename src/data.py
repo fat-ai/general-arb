@@ -21,8 +21,8 @@ class MarketMetadata:
 
     async def refresh(self):
         """
-        Fetches ALL active markets using pagination.
-        Robustly extracts Token IDs (checking multiple field names).
+        Fetches ALL active markets and parses Token IDs correctly,
+        handling cases where the API returns strings instead of lists.
         """
         log.info("🌍 Refreshing Market Metadata (Paginated)...")
         
@@ -39,43 +39,45 @@ class MarketMetadata:
             
             try:
                 resp = await asyncio.to_thread(requests.get, url, params=params)
-                if resp.status_code != 200:
-                    log.error(f"Metadata API Error: {resp.status_code}")
-                    break
+                if resp.status_code != 200: break
                 
                 data = resp.json()
                 if not data: break
                 
-                # --- DEBUG: Print structure of the first market found ---
-                if total_markets == 0 and len(data) > 0:
-                    first_mkt = data[0]
-                    log.info(f"🔍 DEBUG API STRUCTURE: Keys found: {list(first_mkt.keys())}")
-                    if "clobTokenIds" in first_mkt:
-                        log.info(f"🔍 DEBUG: Found 'clobTokenIds': {first_mkt['clobTokenIds']}")
-                    elif "tokens" in first_mkt:
-                        log.info(f"🔍 DEBUG: Found 'tokens': {first_mkt['tokens']}")
-                # ------------------------------------------------------
-
                 for mkt in data:
-                    fpmm = mkt.get("id") or mkt.get("fpmm") or mkt.get("conditionId")
+                    fpmm = mkt.get("id") or mkt.get("fpmm")
                     
-                    # 1. Try standard CLOB IDs (Preferred)
-                    tokens = mkt.get("clobTokenIds", [])
+                    # --- CRITICAL FIX: Handle String vs List ---
+                    raw_tokens = mkt.get("clobTokenIds")
                     
-                    # 2. Fallback: Try parsing 'tokens' list of dicts
+                    tokens = []
+                    if raw_tokens:
+                        if isinstance(raw_tokens, str):
+                            try:
+                                # Parse string "['123', '456']" -> List ['123', '456']
+                                tokens = json.loads(raw_tokens)
+                            except:
+                                tokens = []
+                        elif isinstance(raw_tokens, list):
+                            tokens = raw_tokens
+                    
+                    # Fallbacks if CLOB IDs failed
                     if not tokens and "tokens" in mkt:
-                        tokens = [t.get("tokenId") for t in mkt["tokens"] if t.get("tokenId")]
+                        # Handle list of dicts [{'tokenId': '...'}, ...]
+                        t_list = mkt["tokens"]
+                        if isinstance(t_list, str):
+                             try: t_list = json.loads(t_list)
+                             except: t_list = []
+                        if isinstance(t_list, list):
+                            tokens = [t.get("tokenId") for t in t_list if isinstance(t, dict) and t.get("tokenId")]
 
-                    # 3. Fallback: Try 'outcomeTokenIds' (Older format)
-                    if not tokens:
-                        tokens = mkt.get("outcomeTokenIds", [])
-
-                    # Store if valid
+                    # Validate and Store
                     if fpmm and tokens and len(tokens) >= 2:
-                        # Ensure tokens are strings
-                        tokens = [str(t) for t in tokens]
-                        self.fpmm_to_tokens[fpmm] = tokens
-                        for t in tokens:
+                        # Ensure we store strings, not ints
+                        clean_tokens = [str(t) for t in tokens]
+                        
+                        self.fpmm_to_tokens[fpmm] = clean_tokens
+                        for t in clean_tokens:
                             self.token_to_fpmm[t] = fpmm
                             
                 count = len(data)
@@ -83,14 +85,14 @@ class MarketMetadata:
                 
                 if count < limit: break
                 offset += limit
-                await asyncio.sleep(0.05) # Go fast
+                await asyncio.sleep(0.05)
                 
             except Exception as e:
                 log.error(f"Metadata Loop Failed: {e}")
                 break
                 
         log.info(f"✅ Metadata Complete. Indexed {total_markets} Markets ({len(self.token_to_fpmm)} Tokens).")
-
+        
     def _fetch_all_pages(self):
         """Helper to handle API pagination."""
         results = []
