@@ -522,6 +522,10 @@ class LiveTrader:
                 skipped_counts["not_usdc"] += 1
                 continue 
 
+            score_debug = self.scorer.get_score(wallet, usdc_vol)
+            if score_debug == 0.0:
+                print(f"❌ ZERO SCORE DEBUG | Wallet: {wallet} | Vol: ${usdc_vol:.2f} | In DB: {wallet in self.scorer.wallet_scores}")
+
             fpmm = self.metadata.token_to_fpmm.get(str(token_id))
             
             if not fpmm: 
