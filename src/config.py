@@ -39,7 +39,6 @@ CONFIG = {
     "initial_capital": 10000.0,
     "use_smart_exit": True, 
     "smart_exit_ratio": 0.25,
-    "edge_threshold": 0.05
 }
 
 # --- LOGGING SETUP ---
