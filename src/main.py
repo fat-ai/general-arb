@@ -474,7 +474,7 @@ class LiveTrader:
         
         while self.running:
             raw_trade = await self.trade_queue.get()
-            print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
+         #   print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
             
             try:
                 self.stats['processed_count'] += 1
