@@ -780,14 +780,20 @@ class LiveTrader:
 
         while self.running:
             live_prices = {}
+            # [FIX] Correctly parse the Order Book Dictionary
             for token_id, book in self.order_books.items():
-                bids = book.get('bids', [])
+                bids = book.get('bids', {}) # Get the Dict {'price': 'size'}
+                
                 if bids:
-                    best_price = max(bids, key=lambda x: x[0])[0]
+                    # 1. Extract keys (prices)
+                    # 2. Convert to float for comparison
+                    # 3. Find Max
+                    best_price = float(max(bids.keys(), key=lambda x: float(x)))
                     live_prices[token_id] = best_price
                 else:
                     live_prices[token_id] = 0.0
             
+            # Now live_prices contains FLOATS, so this won't crash
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             cash = self.persistence.state["cash"]
             invested = equity - cash
