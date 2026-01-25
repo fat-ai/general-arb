@@ -499,7 +499,7 @@ class LiveTrader:
             target_usdc_dec = str(int(target_usdc_hex, 16))
             
             def is_usdc(a): 
-            return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
+                return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
 
             token_id = None
             usdc_vol = 0.0
