@@ -7,8 +7,8 @@ import logging
 import requests
 import csv
 import queue
+import websockets
 from typing import Dict, List, Set
-from fastapi import FastAPI, Request
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
@@ -20,6 +20,7 @@ from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
+TRADE_QUEUE = asyncio.Queue()
 
 class LiveTrader:
     def __init__(self):
