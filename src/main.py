@@ -48,13 +48,37 @@ class LiveTrader:
 
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
+        
+        # 1. Initialize Queue
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
-        self.ws_client = PolymarketWS(WS_URL, [], self.ws_queue.put_nowait)
-        
+        # 2. START WS CLIENT (Connects to Polymarket)
+        # We start with empty assets [], we will update them in step 4
+        self.ws_client = PolymarketWS("wss://ws-fidelity.polymarket.com", [], self.ws_queue.put_nowait)
         self.ws_client.start_thread()
 
+        # --- FIX: SEED THE SUBSCRIPTIONS ---
+        print("⏳ Fetching Market Metadata (This may take 10s)...")
+        await self.metadata.refresh() # <--- Force load of Token IDs
+        
+        # Collect all valid Token IDs (Yes/No tokens) from the metadata
+        # We take the top 500 to avoid hitting connection limits, or all if config allows
+        all_tokens = []
+        for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
+            if tokens and len(tokens) >= 2:
+                all_tokens.extend(tokens)
+        
+        # Limit to 100 markets initially to test data flow
+        seed_tokens = all_tokens[:100] 
+        print(f"✅ Metadata Loaded. Subscribing to {len(seed_tokens)} assets...")
+
+        # Push to Subscription Manager
+        self.sub_manager.set_mandatory(seed_tokens)
+        self.sub_manager.dirty = True # Force the monitor loop to send the 'subscribe' msg
+        # -----------------------------------
+
+        # 3. Start Async Loops
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
