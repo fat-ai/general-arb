@@ -51,12 +51,9 @@ class LiveTrader:
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
-        self.ws_client = PolymarketWS(
-            assets_ids=[], 
-            on_message_callback=self.ws_queue.put_nowait
-        )
+        self.ws_client = PolymarketWS(WS_URL, [], self.ws_queue.put_nowait)
         
-        await self.ws_client.start_client() 
+        self.ws_client.start_thread()
 
         await asyncio.gather(
             self._subscription_monitor_loop(), 
