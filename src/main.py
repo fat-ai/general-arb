@@ -84,7 +84,7 @@ class LiveTrader:
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
-            self._poll_subgraph_loop(),
+            self._poll_rpc_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
             self._risk_monitor_loop(),
@@ -246,100 +246,91 @@ class LiveTrader:
             finally:
                 self.ws_queue.task_done()
 
-    async def _poll_subgraph_loop(self):
+    async def _poll_rpc_loop(self):
         """
-        Polls the Public Subgraph with Auto-Sync to handle indexing lag.
+        Polls the Polygon Blockchain directly for 'OrderFilled' events.
+        This bypasses APIs and gets Wallet IDs directly from the source.
         """
-        # Primary and Backup URLs
-        URLS = [
-            "https://api.thegraph.com/subgraphs/name/tokenunion/polymarket-matic",
-            "https://api.thegraph.com/subgraphs/name/polymarket/matic-markets-4"
-        ]
+        from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
+        log.info(f"⛓️ CONNECTING TO RPC: {RPC_URL}")
         
-        current_url = URLS[0]
-        log.info(f"🕵️ STARTING DEANONYMIZER (Source: {current_url})")
+        # Start from the latest block
+        current_block = "latest"
         
-        # --- PHASE 1: INITIAL SYNC ---
-        # Find the "Head" of the subgraph (the latest trade it knows about)
-        last_timestamp = 0
-        try:
-            query = """{ transactions(first: 1, orderBy: timestamp, orderDirection: desc) { timestamp } }"""
-            
-            resp = await asyncio.to_thread(requests.post, current_url, json={'query': query})
-            data = resp.json().get('data', {}).get('transactions', [])
-            
-            if data:
-                last_timestamp = int(data[0]['timestamp'])
-                lag = int(time.time()) - last_timestamp
-                log.info(f"⏰ Subgraph Synced! Lag: {lag} seconds. Starting stream from there.")
-            else:
-                log.warning("⚠️ Subgraph returned no data. Defaulting to 1 hour ago.")
-                last_timestamp = int(time.time()) - 3600
-                
-        except Exception as e:
-            log.error(f"Sync Handshake Failed: {e}")
-            last_timestamp = int(time.time()) - 300 # Default to 5 mins ago
-
-        # --- PHASE 2: STREAMING ---
         while self.running:
             try:
-                # Ask for trades NEWER than the last one we processed
-                query = f"""
-                {{
-                    transactions(
-                        where: {{ timestamp_gt: "{last_timestamp}" }}
-                        orderBy: timestamp
-                        orderDirection: asc
-                        first: 100
-                    ) {{
-                        id
-                        timestamp
-                        user {{ id }}
-                        market {{ id }}
-                        tradeAmount
-                        outcomeIndex
-                        type
-                    }}
-                }}
-                """
+                # 1. Fetch Logs (eth_getLogs)
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_getLogs",
+                    "params": [{
+                        "address": EXCHANGE_CONTRACT,
+                        "fromBlock": current_block,
+                        "toBlock": "latest",
+                        "topics": [ORDER_FILLED_TOPIC]
+                    }]
+                }
                 
-                resp = await asyncio.to_thread(requests.post, current_url, json={'query': query})
+                resp = await asyncio.to_thread(requests.post, RPC_URL, json=payload)
+                data = resp.json()
                 
-                if resp.status_code == 200:
-                    data = resp.json().get('data', {})
-                    trades = data.get('transactions', [])
+                if 'result' in data and data['result']:
+                    logs = data['result']
                     
-                    if trades:
-                        # Update our cursor to the latest trade in this batch
-                        last_timestamp = max(int(t['timestamp']) for t in trades)
-                        
-                        log.info(f"📥 De-anonymizer: Fetched {len(trades)} new trades")
-                        
-                        for t in trades:
-                            # Normalize & Inject
-                            wallet_id = t['user']['id']
-                            fpmm = t['market']['id']
+                    # Update block cursor so we don't re-read
+                    last_block_num = int(logs[-1]['blockNumber'], 16)
+                    current_block = hex(last_block_num + 1)
+                    
+                    for log_item in logs:
+                        try:
+                            # 2. DECODE DATA (Hex Parsing)
+                            # Topics: [Signature, OrderHash, Maker, Taker]
+                            # The "indexed" parameters are in 'topics'
+                            maker_hex = log_item['topics'][2]
+                            taker_hex = log_item['topics'][3]
                             
+                            # Clean "0x0000...1234" -> "0x1234"
+                            maker_addr = "0x" + maker_hex[-40:]
+                            taker_addr = "0x" + taker_hex[-40:]
+                            
+                            # Data: Non-indexed parameters concatenated
+                            # We need to split the huge hex string into 32-byte chunks
+                            data_hex = log_item['data'][2:] # Remove 0x
+                            chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+                            
+                            # Layout: [makerAssetId, takerAssetId, makerAmt, takerAmt, fee, parent]
+                            maker_asset_id = int(chunks[0], 16)
+                            taker_asset_id = int(chunks[1], 16)
+                            maker_amt = int(chunks[2], 16)
+                            taker_amt = int(chunks[3], 16)
+                            
+                            # 3. Create Trade Object
                             trade_obj = {
-                                'id': t['id'],
-                                'timestamp': int(t['timestamp']),
-                                'taker': wallet_id,
-                                'maker': "0x000...", 
-                                'fpmm': fpmm,
-                                'usdc_vol': float(t['tradeAmount']) / 1e6,
-                                'direction': 1.0 if t['type'] == "Buy" else -1.0
+                                'id': log_item['transactionHash'],
+                                'timestamp': int(time.time()), # Approximate (Real time is block time)
+                                'taker': taker_addr,      # <--- WE HAVE IT!
+                                'maker': maker_addr,
+                                'makerAssetId': str(maker_asset_id),
+                                'takerAssetId': str(taker_asset_id),
+                                'makerAmountFilled': str(maker_amt),
+                                'takerAmountFilled': str(taker_amt)
                             }
+                            
                             await self.trade_queue.put(trade_obj)
-                    else:
-                        # If empty, just chill. We are at the chain tip.
-                        pass
-                else:
-                    log.warning(f"Subgraph Error {resp.status_code}")
-
+                            
+                        except Exception as parse_err:
+                            log.error(f"Hex Decode Error: {parse_err}")
+                            continue
+                            
+                elif 'error' in data:
+                    log.warning(f"RPC Error: {data['error']}")
+                    await asyncio.sleep(5) # Backoff on error
+                    
             except Exception as e:
-                log.error(f"Subgraph Poll Failed: {e}")
+                log.error(f"RPC Poll Failed: {e}")
             
-            # Wait 2 seconds to be polite
+            # Fast Poll (2s)
             await asyncio.sleep(2.0)
             
     async def _resolution_monitor_loop(self):
