@@ -86,6 +86,7 @@ class LiveTrader:
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
+            self._poll_subgraph_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
             self._risk_monitor_loop(),
@@ -174,83 +175,104 @@ class LiveTrader:
 
     async def _ws_processor_loop(self):
         """
-        Parses messages:
-        1. Updates Order Books (Existing Logic)
-        2. Captures Trades for Strategy (NEW LOGIC)
+        ONLY handles Order Books. Ignores anonymous WS trades.
         """
-        log.info("⚡ WS Processor: Ready to route Order Books AND Trades")
-        
+        log.info("⚡ WS Processor: Routing Order Books ONLY")
         while self.running:
             msg = await self.ws_queue.get()
             try:
-                if not msg or msg == "PONG": continue
-                try: 
-                    data = json.loads(msg)
+                if not msg: continue
+                try: data = json.loads(msg)
                 except: continue
 
                 items = data if isinstance(data, list) else [data]
-
                 for item in items:
                     event_type = item.get("event_type", "")
                     
-                    # --- 1. HANDLE TRADES (NEW) ---
-                    # We catch the 'last_trade_price' event here!
-                    if event_type == "last_trade_price":
-                        adapted = self._adapt_ws_to_goldsky(item)
-                        if adapted:
-                            # Push to the Strategy Queue
-                            await self.trade_queue.put(adapted)
-
-                    # --- 2. HANDLE SNAPSHOTS (Existing) ---
-                    elif event_type == "book":
-                        asset_id = item.get("asset_id")
-                        if asset_id:
-                            bids = [[float(x['price']), float(x['size'])] for x in item.get('bids', [])]
-                            asks = [[float(x['price']), float(x['size'])] for x in item.get('asks', [])]
-                            bids.sort(key=lambda x: x[0], reverse=True)
-                            asks.sort(key=lambda x: x[0], reverse=False)
-                            
-                            self.ws_books[asset_id] = {
-                                'bids': bids, 
-                                'asks': asks,
-                                'best_bid': bids[0][0] if bids else 0.0, 
-                                'best_ask': asks[0][0] if asks else 0.0
-                            }
-
-                    # --- 3. HANDLE PRICE CHANGES (Existing) ---
+                    # ❌ DELETED: Trade parsing logic (It was anonymous)
+                    
+                    # ✅ KEEP: Order Book Logic
+                    if event_type == "book":
+                        self._process_snapshot(item)
                     elif event_type == "price_change":
-                        changes = item.get("price_changes", []) or item.get("changes", [])
-                        for change in changes:
-                            c_aid = change.get("asset_id")
-                            if not c_aid: continue
-
-                            if c_aid not in self.ws_books:
-                                self.ws_books[c_aid] = {'bids': [], 'asks': [], 'best_bid': 0.0, 'best_ask': 0.0}
-
-                            p = float(change.get("price", 0))
-                            s = float(change.get("size", 0))
-                            raw_side = change.get("side", "").upper()
-
-                            if raw_side == "BUY":
-                                self._update_book_level(self.ws_books[c_aid]['bids'], p, s, "BUY")
-                            elif raw_side == "SELL":
-                                self._update_book_level(self.ws_books[c_aid]['asks'], p, s, "SELL")
-
-                            # Update Best Pointers
-                            if 'best_bid' in change:
-                                self.ws_books[c_aid]['best_bid'] = float(change['best_bid'])
-                            elif self.ws_books[c_aid]['bids']:
-                                self.ws_books[c_aid]['best_bid'] = self.ws_books[c_aid]['bids'][0][0]
-
-                            if 'best_ask' in change:
-                                self.ws_books[c_aid]['best_ask'] = float(change['best_ask'])
-                            elif self.ws_books[c_aid]['asks']:
-                                self.ws_books[c_aid]['best_ask'] = self.ws_books[c_aid]['asks'][0][0]
-
+                        self._process_update(item)
+                        
             except Exception as e:
-                log.error(f"WS Parse Error: {e}")
+                log.error(f"WS Error: {e}")
             finally:
                 self.ws_queue.task_done()
+
+    # --- 2. ADD THE DEANONYMIZER LOOP (The Magic) ---
+    async def _poll_subgraph_loop(self):
+        """
+        Polls the Public Subgraph to get trades WITH Wallet IDs.
+        """
+        from config import SUBGRAPH_URL # Ensure this is the new Public URL
+        log.info(f"🕵️ STARTING DEANONYMIZER (Source: {SUBGRAPH_URL})")
+        
+        last_timestamp = int(time.time()) - 60 # Start from 1 min ago
+        
+        while self.running:
+            try:
+                # 1. Query for RECENT trades (Global feed)
+                # We ask for trades that happened since our last check
+                query = f"""
+                {{
+                    transactions(
+                        where: {{ timestamp_gt: "{last_timestamp}" }}
+                        orderBy: timestamp
+                        orderDirection: asc
+                        first: 100
+                    ) {{
+                        id
+                        timestamp
+                        user {{ id }}  # <--- THIS IS THE WALLET ID YOU NEED
+                        market {{ id }}
+                        tradeAmount
+                        outcomeIndex
+                        type
+                    }}
+                }}
+                """
+                
+                # 2. Execute Request (Standard HTTP Post)
+                resp = await asyncio.to_thread(requests.post, SUBGRAPH_URL, json={'query': query})
+                
+                if resp.status_code == 200:
+                    data = resp.json().get('data', {})
+                    trades = data.get('transactions', [])
+                    
+                    if trades:
+                        # Update timestamp to the latest trade we saw
+                        last_timestamp = max(int(t['timestamp']) for t in trades)
+                        
+                        # 3. Inject into your Pipeline
+                        for t in trades:
+                            # Normalize to your internal format
+                            wallet_id = t['user']['id'] # "0x123..."
+                            fpmm = t['market']['id']
+                            
+                            # Log it to prove we have the ID
+                            # log.info(f"🕵️ DETECTED: {wallet_id[:6]}... traded on {fpmm[:6]}...")
+                            
+                            # Convert to your internal object
+                            trade_obj = {
+                                'id': t['id'],
+                                'timestamp': int(t['timestamp']),
+                                'taker': wallet_id, # <--- FINALLY!
+                                'maker': "0x000...", # Maker is less relevant for taker scoring
+                                'fpmm': fpmm,
+                                'usdc_vol': float(t['tradeAmount']) / 1e6,
+                                'direction': 1.0 if t['type'] == "Buy" else -1.0
+                            }
+                            
+                            await self.trade_queue.put(trade_obj)
+                    
+            except Exception as e:
+                log.error(f"Subgraph Poll Failed: {e}")
+            
+            # 4. Wait 1-2 seconds (Public endpoints have rate limits)
+            await asyncio.sleep(2.0)
 
     def _adapt_ws_to_goldsky(self, event):
         """
