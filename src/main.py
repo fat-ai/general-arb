@@ -113,7 +113,7 @@ class LiveTrader:
             triggers = self.stats['triggers_count']
             scores = self.stats['scores']
 
-            q_size = GLOBAL_TRADE_QUEUE.qsize()
+            q_size = self.trade_queue.qsize() if self.trade_queue else -1
             # 2. Find Top 3 Scores
             # Sort descending (highest first) and take the first 3
             top_3 = sorted(scores, reverse=True)[:3]
@@ -125,7 +125,7 @@ class LiveTrader:
                 top_scores_str = "None"
 
             # 3. Create the Log Message
-            if count > 0:
+            if count > 0 or q_size>0:
                 log.info(
                     f"📊 REPORT (30s): Analyzed {count} trades | "
                     f"Last: {last_seen} | "
@@ -720,8 +720,8 @@ trader = LiveTrader()
 async def start_trading_system():
     log.info("🚀 SERVER STARTED: Launching Trading Bot in background...")
     logging.getLogger("uvicorn.access").disabled = True
-    global GLOBAL_TRADE_QUEUE
-    GLOBAL_TRADE_QUEUE = asyncio.Queue()
+    if trader.trade_queue is None:
+        trader.trade_queue = asyncio.Queue()
     # This runs your trader.start() loop in the background without blocking the server
     asyncio.create_task(trader.start())
     
@@ -743,17 +743,19 @@ async def receive_goldsky_data(request: Request):
         # 2. Process every event in the batch
         count = 0
         for event in events:
-            # We check "op" but also just grab "data" if it exists, to be safe
-            op = event.get("op", "")
+            # Goldsky sends { "op": "INSERT", "data": { ... } }
+            op = event.get("op", "UNKNOWN")
             data = event.get("data")
             
-            # LOOSE CHECK: If there is data, take it. 
-            # We can filter stricter later, but let's get data flowing first.
-            if data: 
-                GLOBAL_TRADE_QUEUE.put_nowait(data)
-                count += 1
+            if op == "INSERT" and data:
+                # Direct injection into the trader
+                if trader.trade_queue:
+                    trader.trade_queue.put_nowait(data)
+                    count += 1
+                else:
+                    log.error("❌ CRITICAL: Trader Queue is missing!")
             else:
-                log.warning(f"⚠️ Event missing 'data' field: {event}")
+                log.warning(f"⚠️ Skipped event with Op: '{op}'")
 
         return {"status": "processed", "count": count}
                 
