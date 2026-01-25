@@ -3,7 +3,7 @@ import json
 import os
 import pandas as pd
 from pathlib import Path
-from config import EQUITY_FILE
+from config import EQUITY_FILE AUDIT_FILE 
 
 DASHBOARD_PATH = Path("dashboard.html")
 
