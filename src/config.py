@@ -16,10 +16,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # --- EXTERNAL SERVICES ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 RPC_URL = "https://polygon-bor.publicnode.com"
-
 EXCHANGE_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-
-# ✅ CORRECT EVENT SIGNATURE (Found by Blueprint Diagnostic)
 ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com"
 USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
