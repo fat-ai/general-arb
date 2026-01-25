@@ -325,51 +325,58 @@ class LiveTrader:
     
     async def _parse_log(self, log_item):
         """
-        Final Parser:
-        Topics[2] = Maker
-        Topics[3] = Taker
-        Data[0]   = Maker Asset ID
-        Data[1]   = Taker Asset ID
-        Data[2]   = Maker Amount
-        Data[3]   = Taker Amount
+        Parses Polymarket CTF Exchange logs.
+        Fixes the 1:1000 scaling artifact by using the max volume value.
         """
         try:
-            topics = log_item['topics']
-            
-            # 1. EXTRACT ADDRESSES (From Topics)
+            topics = log_item.get('topics', [])
+            if len(topics) < 4: return "ERROR"
+
+            # 1. EXTRACT ADDRESSES
             maker = "0x" + topics[2][-40:]
             taker = "0x" + topics[3][-40:]
 
-            # 2. EXTRACT ASSETS & AMOUNTS (From Data)
-            data_hex = log_item.get('data', '0x')[2:] 
+            # 2. EXTRACT DATA CHUNKS
+            data_hex = log_item.get('data', '0x')
+            if data_hex.startswith('0x'): data_hex = data_hex[2:]
+            
+            # Split into 32-byte chunks
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
             
-            # Based on your Diagnostic:
-            # Chunk 0: Asset A ID (often 0 for USDC or Token ID)
-            # Chunk 1: Asset B ID (The other one)
-            # Chunk 2: Amount A
-            # Chunk 3: Amount B
-            
             if len(chunks) >= 4:
-                # Convert Hex -> Int -> String (matches metadata format)
-                asset_a = str(int(chunks[0], 16))
-                asset_b = str(int(chunks[1], 16))
-                amt_a = str(int(chunks[2], 16))
-                amt_b = str(int(chunks[3], 16))
+                # Raw Parsing
+                asset_a_str = str(int(chunks[0], 16))
+                asset_b_str = str(int(chunks[1], 16))
+                amt_a_raw = int(chunks[2], 16)
+                amt_b_raw = int(chunks[3], 16)
 
-                # DEBUG: Log the first ID found to verify it looks like a Token ID
-                if self.stats['processed_count'] == 0:
-                    log.info(f"🎯 IDs FOUND: A={asset_a[:10]}... B={asset_b[:10]}...")
+                # --- CRITICAL FIX: VOLUME NORMALIZATION ---
+                # The logs show a 1000x difference between Amt A and Amt B.
+                # We interpret the LARGER value as the true micro-USDC amount 
+                # to capture the real economic size (e.g. $8.00 vs $0.008).
+                
+                # Check if this looks like a USDC trade (Asset 0 or known USDC)
+                target_usdc_dec = "2791bca1f2de4661ed88a30c99a7a9449aa84174" # Decimal of USDC Addr
+                is_usdc_trade = (
+                    asset_a_str in ["0", target_usdc_dec] or 
+                    asset_b_str in ["0", target_usdc_dec]
+                )
+
+                # Heuristic: If one amount is ~1000x the other, use the larger one for Volume
+                # regardless of which slot it sits in.
+                final_vol_raw = max(amt_a_raw, amt_b_raw)
 
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
                     'timestamp': int(time.time()),
                     'taker': taker,
                     'maker': maker,
-                    'makerAssetId': asset_a, 
-                    'takerAssetId': asset_b, 
-                    'makerAmountFilled': amt_a, 
-                    'takerAmountFilled': amt_b
+                    'makerAssetId': asset_a_str, 
+                    'takerAssetId': asset_b_str,
+                    # We pass the CORRECTED volume into one of the slots to ensure 
+                    # _process_batch reads it correctly later.
+                    'makerAmountFilled': str(final_vol_raw), 
+                    'takerAmountFilled': str(final_vol_raw) 
                 }
                 
                 await self.trade_queue.put(trade_obj)
@@ -379,7 +386,7 @@ class LiveTrader:
             return "UNKNOWN"
 
         except Exception as e:
-            # log.error(f"Parse Fail: {e}")
+            log.error(f"Parse Fail: {e}")
             return "ERROR"
             
     async def _resolution_monitor_loop(self):
@@ -495,32 +502,32 @@ class LiveTrader:
             # 1. Normalize Data
             maker_asset = str(t['makerAssetId']).lower()
             taker_asset = str(t['takerAssetId']).lower()
+            
+            # Fix USDC check
             target_usdc_hex = USDC_ADDRESS.lower()
-            try:
-                target_usdc_dec = str(int(target_usdc_hex, 16))
-            except:
-                target_usdc_dec = "0" # Fallback
-
+            target_usdc_dec = str(int(target_usdc_hex, 16)) 
             def is_usdc(a): 
-                # Match against "0" (Polymarket ID), "0x0", Hex, OR Decimal
                 return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
 
-            token_id = None            
+            token_id = None
             usdc_vol = 0.0
             wallet = t['taker'] 
             direction = 0
             
+            # We now trust makerAmountFilled/takerAmountFilled are normalized to the MAX value
+            raw_vol = float(t['makerAmountFilled']) 
+
             if is_usdc(maker_asset):
                 token_id = taker_asset
-                usdc_vol = float(t['makerAmountFilled']) / 1e6 
-                direction = -1.0 # Selling
+                usdc_vol = raw_vol / 1e6 
+                direction = -1.0 
             elif is_usdc(taker_asset):
                 token_id = maker_asset
-                usdc_vol = float(t['takerAmountFilled']) / 1e6
-                direction = 1.0 # Buying
+                usdc_vol = raw_vol / 1e6
+                direction = 1.0 
             else:
                 skipped_counts["not_usdc"] += 1
-                continue 
+                continue
 
             score_debug = self.scorer.get_score(wallet, usdc_vol)
             if score_debug == 0.0:
