@@ -47,21 +47,17 @@ class LiveTrader:
         self.ws_client = None
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
+        print("\n🚀 STARTING LIVE PAPER TRADER (FULL MARKET MODE)")
         
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
-        # --- FIX 1: THREAD-SAFE CALLBACK ---
-        # We capture the current event loop
+        # 1. SETUP THREAD-SAFE BRIDGE
         loop = asyncio.get_running_loop()
-        
-        # This wrapper safely moves data from the Thread to the Async Loop
         def safe_callback(msg):
             loop.call_soon_threadsafe(self.ws_queue.put_nowait, msg)
             
-        # --- FIX 2: CONNECT ---
-        # Pass the SAFE callback, not the raw queue method
+        # 2. CONNECT TO CLOB
         self.ws_client = PolymarketWS(
             "wss://ws-subscriptions-clob.polymarket.com", 
             [], 
@@ -69,23 +65,24 @@ class LiveTrader:
         )
         self.ws_client.start_thread()
 
-        # --- FIX 3: SEED DATA ---
+        # 3. LOAD ALL MARKETS
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
         
-        # Get valid tokens
+        # Collect ALL valid Token IDs
         all_tokens = []
         for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
             if tokens and len(tokens) >= 2:
                 all_tokens.extend(tokens)
         
-        seed_tokens = all_tokens[:50] # Start small (50 markets) to verify data flow
-        print(f"✅ Metadata Loaded. Subscribing to {len(seed_tokens)} assets...")
+        # --- THE KEY CHANGE: NO LIMITS ---
+        print(f"✅ Metadata Loaded. Subscribing to ALL {len(all_tokens)} assets...")
 
-        self.sub_manager.set_mandatory(seed_tokens)
+        # Force the subscription immediately
+        self.sub_manager.set_mandatory(all_tokens)
         self.sub_manager.dirty = True 
 
-        # Start Async Loops
+        # 4. START LOOPS
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
@@ -664,64 +661,28 @@ class LiveTrader:
 
     async def _maintenance_loop(self):
         """
-        Runs every 60s to prune inactive subscriptions and ensure we don't
-        hit the WebSocket subscription limit with stale markets.
+        Refreshes market metadata hourly to catch NEW markets.
+        Does NOT prune existing subscriptions anymore.
         """
-        # Initialize timestamp for hourly tasks
         last_metadata_refresh = time.time()
 
         while self.running:
-            # 1. Run Maintenance every 60 seconds (High Frequency)
             await asyncio.sleep(60)
 
-            # --- A. PRUNE SIGNALS & SUBSCRIPTIONS ---
-            # 1. Remove trackers that haven't had a trade in 10 minutes (600s)
-            # This updates self.signal_engine.trackers in place
-            self.signal_engine.cleanup(max_age_seconds=600)
-            
-            # 2. Get the list of currently "Hot" Markets (FPMM IDs)
-            active_fpmms = set(self.signal_engine.trackers.keys())
-
-            # 3. Prune Subscription Manager (Thread-Safe)
-            async with self.sub_manager.lock:
-                to_remove = []
-                
-                # Identify speculative tokens that belong to "Cold" markets
-                # We iterate over a copy (list) to allow modification
-                for token_id in list(self.sub_manager.speculative_subs):
-                    # Find which market this token belongs to
-                    fpmm = self.metadata.token_to_fpmm.get(token_id)
-                    
-                    # If market is unknown OR no longer in the active signal list -> Prune
-                    if not fpmm or fpmm not in active_fpmms:
-                        to_remove.append(token_id)
-                
-                # Execute Removal
-                if to_remove:
-                    for t in to_remove:
-                        self.sub_manager.speculative_subs.discard(t)
-                    
-                    # Mark dirty so the Subscription Monitor pushes the update to WebSocket
-                    self.sub_manager.dirty = True
-                    log.info(f"🧹 Pruned {len(to_remove)} cold subscriptions (Inactive > 10m)")
-
-            # --- B. CLEAN MEMORY (Order Books) ---
-            # Drop order book data for assets we are no longer subscribed to
-            # This prevents RAM usage from growing indefinitely
-            active_tokens = self.sub_manager.mandatory_subs.union(self.sub_manager.speculative_subs)
-            
-            # Efficiently remove keys from ws_books
-            dropped_books = [k for k in self.ws_books if k not in active_tokens]
-            for k in dropped_books:
-                del self.ws_books[k]
-                
-            if dropped_books:
-                log.debug(f"🗑️ Released memory for {len(dropped_books)} stale order books.")
-
-            # --- C. METADATA REFRESH (Hourly) ---
-            # Only hit the Gamma API once per hour to save bandwidth
+            # --- ONLY REFRESH METADATA (Hourly) ---
             if time.time() - last_metadata_refresh > 3600:
+                log.info("🌍 Hourly Metadata Refresh...")
                 await self.metadata.refresh()
+                
+                # Add any NEW markets to our subscription list
+                all_tokens = []
+                for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
+                    if tokens: all_tokens.extend(tokens)
+                
+                # Update the subscription (this adds new stuff without removing old stuff)
+                self.sub_manager.set_mandatory(all_tokens)
+                self.sub_manager.dirty = True
+                
                 last_metadata_refresh = time.time()
 
     async def _reporting_loop(self):
