@@ -248,90 +248,105 @@ class LiveTrader:
 
     async def _poll_rpc_loop(self):
         """
-        Polls the Polygon Blockchain directly for 'OrderFilled' events.
-        This bypasses APIs and gets Wallet IDs directly from the source.
+        Robust Block Walker.
+        Iterates block-by-block to ensure NO trades are missed.
         """
         from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
         log.info(f"⛓️ CONNECTING TO RPC: {RPC_URL}")
         
-        # Start from the latest block
-        current_block = "latest"
-        
+        # 1. Initialize Cursor (Start 5 blocks back to be safe)
+        try:
+            resp = await asyncio.to_thread(requests.post, RPC_URL, json={
+                "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
+            })
+            current_block_num = int(resp.json()['result'], 16) - 5
+            log.info(f"⛓️ Starting Block Walk from: {current_block_num}")
+        except Exception as e:
+            log.error(f"Failed to init RPC: {e}")
+            return
+
         while self.running:
             try:
-                # 1. Fetch Logs (eth_getLogs)
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_getLogs",
-                    "params": [{
-                        "address": EXCHANGE_CONTRACT,
-                        "fromBlock": current_block,
-                        "toBlock": "latest",
-                        "topics": [ORDER_FILLED_TOPIC]
-                    }]
-                }
+                # 2. Get Chain Tip
+                resp = await asyncio.to_thread(requests.post, RPC_URL, json={
+                    "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
+                })
+                chain_tip = int(resp.json()['result'], 16)
                 
-                resp = await asyncio.to_thread(requests.post, RPC_URL, json=payload)
-                data = resp.json()
-                
-                if 'result' in data and data['result']:
-                    logs = data['result']
+                # 3. Catch Up (If we are behind)
+                if current_block_num < chain_tip:
+                    # Don't scan more than 10 blocks at once (Rate Limit Protection)
+                    end_block = min(current_block_num + 5, chain_tip)
                     
-                    # Update block cursor so we don't re-read
-                    last_block_num = int(logs[-1]['blockNumber'], 16)
-                    current_block = hex(last_block_num + 1)
+                    # Hex format for RPC
+                    hex_start = hex(current_block_num)
+                    hex_end = hex(end_block)
                     
-                    for log_item in logs:
-                        try:
-                            # 2. DECODE DATA (Hex Parsing)
-                            # Topics: [Signature, OrderHash, Maker, Taker]
-                            # The "indexed" parameters are in 'topics'
-                            maker_hex = log_item['topics'][2]
-                            taker_hex = log_item['topics'][3]
-                            
-                            # Clean "0x0000...1234" -> "0x1234"
-                            maker_addr = "0x" + maker_hex[-40:]
-                            taker_addr = "0x" + taker_hex[-40:]
-                            
-                            # Data: Non-indexed parameters concatenated
-                            # We need to split the huge hex string into 32-byte chunks
-                            data_hex = log_item['data'][2:] # Remove 0x
-                            chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
-                            
-                            # Layout: [makerAssetId, takerAssetId, makerAmt, takerAmt, fee, parent]
-                            maker_asset_id = int(chunks[0], 16)
-                            taker_asset_id = int(chunks[1], 16)
-                            maker_amt = int(chunks[2], 16)
-                            taker_amt = int(chunks[3], 16)
-                            
-                            # 3. Create Trade Object
-                            trade_obj = {
-                                'id': log_item['transactionHash'],
-                                'timestamp': int(time.time()), # Approximate (Real time is block time)
-                                'taker': taker_addr,      # <--- WE HAVE IT!
-                                'maker': maker_addr,
-                                'makerAssetId': str(maker_asset_id),
-                                'takerAssetId': str(taker_asset_id),
-                                'makerAmountFilled': str(maker_amt),
-                                'takerAmountFilled': str(taker_amt)
-                            }
-                            
-                            await self.trade_queue.put(trade_obj)
-                            
-                        except Exception as parse_err:
-                            log.error(f"Hex Decode Error: {parse_err}")
-                            continue
-                            
-                elif 'error' in data:
-                    log.warning(f"RPC Error: {data['error']}")
-                    await asyncio.sleep(5) # Backoff on error
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_getLogs",
+                        "params": [{
+                            "address": EXCHANGE_CONTRACT,
+                            "fromBlock": hex_start,
+                            "toBlock": hex_end,
+                            "topics": [ORDER_FILLED_TOPIC]
+                        }]
+                    }
+                    
+                    logs_resp = await asyncio.to_thread(requests.post, RPC_URL, json=payload)
+                    data = logs_resp.json()
+                    
+                    if 'result' in data:
+                        logs = data['result']
+                        if logs:
+                            # log.info(f"⛓️ Hit: Found {len(logs)} trades in blocks {current_block_num}-{end_block}")
+                            for log_item in logs:
+                                await self._parse_log(log_item)
+                    
+                    # Advance Cursor
+                    current_block_num = end_block + 1
+                    
+                else:
+                    # We are at the tip, wait for next block (Polygon blocks are ~2s)
+                    await asyncio.sleep(2.0)
                     
             except Exception as e:
-                log.error(f"RPC Poll Failed: {e}")
+                log.error(f"RPC Walk Error: {e}")
+                await asyncio.sleep(5)
+    
+    async def _parse_log(self, log_item):
+        """Helper to decode hex logs safely"""
+        try:
+            # Topics: [Signature, OrderHash, Maker, Taker]
+            maker_hex = log_item['topics'][2]
+            taker_hex = log_item['topics'][3]
             
-            # Fast Poll (2s)
-            await asyncio.sleep(2.0)
+            maker_addr = "0x" + maker_hex[-40:]
+            taker_addr = "0x" + taker_hex[-40:]
+            
+            # Data Segment
+            data_hex = log_item['data'][2:]
+            chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+            
+            maker_asset_id = int(chunks[0], 16)
+            taker_asset_id = int(chunks[1], 16)
+            maker_amt = int(chunks[2], 16)
+            taker_amt = int(chunks[3], 16)
+            
+            trade_obj = {
+                'id': log_item['transactionHash'],
+                'timestamp': int(time.time()),
+                'taker': taker_addr,
+                'maker': maker_addr,
+                'makerAssetId': str(maker_asset_id),
+                'takerAssetId': str(taker_asset_id),
+                'makerAmountFilled': str(maker_amt),
+                'takerAmountFilled': str(taker_amt)
+            }
+            await self.trade_queue.put(trade_obj)
+        except:
+            pass
             
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
