@@ -15,7 +15,11 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- EXTERNAL SERVICES ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
-SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/tokenunion/polymarket-matic"
+RPC_URL = "https://polygon-rpc.com"  # Free Public Node
+EXCHANGE_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a" # Polymarket CTF Exchange
+# The "OrderFilled" Event Signature (Keccak-256 hash)
+# OrderFilled(bytes32 orderHash, address maker, address taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmountFilled, uint256 takerAmountFilled, uint256 fee, bytes32 parentOutcome)
+ORDER_FILLED_TOPIC = "0x9d54e5657077a28f115949d12d45c553931855b778749c379a5b3a373d526555"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com"
 USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
