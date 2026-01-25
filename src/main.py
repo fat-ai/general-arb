@@ -322,52 +322,62 @@ class LiveTrader:
     
     async def _parse_log(self, log_item):
         """
-        Parses based on the PROVEN Layout:
+        Final Parser:
         Topics[2] = Maker
         Topics[3] = Taker
-        Data[3]   = Volume (Taker Amount)
+        Data[0]   = Maker Asset ID
+        Data[1]   = Taker Asset ID
+        Data[2]   = Maker Amount
+        Data[3]   = Taker Amount
         """
         try:
             topics = log_item['topics']
             
-            # 1. EXTRACT ADDRESSES FROM TOPICS
-            # Your diagnostic showed these are in Topic 2 and 3
+            # 1. EXTRACT ADDRESSES (From Topics)
             maker = "0x" + topics[2][-40:]
             taker = "0x" + topics[3][-40:]
 
-            # 2. EXTRACT VOLUME FROM DATA
+            # 2. EXTRACT ASSETS & AMOUNTS (From Data)
             data_hex = log_item.get('data', '0x')[2:] 
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
             
-            # Your diagnostic showed Data[3] is the Taker Amount (300000000)
-            if len(chunks) > 3:
-                vol_hex = chunks[3]
-                vol_int = int(vol_hex, 16)
-            else:
-                vol_int = 0 # Fallback
-
-            # 3. LOGGING & QUEUING
-            if self.stats['processed_count'] == 0:
-                log.info(f"🎯 TARGET ACQUIRED: Taker={taker[:8]}... Vol={vol_int}")
-
-            trade_obj = {
-                'id': log_item.get('transactionHash'),
-                'timestamp': int(time.time()),
-                'taker': taker,
-                'maker': maker,
-                'makerAssetId': "0", 
-                'takerAssetId': "0", 
-                'makerAmountFilled': "0", 
-                'takerAmountFilled': str(vol_int)
-            }
+            # Based on your Diagnostic:
+            # Chunk 0: Asset A ID (often 0 for USDC or Token ID)
+            # Chunk 1: Asset B ID (The other one)
+            # Chunk 2: Amount A
+            # Chunk 3: Amount B
             
-            await self.trade_queue.put(trade_obj)
-            self.stats['processed_count'] += 1
-            return True
+            if len(chunks) >= 4:
+                # Convert Hex -> Int -> String (matches metadata format)
+                asset_a = str(int(chunks[0], 16))
+                asset_b = str(int(chunks[1], 16))
+                amt_a = str(int(chunks[2], 16))
+                amt_b = str(int(chunks[3], 16))
+
+                # DEBUG: Log the first ID found to verify it looks like a Token ID
+                if self.stats['processed_count'] == 0:
+                    log.info(f"🎯 IDs FOUND: A={asset_a[:10]}... B={asset_b[:10]}...")
+
+                trade_obj = {
+                    'id': log_item.get('transactionHash'),
+                    'timestamp': int(time.time()),
+                    'taker': taker,
+                    'maker': maker,
+                    'makerAssetId': asset_a, 
+                    'takerAssetId': asset_b, 
+                    'makerAmountFilled': amt_a, 
+                    'takerAmountFilled': amt_b
+                }
+                
+                await self.trade_queue.put(trade_obj)
+                self.stats['processed_count'] += 1
+                return "TRADE"
+            
+            return "UNKNOWN"
 
         except Exception as e:
-            log.error(f"Parse Fail: {e}")
-            return False
+            # log.error(f"Parse Fail: {e}")
+            return "ERROR"
             
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
@@ -548,8 +558,8 @@ class LiveTrader:
             top_3 = batch_scores[:3]
             msg_parts = [f"Mkt {item[2][:6]}..: {item[1]:.1f}" for item in top_3]
             log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
-    #    else:
-    #        log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
+        else:
+            log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
     async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
         """Iterates over held positions in this market and checks for reversal exits."""
