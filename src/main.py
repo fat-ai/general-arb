@@ -248,17 +248,18 @@ class LiveTrader:
 
     async def _poll_rpc_loop(self):
         """
-        Robust Block Walker (Wildcard Mode) with EXPLICIT DEBUGGING.
+        Robust Block Walker (Wildcard Mode).
+        Fetches ALL logs from the Exchange to bypass RPC filtering bugs.
         """
-        from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
+        from config import RPC_URL, EXCHANGE_CONTRACT
         log.info(f"⛓️ CONNECTING TO RPC: {RPC_URL}")
         
-        # 1. Initialize Cursor
+        # 1. Initialize Cursor (Start 5 blocks back)
         try:
             resp = await asyncio.to_thread(requests.post, RPC_URL, json={
                 "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
             })
-            current_block_num = int(resp.json()['result'], 16) - 10
+            current_block_num = int(resp.json()['result'], 16) - 5
             log.info(f"⛓️ Starting Block Walk from: {current_block_num}")
         except Exception as e:
             log.error(f"Failed to init RPC: {e}")
@@ -272,15 +273,13 @@ class LiveTrader:
                 })
                 chain_tip = int(resp.json()['result'], 16)
                 
-                # 3. Catch Up
+                # 3. Catch Up (Scan if behind)
                 if current_block_num < chain_tip:
+                    # Scan 5 blocks at a time
                     end_block = min(current_block_num + 5, chain_tip)
                     
-                    # Log activity every 10 blocks so we know it's moving
-                    # if current_block_num % 10 == 0:
-                    #     log.info(f"⛓️ RPC: Scanning {current_block_num} -> {end_block}...")
-
-                    # WILDCARD REQUEST
+                    # WILDCARD REQUEST (No 'topics' parameter)
+                    # This forces the node to give us EVERYTHING (715+ logs)
                     payload = {
                         "jsonrpc": "2.0",
                         "id": 1,
@@ -298,16 +297,9 @@ class LiveTrader:
                     if 'result' in data:
                         logs = data['result']
                         if logs:
-                            # log.info(f"⛓️ HIT: Found {len(logs)} raw logs.")
+                            # Iterate through the noise to find the signals
                             for log_item in logs:
-                                if not log_item.get('topics'): continue
-                                
-                                # Case-insensitive Topic Match
-                                topic0 = log_item['topics'][0].lower()
-                                target = ORDER_FILLED_TOPIC.lower()
-                                
-                                if topic0 == target:
-                                    await self._parse_log(log_item)
+                                await self._parse_log(log_item)
                     
                     current_block_num = end_block + 1
                     
@@ -320,33 +312,21 @@ class LiveTrader:
     
     async def _parse_log(self, log_item):
         """
-        Decodes the log and pushes to Queue.
-        NOW WITH ERROR REPORTING.
+        Decodes logs locally. 
+        Safely ignores 'Cancel' events (5 chunks) and captures 'Trade' events (7+ chunks).
         """
         try:
-            # Clean Hex
-            data_hex = log_item['data'][2:] 
+            # 1. Extract Data
+            data_hex = log_item.get('data', '0x')[2:] 
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
             
-            # --- DEBUG: Print Structure of FIRST successful hit ---
-            if self.stats['processed_count'] == 0:
-                 log.info(f"🔍 DEBUG DATA CHUNKS ({len(chunks)}): {chunks}")
-            # ----------------------------------------------------
-
-            maker_addr = None
-            taker_addr = None
-            
-            # NEGRISK LAYOUT: 
-            # 0: OrderHash
-            # 1: Maker
-            # 2: Taker
-            # 3: MakerAssetId
-            # 4: TakerAssetId
-            # 5: MakerAmount
-            # 6: TakerAmount
-            # 7: Fee
+            # 2. Filter by Shape
+            # Your diagnostic showed Cancel events have 5 chunks.
+            # We ONLY want Trade events, which have 7+ chunks.
             if len(chunks) >= 7:
+                # Chunk 1: Maker Address
                 maker_addr = "0x" + chunks[1][-40:]
+                # Chunk 2: Taker Address
                 taker_addr = "0x" + chunks[2][-40:]
                 
                 maker_asset_id = int(chunks[3], 16)
@@ -354,9 +334,13 @@ class LiveTrader:
                 maker_amt = int(chunks[5], 16)
                 taker_amt = int(chunks[6], 16)
 
+                # 3. Log Success (Once per batch to prove it's working)
+                if self.stats['processed_count'] == 0:
+                    log.info(f"👀 SEEN TRADE: Taker {taker_addr[:8]}... Vol: {taker_amt}")
+
                 if maker_addr and taker_addr:
                     trade_obj = {
-                        'id': log_item.get('transactionHash'),
+                        'id': log_item.get('transactionHash') or str(time.time()),
                         'timestamp': int(time.time()),
                         'taker': taker_addr,
                         'maker': maker_addr,
@@ -367,12 +351,10 @@ class LiveTrader:
                     }
                     await self.trade_queue.put(trade_obj)
                     self.stats['processed_count'] += 1
-            else:
-                 log.warning(f"⚠️ Chunk Mismatch: Expected 7+, got {len(chunks)}")
-
+            
         except Exception as e:
-            # THIS IS THE CRITICAL FIX: Print the error!
-            log.error(f"❌ PARSE CRASH: {e} | Data: {log_item['data'][:50]}...")
+            log.error(f"Parse Fail: {e}")
+            pass
             
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
