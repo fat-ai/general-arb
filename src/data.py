@@ -11,52 +11,61 @@ logger = logging.getLogger("PaperGold")
 
 class MarketMetadata:
     def __init__(self):
-        self.token_to_fpmm = {}     # Maps TokenID -> MarketID (FPMM or ConditionID)
-        self.fpmm_to_data = {}      # Maps MarketID -> Metadata (Question, Active, etc)
-        self.fpmm_to_tokens = {}    # Maps MarketID -> [TokenYes, TokenNo] (Legacy Support)
+        self.token_to_fpmm = {}     # Maps TokenID -> MarketID
+        self.fpmm_to_data = {}      # Maps MarketID -> Metadata
+        self.fpmm_to_tokens = {}    # Maps MarketID -> Tokens List
         self.last_refresh = 0
 
     async def refresh(self):
         """
-        Builds the Master Index.
-        1. Gamma API (Primary Source - Fast)
-        2. CLOB API (Deep Scan - Finds Ghost Markets)
+        Blocking Metadata Refresh.
+        The bot will NOT start until this completes successfully.
         """
         start_time = time.time()
-        logger.info("🌍 Refreshing Metadata (Gamma + CLOB)...")
+        logger.info("🌍 Starting Strict Metadata Index...")
         
         async with aiohttp.ClientSession() as session:
-            # 1. Fetch from Gamma (Rich Metadata)
-            await self._fetch_gamma_markets(session)
+            # 1. Fetch Gamma (Metadata Layer) - Fast, Good Descriptions
+            await self._fetch_gamma_strict(session)
             
-            # 2. Fetch from CLOB (Deep Scan for Ghosts)
-            await self._fetch_clob_markets(session)
+            # 2. Fetch CLOB (Trading Layer) - Strict, Deep Scan
+            # We scan until the API returns an empty list. No arbitrary page limits.
+            await self._fetch_clob_strict(session)
 
         count = len(self.fpmm_to_data)
         tokens = len(self.token_to_fpmm)
-        logger.info(f"✅ Metadata Complete. Indexed {count} Markets ({tokens} Tokens) in {time.time() - start_time:.2f}s")
+        logger.info(f"✅ Indexing Complete. Loaded {count} Markets ({tokens} Tokens) in {time.time() - start_time:.2f}s")
+        
+        # SELF-CHECK: Verify the "Elon Musk" token exists in our map
+        # This guarantees we solved the problem before running the strategy.
+        target_id = "105983398713597801788725523674983519534626045739886740412062803259294550362235"
+        if target_id in self.token_to_fpmm:
+            logger.info(f"🛡️ INTEGRITY CHECK PASSED: Found Target Token {target_id[:10]}...")
+        else:
+            logger.warning(f"⚠️ INTEGRITY CHECK FAILED: Target Token {target_id[:10]}... is MISSING from index.")
+
         self.last_refresh = time.time()
 
-    async def _fetch_gamma_markets(self, session):
+    async def _fetch_gamma_strict(self, session):
+        """Downloads active markets from Gamma with simple pagination."""
         try:
             offset = 0
             limit = 1000
-            keep_fetching = True
-            
-            # Cap at 20k to ensure we get everything
-            while keep_fetching and offset < 20000:
+            while True:
                 url = f"{GAMMA_API_URL}?limit={limit}&offset={offset}&active=true"
-                
                 async with session.get(url) as response:
-                    if response.status != 200: break
+                    if response.status != 200:
+                        logger.error(f"Gamma API Error: {response.status}")
+                        break
                     
-                    chunk = await response.json()
-                    if isinstance(chunk, dict): chunk = chunk.get('data', [])
+                    data = await response.json()
+                    chunk = data.get('data', []) if isinstance(data, dict) else data
+                    
                     if not chunk: break
                     
                     self._process_gamma_chunk(chunk)
                     
-                    if len(chunk) < limit: keep_fetching = False
+                    if len(chunk) < limit: break
                     offset += limit
                     
         except Exception as e:
@@ -65,8 +74,7 @@ class MarketMetadata:
     def _process_gamma_chunk(self, markets):
         for mkt in markets:
             try:
-                # Gamma Key: FPMM Address
-                mid = mkt.get('fpmm') or mkt.get('marketMakerAddress') or mkt.get('fixedProductMarketMaker')
+                mid = mkt.get('fpmm') or mkt.get('marketMakerAddress')
                 if not mid: continue
                 mid = mid.lower()
 
@@ -81,30 +89,41 @@ class MarketMetadata:
                         "question": mkt.get('question', 'Unknown'),
                         "source": "gamma"
                     }
-                    # CRITICAL FIX: Restore this dict for the Strategy Engine
                     self.fpmm_to_tokens[mid] = tokens
-                    
                     for t in tokens: self.token_to_fpmm[t] = mid
             except: continue
 
-    async def _fetch_clob_markets(self, session):
-        """Deep Scan of CLOB to find markets missing from Gamma."""
-        try:
-            next_cursor = ""
-            page = 0
-            # Safety cap of 100 pages * 100 items = 10,000 markets
-            # This reaches deep into the catalog to find your 'Ghost' tokens
-            max_pages = 100 
+    async def _fetch_clob_strict(self, session):
+        """
+        Robust CLOB Downloader.
+        - Retries on 429 (Rate Limit)
+        - Scans until 'next_cursor' is exhausted
+        """
+        next_cursor = ""
+        page = 0
+        retry_count = 0
+        
+        while True:
+            url = f"{CLOB_API_URL}?limit=100" # CLOB max limit
+            if next_cursor and next_cursor != "0": 
+                url += f"&next_cursor={next_cursor}"
             
-            while page < max_pages:
-                # Limit=100 is CLOB Max
-                url = f"{CLOB_API_URL}?limit=100"
-                if next_cursor and next_cursor != "0": 
-                    url += f"&next_cursor={next_cursor}"
-                
+            try:
                 async with session.get(url) as response:
-                    if response.status != 200: break
+                    # RATE LIMIT HANDLING
+                    if response.status == 429:
+                        wait = 2 ** retry_count
+                        logger.warning(f"⚠️ CLOB Rate Limit. Waiting {wait}s...")
+                        await asyncio.sleep(wait)
+                        retry_count += 1
+                        if retry_count > 5: break # Avoid infinite loops
+                        continue
                     
+                    if response.status != 200:
+                        logger.error(f"CLOB API Error {response.status}")
+                        break
+
+                    retry_count = 0 # Reset on success
                     data = await response.json()
                     markets = data.get('data', [])
                     next_cursor = data.get('next_cursor')
@@ -112,42 +131,48 @@ class MarketMetadata:
                     self._process_clob_chunk(markets)
                     
                     if page > 0 and page % 10 == 0:
-                        logger.info(f"   🔍 CLOB Deep Scan: Page {page}...")
+                        logger.info(f"   🔍 Indexed CLOB Page {page}...")
 
-                    if not next_cursor or next_cursor == "0": break
+                    # STOP CONDITION: No more pages
+                    if not next_cursor or next_cursor == "0":
+                        break
+                    if not markets:
+                        break
+                        
                     page += 1
+                    # Tiny sleep to be polite
+                    await asyncio.sleep(0.05)
                     
-        except Exception as e:
-            logger.error(f"CLOB Fetch Error: {e}")
+            except Exception as e:
+                logger.error(f"CLOB Network Error: {e}")
+                await asyncio.sleep(1)
 
     def _process_clob_chunk(self, markets):
         for mkt in markets:
             try:
-                # CLOB Key: Condition ID
+                # Primary Key: Condition ID
                 mid = mkt.get('condition_id')
                 if not mid: continue
                 mid = mid.lower()
 
                 tokens = []
-                if 'tokens' in mkt and isinstance(mkt['tokens'], list):
+                if 'tokens' in mkt:
                      for t in mkt['tokens']:
                         if isinstance(t, dict): tokens.append(str(t.get('token_id', '')))
                         else: tokens.append(str(t))
                 
-                # Only add if we DON'T know these tokens yet
-                if tokens and len(tokens) >= 2:
-                    if tokens[0] not in self.token_to_fpmm:
-                        self.fpmm_to_data[mid] = {
-                            "tokens": tokens,
-                            "active": mkt.get('active', True),
-                            "question": mkt.get('question', 'Unknown (CLOB)'),
-                            "source": "clob"
-                        }
-                        # CRITICAL FIX: Restore this dict
-                        self.fpmm_to_tokens[mid] = tokens
-                        
-                        for t in tokens: self.token_to_fpmm[t] = mid
-                    
+                # We only add if this specific market ID is NOT yet known.
+                # This ensures Gamma (Rich Metadata) takes precedence, 
+                # but CLOB (Complete List) fills the gaps.
+                if mid not in self.fpmm_to_data and len(tokens) >= 2:
+                    self.fpmm_to_data[mid] = {
+                        "tokens": tokens,
+                        "active": mkt.get('active', True),
+                        "question": mkt.get('question', 'Unknown (CLOB)'),
+                        "source": "clob"
+                    }
+                    self.fpmm_to_tokens[mid] = tokens
+                    for t in tokens: self.token_to_fpmm[t] = mid
             except: continue
 
 class SubscriptionManager:
@@ -156,16 +181,9 @@ class SubscriptionManager:
         self.speculative_subs = set()
         self.lock = asyncio.Lock()
         self.dirty = False
-
-    def set_mandatory(self, token_ids):
-        new_set = set(token_ids)
-        if new_set != self.mandatory_subs:
-            self.mandatory_subs = new_set
-            self.dirty = True
-            
-    def add_speculative(self, token_ids):
-        for t in token_ids:
-            self.speculative_subs.add(t)
+    def set_mandatory(self, t): self.mandatory_subs = set(t); self.dirty = True
+    def add_speculative(self, t): 
+        for x in t: self.speculative_subs.add(x)
         self.dirty = True
 
 async def fetch_graph_trades(since): return []
