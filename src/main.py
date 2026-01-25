@@ -54,8 +54,8 @@ class LiveTrader:
             self.trade_queue = asyncio.Queue()
         
         # 2. START WS CLIENT (Connects to Polymarket)
-        # We start with empty assets [], we will update them in step 4
-        self.ws_client = PolymarketWS("wss://ws-fidelity.polymarket.com", [], self.ws_queue.put_nowait)
+
+        self.ws_client = PolymarketWS("wss://ws-subscriptions-clob.polymarket.com", [], self.ws_queue.put_nowait)
         self.ws_client.start_thread()
 
         # --- FIX: SEED THE SUBSCRIPTIONS ---
