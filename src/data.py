@@ -11,14 +11,16 @@ logger = logging.getLogger("PaperGold")
 
 class MarketMetadata:
     def __init__(self):
-        self.token_to_fpmm = {}     # Map: TokenID -> MarketID (FPMM or ConditionID)
-        self.fpmm_to_data = {}      # Map: MarketID -> Full Metadata (Active, Question, etc)
-        self.fpmm_to_tokens = {}    # Map: MarketID -> [TokenYes, TokenNo] (Legacy support)
+        self.token_to_fpmm = {}     # Maps TokenID -> MarketID (FPMM or ConditionID)
+        self.fpmm_to_data = {}      # Maps MarketID -> Metadata (Question, Active, etc)
+        self.fpmm_to_tokens = {}    # Maps MarketID -> [TokenYes, TokenNo] (Legacy Support)
         self.last_refresh = 0
 
     async def refresh(self):
         """
-        Builds the Master Index using both Gamma (Metadata) and CLOB (Trading Engine).
+        Builds the Master Index.
+        1. Gamma API (Primary Source - Fast)
+        2. CLOB API (Deep Scan - Finds Ghost Markets)
         """
         start_time = time.time()
         logger.info("🌍 Refreshing Metadata (Gamma + CLOB)...")
@@ -27,7 +29,7 @@ class MarketMetadata:
             # 1. Fetch from Gamma (Rich Metadata)
             await self._fetch_gamma_markets(session)
             
-            # 2. Fetch from CLOB (The Source of Truth for Trading)
+            # 2. Fetch from CLOB (Deep Scan for Ghosts)
             await self._fetch_clob_markets(session)
 
         count = len(self.fpmm_to_data)
@@ -41,7 +43,8 @@ class MarketMetadata:
             limit = 1000
             keep_fetching = True
             
-            while keep_fetching and offset < 10000:
+            # Cap at 20k to ensure we get everything
+            while keep_fetching and offset < 20000:
                 url = f"{GAMMA_API_URL}?limit={limit}&offset={offset}&active=true"
                 
                 async with session.get(url) as response:
@@ -62,6 +65,7 @@ class MarketMetadata:
     def _process_gamma_chunk(self, markets):
         for mkt in markets:
             try:
+                # Gamma Key: FPMM Address
                 mid = mkt.get('fpmm') or mkt.get('marketMakerAddress') or mkt.get('fixedProductMarketMaker')
                 if not mid: continue
                 mid = mid.lower()
@@ -71,29 +75,32 @@ class MarketMetadata:
                 elif 'tokens' in mkt: tokens = [str(t.get('tokenId', '')) for t in mkt['tokens']]
                 
                 if len(tokens) >= 2:
-                    # 1. Populate Data Dict (New Standard)
                     self.fpmm_to_data[mid] = {
                         "tokens": tokens,
                         "active": not mkt.get('closed', False),
                         "question": mkt.get('question', 'Unknown'),
                         "source": "gamma"
                     }
-                    # 2. Populate Tokens Dict (Legacy Support - FIXES CRASH)
+                    # CRITICAL FIX: Restore this dict for the Strategy Engine
                     self.fpmm_to_tokens[mid] = tokens
                     
-                    # 3. Index Tokens
                     for t in tokens: self.token_to_fpmm[t] = mid
             except: continue
 
     async def _fetch_clob_markets(self, session):
+        """Deep Scan of CLOB to find markets missing from Gamma."""
         try:
             next_cursor = ""
-            max_pages = 20 
             page = 0
+            # Safety cap of 100 pages * 100 items = 10,000 markets
+            # This reaches deep into the catalog to find your 'Ghost' tokens
+            max_pages = 100 
             
             while page < max_pages:
-                url = CLOB_API_URL
-                if next_cursor: url += f"?next_cursor={next_cursor}"
+                # Limit=100 is CLOB Max
+                url = f"{CLOB_API_URL}?limit=100"
+                if next_cursor and next_cursor != "0": 
+                    url += f"&next_cursor={next_cursor}"
                 
                 async with session.get(url) as response:
                     if response.status != 200: break
@@ -104,6 +111,9 @@ class MarketMetadata:
                     
                     self._process_clob_chunk(markets)
                     
+                    if page > 0 and page % 10 == 0:
+                        logger.info(f"   🔍 CLOB Deep Scan: Page {page}...")
+
                     if not next_cursor or next_cursor == "0": break
                     page += 1
                     
@@ -113,6 +123,7 @@ class MarketMetadata:
     def _process_clob_chunk(self, markets):
         for mkt in markets:
             try:
+                # CLOB Key: Condition ID
                 mid = mkt.get('condition_id')
                 if not mid: continue
                 mid = mid.lower()
@@ -123,20 +134,19 @@ class MarketMetadata:
                         if isinstance(t, dict): tokens.append(str(t.get('token_id', '')))
                         else: tokens.append(str(t))
                 
-                known = False
-                if tokens and tokens[0] in self.token_to_fpmm: known = True
-                
-                if not known and len(tokens) >= 2:
-                    self.fpmm_to_data[mid] = {
-                        "tokens": tokens,
-                        "active": mkt.get('active', True),
-                        "question": mkt.get('question', 'Unknown (CLOB)'),
-                        "source": "clob"
-                    }
-                    # FIXES CRASH
-                    self.fpmm_to_tokens[mid] = tokens
-                    
-                    for t in tokens: self.token_to_fpmm[t] = mid
+                # Only add if we DON'T know these tokens yet
+                if tokens and len(tokens) >= 2:
+                    if tokens[0] not in self.token_to_fpmm:
+                        self.fpmm_to_data[mid] = {
+                            "tokens": tokens,
+                            "active": mkt.get('active', True),
+                            "question": mkt.get('question', 'Unknown (CLOB)'),
+                            "source": "clob"
+                        }
+                        # CRITICAL FIX: Restore this dict
+                        self.fpmm_to_tokens[mid] = tokens
+                        
+                        for t in tokens: self.token_to_fpmm[t] = mid
                     
             except: continue
 
