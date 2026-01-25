@@ -248,19 +248,23 @@ class LiveTrader:
 
     async def _poll_rpc_loop(self):
         """
-        Verbose Block Walker.
-        Shows EXACTLY what the RPC returns so we stop guessing.
+        The 'Blueprint' Loop.
+        Implements the exact finding from the diagnostic:
+        - Fetch Everything (Vacuum)
+        - Parse 5-chunk logs as TRADES
+        - Parse 4-chunk logs as CANCELS
         """
-        from config import RPC_URL, EXCHANGE_CONTRACT
-        print(f"\n🔗 CONNECTING TO RPC: {RPC_URL} [Monitoring {EXCHANGE_CONTRACT}]")
+        from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
+        log.info(f"🔗 CONNECTING TO RPC: {RPC_URL}")
         
-        # 1. Initialize Cursor
+        # 1. Init Cursor
         try:
             resp = await asyncio.to_thread(requests.post, RPC_URL, json={
                 "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
             })
+            # Start 10 blocks back to catch immediate data
             current_block_num = int(resp.json()['result'], 16) - 10
-            print(f"🚦 STARTING FROM BLOCK: {current_block_num}")
+            log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
         except Exception as e:
             log.error(f"Failed to init RPC: {e}")
             return
@@ -273,20 +277,18 @@ class LiveTrader:
                 })
                 chain_tip = int(resp.json()['result'], 16)
                 
-                # 3. Catch Up
+                # 3. Scan Batch
                 if current_block_num < chain_tip:
-                    # Scan small batches to prevent timeouts
                     end_block = min(current_block_num + 5, chain_tip)
                     
-                    # WILDCARD REQUEST (Get everything)
+                    # WILDCARD REQUEST
                     payload = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "eth_getLogs",
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
                         "params": [{
                             "address": EXCHANGE_CONTRACT,
                             "fromBlock": hex(current_block_num),
                             "toBlock": hex(end_block)
+                            # No topics filter, we filter locally
                         }]
                     }
                     
@@ -297,72 +299,85 @@ class LiveTrader:
                         logs = data['result']
                         count = len(logs)
                         
-                        # LOG THE RAW NUMBERS
                         if count > 0:
-                            log.info(f"⛓️ RPC: Blocks {current_block_num}-{end_block} | Found {count} Events")
+                            trades = 0
+                            cancels = 0
                             
-                            # Parse them
                             for log_item in logs:
-                                await self._parse_log(log_item)
-                        else:
-                            # Optional: Print silence if you want to know it's checking
-                            # log.info(f"⛓️ RPC: Blocks {current_block_num}-{end_block} | Empty")
-                            pass
-                    
+                                res = await self._parse_log(log_item)
+                                if res == "TRADE": trades += 1
+                                elif res == "CANCEL": cancels += 1
+                            
+                            # Log heartbeat
+                            log.info(f"⛓️ Blocks {current_block_num}-{end_block}: {count} Events (✅ {trades} Trades | 🗑️ {cancels} Cancels)")
+                            
                     current_block_num = end_block + 1
                     
                 else:
                     await asyncio.sleep(2.0)
                     
             except Exception as e:
-                log.error(f"RPC Walk Error: {e}")
+                log.error(f"RPC Error: {e}")
                 await asyncio.sleep(5)
     
     async def _parse_log(self, log_item):
         """
-        Decodes logs and reports why they were accepted or rejected.
+        Decodes based on the Blueprint Table.
+        5 Chunks = TRADE (Signature 0xd0a0...)
+        4 Chunks = CANCEL (Signature 0x63bf...)
         """
         try:
             data_hex = log_item.get('data', '0x')[2:] 
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+            chunk_len = len(chunks)
+
+            # --- BLUEPRINT LOGIC ---
             
-            # DEBUG: Print the chunk count for the first few items
-            # This confirms if we are seeing Cancels (5) or Trades (7+)
-            # if self.stats['processed_count'] < 5:
-            #    log.info(f"🔎 DEBUG: Found Log with {len(chunks)} chunks")
+            # CASE A: CANCEL (4 Chunks)
+            if chunk_len == 4:
+                return "CANCEL"
 
-            # FILTER: We only want Trades (7+ chunks)
-            # 5 chunks = OrderCancelled
-            if len(chunks) >= 7:
-                # Chunk 1: Maker Address
-                maker_addr = "0x" + chunks[1][-40:]
-                # Chunk 2: Taker Address
-                taker_addr = "0x" + chunks[2][-40:]
+            # CASE B: TRADE (5 Chunks)
+            if chunk_len == 5:
+                # Blueprint Mapping:
+                # 0: OrderHash
+                # 1: Maker Address
+                # 2: Taker Address
+                # 3: Maker Amount/Asset (Variable)
+                # 4: Taker Amount/Volume (Variable)
+
+                maker = "0x" + chunks[1][-40:]
+                taker = "0x" + chunks[2][-40:]
                 
-                maker_asset_id = int(chunks[3], 16)
-                taker_asset_id = int(chunks[4], 16)
-                maker_amt = int(chunks[5], 16)
-                taker_amt = int(chunks[6], 16)
+                # Valid addresses check
+                if maker != "0x" and taker != "0x":
+                    # For safety, we treat the last chunk as volume (standard convention)
+                    # We convert to int to be safe
+                    vol_raw = int(chunks[4], 16)
+                    
+                    # Debug print the first one to verify values are sane
+                    if self.stats['processed_count'] == 0:
+                        log.info(f"🔍 CALIBRATING: Taker={taker[:8]}... VolRaw={vol_raw}")
 
-                if maker_addr and taker_addr:
                     trade_obj = {
-                        'id': log_item.get('transactionHash') or str(time.time()),
+                        'id': log_item.get('transactionHash'),
                         'timestamp': int(time.time()),
-                        'taker': taker_addr,
-                        'maker': maker_addr,
-                        'makerAssetId': str(maker_asset_id),
-                        'takerAssetId': str(taker_asset_id),
-                        'makerAmountFilled': str(maker_amt),
-                        'takerAmountFilled': str(taker_amt)
+                        'taker': taker,
+                        'maker': maker,
+                        'makerAssetId': "0", # Not available in simplified 5-chunk log
+                        'takerAssetId': "0", 
+                        'makerAmountFilled': "0", 
+                        'takerAmountFilled': str(vol_raw) # Critical metric
                     }
+                    
                     await self.trade_queue.put(trade_obj)
                     self.stats['processed_count'] += 1
-                    
-                    # Log the VICTORY
-                    log.info(f"✅ TRADE PARSED: {taker_addr[:6]}... bought {taker_amt}")
+                    return "TRADE"
             
+            return "UNKNOWN"
+
         except Exception as e:
-            pass
+            return "ERROR"
             
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
