@@ -248,13 +248,13 @@ class LiveTrader:
 
     async def _poll_rpc_loop(self):
         """
-        Robust Block Walker.
-        Iterates block-by-block to ensure NO trades are missed.
+        Robust Block Walker (Wildcard Mode).
+        Fetches ALL contract logs and filters locally to avoid RPC strictness issues.
         """
         from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
         log.info(f"⛓️ CONNECTING TO RPC: {RPC_URL}")
         
-        # 1. Initialize Cursor (Start 5 blocks back to be safe)
+        # 1. Initialize Cursor
         try:
             resp = await asyncio.to_thread(requests.post, RPC_URL, json={
                 "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
@@ -273,24 +273,20 @@ class LiveTrader:
                 })
                 chain_tip = int(resp.json()['result'], 16)
                 
-                # 3. Catch Up (If we are behind)
+                # 3. Catch Up
                 if current_block_num < chain_tip:
-                    # Don't scan more than 10 blocks at once (Rate Limit Protection)
-                    end_block = min(current_block_num + 5, chain_tip)
+                    end_block = min(current_block_num + 10, chain_tip)
                     
-                    # Hex format for RPC
-                    hex_start = hex(current_block_num)
-                    hex_end = hex(end_block)
-                    
+                    # WILDCARD REQUEST (No 'topics' filter)
                     payload = {
                         "jsonrpc": "2.0",
                         "id": 1,
                         "method": "eth_getLogs",
                         "params": [{
                             "address": EXCHANGE_CONTRACT,
-                            "fromBlock": hex_start,
-                            "toBlock": hex_end,
-                            "topics": [ORDER_FILLED_TOPIC]
+                            "fromBlock": hex(current_block_num),
+                            "toBlock": hex(end_block)
+                            # "topics": REMOVED to match your working script
                         }]
                     }
                     
@@ -300,15 +296,23 @@ class LiveTrader:
                     if 'result' in data:
                         logs = data['result']
                         if logs:
-                            # log.info(f"⛓️ Hit: Found {len(logs)} trades in blocks {current_block_num}-{end_block}")
+                            # Debug Log to prove we are getting data
+                            # log.info(f"⛓️ RPC Hit: Found {len(logs)} raw logs in {current_block_num}-{end_block}")
+                            
                             for log_item in logs:
-                                await self._parse_log(log_item)
+                                # LOCAL FILTERING
+                                if not log_item.get('topics'): continue
+                                
+                                # Compare Topic (Case-insensitive)
+                                topic0 = log_item['topics'][0].lower()
+                                target = ORDER_FILLED_TOPIC.lower()
+                                
+                                if topic0 == target:
+                                    await self._parse_log(log_item)
                     
-                    # Advance Cursor
                     current_block_num = end_block + 1
                     
                 else:
-                    # We are at the tip, wait for next block (Polygon blocks are ~2s)
                     await asyncio.sleep(2.0)
                     
             except Exception as e:
@@ -317,67 +321,45 @@ class LiveTrader:
     
     async def _parse_log(self, log_item):
         """
-        Robust Decoder: Handles both Indexed (Legacy) and Unindexed (NegRisk) events.
+        Decodes the log and pushes to Queue.
         """
         try:
-            # 1. Clean Hex Strings
-            data_hex = log_item['data'][2:] # Remove '0x'
-            
-            # Split data into 32-byte chunks (64 hex characters)
+            # Clean Hex
+            data_hex = log_item['data'][2:] 
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
             
             maker_addr = None
             taker_addr = None
-            maker_asset_id = 0
-            taker_asset_id = 0
-            maker_amt = 0
-            taker_amt = 0
             
-            # 2. Determine Layout based on Topic Length
-            # Legacy Binary: topics has 4 items (Sig, OrderHash, Maker, Taker)
-            # New NegRisk: topics has 1 item (Sig only) -> Everything is in Data
-            
-            if len(log_item['topics']) == 4:
-                # --- LEGACY LAYOUT ---
-                maker_addr = "0x" + log_item['topics'][2][-40:]
-                taker_addr = "0x" + log_item['topics'][3][-40:]
+            # NegRisk Layout (All in Data)
+            # [OrderHash, Maker, Taker, MakerAssetId, TakerAssetId, ...]
+            if len(chunks) >= 7:
+                # Chunk 1: Maker Address
+                maker_addr = "0x" + chunks[1][-40:]
+                # Chunk 2: Taker Address
+                taker_addr = "0x" + chunks[2][-40:]
                 
-                # Data: [makerAssetId, takerAssetId, makerAmt, takerAmt, ...]
-                if len(chunks) >= 4:
-                    maker_asset_id = int(chunks[0], 16)
-                    taker_asset_id = int(chunks[1], 16)
-                    maker_amt = int(chunks[2], 16)
-                    taker_amt = int(chunks[3], 16)
+                maker_asset_id = int(chunks[3], 16)
+                taker_asset_id = int(chunks[4], 16)
+                maker_amt = int(chunks[5], 16)
+                taker_amt = int(chunks[6], 16)
 
-            elif len(log_item['topics']) == 1:
-                # --- NEGRISK LAYOUT (ALL IN DATA) ---
-                # Order: [OrderHash, Maker, Taker, MakerAssetId, TakerAssetId, MakerAmt, TakerAmt, Fee]
-                if len(chunks) >= 7:
-                    # Chunk 0: OrderHash
-                    # Chunk 1: Maker Address
-                    maker_addr = "0x" + chunks[1][-40:]
-                    # Chunk 2: Taker Address
-                    taker_addr = "0x" + chunks[2][-40:]
+                if maker_addr and taker_addr:
+                    trade_obj = {
+                        'id': log_item.get('transactionHash') or str(time.time()),
+                        'timestamp': int(time.time()),
+                        'taker': taker_addr,
+                        'maker': maker_addr,
+                        'makerAssetId': str(maker_asset_id),
+                        'takerAssetId': str(taker_asset_id),
+                        'makerAmountFilled': str(maker_amt),
+                        'takerAmountFilled': str(taker_amt)
+                    }
+                    await self.trade_queue.put(trade_obj)
                     
-                    maker_asset_id = int(chunks[3], 16)
-                    taker_asset_id = int(chunks[4], 16)
-                    maker_amt = int(chunks[5], 16)
-                    taker_amt = int(chunks[6], 16)
-
-            # 3. Create Trade Object (Only if decoding succeeded)
-            if maker_addr and taker_addr:
-                trade_obj = {
-                    'id': log_item['transactionHash'],
-                    'timestamp': int(time.time()),
-                    'taker': taker_addr,
-                    'maker': maker_addr,
-                    'makerAssetId': str(maker_asset_id),
-                    'takerAssetId': str(taker_asset_id),
-                    'makerAmountFilled': str(maker_amt),
-                    'takerAmountFilled': str(taker_amt)
-                }
-                await self.trade_queue.put(trade_obj)
-                
+                    # Force stats update so we see it in the log
+                    self.stats['processed_count'] += 1
+                    
         except Exception as e:
             # log.error(f"Parse Error: {e}") 
             pass
