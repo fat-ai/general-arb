@@ -59,7 +59,8 @@ class LiveTrader:
             self._maintenance_loop(),
             self._risk_monitor_loop(),
             self._reporting_loop(),
-            self._monitor_loop()
+            self._monitor_loop(),
+            self._ws_ingestion_loop()
         )
 
     async def shutdown(self):
@@ -226,6 +227,114 @@ class LiveTrader:
                 log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
+
+    async def _ws_ingestion_loop(self):
+        """
+        Replaces Goldsky Webhook. Connects to Polymarket WS, 
+        normalizes trade data, and feeds the internal trade_queue.
+        """
+        uri = "wss://ws-fidelity.polymarket.com"
+        log.info(f"🔌 CONNECTING to Trade Source: {uri}")
+        
+        while self.running:
+            try:
+                async with websockets.connect(uri) as ws:
+                    log.info("✅ CONNECTED to Polymarket Trade Stream")
+                    
+                    # 1. Subscribe to Trades (using your Sub Manager's list)
+                    # We subscribe to the entire market to catch all "last_trade_price" events
+                    # Note: Subscribing to specific assets is better if the list is huge.
+                    # For now, we subscribe to your active markets.
+                    sub_msg = {
+                        "assets": list(self.sub_manager.mandatory_subs), 
+                        "type": "market"
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    
+                    async for msg in ws:
+                        if not self.running: break
+                        
+                        data = json.loads(msg)
+                        events = data if isinstance(data, list) else [data]
+                        
+                        for event in events:
+                            if event.get("event_type") == "last_trade_price":
+                                # --- ADAPTER: CONVERT WS TO GOLDSKY FORMAT ---
+                                # We must fake the fields your Signal Engine expects
+                                adapted_trade = self._adapt_ws_to_goldsky(event)
+                                if adapted_trade:
+                                    await self.trade_queue.put(adapted_trade)
+
+            except Exception as e:
+                log.error(f"❌ Trade Stream Error: {e}")
+                await asyncio.sleep(5) # Cooldown before reconnect
+
+    def _adapt_ws_to_goldsky(self, event):
+        """
+        Converts a Polymarket WS 'last_trade_price' event into the 
+        Goldsky Subgraph format your logic expects.
+        """
+        try:
+            # WS Data: {"price": "0.60", "size": "10", "side": "BUY", "asset_id": "..."}
+            price = float(event.get("price", 0))
+            size = float(event.get("size", 0))
+            side = event.get("side", "UNKNOWN") # "BUY" or "SELL"
+            asset_id = event.get("asset_id")
+            timestamp = int(time.time())
+
+            # Skip invalid data
+            if not asset_id or price == 0 or size == 0:
+                return None
+
+            # MAPPING LOGIC:
+            # Your _process_batch logic expects:
+            # - makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+            # - taker (Wallet Address) -> WS DOES NOT PROVIDE THIS!
+            
+            # We must use a dummy wallet. 
+            # ⚠️ NOTE: This means WalletScorer will effectively be disabled for these trades.
+            dummy_wallet = "0x0000000000000000000000000000000000000000"
+
+            # Determine Assets based on "Side"
+            # Side "BUY" = Taker bought Token (Paid USDC)
+            # Side "SELL" = Taker sold Token (Got USDC)
+            usdc_addr = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # Polygon USDC
+            
+            if side == "BUY":
+                # Taker GIVES USDC, GETS Token
+                # Maker GIVES Token, GETS USDC
+                maker_asset = asset_id
+                taker_asset = usdc_addr
+                
+                # Amounts (approximate based on price)
+                # Maker gave 'size' tokens
+                maker_amt = size * 1e6 # assuming 6 decimals for internal logic
+                # Taker gave 'size * price' USDC
+                taker_amt = (size * price) * 1e6
+                
+            else: # SELL
+                # Taker GIVES Token, GETS USDC
+                # Maker GIVES USDC, GETS Token
+                maker_asset = usdc_addr
+                taker_asset = asset_id
+                
+                maker_amt = (size * price) * 1e6
+                taker_amt = size * 1e6
+
+            # Construct the Fake Goldsky Object
+            return {
+                'id': f"ws_{timestamp}_{asset_id}", # Fake ID
+                'timestamp': timestamp,
+                'maker': dummy_wallet, # Maker unknown
+                'taker': dummy_wallet, # Taker unknown (CRITICAL LIMITATION)
+                'makerAssetId': maker_asset,
+                'takerAssetId': taker_asset,
+                'makerAmountFilled': str(int(maker_amt)), # Logic expects strings often
+                'takerAmountFilled': str(int(taker_amt))
+            }
+        except Exception as e:
+            log.error(f"Adapter Error: {e}")
+            return None
 
     def _update_book_level(self, book_list, price, size, side):
         """
@@ -706,58 +815,16 @@ class LiveTrader:
             
             await asyncio.sleep(60)
             
-# --- NEW SERVER ARCHITECTURE ---
-# 1. Initialize the Web Server
-app = FastAPI()
-     
-# 2. Initialize the Trader (Global Instance)
-trader = LiveTrader()
-    
-# 3. Define the Startup Event 
-# This tells the Server: "When you wake up, start the Bot immediately."
-@app.on_event("startup")
-async def start_trading_system():
-    log.info("🚀 SERVER STARTED: Launching Trading Bot in background...")
-    logging.getLogger("uvicorn.access").disabled = True
-    if trader.trade_queue is None:
-        trader.trade_queue = asyncio.Queue()
-    # This runs your trader.start() loop in the background without blocking the server
-    asyncio.create_task(trader.start())
-    
-# 4. Define the Webhook Endpoint
-# This receives data from Goldsky and pushes it directly into the Bot
-@app.post("/webhook")
-async def receive_goldsky_data(request: Request):
+async def main():
     try:
-            
-        # Get the JSON payload
-        payload = await request.json()
-        log.info(f"📥 RAW DATA RECEIVED: {str(payload)[:200]}...")
-        # 1. Handle Lists (Goldsky often sends a batch of events)
-        if isinstance(payload, list):
-            events = payload
-        else:
-            events = [payload]
-            
-        # 2. Process every event in the batch
-        count = 0
-        for event in events:
-            # Goldsky sends { "op": "INSERT", "data": { ... } }
-            op = event.get("op", "UNKNOWN")
-            data = event.get("data")
-            
-            if op == "INSERT" and data:
-                # Direct injection into the trader
-                if trader.trade_queue:
-                    trader.trade_queue.put_nowait(data)
-                    count += 1
-                else:
-                    log.error("❌ CRITICAL: Trader Queue is missing!")
-            else:
-                log.warning(f"⚠️ Skipped event with Op: '{op}'")
-
-        return {"status": "processed", "count": count}
-                
+        # Create and Start the Trader
+        trader = LiveTrader()
+        await trader.start()
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+        await trader.shutdown()
     except Exception as e:
-        log.error(f"Webhook Error: {e}")
-        return {"status": "error"}
+        log.critical(f"Fatal Error: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
