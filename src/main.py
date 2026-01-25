@@ -111,7 +111,8 @@ class LiveTrader:
             last_seen = self.stats['last_trade_time']
             triggers = self.stats['triggers_count']
             scores = self.stats['scores']
-            
+
+            q_size = self.trade_queue.qsize() if self.trade_queue else 0
             # 2. Find Top 3 Scores
             # Sort descending (highest first) and take the first 3
             top_3 = sorted(scores, reverse=True)[:3]
@@ -129,9 +130,10 @@ class LiveTrader:
                     f"Last: {last_seen} | "
                     f"🏆 Top Scores: [{top_scores_str}] | "
                     f"🎯 Triggers: {triggers}"
+                    f"Queue Size: {q_size}"
                 )
             else:
-                log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...")
+                log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
             
             # 4. Reset counters for the next window
             self.stats['processed_count'] = 0
@@ -725,6 +727,9 @@ async def start_trading_system():
 @app.post("/webhook")
 async def receive_goldsky_data(request: Request):
     try:
+        if trader.trade_queue is None:
+            trader.trade_queue = asyncio.Queue()
+            
         # Get the JSON payload
         payload = await request.json()
         
@@ -733,6 +738,12 @@ async def receive_goldsky_data(request: Request):
             events = payload
         else:
             events = [payload]
+
+        if len(events) > 0:
+            first = events[0]
+            # Print only once every few seconds to avoid spamming too much
+            op_code = first.get("op", "UNKNOWN")
+            log.info(f"🕵️ SPY: Received {len(events)} events. First Op: '{op_code}'")
             
         # 2. Process every event in the batch
         count = 0
