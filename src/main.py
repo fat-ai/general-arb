@@ -113,6 +113,60 @@ class LiveTrader:
         finally:
             self.pending_orders.discard(token_id)
 
+    def _process_snapshot(self, item):
+        """
+        Handles initial Order Book snapshot (event_type: 'book').
+        """
+        try:
+            asset_id = item.get("asset_id")
+            if not asset_id: return
+
+            # Initialize book if missing
+            if asset_id not in self.order_books:
+                self.order_books[asset_id] = {'bids': {}, 'asks': {}}
+
+            # Polymarket sends full snapshots as lists of {price, size}
+            # We clear the old book and rebuild it
+            self.order_books[asset_id]['bids'] = {
+                x['price']: x['size'] for x in item.get('bids', [])
+            }
+            self.order_books[asset_id]['asks'] = {
+                x['price']: x['size'] for x in item.get('asks', [])
+            }
+            
+            # Optional: Log the heat if you want to verify data
+            # log.info(f"📸 Snapshot: {asset_id} | Bids: {len(self.order_books[asset_id]['bids'])}")
+
+        except Exception as e:
+            log.error(f"Snapshot Error: {e}")
+
+    def _process_update(self, item):
+        """
+        Handles incremental price updates (event_type: 'price_change').
+        """
+        try:
+            asset_id = item.get("asset_id")
+            if not asset_id or asset_id not in self.order_books: 
+                return
+
+            changes = item.get("changes", [])
+            for change in changes:
+                # change format: {"side": "buy", "price": "0.50", "size": "100"}
+                side = "bids" if change.get("side") == "buy" else "asks"
+                price = change.get("price")
+                size = change.get("size")
+                
+                if not price: continue
+
+                # If size is 0, remove the price level
+                if float(size) == 0:
+                    self.order_books[asset_id][side].pop(price, None)
+                else:
+                    self.order_books[asset_id][side][price] = size
+
+        except Exception as e:
+            log.error(f"Update Error: {e}")
+
     # --- LOOPS ---
 
     async def _subscription_monitor_loop(self):
