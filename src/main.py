@@ -358,8 +358,7 @@ class LiveTrader:
         log.info("⚡ Signal Loop: Waiting for Webhook Data...")
         
         while self.running:
-            # FIX: Use 'self.trade_queue' instead of 'trade_queue'
-            raw_trade = await GLOBAL_TRADE_QUEUE.get()
+            raw_trade = await self.trade_queue.get()
             
             try:
                 self.stats['processed_count'] += 1
