@@ -316,36 +316,70 @@ class LiveTrader:
                 await asyncio.sleep(5)
     
     async def _parse_log(self, log_item):
-        """Helper to decode hex logs safely"""
+        """
+        Robust Decoder: Handles both Indexed (Legacy) and Unindexed (NegRisk) events.
+        """
         try:
-            # Topics: [Signature, OrderHash, Maker, Taker]
-            maker_hex = log_item['topics'][2]
-            taker_hex = log_item['topics'][3]
+            # 1. Clean Hex Strings
+            data_hex = log_item['data'][2:] # Remove '0x'
             
-            maker_addr = "0x" + maker_hex[-40:]
-            taker_addr = "0x" + taker_hex[-40:]
-            
-            # Data Segment
-            data_hex = log_item['data'][2:]
+            # Split data into 32-byte chunks (64 hex characters)
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
             
-            maker_asset_id = int(chunks[0], 16)
-            taker_asset_id = int(chunks[1], 16)
-            maker_amt = int(chunks[2], 16)
-            taker_amt = int(chunks[3], 16)
+            maker_addr = None
+            taker_addr = None
+            maker_asset_id = 0
+            taker_asset_id = 0
+            maker_amt = 0
+            taker_amt = 0
             
-            trade_obj = {
-                'id': log_item['transactionHash'],
-                'timestamp': int(time.time()),
-                'taker': taker_addr,
-                'maker': maker_addr,
-                'makerAssetId': str(maker_asset_id),
-                'takerAssetId': str(taker_asset_id),
-                'makerAmountFilled': str(maker_amt),
-                'takerAmountFilled': str(taker_amt)
-            }
-            await self.trade_queue.put(trade_obj)
-        except:
+            # 2. Determine Layout based on Topic Length
+            # Legacy Binary: topics has 4 items (Sig, OrderHash, Maker, Taker)
+            # New NegRisk: topics has 1 item (Sig only) -> Everything is in Data
+            
+            if len(log_item['topics']) == 4:
+                # --- LEGACY LAYOUT ---
+                maker_addr = "0x" + log_item['topics'][2][-40:]
+                taker_addr = "0x" + log_item['topics'][3][-40:]
+                
+                # Data: [makerAssetId, takerAssetId, makerAmt, takerAmt, ...]
+                if len(chunks) >= 4:
+                    maker_asset_id = int(chunks[0], 16)
+                    taker_asset_id = int(chunks[1], 16)
+                    maker_amt = int(chunks[2], 16)
+                    taker_amt = int(chunks[3], 16)
+
+            elif len(log_item['topics']) == 1:
+                # --- NEGRISK LAYOUT (ALL IN DATA) ---
+                # Order: [OrderHash, Maker, Taker, MakerAssetId, TakerAssetId, MakerAmt, TakerAmt, Fee]
+                if len(chunks) >= 7:
+                    # Chunk 0: OrderHash
+                    # Chunk 1: Maker Address
+                    maker_addr = "0x" + chunks[1][-40:]
+                    # Chunk 2: Taker Address
+                    taker_addr = "0x" + chunks[2][-40:]
+                    
+                    maker_asset_id = int(chunks[3], 16)
+                    taker_asset_id = int(chunks[4], 16)
+                    maker_amt = int(chunks[5], 16)
+                    taker_amt = int(chunks[6], 16)
+
+            # 3. Create Trade Object (Only if decoding succeeded)
+            if maker_addr and taker_addr:
+                trade_obj = {
+                    'id': log_item['transactionHash'],
+                    'timestamp': int(time.time()),
+                    'taker': taker_addr,
+                    'maker': maker_addr,
+                    'makerAssetId': str(maker_asset_id),
+                    'takerAssetId': str(taker_asset_id),
+                    'makerAmountFilled': str(maker_amt),
+                    'takerAmountFilled': str(taker_amt)
+                }
+                await self.trade_queue.put(trade_obj)
+                
+        except Exception as e:
+            # log.error(f"Parse Error: {e}") 
             pass
             
     async def _resolution_monitor_loop(self):
