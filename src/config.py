@@ -31,7 +31,7 @@ CONFIG = {
     "stop_loss": 0.99,
     "take_profit": 1000.0,
     "preheat_threshold": 0.5,
-    "max_ws_subs": 500,
+    "max_ws_subs": 100000,
     "max_positions": 1000,
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
