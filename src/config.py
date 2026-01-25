@@ -18,7 +18,9 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 RPC_URL = "https://polygon-bor.publicnode.com" 
 
 EXCHANGE_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-ORDER_FILLED_TOPIC = "0x9d54e5657077a28f115949d12d45c553931855b778749c379a5b3a373d526555"
+
+# This is the hash for OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)
+ORDER_FILLED_TOPIC = "0xd0a08e8c205615d85202685a1dd7e078972e259e8f4704870d0617300f2e5133"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com"
 USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 
