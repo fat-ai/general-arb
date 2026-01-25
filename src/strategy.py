@@ -139,3 +139,53 @@ class SignalEngine:
         to_remove = [k for k, v in self.trackers.items() if now - v['last_ts'] > 3600]
         for k in to_remove:
             del self.trackers[k]
+
+class TradeLogic:
+    """
+    Pure logic class for deciding actions. 
+    Decouples 'Calculation' from 'Execution'.
+    """
+    
+    @staticmethod
+    def check_entry_signal(signal_weight: float) -> str:
+        """
+        Determines if a signal is strong enough to act on.
+        Returns: 'BUY', 'SPECULATE', or 'NONE'
+        """
+        abs_w = abs(signal_weight)
+        
+        if abs_w > CONFIG['splash_threshold']:
+            return 'BUY'
+        elif abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
+            return 'SPECULATE'
+        return 'NONE'
+
+    @staticmethod
+    def check_smart_exit(position_type: str, signal_weight: float) -> bool:
+        """
+        Determines if we should exit based on signal reversal.
+        
+        Args:
+            position_type: 'YES' (Long) or 'NO' (Short)
+            signal_weight: The current aggregated market signal
+            
+        Returns:
+            bool: True if we should exit immediately.
+        """
+        if not CONFIG['use_smart_exit']: return False
+        
+        threshold = CONFIG['splash_threshold'] * CONFIG['smart_exit_ratio']
+        
+        if position_type == 'YES':
+            # We are Long (Expecting Positive Signal). 
+            # Exit if signal drops below threshold (momentum lost).
+            if signal_weight < threshold:
+                return True
+                
+        elif position_type == 'NO':
+            # We are Short (Expecting Negative Signal).
+            # Exit if signal rises above -threshold (momentum lost).
+            if signal_weight > -threshold:
+                return True
+                
+        return False
