@@ -49,36 +49,43 @@ class LiveTrader:
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
         
-        # 1. Initialize Queue
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
-        # 2. START WS CLIENT (Connects to Polymarket)
-
-        self.ws_client = PolymarketWS("wss://ws-subscriptions-clob.polymarket.com", [], self.ws_queue.put_nowait)
+        # --- FIX 1: THREAD-SAFE CALLBACK ---
+        # We capture the current event loop
+        loop = asyncio.get_running_loop()
+        
+        # This wrapper safely moves data from the Thread to the Async Loop
+        def safe_callback(msg):
+            loop.call_soon_threadsafe(self.ws_queue.put_nowait, msg)
+            
+        # --- FIX 2: CONNECT ---
+        # Pass the SAFE callback, not the raw queue method
+        self.ws_client = PolymarketWS(
+            "wss://ws-subscriptions-clob.polymarket.com", 
+            [], 
+            safe_callback
+        )
         self.ws_client.start_thread()
 
-        # --- FIX: SEED THE SUBSCRIPTIONS ---
-        print("⏳ Fetching Market Metadata (This may take 10s)...")
-        await self.metadata.refresh() # <--- Force load of Token IDs
+        # --- FIX 3: SEED DATA ---
+        print("⏳ Fetching Market Metadata...")
+        await self.metadata.refresh()
         
-        # Collect all valid Token IDs (Yes/No tokens) from the metadata
-        # We take the top 500 to avoid hitting connection limits, or all if config allows
+        # Get valid tokens
         all_tokens = []
         for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
             if tokens and len(tokens) >= 2:
                 all_tokens.extend(tokens)
         
-        # Limit to 100 markets initially to test data flow
-        seed_tokens = all_tokens[:100] 
+        seed_tokens = all_tokens[:50] # Start small (50 markets) to verify data flow
         print(f"✅ Metadata Loaded. Subscribing to {len(seed_tokens)} assets...")
 
-        # Push to Subscription Manager
         self.sub_manager.set_mandatory(seed_tokens)
-        self.sub_manager.dirty = True # Force the monitor loop to send the 'subscribe' msg
-        # -----------------------------------
+        self.sub_manager.dirty = True 
 
-        # 3. Start Async Loops
+        # Start Async Loops
         await asyncio.gather(
             self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
