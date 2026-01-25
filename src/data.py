@@ -6,7 +6,7 @@ import requests
 from typing import Dict, List, Set, Any, Optional
 
 # Import configuration
-from config import GAMMA_API_URL, SUBGRAPH_URL, CONFIG
+from config import GAMMA_API_URL, CONFIG
 
 log = logging.getLogger("PaperGold")
 
