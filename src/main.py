@@ -495,9 +495,11 @@ class LiveTrader:
             # 1. Normalize Data
             maker_asset = str(t['makerAssetId']).lower()
             taker_asset = str(t['takerAssetId']).lower()
-            target_usdc = USDC_ADDRESS.lower()
+            target_usdc_hex = USDC_ADDRESS.lower()
+            target_usdc_dec = str(int(target_usdc_hex, 16))
             
-            def is_usdc(a): return a in ["0", "0x0", target_usdc]
+            def is_usdc(a): 
+            return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
 
             token_id = None
             usdc_vol = 0.0
