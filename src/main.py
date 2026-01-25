@@ -618,7 +618,8 @@ class LiveTrader:
         # 1. Wait for Liquidity (Now Non-Blocking safe)
         book = None
         for i in range(5):
-            book = self.ws_books.get(token_id)
+            # [FIX] Use self.order_books
+            book = self.order_books.get(token_id)
             if book and book.get('asks') and book.get('bids'): break
             
             if i == 0:
