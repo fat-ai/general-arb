@@ -65,6 +65,9 @@ class LiveTrader:
         self.ws_client.start_thread()
 
         # 3. LOAD ALL MARKETS
+        print("🧠 Loading Wallet Brain...")
+        self.scorer.load()
+        
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
         
