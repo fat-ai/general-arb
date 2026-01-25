@@ -601,7 +601,7 @@ class LiveTrader:
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
             
             if should_exit:
-                book = self.ws_books.get(pos_token)
+                book = self.order_books.get(pos_token)
                 if book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
                     await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=book)
@@ -631,7 +631,7 @@ class LiveTrader:
             await asyncio.sleep(1.0)
         
         # 2. Final Validation
-        book = self.ws_books.get(token_id)
+        book = self.order_books.get(token_id)
         if not book or not book.get('asks'): 
             log.warning(f"❌ Missed Opportunity: No Liquidity for {token_id}")
             return
@@ -685,7 +685,7 @@ class LiveTrader:
         pnl = (price - avg) / avg
         
         if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
-            book = self.ws_books.get(token_id)
+            book = self.order_books.get(token_id)
             if book:
                 log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
                 success = await self.broker.execute_market_order(
