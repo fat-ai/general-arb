@@ -2,3 +2,5 @@ websocket-client>=1.6.0
 requests>=2.31.0
 tabulate
 pandas
+websockets
+numpy
