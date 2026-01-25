@@ -1,11 +1,12 @@
 import time
 import json
 import os
+import traceback
 import pandas as pd
+import numpy as np               # <--- ADDED
 from pathlib import Path
+from tabulate import tabulate    # <--- ADDED
 from config import EQUITY_FILE, AUDIT_FILE, CONFIG
-import numpy as np
-import tabulate
 
 DASHBOARD_PATH = Path("dashboard.html")
 
@@ -134,6 +135,17 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# Helper to ensure JSON doesn't crash on Numpy types
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
+
 def generate_html_report(state, live_prices, metadata):
     try:
         # 1. Calculate Metrics
@@ -164,9 +176,7 @@ def generate_html_report(state, live_prices, metadata):
             side = "YES" if (tokens and str(tid) == tokens[1]) else "NO"
             
             # Prepare Chart Data (Price Trace)
-            # Ensure we have a list, even if empty
             hist = pos.get('trace_price', [])
-            # If empty, seed with entry price
             if not hist: hist = [entry]
             
             pos_data[tid] = {
@@ -184,8 +194,11 @@ def generate_html_report(state, live_prices, metadata):
         # 2. Prepare History
         hist_data = []
         for h in state.get("closed_history", [])[-10:]:
+            ts = h.get('exit_ts', 0)
+            t_str = time.strftime('%H:%M:%S', time.localtime(ts))
+            
             hist_data.append({
-                "time": time.strftime('%H:%M:%S', time.localtime(h.get('exit_ts', 0))),
+                "time": t_str,
                 "market": h.get('market_fpmm', '')[:6],
                 "status": h.get('status', 'CLOSED'),
                 "pnl": h.get('pnl_usd', 0),
@@ -202,8 +215,9 @@ def generate_html_report(state, live_prices, metadata):
         html = html.replace("{{PNL_COLOR}}", pnl_color)
         html = html.replace("{{POS_COUNT}}", str(len(pos_data)))
         
-        html = html.replace("{{POSITIONS_JSON}}", json.dumps(pos_data))
-        html = html.replace("{{HISTORY_JSON}}", json.dumps(hist_data))
+        # USE CUSTOM ENCODER TO PREVENT CRASHES
+        html = html.replace("{{POSITIONS_JSON}}", json.dumps(pos_data, cls=NpEncoder))
+        html = html.replace("{{HISTORY_JSON}}", json.dumps(hist_data, cls=NpEncoder))
         
         # 4. Write File
         with open(DASHBOARD_PATH, "w", encoding="utf-8") as f:
@@ -212,6 +226,7 @@ def generate_html_report(state, live_prices, metadata):
         return f"✅ Dashboard Updated: {DASHBOARD_PATH.absolute()}"
 
     except Exception as e:
+        traceback.print_exc()
         return f"Reporting Error: {e}"
 
 def generate_institutional_report():
@@ -235,34 +250,35 @@ def generate_institutional_report():
         df_trades = pd.DataFrame(trades)
 
         # --- 3. CALCULATE RISK METRICS (Time Series) ---
+        if df_eq.empty: return "⏳ Gathering Data..."
+        
         curr_eq = df_eq['equity'].iloc[-1]
         start_eq = CONFIG['initial_capital']
         total_ret = (curr_eq - start_eq) / start_eq
         
-        # Resample to Hourly to standardize volatility (remove minute-noise)
+        # Resample to Hourly
         df_hourly = df_eq['equity'].resample('1h').last().ffill()
         returns = df_hourly.pct_change().fillna(0)
         
         # Annualized Volatility (Crypto 24/7 = 8760 hours/yr)
-        vol = returns.std() * np.sqrt(8760)
+        vol_metric = returns.std() * np.sqrt(8760)
         
-        # Sharpe Ratio (Avg Return / Volatility)
+        # Sharpe Ratio
         sharpe = (returns.mean() / returns.std()) * np.sqrt(8760) if returns.std() > 0 else 0.0
         
-        # Sortino Ratio (Downside Risk Only)
+        # Sortino Ratio
         neg_ret = returns[returns < 0]
         downside_std = neg_ret.std()
         sortino = (returns.mean() / downside_std) * np.sqrt(8760) if downside_std > 0 else 0.0
         
-        max_dd = df_eq['drawdown'].min() # Drawdown is stored as negative or 0
+        max_dd = df_eq['drawdown'].min() 
 
         # --- 4. CALCULATE EXECUTION METRICS (Event Series) ---
         win_rate, profit_factor, expectancy = 0.0, 0.0, 0.0
         total_closed = 0
-        avg_win, avg_loss = 0.0, 0.0
 
         if not df_trades.empty and 'pnl' in df_trades.columns:
-            # Filter for Closed Trades (SELL or REDEEM)
+            # Filter for Closed Trades
             closed = df_trades[df_trades['side'].isin(['SELL', 'REDEEM'])]
             
             if not closed.empty:
@@ -270,7 +286,7 @@ def generate_institutional_report():
                 wins = closed[closed['pnl'] > 0]
                 losses = closed[closed['pnl'] <= 0]
                 
-                win_rate = len(wins) / total_closed
+                win_rate = len(wins) / total_closed if total_closed > 0 else 0
                 
                 gross_win = wins['pnl'].sum()
                 gross_loss = abs(losses['pnl'].sum())
@@ -279,7 +295,6 @@ def generate_institutional_report():
                 avg_win = wins['pnl'].mean() if not wins.empty else 0
                 avg_loss = losses['pnl'].mean() if not losses.empty else 0
                 
-                # Expectancy = (Win% * AvgWin) + (Loss% * AvgLoss)
                 expectancy = (avg_win * win_rate) + (avg_loss * (1 - win_rate))
 
         # --- 5. FORMAT OUTPUT ---
@@ -287,10 +302,10 @@ def generate_institutional_report():
             ["💰 Total Return", f"{total_ret:+.2%}"],
             ["💵 Current Equity", f"${curr_eq:,.2f}"],
             ["📉 Max Drawdown", f"{max_dd:.2%}"],
-            ["🌊 Annualized Vol", f"{vol:.2%}"],
+            ["🌊 Annualized Vol", f"{vol_metric:.2%}"],
             ["-----------------", "-----------------"],
-            ["📊 Sharpe Ratio", f"{sharpe:.2f} (>1.0 Good)"],
-            ["🛡️ Sortino Ratio", f"{sortino:.2f} (>1.5 Good)"],
+            ["📊 Sharpe Ratio", f"{sharpe:.2f}"],
+            ["🛡️ Sortino Ratio", f"{sortino:.2f}"],
             ["-----------------", "-----------------"],
             ["🎲 Closed Trades", f"{total_closed}"],
             ["✅ Win Rate", f"{win_rate:.1%}"],
@@ -298,8 +313,8 @@ def generate_institutional_report():
             ["🔮 Expectancy", f"${expectancy:.2f} / trade"]
         ]
         
-        table = tabulate(data, headers=["Metric", "Value"], tablefmt="fancy_grid")
-        return f"\nINSTITUTIONAL PERFORMANCE REPORT\n{table}"
+        return f"\nINSTITUTIONAL PERFORMANCE REPORT\n{tabulate(data, headers=['Metric', 'Value'], tablefmt='fancy_grid')}"
 
     except Exception as e:
+        traceback.print_exc()
         return f"Reporting Error: {e}"
