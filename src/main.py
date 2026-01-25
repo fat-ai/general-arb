@@ -7,7 +7,6 @@ import logging
 import requests
 import csv
 import queue
-import websockets
 from typing import Dict, List, Set
 
 # --- MODULE IMPORTS ---
@@ -51,16 +50,21 @@ class LiveTrader:
         print("\n🚀 STARTING LIVE PAPER TRADER (HYBRID MODE)")
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
+        
+        self.ws_client = PolymarketWS(self.ws_queue)
+        await self.ws_client.start_client() 
+        # ---------------------------------------------------
+
         # Start Async Loops
         await asyncio.gather(
-            self._subscription_monitor_loop(), # Replaces ingestion loop
+            self._subscription_monitor_loop(), 
             self._ws_processor_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
             self._risk_monitor_loop(),
             self._reporting_loop(),
             self._monitor_loop(),
-            self._ws_ingestion_loop()
+            # self._ws_ingestion_loop()  <-- DELETE THIS LINE
         )
 
     async def shutdown(self):
@@ -221,47 +225,6 @@ class LiveTrader:
                 log.error(f"WS Parse Error: {e}")
             finally:
                 self.ws_queue.task_done()
-
-    async def _ws_ingestion_loop(self):
-        """
-        Replaces Goldsky Webhook. Connects to Polymarket WS, 
-        normalizes trade data, and feeds the internal trade_queue.
-        """
-        uri = "wss://ws-fidelity.polymarket.com"
-        log.info(f"🔌 CONNECTING to Trade Source: {uri}")
-        
-        while self.running:
-            try:
-                async with websockets.connect(uri) as ws:
-                    log.info("✅ CONNECTED to Polymarket Trade Stream")
-                    
-                    # 1. Subscribe to Trades (using your Sub Manager's list)
-                    # We subscribe to the entire market to catch all "last_trade_price" events
-                    # Note: Subscribing to specific assets is better if the list is huge.
-                    # For now, we subscribe to your active markets.
-                    sub_msg = {
-                        "assets": list(self.sub_manager.mandatory_subs), 
-                        "type": "market"
-                    }
-                    await ws.send(json.dumps(sub_msg))
-                    
-                    async for msg in ws:
-                        if not self.running: break
-                        
-                        data = json.loads(msg)
-                        events = data if isinstance(data, list) else [data]
-                        
-                        for event in events:
-                            if event.get("event_type") == "last_trade_price":
-                                # --- ADAPTER: CONVERT WS TO GOLDSKY FORMAT ---
-                                # We must fake the fields your Signal Engine expects
-                                adapted_trade = self._adapt_ws_to_goldsky(event)
-                                if adapted_trade:
-                                    await self.trade_queue.put(adapted_trade)
-
-            except Exception as e:
-                log.error(f"❌ Trade Stream Error: {e}")
-                await asyncio.sleep(5) # Cooldown before reconnect
 
     def _adapt_ws_to_goldsky(self, event):
         """
