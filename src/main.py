@@ -20,7 +20,6 @@ from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
-GLOBAL_TRADE_QUEUE = None
 
 class LiveTrader:
     def __init__(self):
