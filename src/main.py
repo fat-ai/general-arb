@@ -248,16 +248,42 @@ class LiveTrader:
 
     async def _poll_subgraph_loop(self):
         """
-        Polls the Public Subgraph to get trades WITH Wallet IDs.
+        Polls the Public Subgraph with Auto-Sync to handle indexing lag.
         """
-        from config import SUBGRAPH_URL 
-        log.info(f"🕵️ STARTING DEANONYMIZER (Source: {SUBGRAPH_URL})")
+        # Primary and Backup URLs
+        URLS = [
+            "https://api.thegraph.com/subgraphs/name/tokenunion/polymarket-matic",
+            "https://api.thegraph.com/subgraphs/name/polymarket/matic-markets-4"
+        ]
         
-        last_timestamp = int(time.time()) - 60 
+        current_url = URLS[0]
+        log.info(f"🕵️ STARTING DEANONYMIZER (Source: {current_url})")
         
+        # --- PHASE 1: INITIAL SYNC ---
+        # Find the "Head" of the subgraph (the latest trade it knows about)
+        last_timestamp = 0
+        try:
+            query = """{ transactions(first: 1, orderBy: timestamp, orderDirection: desc) { timestamp } }"""
+            
+            resp = await asyncio.to_thread(requests.post, current_url, json={'query': query})
+            data = resp.json().get('data', {}).get('transactions', [])
+            
+            if data:
+                last_timestamp = int(data[0]['timestamp'])
+                lag = int(time.time()) - last_timestamp
+                log.info(f"⏰ Subgraph Synced! Lag: {lag} seconds. Starting stream from there.")
+            else:
+                log.warning("⚠️ Subgraph returned no data. Defaulting to 1 hour ago.")
+                last_timestamp = int(time.time()) - 3600
+                
+        except Exception as e:
+            log.error(f"Sync Handshake Failed: {e}")
+            last_timestamp = int(time.time()) - 300 # Default to 5 mins ago
+
+        # --- PHASE 2: STREAMING ---
         while self.running:
             try:
-                # 1. Query for RECENT trades (Global feed)
+                # Ask for trades NEWER than the last one we processed
                 query = f"""
                 {{
                     transactions(
@@ -268,7 +294,7 @@ class LiveTrader:
                     ) {{
                         id
                         timestamp
-                        user {{ id }} 
+                        user {{ id }}
                         market {{ id }}
                         tradeAmount
                         outcomeIndex
@@ -277,18 +303,21 @@ class LiveTrader:
                 }}
                 """
                 
-                resp = await asyncio.to_thread(requests.post, SUBGRAPH_URL, json={'query': query})
+                resp = await asyncio.to_thread(requests.post, current_url, json={'query': query})
                 
                 if resp.status_code == 200:
                     data = resp.json().get('data', {})
                     trades = data.get('transactions', [])
                     
                     if trades:
+                        # Update our cursor to the latest trade in this batch
                         last_timestamp = max(int(t['timestamp']) for t in trades)
                         
+                        log.info(f"📥 De-anonymizer: Fetched {len(trades)} new trades")
+                        
                         for t in trades:
-                            # Normalize to your internal format
-                            wallet_id = t['user']['id'] 
+                            # Normalize & Inject
+                            wallet_id = t['user']['id']
                             fpmm = t['market']['id']
                             
                             trade_obj = {
@@ -300,15 +329,19 @@ class LiveTrader:
                                 'usdc_vol': float(t['tradeAmount']) / 1e6,
                                 'direction': 1.0 if t['type'] == "Buy" else -1.0
                             }
-                            
                             await self.trade_queue.put(trade_obj)
-                    
+                    else:
+                        # If empty, just chill. We are at the chain tip.
+                        pass
+                else:
+                    log.warning(f"Subgraph Error {resp.status_code}")
+
             except Exception as e:
                 log.error(f"Subgraph Poll Failed: {e}")
             
-            # Wait 2 seconds (Public endpoints have rate limits)
+            # Wait 2 seconds to be polite
             await asyncio.sleep(2.0)
-
+            
     async def _resolution_monitor_loop(self):
         """Checks if any held positions have resolved using Batched API calls."""
         log.info("⚖️ Resolution Monitor Started (Batched Mode)")
