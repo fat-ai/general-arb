@@ -604,7 +604,23 @@ class LiveTrader:
                 book = self.order_books.get(pos_token)
                 if book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
-                    await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=book)
+                    bids_dict = book.get('bids', {})
+                    asks_dict = book.get('asks', {})
+            
+                    if not bids_dict or not asks_dict:
+                        log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
+                        return
+            
+                    # Create Lists: [[price, size], [price, size], ...]
+                    bids_list = [[p, s] for p, s in bids_dict.items()]
+                    asks_list = [[p, s] for p, s in asks_dict.items()]
+            
+                    # Sort: Bids = Highest First, Asks = Lowest First
+                    sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
+                    sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+                    
+                    clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
+                    await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=clean_book)
 
     # --- EXECUTION HELPERS ---
 
@@ -613,14 +629,12 @@ class LiveTrader:
         
         if token_id in self.persistence.state["positions"]:
             return
-        # -----------------------------------------------
 
-        # 1. Wait for Liquidity (Now Non-Blocking safe)
-        book = None
+        # 1. Wait for Liquidity
+        raw_book = None
         for i in range(5):
-            # [FIX] Use self.order_books
-            book = self.order_books.get(token_id)
-            if book and book.get('asks') and book.get('bids'): break
+            raw_book = self.order_books.get(token_id) # Use self.order_books
+            if raw_book and raw_book.get('asks') and raw_book.get('bids'): break
             
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for {token_id}...")
@@ -630,52 +644,63 @@ class LiveTrader:
                     self.sub_manager.dirty = True 
             await asyncio.sleep(1.0)
         
-        # 2. Final Validation
-        book = self.order_books.get(token_id)
-        if not book or not book.get('asks'): 
-            log.warning(f"❌ Missed Opportunity: No Liquidity for {token_id}")
+        # 2. DATA CONVERSION (Dict -> List)
+        # We must convert the {price: size} dictionary into a sorted list [[price, size]]
+        # so the Broker can calculate VWAP and we can check the spread.
+        if not raw_book: return
+
+        bids_dict = raw_book.get('bids', {})
+        asks_dict = raw_book.get('asks', {})
+
+        if not bids_dict or not asks_dict:
+            log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
             return
 
-        best_bid = book['bids'][0][0]
-        best_ask = book['asks'][0][0]
+        # Create Lists: [[price, size], [price, size], ...]
+        bids_list = [[p, s] for p, s in bids_dict.items()]
+        asks_list = [[p, s] for p, s in asks_dict.items()]
+
+        # Sort: Bids = Highest First, Asks = Lowest First
+        sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
+        sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+        
+        # 3. Final Validation
+        best_bid = float(sorted_bids[0][0])
+        best_ask = float(sorted_asks[0][0])
+        
         if best_ask > 0:
             spread = (best_ask - best_bid) / best_ask
-            if spread > 0.15: # 15% Max Spread
+            if spread > 0.15: 
                 log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
                 return
 
-        # 3. Execute
-        trade_size = CONFIG['fixed_size'] # Default fallback
+        # 4. Prepare "Clean" Book for Broker
+        # The broker expects lists, not dictionaries.
+        clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
+
+        # 5. Execute
+        trade_size = CONFIG['fixed_size'] 
         
         if CONFIG.get('use_percentage_staking'):
             try:
-                # 1. Get Total Equity (Cash + Position Value)
                 total_equity = self.persistence.calculate_equity()
-                
-                # 2. Calculate Stake
                 calculated_stake = total_equity * CONFIG['percentage_stake']
-                
-                # 3. Safety Floor (Don't bet less than $2.00)
                 trade_size = max(2.0, calculated_stake)
-                
-                # 4. Cash Check
                 available_cash = self.persistence.state["cash"]
                 if trade_size > available_cash:
-                    log.warning(f"⚠️ Insufficient Cash for % Stake. Need ${trade_size:.2f}, Available: ${available_cash:.2f}")
+                    log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
                     return 
-                    
             except Exception as e:
-                log.error(f"Sizing Calculation Failed: {e}. Reverting to fixed size.")
+                log.error(f"Sizing Failed: {e}")
                 trade_size = CONFIG['fixed_size']
                 
         success = await self.broker.execute_market_order(
-            token_id, "BUY", trade_size, fpmm, current_book=book
+            token_id, "BUY", trade_size, fpmm, current_book=clean_book
         )
         
         if success:
              open_pos = list(self.persistence.state["positions"].keys())
              self.sub_manager.set_mandatory(open_pos)
-            
             
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
@@ -688,9 +713,28 @@ class LiveTrader:
             book = self.order_books.get(token_id)
             if book:
                 log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
+
+                bids_dict = book.get('bids', {})
+                asks_dict = book.get('asks', {})
+        
+                if not bids_dict or not asks_dict:
+                    log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
+                    return
+        
+                # Create Lists: [[price, size], [price, size], ...]
+                bids_list = [[p, s] for p, s in bids_dict.items()]
+                asks_list = [[p, s] for p, s in asks_dict.items()]
+        
+                # Sort: Bids = Highest First, Asks = Lowest First
+                sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
+                sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+                
+                clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
+                
                 success = await self.broker.execute_market_order(
-                    token_id, "SELL", 0, pos['market_fpmm'], current_book=book
+                    token_id, "SELL", 0, pos['market_fpmm'], current_book=clean_book
                 )
+                
                 if success:
                     open_pos = list(self.persistence.state["positions"].keys())
                     self.sub_manager.set_mandatory(open_pos)
