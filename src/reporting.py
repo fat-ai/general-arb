@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 from config import EQUITY_FILE, AUDIT_FILE, CONFIG
 import numpy as np
+import tabulate
 
 DASHBOARD_PATH = Path("dashboard.html")
 
