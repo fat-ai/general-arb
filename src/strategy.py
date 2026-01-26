@@ -106,11 +106,14 @@ class SignalEngine:
         
         # 1. Get Score
         score = scorer.get_score(wallet, usdc_vol)
-        
+
+        # Ignore bad traders rather than fade them
+        score = max(0.0, score)
+                          
         # If score is still 0, we can't do anything
         if score == 0.0:
             return self.get_signal(fpmm)
-
+              
         # 2. Initialize Tracker
         if fpmm not in self.trackers:
             self.trackers[fpmm] = {'weight': 0.0, 'last_ts': time.time()}
@@ -118,10 +121,13 @@ class SignalEngine:
         tracker = self.trackers[fpmm]
         
         # 3. Apply Decay
-        self._apply_decay(tracker)
+        #self._apply_decay(tracker)
+
+        skill_factor = np.log1p(raw_skill * 100)
+        weight_multiplier = 1.0 + min(skill_factor * 2.0, 10.0)
         
         # 4. Calculate Impact
-        raw_impact = usdc_vol * score
+        raw_impact = usdc_vol * weight_multiplier
         
         # 5. Apply Direction
         final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction
