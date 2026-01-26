@@ -246,7 +246,7 @@ class DataFetcher:
         
         drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
-        new_df = new_df.drop_duplicates(subset=['contract_id'])
+        new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
         # -----------------------------------------------------
 
         # 6. MERGE WITH EXISTING
