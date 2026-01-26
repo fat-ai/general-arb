@@ -368,9 +368,18 @@ class DataFetcher:
                 return pd.DataFrame()
         
         try:
+            # explicit end date from config
             global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
         except NameError:
+            # fallback to now
             global_start_cursor = int(time.time())
+
+        try:
+            # CRITICAL FIX: explicit start date from config
+            global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
+        except NameError:
+            # fallback to days_back math if constant is missing
+            global_stop_ts = global_start_cursor - (days_back * 86400)
             
         global_stop_ts = global_start_cursor - (days_back * 86400)
 
