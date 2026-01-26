@@ -18,10 +18,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-DAYS_BACK = 365
-FIXED_END_DATE = pd.Timestamp("2026-01-02") # Kept from original context, adjustable if needed
-CACHE_DIR = Path("polymarket_cache")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+FIXED_START_DATE = pd.Timestamp("2025-01-02")
+FIXED_END_DATE   = pd.Timestamp("2026-01-02")
+today = pd.Timestamp.now().normalize()
+DAYS_BACK = (today - FIXED_START_DATE).days + 10
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
@@ -151,6 +151,7 @@ class DataFetcher:
             'volume': 'volume',
             'conditionId': 'condition_id'
         }
+        
         df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
         
         df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
