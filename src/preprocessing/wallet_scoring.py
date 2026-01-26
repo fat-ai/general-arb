@@ -105,17 +105,28 @@ def fetch_filtered_outcomes(min_timestamp_str):
     df['contract_id_list'] = df['contract_id'].str.split(',')
     df['market_row_id'] = df.index 
     df = df.explode('contract_id_list')
+    
+    # 0 = NO Token, 1 = YES Token (Standard Polymarket Binary)
     df['token_index'] = df.groupby('market_row_id').cumcount()
     df['contract_id'] = df['contract_id_list'].str.strip()
     
-    def final_payout(row):
-        winning_idx = int(round(row['outcome']))
-        return 1.0 if row['token_index'] == winning_idx else 0.0
+    # Save the MARKET Outcome (e.g. 1.0 = YES Won, 0.0 = NO Won)
+    # derived from the API outcome field
+    def get_market_outcome(row):
+        try:
+            return float(row['outcome']) # Returns 1.0 or 0.0
+        except:
+            return np.nan
 
-    df['final_outcome'] = df.apply(final_payout, axis=1)
+    df['market_outcome'] = df.apply(get_market_outcome, axis=1)
     df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
     
-    pl_outcomes = pl.from_pandas(df[['contract_id', 'final_outcome']].drop_duplicates(subset=['contract_id']))
+    # We now save 'token_index' and 'market_outcome'
+    pl_outcomes = pl.from_pandas(
+        df[['contract_id', 'token_index', 'market_outcome']]
+        .drop_duplicates(subset=['contract_id'])
+    )
+    
     pl_outcomes.write_parquet(cache_file)
     return pl_outcomes
 
@@ -312,18 +323,28 @@ def main():
                 pl.col("cost_short").sum(),
                 pl.col("trade_count").sum()
             ])
+            # Join token_index (0=No, 1=Yes) and market_outcome (1=YesWins)
             .join(outcomes.lazy(), on="contract_id", how="inner")
             .with_columns([
-                # 1. Total Invested (Sum of both costs)
                 (pl.col("cost_long") + pl.col("cost_short")).alias("total_invested_contract"),
 
-                # 2. Final Payout Value
-                # Longs pay out on Outcome (0 or 1)
-                # Shorts pay out on Inverse Outcome (1 - Outcome)
-                (
-                    (pl.col("qty_long") * pl.col("final_outcome")) + 
-                    (pl.col("qty_short") * (1.0 - pl.col("final_outcome")))
-                ).alias("final_payout")
+                # === THE ADJUSTMENT ===
+                pl.when(pl.col("token_index") == 1) 
+                # CASE A: YES TOKEN (Standard)
+                # Long pays if Yes Wins (Outcome)
+                # Short pays if Yes Loses (1 - Outcome)
+                .then(
+                    (pl.col("qty_long") * pl.col("market_outcome")) + 
+                    (pl.col("qty_short") * (1.0 - pl.col("market_outcome")))
+                )
+                # CASE B: NO TOKEN (Inverted)
+                # Long pays if Yes Loses (1 - Outcome)
+                # Short pays if Yes Wins (Outcome)
+                .otherwise(
+                    (pl.col("qty_long") * (1.0 - pl.col("market_outcome"))) + 
+                    (pl.col("qty_short") * pl.col("market_outcome"))
+                )
+                .alias("final_payout")
             ])
             .with_columns([
                 (pl.col("final_payout") - pl.col("total_invested_contract")).alias("pnl")
