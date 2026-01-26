@@ -124,38 +124,61 @@ def fetch_filtered_outcomes(min_timestamp_str):
 # ==========================================
 
 def process_chunk_universal(df_chunk, outcomes_df):
-    # Normalize IDs
+    # Standard cleanup
     df_chunk = df_chunk.with_columns(
         pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "")
     )
-    
     df_chunk = df_chunk.filter(pl.col("price").is_between(0.001, 0.999))
     
     joined = df_chunk.join(outcomes_df, on="contract_id", how="inner")
     
-    if joined.height == 0:
-        return None
+    if joined.height == 0: return None
 
-    # Calculate Cash Values
+    # LOGIC CHANGE: Split into "Long Side" and "Short Side" (Implied NO)
     joined = joined.with_columns([
-        (pl.col("price") * pl.col("outcomeTokensAmount").abs()).alias("cash_value"),
-        (pl.col("outcomeTokensAmount").abs()).alias("size")
+        # 1. Identify trade direction
+        (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
+        
+        # 2. Absolute Token Count (Quantity is always positive)
+        (pl.col("outcomeTokensAmount").abs()).alias("quantity"),
+    ])
+
+    # 3. Calculate Cost based on direction
+    # If Buy:  Cost = Price * Quantity
+    # If Sell: Cost = (1.0 - Price) * Quantity  <-- "Paying for the NO token"
+    joined = joined.with_columns([
+        pl.when(pl.col("is_buy"))
+          .then(pl.col("price") * pl.col("quantity"))
+          .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
+          .alias("invested_amount")
     ])
 
     stats = (
         joined.group_by(["user", "contract_id"])
         .agg([
-            pl.col("size").filter(pl.col("outcomeTokensAmount") > 0).sum().fill_null(0).alias("tokens_yes"),
-            pl.col("cash_value").filter(pl.col("outcomeTokensAmount") > 0).sum().fill_null(0).alias("cost_buy_yes"),
-            
-            pl.col("size").filter(pl.col("outcomeTokensAmount") < 0).sum().fill_null(0).alias("tokens_no"),
-            pl.col("cash_value").filter(pl.col("outcomeTokensAmount") < 0).sum().fill_null(0).alias("cash_from_sell"),
-            
+            # BUCKET 1: LONG TOKENS (Buying YES)
+            pl.col("quantity")
+              .filter(pl.col("is_buy"))
+              .sum().fill_null(0).alias("qty_long"),
+              
+            pl.col("invested_amount")
+              .filter(pl.col("is_buy"))
+              .sum().fill_null(0).alias("cost_long"),
+
+            # BUCKET 2: SHORT TOKENS (Selling YES = Buying NO)
+            pl.col("quantity")
+              .filter(~pl.col("is_buy"))
+              .sum().fill_null(0).alias("qty_short"), # Effectively "NO" tokens
+              
+            pl.col("invested_amount")
+              .filter(~pl.col("is_buy"))
+              .sum().fill_null(0).alias("cost_short"),
+
             pl.len().alias("trade_count")
         ])
     )
     return stats
-
+    
 # ==========================================
 # 3. MAIN EXECUTION
 # ==========================================
@@ -272,10 +295,10 @@ def main():
         schema_map = {
             "user": pl.String,
             "contract_id": pl.String,
-            "tokens_yes": pl.Float64,
-            "cost_buy_yes": pl.Float64,
-            "tokens_no": pl.Float64,
-            "cash_from_sell": pl.Float64,
+            "qty_long": pl.Float64,
+            "cost_long": pl.Float64,
+            "qty_short": pl.Float64,
+            "cost_short": pl.Float64,
             "trade_count": pl.Int64
         }
 
@@ -283,46 +306,34 @@ def main():
             pl.scan_csv(temp_file, schema_overrides=schema_map)
             .group_by(["user", "contract_id"])
             .agg([
-                pl.col("tokens_yes").sum(),
-                pl.col("cost_buy_yes").sum(),
-                pl.col("tokens_no").sum(),
-                pl.col("cash_from_sell").sum(),
+                pl.col("qty_long").sum(),
+                pl.col("cost_long").sum(),
+                pl.col("qty_short").sum(),
+                pl.col("cost_short").sum(),
                 pl.col("trade_count").sum()
             ])
             .join(outcomes.lazy(), on="contract_id", how="inner")
             .with_columns([
-                # 1. Calculate Implicit Cost of NO tokens (Shorts)
-                (pl.col("tokens_no") - pl.col("cash_from_sell")).alias("cost_buy_no"),
-                
-                # 2. Calculate Final Portfolio Value
+                # 1. Total Invested (Sum of both costs)
+                (pl.col("cost_long") + pl.col("cost_short")).alias("total_invested_contract"),
+
+                # 2. Final Payout Value
+                # Longs pay out on Outcome (0 or 1)
+                # Shorts pay out on Inverse Outcome (1 - Outcome)
                 (
-                    (pl.col("tokens_yes") * pl.col("final_outcome")) + 
-                    (pl.col("tokens_no") * (1.0 - pl.col("final_outcome")))
-                ).alias("residual_value")
+                    (pl.col("qty_long") * pl.col("final_outcome")) + 
+                    (pl.col("qty_short") * (1.0 - pl.col("final_outcome")))
+                ).alias("final_payout")
             ])
             .with_columns([
-                (pl.col("cost_buy_yes") + pl.col("cost_buy_no")).alias("invested"),
-                (pl.col("residual_value") - (pl.col("cost_buy_yes") + pl.col("cost_buy_no"))).alias("pnl")
+                (pl.col("final_payout") - pl.col("total_invested_contract")).alias("pnl")
             ])
             .group_by("user")
             .agg([
                 pl.col("pnl").sum().alias("total_pnl"),
-                pl.col("invested").sum().alias("total_invested"),
+                pl.col("total_invested_contract").sum().alias("total_invested"),
                 pl.col("trade_count").sum().alias("total_trades")
             ])
-            .filter(
-                (pl.col("total_trades") >= 2) & 
-                (pl.col("total_invested") > 100.0) 
-            )
-            .with_columns([
-                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
-            ])
-            .with_columns([
-                (pl.col("roi") * pl.col("vol_boost")).alias("score")
-            ])
-            .collect(engine="streaming")
-        )
 
         print(f"✅ Calculation complete. Scored {final_stats.height} wallets.", flush=True)
 
