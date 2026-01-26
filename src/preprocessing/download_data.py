@@ -104,8 +104,9 @@ class DataFetcher:
                 try:
                     resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
                     if resp.status_code != 200: 
-                        print(f"[Error {resp.status_code}]", end=" ")
-                        break
+                        print(f" ❌ {resp.status_code}")
+                        time.sleep(2)  # Wait 2 seconds
+                        continue
                     
                     rows = resp.json()
                     if not rows: break
