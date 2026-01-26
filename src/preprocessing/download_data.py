@@ -278,6 +278,7 @@ class DataFetcher:
         import time
         import os
         import shutil
+        import pandas as pd  # Explicit import to ensure pd.Timestamp works
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -324,13 +325,13 @@ class DataFetcher:
                 try:
                     row = next(csv.reader([first_line.decode('utf-8')]))
                     high_ts = parse_iso_to_ts(row[1])
+                    low_ts = high_ts 
                 except Exception as e:
-                    print(f"   ⚠️ Error reading first line: {e}")
                     return None, None
                 
                 f.seek(0, os.SEEK_END)
                 try:
-                    while f.tell() > len(header) + len(first_line):
+                    while f.tell() > len(header) + len(first_line) + 1:
                         f.seek(-2, os.SEEK_CUR)
                         while f.read(1) != b'\n':
                             f.seek(-2, os.SEEK_CUR)
@@ -340,11 +341,13 @@ class DataFetcher:
                         
                         try:
                             row = next(csv.reader([last_line.decode('utf-8')]))
-                            low_ts = parse_iso_to_ts(row[1])
-                            break 
+                            parsed_low = parse_iso_to_ts(row[1])
+                            if parsed_low > 0:
+                                low_ts = parsed_low
+                                break 
                         except: continue
-                except Exception as e:
-                    print(f"   ⚠️ Error reading last line: {e}")
+                except Exception:
+                    pass 
             
             return high_ts, low_ts
 
@@ -367,22 +370,194 @@ class DataFetcher:
                 print("   ❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
                 print("   ➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
                 return pd.DataFrame()
-        
-        try:
-            # explicit end date from config
-            global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
-        except NameError:
-            # fallback to now
-            global_start_cursor = int(time.time())
 
+        # --- DATE CONFIGURATION (Robust) ---
+        # Explicitly look for globals if available, otherwise rely on hard error to warn user
         try:
-            # CRITICAL FIX: explicit start date from config
-            global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
-        except NameError:
-            # fallback to days_back math if constant is missing
-            global_stop_ts = global_start_cursor - (days_back * 86400)
+            # We access the module-level globals if possible, or use the variable if it's in scope
+            if 'FIXED_END_DATE' in globals():
+                global_start_cursor = int(pd.Timestamp(globals()['FIXED_END_DATE']).timestamp())
+                print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
+            else:
+                # Fallback only if strictly necessary
+                global_start_cursor = int(time.time())
+                print(f"   ⚠️ Config End Date not found. Using NOW.")
+
+            if 'FIXED_START_DATE' in globals():
+                global_stop_ts = int(pd.Timestamp(globals()['FIXED_START_DATE']).timestamp())
+                print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
+            else:
+                # Fallback to days_back logic
+                global_stop_ts = global_start_cursor - (days_back * 86400)
+                print(f"   ⚠️ Config Start Date not found. Using days_back={days_back}.")
+                
+        except Exception as e:
+            print(f"   ⚠️ Date calculation error: {e}. Defaulting to safe 24h window.")
+            global_start_cursor = int(time.time())
+            global_stop_ts = global_start_cursor - 86400
+
+        # 5. EXECUTION FUNCTION
+        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
+            cursor = int(start_ts)
+            stop_limit = int(end_ts)
             
-        global_stop_ts = global_start_cursor - (days_back * 86400)
+            print(f"   🚀 Starting Segment: {segment_name}")
+            print(f"      Range: {datetime.utcfromtimestamp(cursor)} -> {datetime.utcfromtimestamp(stop_limit)}")
+            
+            seg_captured = 0
+            seg_dropped = 0
+            batch_num = 0
+            
+            while cursor > stop_limit:
+                try:
+                    batch_num += 1
+                    query = f"""
+                    query {{
+                        orderFilledEvents(
+                            first: 1000, 
+                            orderBy: timestamp, 
+                            orderDirection: desc, 
+                            where: {{ timestamp_lt: {cursor}, timestamp_gte: {stop_limit} }}
+                        ) {{
+                            id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+                        }}
+                    }}
+                    """
+                    
+                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=10)
+                    if resp.status_code != 200:
+                        print(f" ❌ {resp.status_code}")
+                        time.sleep(2)
+                        continue
+
+                    data = resp.json().get('data', {}).get('orderFilledEvents', [])
+                    
+                    if not data:
+                        print(" Gap/Done.")
+                        break
+
+                    by_ts = defaultdict(list)
+                    for row in data:
+                        ts = int(row['timestamp'])
+                        by_ts[ts].append(row)
+                    
+                    sorted_ts = sorted(by_ts.keys(), reverse=True)
+                    oldest_ts = sorted_ts[-1]
+                    is_full_batch = (len(data) >= 1000)
+                    
+                    out_rows = []
+                    
+                    for ts in sorted_ts:
+                        if is_full_batch and ts == oldest_ts: continue
+                        
+                        for r in by_ts[ts]:
+                            if r.get('maker') == r.get('taker'):
+                                seg_dropped += 1; continue
+                            
+                            m_raw = str(r.get('makerAssetId', '0')).strip()
+                            if m_raw.startswith("0x"): m_int = int(m_raw, 16)
+                            else: m_int = int(Decimal(m_raw))
+                            
+                            t_raw = str(r.get('takerAssetId', '0')).strip()
+                            if t_raw.startswith("0x"): t_int = int(t_raw, 16)
+                            else: t_int = int(Decimal(t_raw))
+                            
+                            tid = None; mult = 0
+                            if m_int in valid_token_ints:
+                                tid = m_int; mult = 1
+                                val_usdc = float(r['takerAmountFilled']) / 1e6
+                                val_size = float(r['makerAmountFilled']) / 1e6
+                            elif t_int in valid_token_ints:
+                                tid = t_int; mult = -1
+                                val_usdc = float(r['makerAmountFilled']) / 1e6
+                                val_size = float(r['takerAmountFilled']) / 1e6
+                            
+                            if tid and val_usdc > 0 and val_size > 0:
+                                price = val_usdc / val_size
+                                if price > 1.00 or price < 0.000001:
+                                    seg_dropped += 1; continue
+                                    
+                                out_rows.append({
+                                    'id': r['id'], 
+                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                    'tradeAmount': val_usdc, 
+                                    'outcomeTokensAmount': val_size * mult,
+                                    'user': r['taker'], 
+                                    'contract_id': str(tid),
+                                    'price': price, 
+                                    'size': val_size, 
+                                    'side_mult': mult
+                                })
+
+                    if out_rows:
+                        writer_obj.writerows(out_rows)
+                        seg_captured += len(out_rows)
+
+                    if is_full_batch:
+                         cursor = oldest_ts + 1 
+                    else:
+                        cursor = oldest_ts
+
+                    print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
+
+                except Exception as e:
+                    print(f" Err: {e}")
+                    time.sleep(1)
+            
+            print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
+            return seg_captured
+
+        # 6. MAIN ORCHESTRATION
+        total_captured = 0
+        
+        with open(temp_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+            writer.writeheader()
+            
+            # PHASE 1: NEWER DATA
+            if existing_high_ts:
+                if global_start_cursor > existing_high_ts:
+                    print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
+                    count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
+                    total_captured += count
+                else:
+                    print(f"\n🌊 PHASE 1: Skipped (Configured End Date {datetime.utcfromtimestamp(global_start_cursor)} <= Existing Head)")
+
+            # PHASE 2: STREAM EXISTING
+            if existing_high_ts and existing_low_ts:
+                print(f"\n💾 PHASE 2: Streaming Existing Cache...")
+                f.flush()
+                with open(cache_file, 'r') as f_old:
+                    f_old.readline() # Skip header
+                    shutil.copyfileobj(f_old, f)
+                print(f"   ✅ Existing data merged.")
+                f.flush()
+
+            # PHASE 3: OLDER DATA
+            if existing_low_ts:
+                if existing_low_ts > global_stop_ts:
+                    print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                    count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
+                    total_captured += count
+                else:
+                    print(f"\n📜 PHASE 3: Skipped (Existing Tail {datetime.utcfromtimestamp(existing_low_ts)} covers request {datetime.utcfromtimestamp(global_stop_ts)})")
+
+            elif not existing_high_ts:
+                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
+                total_captured += count
+
+        # 7. COMMIT
+        print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
+        if total_captured > 0 or existing_high_ts:
+            if cache_file.exists(): 
+                try: os.remove(cache_file)
+                except: pass
+            os.rename(temp_file, cache_file)
+            print("   ✅ File saved successfully. Returning empty DataFrame to save RAM.")
+            return pd.DataFrame()
+        
+        return pd.DataFrame()
 
         # 5. EXECUTION FUNCTION
         def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
