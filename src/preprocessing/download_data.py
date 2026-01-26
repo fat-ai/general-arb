@@ -44,27 +44,60 @@ class DataFetcher:
 
         cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
-        # Remove old cache to force a fresh, correct fetch
+        # 1. ANALYZE EXISTING CACHE
+        existing_df = pd.DataFrame()
+        min_created_at = None
+        max_created_at = None
+        
         if cache_file.exists():
-            try: os.remove(cache_file)
-            except: pass
+            try:
+                print(f"   📂 Loading existing markets cache to determine update range...")
+                existing_df = pd.read_parquet(cache_file)
+                
+                # Ensure timestamps are actual datetimes for comparison
+                if not existing_df.empty and 'created_at' in existing_df.columns:
+                    # Convert to naive UTC for consistency
+                    dates = pd.to_datetime(existing_df['created_at'], utc=True).dt.tz_localize(None)
+                    min_created_at = dates.min()
+                    max_created_at = dates.max()
+                    print(f"      Existing Range: {min_created_at} <-> {max_created_at}")
+            except Exception as e:
+                print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
+                existing_df = pd.DataFrame()
 
-        # 1. FETCH FROM API (Active AND Closed)
-        all_rows = []
+        # 2. SETUP SESSION
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
         
-        print(f"Fetching GLOBAL market list (Active & Closed)...")
-        
-        # Fetch both states to ensure we get historical resolution data + live markets
-        for state in ["false", "true"]: 
+        all_new_rows = []
+
+        # 3. DEFINE FETCH HELPER
+        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
+            """
+            state: "true" (closed) or "false" (active)
+            mode_label: For logging
+            time_filter_func: function(row_timestamp) -> bool (True to STOP fetching)
+            sort_order: "desc" (newest first) or "asc" (oldest first)
+            """
             offset = 0
-            print(f"   Fetching closed={state}...", end=" ", flush=True)
+            limit = 500
+            is_ascending = "true" if sort_order == "asc" else "false"
+            
+            print(f"   Fetching {mode_label} (closed={state})...", end=" ", flush=True)
+            
+            local_rows = []
             while True:
-                params = {"limit": 500, "offset": offset, "closed": state}
+                # We use explicit sorting to allow safe incremental fetching
+                params = {
+                    "limit": limit, 
+                    "offset": offset, 
+                    "closed": state,
+                    "order": "createdAt",
+                    "ascending": is_ascending
+                }
+                
                 try:
-                    # Using the Markets endpoint directly
                     resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
                     if resp.status_code != 200: 
                         print(f"[Error {resp.status_code}]", end=" ")
@@ -72,137 +105,174 @@ class DataFetcher:
                     
                     rows = resp.json()
                     if not rows: break
-                    all_rows.extend(rows)
+                    
+                    # Check Time Boundaries
+                    if time_filter_func:
+                        # Inspect the last item in this page to see if we passed the boundary
+                        # (Optimized: We check row-by-row to find the exact cut-off)
+                        valid_batch = []
+                        stop_signal = False
+                        
+                        for r in rows:
+                            # Parse date safely
+                            c_date = r.get('createdAt')
+                            if c_date:
+                                try:
+                                    ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
+                                    # If the function returns True, we have hit known data -> STOP
+                                    if time_filter_func(ts):
+                                        stop_signal = True
+                                        continue # Skip this row
+                                except: pass
+                            
+                            # If we haven't stopped, keep row
+                            if not stop_signal:
+                                valid_batch.append(r)
+                        
+                        local_rows.extend(valid_batch)
+                        if stop_signal:
+                            print(f"| Intersected existing data.", end="")
+                            break
+                    else:
+                        local_rows.extend(rows)
                     
                     offset += len(rows)
-                    if len(rows) < 500: break 
+                    if len(rows) < limit: break 
                     print(".", end="", flush=True)
+                    
                 except Exception as e:
                     print(f"[Exc: {e}]", end=" ")
                     break
-            print(f" Done.")
-        
-        print(f" Total raw markets fetched: {len(all_rows)}")
-        if not all_rows: return pd.DataFrame()
-
-        df = pd.DataFrame(all_rows)
-
-        # 2. ROBUST TOKEN EXTRACTION
-        def extract_tokens(row):
-            # Try 'clobTokenIds' first, fallback to 'tokens'
-            raw = row.get('clobTokenIds') or row.get('tokens')
             
-            # Handle stringified JSON
+            print(f" Done ({len(local_rows)}).")
+            return local_rows
+
+        # 4. EXECUTE FETCHES
+        
+        # A. ALWAYS fetch ALL Active markets (closed=false)
+        # Why? Active markets change outcomes/volume constantly. We must refresh them.
+        all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
+        
+        # B. HEAD: Fetch "New" Closed Markets (Newer than max_created_at)
+        if max_created_at:
+            # Stop if we see a date <= max_created_at
+            stop_condition = lambda ts: ts <= max_created_at
+            all_new_rows.extend(fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
+        else:
+            # No existing file? Fetch ALL closed markets (descending)
+            all_new_rows.extend(fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc"))
+
+        # C. TAIL: Fetch "Old" Closed Markets (Older than min_created_at)
+        # Only needed if we suspect we have a 'future' chunk but missing 'past' chunk
+        if min_created_at:
+             # Stop if we see a date >= min_created_at (because we are ascending from 0)
+             stop_condition = lambda ts: ts >= min_created_at
+             all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
+
+        # 5. PROCESS & MERGE
+        if not all_new_rows: 
+            print("   ✅ No new market updates found.")
+            return existing_df
+
+        print(f"   Processing {len(all_new_rows)} new/updated market records...")
+        new_df = pd.DataFrame(all_new_rows)
+
+        # --- RE-USE CLEANING LOGIC (Identical to Original) ---
+        def extract_tokens(row):
+            raw = row.get('clobTokenIds') or row.get('tokens')
             if isinstance(raw, str):
                 try: raw = json.loads(raw)
                 except: pass
-            
             if isinstance(raw, list):
                 clean_tokens = []
                 for t in raw:
                     if isinstance(t, dict):
-                        # Handle varied dictionary keys
                         tid = t.get('token_id') or t.get('id') or t.get('tokenId')
                         if tid: clean_tokens.append(str(tid).strip())
                     else:
                         clean_tokens.append(str(t).strip())
-                
-                # Polymarket is typically binary (2 tokens), but we join all just in case
                 if len(clean_tokens) >= 2:
                     return ",".join(clean_tokens)
             return None
 
-        df['contract_id'] = df.apply(extract_tokens, axis=1)
-        df = df.dropna(subset=['contract_id'])
+        new_df['contract_id'] = new_df.apply(extract_tokens, axis=1)
+        new_df = new_df.dropna(subset=['contract_id'])
 
-        # 3. ROBUST OUTCOME DERIVATION
         def derive_outcome(row):
-            # A. Try explicit 'outcome' field (usually "1" or "0" or "0.5")
             val = row.get('outcome')
             if pd.notna(val):
                 try:
-                    # Clean string inputs like "0.0"
                     f = float(str(val).replace('"', '').strip())
                     return f
                 except: pass
-            
-            # B. Fallback: Infer winner from 'outcomePrices' (Critical for Closed markets)
-            # outcomePrices is often a JSON string like '["0", "1"]'
             prices = row.get('outcomePrices')
             if prices:
                 try:
                     if isinstance(prices, str): prices = json.loads(prices)
                     if isinstance(prices, list):
                         p_floats = [float(p) for p in prices]
-                        # If a price is >= 0.95, that index is the winner
                         for i, p in enumerate(p_floats):
                             if p >= 0.95: return float(i)
                 except: pass
-            
             return np.nan 
 
-        df['outcome'] = df.apply(derive_outcome, axis=1)
+        new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
         
-        # 4. RENAME & FORMAT
-        rename_map = {
-            'question': 'question', 
-            'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at', 
-            'volume': 'volume',
-            'conditionId': 'condition_id'
-        }
+        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume', 'conditionId': 'condition_id'}
+        new_df = new_df.rename(columns={k:v for k,v in rename_map.items() if k in new_df.columns})
         
-        df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+        # Safe Timestamp Conversion
+        if 'resolution_timestamp' in new_df.columns:
+            new_df['resolution_timestamp'] = pd.to_datetime(new_df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
         
-        df['resolution_timestamp'] = pd.to_datetime(df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
-        
-        # Only drop if we really can't determine the winner or date
-        df = df.dropna(subset=['resolution_timestamp', 'outcome'])
+        if 'created_at' in new_df.columns:
+            new_df['created_at'] = pd.to_datetime(new_df['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
+            
+        new_df = new_df.dropna(subset=['resolution_timestamp', 'outcome'])
 
-        # 5. EXPLODE & INDEXING (CRITICAL FIX)
-        # We assign the token index *before* exploding or strictly via GroupBy to avoid % 2 errors
-        df['contract_id_list'] = df['contract_id'].str.split(',')
-        
-        # Create a unique ID for the market row to group by after explosion
-        df['market_row_id'] = df.index 
-        
-        df = df.explode('contract_id_list')
-        
-        # Generate strict 0, 1, 2... index per market
-        df['token_index'] = df.groupby('market_row_id').cumcount()
-        
-        df['contract_id'] = df['contract_id_list'].str.strip()
-        
-        # 6. ASSIGN LABELS
-        # Index 0 = "No" (Long No / Short Yes), Index 1 = "Yes" (Long Yes)
-        # Polymarket Standard: 0 is "No" (or first option), 1 is "Yes" (or second option)
-        df['token_outcome_label'] = np.where(df['token_index'] == 1, "Yes", "No")
+        # Explode Logic
+        new_df['contract_id_list'] = new_df['contract_id'].str.split(',')
+        new_df['market_row_id'] = new_df.index 
+        new_df = new_df.explode('contract_id_list')
+        new_df['token_index'] = new_df.groupby('market_row_id').cumcount()
+        new_df['contract_id'] = new_df['contract_id_list'].str.strip()
+        new_df['token_outcome_label'] = np.where(new_df['token_index'] == 1, "Yes", "No")
 
-        # Calculate final binary payout (1.0 or 0.0) based on which token index won
         def final_payout(row):
             winning_idx = int(round(row['outcome']))
             return 1.0 if row['token_index'] == winning_idx else 0.0
 
-        df['outcome'] = df.apply(final_payout, axis=1)
-
-        # Cleanup
+        new_df['outcome'] = new_df.apply(final_payout, axis=1)
+        
         drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
-        df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
+        new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
+        new_df = new_df.drop_duplicates(subset=['contract_id'])
+        # -----------------------------------------------------
 
-        # Dedup final tokens (just in case)
-        df = df.drop_duplicates(subset=['contract_id'])
-
-        if not df.empty:
-            df.to_parquet(cache_file)
-            print(f"✅ Processed {len(df)} tokens successfully.")
+        # 6. MERGE WITH EXISTING
+        if not existing_df.empty:
+            print(f"   Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
+            # Concatenate
+            combined = pd.concat([existing_df, new_df])
             
-        return df
+            # Deduplicate by contract_id, keeping the NEWEST one (from new_df)
+            # This handles cases where an Active market (in existing) became Closed (in new)
+            combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
+        else:
+            combined = new_df
+
+        if not combined.empty:
+            combined.to_parquet(cache_file)
+            print(f"✅ Saved total {len(combined)} market tokens.")
+            
+        return combined
 
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
         import requests
         import csv
         import time
         import os
+        import shutil
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -227,99 +297,97 @@ class DataFetcher:
         print(f"   🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
         if not valid_token_ints: return pd.DataFrame()
 
-        # 3. SETUP SESSION
+        # 3. SETUP SESSION & CONSTANTS
         GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
         session = requests.Session()
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
+        
+        def parse_iso_to_ts(iso_str):
+            try: return pd.Timestamp(iso_str).timestamp()
+            except: return 0.0
 
-        # 4. INITIALIZE CURSOR
-        try:
-            current_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
-            print(f"   ⏱️  CURSOR LOCKED: {FIXED_END_DATE} (Int: {current_cursor})")
-        except NameError:
-            print("   ⚠️  FIXED_END_DATE not found. Using 'Now'.")
-            current_cursor = int(time.time())
-
-        stop_ts = current_cursor - (days_back * 86400)
-        total_captured = 0
-        total_scanned = 0
-        total_dropped = 0
-        batch_count = 0
-
-        # Helper: Write rows
-        def process_and_write(rows_in, writer_obj):
-            out_rows = []
-            for r in rows_in:
-                try:
-                    
-                    if r.get('maker') == r.get('taker'):
-                        total_dropped += 1
-                        continue
-                        
-                    m_raw = str(r.get('makerAssetId', '0')).strip()
-                    if m_raw.startswith("0x"): m_int = int(m_raw, 16)
-                    else: m_int = int(Decimal(m_raw))
-
-                    t_raw = str(r.get('takerAssetId', '0')).strip()
-                    if t_raw.startswith("0x"): t_int = int(t_raw, 16)
-                    else: t_int = int(Decimal(t_raw))
-
-                    tid = None; mult = 0
-                    
-                    if m_int in valid_token_ints:
-                        tid = m_int; mult = 1
-                        val_usdc = float(r['takerAmountFilled']) / 1e6
-                        val_size = float(r['makerAmountFilled']) / 1e6
-                    elif t_int in valid_token_ints:
-                        tid = t_int; mult = -1
-                        val_usdc = float(r['makerAmountFilled']) / 1e6
-                        val_size = float(r['takerAmountFilled']) / 1e6
-                    
-                    if tid and val_usdc > 0 and val_size > 0:
-                        price = val_usdc / val_size
-                        if price > 1.00: 
-                            total_dropped += 1
-                            continue
-                        if price < 0.000001:
-                            total_dropped += 1
-                            continue
-                        out_rows.append({
-                                'id': r['id'], 
-                                'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
-                                'tradeAmount': val_usdc, 
-                                'outcomeTokensAmount': val_size * mult,
-                                'user': r['taker'], 
-                                'contract_id': str(tid),
-                                'price': price, 
-                                'size': val_size, 
-                                'side_mult': mult
-                                })
-                except: continue
-
-            if out_rows: 
-                writer_obj.writerows(out_rows)
-            return len(out_rows)
-
-        with open(temp_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-            writer.writeheader()
-            f.flush()
+        def get_csv_bounds(filepath):
+            """Reads first and last data rows to get timestamp range. Assumes Descending Sort."""
+            high_ts = None
+            low_ts = None
             
-            print(f"   🚀 Starting Loop. Target > {stop_ts}")
-
-            while current_cursor > stop_ts:
+            with open(filepath, 'rb') as f:
+                header = f.readline()
+                first_line = f.readline()
+                if not first_line: return None, None
+                
                 try:
-                    batch_count += 1
-                    # VERBOSE: Print before network call
-                    print(f"   [Batch {batch_count}] Req < {current_cursor}...", end='', flush=True)
+                    row = next(csv.reader([first_line.decode('utf-8')]))
+                    high_ts = parse_iso_to_ts(row[1])
+                except Exception as e:
+                    print(f"   ⚠️ Error reading first line: {e}")
+                    return None, None
+                
+                f.seek(0, os.SEEK_END)
+                try:
+                    while f.tell() > len(header) + len(first_line):
+                        f.seek(-2, os.SEEK_CUR)
+                        while f.read(1) != b'\n':
+                            f.seek(-2, os.SEEK_CUR)
+                        
+                        last_line = f.readline()
+                        if not last_line: break
+                        
+                        try:
+                            row = next(csv.reader([last_line.decode('utf-8')]))
+                            low_ts = parse_iso_to_ts(row[1])
+                            break 
+                        except: continue
+                except Exception as e:
+                    print(f"   ⚠️ Error reading last line: {e}")
+            
+            return high_ts, low_ts
 
+        # 4. DETERMINE FETCH STRATEGY
+        existing_high_ts = None
+        existing_low_ts = None
+        
+        if cache_file.exists():
+            print(f"   📂 Found existing cache. Checking bounds...")
+            existing_high_ts, existing_low_ts = get_csv_bounds(cache_file)
+            
+            if existing_high_ts and existing_low_ts:
+                print(f"      Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
+                if existing_low_ts > existing_high_ts:
+                    print("   ❌ Existing file is not sorted Descending! Forcing full re-download.")
+                    existing_high_ts = None; existing_low_ts = None
+            else:
+                print("   ⚠️ Could not determine bounds (empty or corrupt?). Full re-download.")
+        
+        try:
+            global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+        except NameError:
+            global_start_cursor = int(time.time())
+            
+        global_stop_ts = global_start_cursor - (days_back * 86400)
+
+        # 5. EXECUTION FUNCTION
+        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
+            cursor = int(start_ts)
+            stop_limit = int(end_ts)
+            
+            print(f"   🚀 Starting Segment: {segment_name}")
+            print(f"      Range: {datetime.utcfromtimestamp(cursor)} -> {datetime.utcfromtimestamp(stop_limit)}")
+            
+            seg_captured = 0
+            seg_dropped = 0
+            batch_num = 0
+            
+            while cursor > stop_limit:
+                try:
+                    batch_num += 1
                     query = f"""
                     query {{
                         orderFilledEvents(
                             first: 1000, 
                             orderBy: timestamp, 
                             orderDirection: desc, 
-                            where: {{ timestamp_lt: {current_cursor} }}
+                            where: {{ timestamp_lt: {cursor}, timestamp_gte: {stop_limit} }}
                         ) {{
                             id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
                         }}
@@ -327,32 +395,17 @@ class DataFetcher:
                     """
                     
                     resp = session.post(GRAPH_URL, json={'query': query}, timeout=10)
-                    
                     if resp.status_code != 200:
-                        print(f" ❌ HTTP {resp.status_code}")
+                        print(f" ❌ {resp.status_code}")
                         time.sleep(2)
                         continue
 
                     data = resp.json().get('data', {}).get('orderFilledEvents', [])
-                    print(f" OK ({len(data)} rows).", end='', flush=True)
                     
                     if not data:
-                        print(" Gap.", end='', flush=True)
-                        # Probe Gap
-                        probe_q = f"""query {{ orderFilledEvents(first: 1, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: {current_cursor} }}) {{ timestamp }} }}"""
-                        p_resp = session.post(GRAPH_URL, json={'query': probe_q}, timeout=5)
-                        p_data = p_resp.json().get('data', {}).get('orderFilledEvents', [])
-                        
-                        if p_data:
-                            next_ts = int(p_data[0]['timestamp'])
-                            print(f" Jump -> {datetime.utcfromtimestamp(next_ts)}")
-                            current_cursor = next_ts + 1 
-                        else:
-                            print("\n   ✅ History exhausted.")
-                            break
-                        continue
+                        print(" Gap/Done.")
+                        break
 
-                    # Process
                     by_ts = defaultdict(list)
                     for row in data:
                         ts = int(row['timestamp'])
@@ -362,49 +415,113 @@ class DataFetcher:
                     oldest_ts = sorted_ts[-1]
                     is_full_batch = (len(data) >= 1000)
                     
+                    out_rows = []
+                    
                     for ts in sorted_ts:
                         if is_full_batch and ts == oldest_ts: continue
-                        count = process_and_write(by_ts[ts], writer)
-                        total_captured += count
-
-                    total_scanned += len(data)
-                    
-                    # Drain Dense
-                    if is_full_batch:
-                        print(" Draining...", end='', flush=True)
-                        last_id = by_ts[oldest_ts][-1]['id']
-                        count = process_and_write(by_ts[oldest_ts], writer)
-                        total_captured += count
                         
-                        while True:
-                            dq = f"""query {{ orderFilledEvents(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp: {oldest_ts}, id_lt: "{last_id}" }}) {{ id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled }} }}"""
-                            dresp = session.post(GRAPH_URL, json={'query': dq}, timeout=10)
-                            ddata = dresp.json().get('data', {}).get('orderFilledEvents', [])
-                            if not ddata: break
+                        for r in by_ts[ts]:
+                            if r.get('maker') == r.get('taker'):
+                                seg_dropped += 1; continue
                             
-                            count = process_and_write(ddata, writer)
-                            total_captured += count
-                            total_scanned += len(ddata)
-                            last_id = ddata[-1]['id']
-                    
-                    current_cursor = oldest_ts
-                    
-                    # UPDATE LINE
-                    f.flush()
-                    os.fsync(f.fileno())
-                    print(f" | Tot: {total_captured} | 🗑️ Dropped: {total_dropped}")
+                            m_raw = str(r.get('makerAssetId', '0')).strip()
+                            if m_raw.startswith("0x"): m_int = int(m_raw, 16)
+                            else: m_int = int(Decimal(m_raw))
+                            
+                            t_raw = str(r.get('takerAssetId', '0')).strip()
+                            if t_raw.startswith("0x"): t_int = int(t_raw, 16)
+                            else: t_int = int(Decimal(t_raw))
+                            
+                            tid = None; mult = 0
+                            if m_int in valid_token_ints:
+                                tid = m_int; mult = 1
+                                val_usdc = float(r['takerAmountFilled']) / 1e6
+                                val_size = float(r['makerAmountFilled']) / 1e6
+                            elif t_int in valid_token_ints:
+                                tid = t_int; mult = -1
+                                val_usdc = float(r['makerAmountFilled']) / 1e6
+                                val_size = float(r['takerAmountFilled']) / 1e6
+                            
+                            if tid and val_usdc > 0 and val_size > 0:
+                                price = val_usdc / val_size
+                                if price > 1.00 or price < 0.000001:
+                                    seg_dropped += 1; continue
+                                    
+                                out_rows.append({
+                                    'id': r['id'], 
+                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                    'tradeAmount': val_usdc, 
+                                    'outcomeTokensAmount': val_size * mult,
+                                    'user': r['taker'], 
+                                    'contract_id': str(tid),
+                                    'price': price, 
+                                    'size': val_size, 
+                                    'side_mult': mult
+                                })
+
+                    if out_rows:
+                        writer_obj.writerows(out_rows)
+                        seg_captured += len(out_rows)
+
+                    if is_full_batch:
+                         cursor = oldest_ts + 1 
+                    else:
+                        cursor = oldest_ts
+
+                    print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
 
                 except Exception as e:
-                    print(f"\n❌ ERROR: {e}")
-                    time.sleep(2)
+                    print(f" Err: {e}")
+                    time.sleep(1)
+            
+            print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
+            return seg_captured
 
-        print(f"\n   ✅ Capture Complete: {total_captured} trades.")
-        if total_captured > 0:
+        # 6. MAIN ORCHESTRATION
+        total_captured = 0
+        
+        with open(temp_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+            writer.writeheader()
+            
+            # PHASE 1: NEWER DATA
+            if existing_high_ts:
+                print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
+                count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
+                total_captured += count
+
+            # PHASE 2: STREAM EXISTING
+            if existing_high_ts and existing_low_ts:
+                print(f"\n💾 PHASE 2: Streaming Existing Cache...")
+                f.flush()
+                with open(cache_file, 'r') as f_old:
+                    f_old.readline() # Skip header
+                    shutil.copyfileobj(f_old, f)
+                print(f"   ✅ Existing data merged.")
+                f.flush()
+
+            # PHASE 3: OLDER DATA
+            if existing_low_ts:
+                print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
+                total_captured += count
+            elif not existing_high_ts:
+                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
+                total_captured += count
+
+        # 7. COMMIT
+        print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
+        if total_captured > 0 or existing_high_ts:
             if cache_file.exists(): 
                 try: os.remove(cache_file)
                 except: pass
             os.rename(temp_file, cache_file)
-            return pd.read_csv(cache_file, dtype={'contract_id': str, 'user': str})
+            
+            # CRITICAL FIX: DO NOT LOAD CSV. Return empty DF.
+            # The 'run()' method ignores this return value anyway.
+            print("   ✅ File saved successfully. Returning empty DataFrame to save RAM.")
+            return pd.DataFrame()
         
         return pd.DataFrame()
 
