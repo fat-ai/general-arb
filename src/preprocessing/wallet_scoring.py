@@ -19,9 +19,18 @@ sys.stdout.reconfigure(line_buffering=True)
 def fetch_filtered_outcomes(min_timestamp_str):
     cache_file = "market_outcomes_filtered.parquet"
     
+    # 1. Check Cache
     if os.path.exists(cache_file):
-        print(f"✅ Found cached markets. Loading...", flush=True)
-        return pl.read_parquet(cache_file)
+        try:
+            df_cache = pl.read_parquet(cache_file)
+            if "token_index" in df_cache.columns and "market_outcome" in df_cache.columns:
+                print(f"✅ Found valid cached markets. Loading...", flush=True)
+                return df_cache
+            else:
+                print(f"⚠️ Cache outdated. Deleting...", flush=True)
+                os.remove(cache_file)
+        except:
+            os.remove(cache_file)
 
     print("Fetching market outcomes from Polymarket API...", flush=True)
     all_rows = []
@@ -29,6 +38,7 @@ def fetch_filtered_outcomes(min_timestamp_str):
     retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
+    # 2. Fetch Data
     for state in ["false", "true"]: 
         offset = 0
         print(f"   Fetching closed={state}...", end=" ", flush=True)
@@ -48,86 +58,111 @@ def fetch_filtered_outcomes(min_timestamp_str):
 
     if not all_rows: return pl.DataFrame()
 
+    # 3. Optimize DataFrame Creation
+    print(f"   Converting {len(all_rows)} rows to DataFrame...", flush=True)
+    # Only keep cols we strictly need to save RAM
+    keep_cols = ['clobTokenIds', 'tokens', 'outcome', 'outcomePrices', 'createdAt']
     df = pd.DataFrame(all_rows)
+    
+    # Drop columns not in keep_cols to free memory immediately
+    cols_to_drop = [c for c in df.columns if c not in keep_cols]
+    df.drop(columns=cols_to_drop, inplace=True, errors='ignore')
+    del all_rows
+    gc.collect()
 
-    # Date Filtering
-    print(f"   Filtering markets created before {min_timestamp_str}...", flush=True)
+    # 4. Date Filter
+    print(f"   Filtering by date...", flush=True)
     try:
         cutoff_dt = pd.to_datetime(min_timestamp_str, utc=True)
         df['createdAt'] = pd.to_datetime(df['createdAt'], utc=True, errors='coerce')
         df = df[df['createdAt'] >= cutoff_dt]
         print(f"   Kept {len(df)} markets (post-cutoff).", flush=True)
     except Exception as e:
-        print(f"⚠️ Date filtering failed: {e}. Proceeding with all markets.", flush=True)
+        print(f"⚠️ Date filtering failed: {e}. Proceeding.", flush=True)
 
-    # Extract Token IDs
+    # 5. Token Extraction (Heavy Step)
+    print("   Extracting Token IDs (this may take a moment)...", flush=True)
+    
     def extract_tokens(row):
-        raw = row.get('clobTokenIds') or row.get('tokens')
+        # Optimization: prioritize 'clobTokenIds' string parsing
+        raw = row.get('clobTokenIds')
+        if not raw: raw = row.get('tokens')
+        
         if isinstance(raw, str):
             try: raw = json.loads(raw)
             except: pass
+            
         if isinstance(raw, list):
-            clean_tokens = []
-            for t in raw:
-                if isinstance(t, dict):
-                    tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                    if tid: clean_tokens.append(str(tid).strip())
-                else:
-                    clean_tokens.append(str(t).strip())
-            if len(clean_tokens) >= 2:
-                return ",".join(clean_tokens)
+            # Fast list comp
+            clean = [str(t.get('token_id') or t.get('tokenId') or t.get('id', '')).strip() 
+                     for t in raw if isinstance(t, dict)]
+            # If raw list was just strings (rare but possible)
+            if not clean and raw and isinstance(raw[0], str):
+                clean = [str(x).strip() for x in raw]
+                
+            if len(clean) >= 2:
+                return ",".join(clean)
         return None
 
-    df['contract_id'] = df.apply(extract_tokens, axis=1)
-    df = df.dropna(subset=['contract_id'])
+    try:
+        df['contract_id'] = df.apply(extract_tokens, axis=1)
+        df.dropna(subset=['contract_id'], inplace=True)
+        print(f"   Markets with valid tokens: {len(df)}", flush=True)
+    except Exception as e:
+        print(f"❌ Error during token extraction: {e}", flush=True)
+        return pl.DataFrame()
 
-    # Derive Outcome
+    # 6. Outcome Derivation
+    print("   Deriving outcomes...", flush=True)
     def derive_outcome(row):
+        # 1. Trust explicit outcome first
         val = row.get('outcome')
         if pd.notna(val):
             try: return float(str(val).replace('"', '').strip())
             except: pass
+            
+        # 2. Check prices (fallback)
         prices = row.get('outcomePrices')
         if prices:
             try:
                 if isinstance(prices, str): prices = json.loads(prices)
                 if isinstance(prices, list):
-                    p_floats = [float(p) for p in prices]
-                    for i, p in enumerate(p_floats):
-                        if p >= 0.95: return float(i)
+                    # Fast check for >= 0.95
+                    for i, p in enumerate(prices):
+                        if float(p) >= 0.95: return float(i)
             except: pass
         return np.nan 
 
     df['outcome'] = df.apply(derive_outcome, axis=1)
-    df = df.dropna(subset=['outcome'])
+    df.dropna(subset=['outcome'], inplace=True)
+    print(f"   Markets with resolved outcomes: {len(df)}", flush=True)
 
-    # Map Outcomes
+    # 7. Final Expansion (The "Explode" step)
+    print("   Mapping tokens to outcomes...", flush=True)
     df['contract_id_list'] = df['contract_id'].str.split(',')
     df['market_row_id'] = df.index 
+    
+    # Explode can be memory intensive, doing it safely
     df = df.explode('contract_id_list')
-    
-    # 0 = NO Token, 1 = YES Token (Standard Polymarket Binary)
     df['token_index'] = df.groupby('market_row_id').cumcount()
-    df['contract_id'] = df['contract_id_list'].str.strip()
+    df['contract_id'] = df['contract_id_list'].str.strip().str.lower().str.replace('0x', '')
     
-    # Save the MARKET Outcome (e.g. 1.0 = YES Won, 0.0 = NO Won)
-    # derived from the API outcome field
-    def get_market_outcome(row):
-        try:
-            return float(row['outcome']) # Returns 1.0 or 0.0
-        except:
-            return np.nan
-
-    df['market_outcome'] = df.apply(get_market_outcome, axis=1)
-    df['contract_id'] = df['contract_id'].astype(str).str.strip().str.lower().str.replace('0x', '')
+    # Convert Outcome col to standardized Float
+    df['market_outcome'] = pd.to_numeric(df['outcome'], errors='coerce')
     
-    # We now save 'token_index' and 'market_outcome'
-    pl_outcomes = pl.from_pandas(
-        df[['contract_id', 'token_index', 'market_outcome']]
-        .drop_duplicates(subset=['contract_id'])
-    )
+    # 8. Convert to Polars
+    print("   Saving to Parquet...", flush=True)
+    final_df = df[['contract_id', 'token_index', 'market_outcome']].drop_duplicates(subset=['contract_id'])
     
+    pl_outcomes = pl.from_pandas(final_df)
     pl_outcomes.write_parquet(cache_file)
+    
+    # Cleanup pandas garbage
+    del df
+    del final_df
+    gc.collect()
+    
+    print("✅ Market processing complete.", flush=True)
     return pl_outcomes
 
 # ==========================================
