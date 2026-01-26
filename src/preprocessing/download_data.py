@@ -23,7 +23,7 @@ FIXED_END_DATE   = pd.Timestamp("2026-01-02")
 today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
 
-CACHE_DIR = Path("polymarket_cache/subgraph_ops")
+CACHE_DIR = Path("polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_VERSION = "1.0.0"
 
