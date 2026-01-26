@@ -230,7 +230,7 @@ def process_chunk_universal(df_chunk, outcomes_df):
 # ==========================================
 
 def main():
-    print("DEBUG: Starting Universal Mint Logic Script...", flush=True)
+    print("DEBUG: Starting Universal Mint Logic Script (Production Version)...", flush=True)
     
     csv_file = "gamma_trades_stream.csv"
     temp_file = "temp_universal_stats.csv"
@@ -240,14 +240,45 @@ def main():
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
-    # --- A. DETECT START DATE (No changes needed here) ---
+    # --- A. DETECT START DATE ---
     print("👀 Detecting true start date (checking first and last rows)...", flush=True)
-    # ... (Keep your existing date detection logic here) ...
-    # [For brevity, assuming you keep the date detection block from your upload]
-    # If you need me to paste the date detection block back in, let me know.
-    # We will assume start_ts_str is set correctly as per your script.
-    # Default fallback for safety:
-    start_ts_str = "2024-01-01" 
+    try:
+        # Read First Row
+        df_head = pd.read_csv(csv_file, nrows=1)
+        ts_head = pd.to_datetime(df_head['timestamp'].iloc[0])
+        
+        # Read Last Row (Seek to end)
+        with open(csv_file, "rb") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                end_pos = mm.rfind(b'\n', 0, mm.size() - 1)
+                if end_pos != -1:
+                    start_pos = mm.rfind(b'\n', 0, end_pos)
+                    if start_pos != -1:
+                        mm.seek(start_pos + 1)
+                        last_line = mm.read(end_pos - start_pos - 1).decode('utf-8')
+                    else:
+                        mm.seek(0)
+                        last_line = mm.read(end_pos).decode('utf-8')
+                else:
+                    mm.seek(0)
+                    last_line = mm.read().decode('utf-8')
+
+        last_line_split = last_line.split(',')
+        if len(last_line_split) > 1:
+             ts_tail_str = last_line_split[1].replace('"', '') 
+             ts_tail = pd.to_datetime(ts_tail_str)
+        else:
+             ts_tail = ts_head 
+
+        min_date = min(ts_head, ts_tail)
+        print(f"   Head Date: {ts_head}")
+        print(f"   Tail Date: {ts_tail}")
+        print(f"   ✅ True Data Start: {min_date}", flush=True)
+        start_ts_str = min_date.isoformat()
+
+    except Exception as e:
+        print(f"⚠️ Start date detection failed ({e}). Defaulting to 2024-01-01.", flush=True)
+        start_ts_str = "2024-01-01"
 
     # --- B. FETCH MARKETS ---
     outcomes = fetch_filtered_outcomes(start_ts_str)
@@ -256,10 +287,10 @@ def main():
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
-    # --- C. PROCESS TRADES ---
+    # --- C. PROCESS TRADES (SCAN) ---
     if os.path.exists(temp_file): os.remove(temp_file)
     
-    # CORRECTION 1: Initialize Temp CSV with the CORRECT new columns
+    # Initialize Temp CSV with CORRECT COLUMNS
     pl.DataFrame({
         "user": [], "contract_id": [], 
         "qty_long": [], "cost_long": [],
@@ -302,86 +333,123 @@ def main():
             print(f"\n❌ Chunk Error: {e}", flush=True)
             continue
 
-    print(f"\n✅ Scan complete. Finalizing Scores...", flush=True)
+    print(f"\n✅ Scan complete. Starting Memory-Safe Aggregation...", flush=True)
 
-    # --- D. FINAL CALCULATION ---
+    # --- D. FINAL CALCULATION (MEMORY SAFE MAP-REDUCE) ---
     try:
-        schema_map = {
-            "user": pl.String,
-            "contract_id": pl.String,
-            "qty_long": pl.Float64, "cost_long": pl.Float64,
-            "qty_short": pl.Float64, "cost_short": pl.Float64,
-            "trade_count": pl.Int64
-        }
+        # 1. Define Reduction Logic
+        def reduce_chunk(pd_chunk, outcomes_pl):
+            pl_chunk = pl.from_pandas(pd_chunk)
+            joined = pl_chunk.join(outcomes_pl, on="contract_id", how="inner")
+            
+            if joined.height == 0: return None
+            
+            # Calculate PnL per row
+            calculated = joined.with_columns([
+                (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+                
+                # Payout Logic (Dual Long / Inversion)
+                pl.when(pl.col("token_index") == 1) # YES Token
+                  .then(
+                      (pl.col("qty_long") * pl.col("market_outcome")) + 
+                      (pl.col("qty_short") * (1.0 - pl.col("market_outcome")))
+                  )
+                  # NO Token (Inverted)
+                  .otherwise(
+                      (pl.col("qty_long") * (1.0 - pl.col("market_outcome"))) + 
+                      (pl.col("qty_short") * pl.col("market_outcome"))
+                  )
+                  .alias("payout")
+            ])
+            
+            # Reduce to User Totals immediately
+            user_totals = calculated.group_by("user").agg([
+                (pl.col("payout") - pl.col("invested")).sum().alias("chunk_pnl"),
+                pl.col("invested").sum().alias("chunk_invested"),
+                pl.col("trade_count").sum().alias("chunk_trades")
+            ])
+            return user_totals
 
-        final_stats = (
-            pl.scan_csv(temp_file, schema_overrides=schema_map)
-            .group_by(["user", "contract_id"])
-            .agg([
-                pl.col("qty_long").sum(),
-                pl.col("cost_long").sum(),
-                pl.col("qty_short").sum(),
-                pl.col("cost_short").sum(),
-                pl.col("trade_count").sum()
-            ])
-            .join(outcomes.lazy(), on="contract_id", how="inner")
-            .with_columns([
-                (pl.col("cost_long") + pl.col("cost_short")).alias("total_invested_contract"),
-
-                # LOGIC CHECK:
-                # YES Token (1): Long pays on 1, Short pays on 0 (1-Outcome)
-                # NO Token (0): Long pays on 0 (1-Outcome), Short pays on 1 (Outcome)
-                pl.when(pl.col("token_index") == 1) 
-                .then(
-                    (pl.col("qty_long") * pl.col("market_outcome")) + 
-                    (pl.col("qty_short") * (1.0 - pl.col("market_outcome")))
-                )
-                .otherwise(
-                    (pl.col("qty_long") * (1.0 - pl.col("market_outcome"))) + 
-                    (pl.col("qty_short") * pl.col("market_outcome"))
-                )
-                .alias("final_payout")
-            ])
-            .with_columns([
-                (pl.col("final_payout") - pl.col("total_invested_contract")).alias("pnl")
-            ])
-            .group_by("user")
-            .agg([
-                pl.col("pnl").sum().alias("total_pnl"),
-                pl.col("total_invested_contract").sum().alias("total_invested"),
-                pl.col("trade_count").sum().alias("total_trades")
-            ])
-            # CORRECTION 2: APPLY FILTERS AND SCORING MATH
-            .filter(
-                (pl.col("total_trades") >= 5) & 
-                (pl.col("total_invested") > 50.0) 
-            )
-            .with_columns([
-                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
-            ])
-            .with_columns([
-                (pl.col("roi") * pl.col("vol_boost")).alias("score")
-            ])
-            .collect(engine="streaming")
+        # 2. Iterate and Aggregate
+        agg_chunk_size = 1_000_000 
+        partial_results = []
+        
+        reader = pd.read_csv(
+            temp_file, 
+            chunksize=agg_chunk_size,
+            dtype={
+                "user": str, "contract_id": str, 
+                "qty_long": float, "cost_long": float, 
+                "qty_short": float, "cost_short": float, 
+                "trade_count": int
+            }
         )
+        
+        counter = 0
+        for pd_chunk in reader:
+            p_res = reduce_chunk(pd_chunk, outcomes)
+            if p_res is not None:
+                partial_results.append(p_res)
+            
+            counter += 1
+            print(f"   Aggregating chunk {counter}...", end='\r', flush=True)
+            
+            # Intermediate Merge to save RAM
+            if len(partial_results) > 5:
+                merged = pl.concat(partial_results)
+                compacted = merged.group_by("user").agg([
+                    pl.col("chunk_pnl").sum(),
+                    pl.col("chunk_invested").sum(),
+                    pl.col("chunk_trades").sum()
+                ])
+                partial_results = [compacted]
+                gc.collect()
 
-        print(f"✅ Calculation complete. Scored {final_stats.height} wallets.", flush=True)
+        print(f"\n   Merging final partials...", flush=True)
+        
+        if not partial_results:
+            print("❌ No data found after aggregation.")
+            return
 
+        final_df = pl.concat(partial_results).group_by("user").agg([
+            pl.col("chunk_pnl").sum().alias("total_pnl"),
+            pl.col("chunk_invested").sum().alias("total_invested"),
+            pl.col("chunk_trades").sum().alias("total_trades")
+        ])
+        
+        # 3. Scoring
+        print(f"   Scoring {final_df.height} unique users...", flush=True)
+        
+        scored_df = final_df.filter(
+            (pl.col("total_trades") >= 5) & 
+            (pl.col("total_invested") > 50.0) 
+        ).with_columns([
+            (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
+            (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
+        ]).with_columns([
+            (pl.col("roi") * pl.col("vol_boost")).alias("score")
+        ])
+
+        scored_df = scored_df.sort("score", descending=True)
+
+        # 4. Save
         final_dict = {}
-        for row in final_stats.iter_rows(named=True):
-            # Safe access to score now that it exists
+        # Using iter_rows is safe now because result is aggregated (small)
+        for row in scored_df.iter_rows(named=True):
             key = f"{row['user']}|default_topic"
             final_dict[key] = row['score'] 
 
         with open(output_file, "w") as f:
             json.dump(final_dict, f, indent=2)
         
-        print(f"Saved results to {output_file}", flush=True)
+        print(f"✅ Success! Saved {len(final_dict)} scores to {output_file}", flush=True)
+        
         if os.path.exists(temp_file): os.remove(temp_file)
 
     except Exception as e:
         print(f"❌ Error during final aggregation: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
