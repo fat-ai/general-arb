@@ -18,8 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-start_env = os.getenv("START_DATE", "2025-01-02")
-FIXED_START_DATE = pd.Timestamp(start_env)
+FIXED_START_DATE = "2025-12-31"
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 
 # 3. Derived Constants
