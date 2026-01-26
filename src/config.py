@@ -24,7 +24,7 @@ USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 # --- TRADING CONFIGURATION ---
 # Adjust these values to tune the strategy risk profile
 CONFIG = {
-    "splash_threshold": 100000.0,
+    "splash_threshold": 1000.0,
     "decay_factor": 0.95,
     "sizing_mode": "fixed",
     "fixed_size": 10.0,
@@ -38,7 +38,7 @@ CONFIG = {
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
     "use_smart_exit": True, 
-    "smart_exit_ratio": 0.25,
+    "smart_exit_ratio": 0.5,
 }
 
 # --- LOGGING SETUP ---
