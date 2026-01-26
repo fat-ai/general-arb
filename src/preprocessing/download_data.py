@@ -351,13 +351,17 @@ class DataFetcher:
             print(f"   📂 Found existing cache. Checking bounds...")
             existing_high_ts, existing_low_ts = get_csv_bounds(cache_file)
             
-            if existing_high_ts and existing_low_ts:
-                print(f"      Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
-                if existing_low_ts > existing_high_ts:
-                    print("   ❌ Existing file is not sorted Descending! Forcing full re-download.")
-                    existing_high_ts = None; existing_low_ts = None
-            else:
-                print("   ⚠️ Could not determine bounds (empty or corrupt?). Full re-download.")
+            if existing_high_ts is None or existing_low_ts is None:
+                print("   ❌ CRITICAL ERROR: Existing CSV is empty, corrupt, or unreadable.")
+                print("   ➡️  Action: Delete 'gamma_trades_stream.csv' manually and retry.")
+                return pd.DataFrame()
+
+            print(f"      Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
+            
+            if existing_low_ts > existing_high_ts:
+                print("   ❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
+                print("   ➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
+                return pd.DataFrame()
         
         try:
             global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
