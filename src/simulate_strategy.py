@@ -99,7 +99,7 @@ def main():
         if not chunks: break
         
         # Ensure correct types and sort by time (crucial for simulation)
-        batch = chunks[0].with_columns(pl.col("timestamp").str.to_datetime())
+        batch = chunks[0]
         batch = batch.sort("timestamp")
         
         # We process the batch row-by-row (or small group) to respect time
