@@ -79,112 +79,105 @@ class DataFetcher:
         all_new_rows = []
 
         # 3. DEFINE FETCH HELPER
+        def fetch_gamma_markets(self):
+        import os
+        import json
+        import pandas as pd
+        import numpy as np
+        import requests
+        import gc  # Added for memory management
+        from requests.adapters import HTTPAdapter, Retry
+
+        cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        
+        # 1. ANALYZE EXISTING CACHE
+        existing_df = pd.DataFrame()
+        min_created_at = None
+        max_created_at = None
+        
+        if cache_file.exists():
+            try:
+                print(f"   📂 Loading existing markets cache to determine update range...")
+                existing_df = pd.read_parquet(cache_file)
+                if not existing_df.empty and 'created_at' in existing_df.columns:
+                    dates = pd.to_datetime(existing_df['created_at'], utc=True).dt.tz_localize(None)
+                    min_created_at = dates.min()
+                    max_created_at = dates.max()
+                    print(f"      Existing Range: {min_created_at} <-> {max_created_at}")
+            except Exception as e:
+                print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
+                existing_df = pd.DataFrame()
+
+        # 2. SETUP SESSION
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        all_new_rows = []
+
+        # 3. DEFINE FETCH HELPER
         def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
-            """
-            state: "true" (closed) or "false" (active)
-            mode_label: For logging
-            time_filter_func: function(row_timestamp) -> bool (True to STOP fetching)
-            sort_order: "desc" (newest first) or "asc" (oldest first)
-            """
-            offset = 0
-            limit = 500
+            offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
-            
             print(f"   Fetching {mode_label} (closed={state})...", end=" ", flush=True)
-            
             local_rows = []
             while True:
-                # We use explicit sorting to allow safe incremental fetching
-                params = {
-                    "limit": limit, 
-                    "offset": offset, 
-                    "closed": state,
-                    "order": "createdAt",
-                    "ascending": is_ascending
-                }
-                
+                params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
                 try:
                     resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
-                    if resp.status_code != 200: 
-                        print(f" ❌ {resp.status_code}")
-                        time.sleep(2)  # Wait 2 seconds
-                        continue
-                    
+                    if resp.status_code != 200: break
                     rows = resp.json()
                     if not rows: break
                     
-                    # Check Time Boundaries
                     if time_filter_func:
-                        # Inspect the last item in this page to see if we passed the boundary
-                        # (Optimized: We check row-by-row to find the exact cut-off)
                         valid_batch = []
                         stop_signal = False
-                        
                         for r in rows:
-                            # Parse date safely
                             c_date = r.get('createdAt')
                             if c_date:
                                 try:
                                     ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
-                                    # If the function returns True, we have hit known data -> STOP
                                     if time_filter_func(ts):
-                                        stop_signal = True
-                                        continue # Skip this row
+                                        stop_signal = True; continue
                                 except: pass
-                            
-                            # If we haven't stopped, keep row
-                            if not stop_signal:
-                                valid_batch.append(r)
+                            if not stop_signal: valid_batch.append(r)
                         
                         local_rows.extend(valid_batch)
-                        if stop_signal:
-                            print(f"| Intersected existing data.", end="")
-                            break
+                        if stop_signal: break
                     else:
                         local_rows.extend(rows)
                     
                     offset += len(rows)
                     if len(rows) < limit: break 
                     print(".", end="", flush=True)
-                    
-                except Exception as e:
-                    print(f"[Exc: {e}]", end=" ")
-                    break
-            
+                except Exception: break
             print(f" Done ({len(local_rows)}).")
             return local_rows
 
         # 4. EXECUTE FETCHES
-        
-        # A. ALWAYS fetch ALL Active markets (closed=false)
-        # Why? Active markets change outcomes/volume constantly. We must refresh them.
         all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
         
-        # B. HEAD: Fetch "New" Closed Markets (Newer than max_created_at)
         if max_created_at:
-            # Stop if we see a date <= max_created_at
             stop_condition = lambda ts: ts <= max_created_at
             all_new_rows.extend(fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
         else:
-            # No existing file? Fetch ALL closed markets (descending)
             all_new_rows.extend(fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc"))
 
-        # C. TAIL: Fetch "Old" Closed Markets (Older than min_created_at)
-        # Only needed if we suspect we have a 'future' chunk but missing 'past' chunk
         if min_created_at:
-             # Stop if we see a date >= min_created_at (because we are ascending from 0)
              stop_condition = lambda ts: ts >= min_created_at
              all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
 
-        # 5. PROCESS & MERGE
+        # 5. PROCESS
         if not all_new_rows: 
             print("   ✅ No new market updates found.")
-            return existing_df
+            # Clear memory before returning
+            del existing_df, all_new_rows
+            gc.collect()
+            return
 
         print(f"   Processing {len(all_new_rows)} new/updated market records...")
         new_df = pd.DataFrame(all_new_rows)
 
-        # --- RE-USE CLEANING LOGIC (Identical to Original) ---
         def extract_tokens(row):
             raw = row.get('clobTokenIds') or row.get('tokens')
             if isinstance(raw, str):
@@ -198,8 +191,7 @@ class DataFetcher:
                         if tid: clean_tokens.append(str(tid).strip())
                     else:
                         clean_tokens.append(str(t).strip())
-                if len(clean_tokens) >= 2:
-                    return ",".join(clean_tokens)
+                if len(clean_tokens) >= 2: return ",".join(clean_tokens)
             return None
 
         new_df['contract_id'] = new_df.apply(extract_tokens, axis=1)
@@ -208,9 +200,7 @@ class DataFetcher:
         def derive_outcome(row):
             val = row.get('outcome')
             if pd.notna(val):
-                try:
-                    f = float(str(val).replace('"', '').strip())
-                    return f
+                try: return float(str(val).replace('"', '').strip())
                 except: pass
             prices = row.get('outcomePrices')
             if prices:
@@ -224,20 +214,15 @@ class DataFetcher:
             return np.nan 
 
         new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
-        
         rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume', 'conditionId': 'condition_id'}
         new_df = new_df.rename(columns={k:v for k,v in rename_map.items() if k in new_df.columns})
         
-        # Safe Timestamp Conversion
         if 'resolution_timestamp' in new_df.columns:
             new_df['resolution_timestamp'] = pd.to_datetime(new_df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
-        
         if 'created_at' in new_df.columns:
             new_df['created_at'] = pd.to_datetime(new_df['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
             
         new_df = new_df.dropna(subset=['resolution_timestamp', 'outcome'])
-
-        # Explode Logic
         new_df['contract_id_list'] = new_df['contract_id'].str.split(',')
         new_df['market_row_id'] = new_df.index 
         new_df = new_df.explode('contract_id_list')
@@ -250,20 +235,14 @@ class DataFetcher:
             return 1.0 if row['token_index'] == winning_idx else 0.0
 
         new_df['outcome'] = new_df.apply(final_payout, axis=1)
-        
         drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
-        # -----------------------------------------------------
 
-        # 6. MERGE WITH EXISTING
+        # 6. MERGE
         if not existing_df.empty:
             print(f"   Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
-            # Concatenate
             combined = pd.concat([existing_df, new_df])
-            
-            # Deduplicate by contract_id, keeping the NEWEST one (from new_df)
-            # This handles cases where an Active market (in existing) became Closed (in new)
             combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
         else:
             combined = new_df
@@ -271,8 +250,12 @@ class DataFetcher:
         if not combined.empty:
             combined.to_parquet(cache_file)
             print(f"✅ Saved total {len(combined)} market tokens.")
-            
-        return combined
+        
+        # --- MEMORY CLEANUP ---
+        # Explicitly delete large DataFrames to free RAM immediately
+        del existing_df, new_df, combined, all_new_rows
+        gc.collect()
+        return
 
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
         import requests
@@ -888,33 +871,46 @@ class DataFetcher:
         return df
 
     def run(self):
+        import gc  # Ensure GC is imported
+
         print("Starting data collection...")
         
-        # 1. Fetch Markets
+        # 1. Fetch Markets (Saves to Disk, Returns None)
         print("\n--- Phase 1: Fetching Markets ---")
-        markets_df = self.fetch_gamma_markets()
+        self.fetch_gamma_markets()
         
-        if not markets_df.empty:
-            # Normalize IDs for trade filtering
-            markets_df['contract_id'] = markets_df['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
-            valid_market_ids = set(markets_df['contract_id'].unique())
+        # Force cleanup just in case
+        gc.collect()
+        
+        market_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        
+        if market_file.exists():
+            # MEMORY FIX: Read ONLY the 'contract_id' column.
+            # This avoids loading huge string columns like 'question' or 'description'.
+            print("   Loading contract IDs from disk (Lightweight Mode)...")
+            market_ids_df = pd.read_parquet(market_file, columns=['contract_id'])
+            
+            # Normalize and convert to set
+            market_ids_df['contract_id'] = market_ids_df['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
+            valid_market_ids = set(market_ids_df['contract_id'].unique())
+            
+            # Free the single-column DF immediately
+            del market_ids_df
+            gc.collect()
+            
             print(f"Found {len(valid_market_ids)} unique contract IDs.")
 
             # 2. Fetch Trades (Parallel/Orderbook)
             print("\n--- Phase 2: Fetching Trades (Goldsky Orderbook) ---")
             self.fetch_gamma_trades_parallel(valid_market_ids, days_back=DAYS_BACK)
             
-            # 3. Optional: Fetch Subgraph (FPMM) Trades
-            # print("\n--- Phase 3: Fetching Trades (FPMM Subgraph) ---")
-            # self.fetch_subgraph_trades(days_back=DAYS_BACK)
-            
-            # 4. Fetch Orderbook Stats
-            print("\n--- Phase 4: Fetching Orderbook Stats ---")
+            # 3. Fetch Orderbook Stats
+            print("\n--- Phase 3: Fetching Orderbook Stats ---")
             self.fetch_orderbook_stats()
             
         else:
-            print("No markets found. Skipping trade fetch.")
-
+            print("No markets file found. Skipping trade fetch.")
+            
 if __name__ == "__main__":
     fetcher = DataFetcher(CACHE_DIR)
     fetcher.run()
