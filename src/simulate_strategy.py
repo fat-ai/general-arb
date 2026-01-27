@@ -5,10 +5,12 @@ import statsmodels.api as sm
 import logging
 import gc
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Import your Strategy Logic
 from strategy import SignalEngine, WalletScorer
+
+WARMUP_DAYS = 30
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -188,46 +190,65 @@ def main():
             # B. GET TRADES FOR THIS DAY
             daily_trades = batch.filter(pl.col("day") == day)
             
-            # C. SIMULATE SIGNALS (The "Forward" Pass)
-            # We convert to dict for fast iteration in Python (Polars iteration is slow)
-            sim_rows = daily_trades.select([
-                "user", "contract_id", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"
-            ]).to_dicts()
-            
-            results = []
-            for t in sim_rows:
-                cid = t['contract_id']
-                if cid not in market_map: continue
-                m = market_map[cid]
-                
-                # Start Date Check
-                m_start = m.get('start')
-                if not m_start or (isinstance(m_start, str) and m_start > str(t['timestamp'])):
-                    continue
-                if isinstance(m_start, datetime) and t['timestamp'] < m_start:
-                    continue
+            # --- [FIX] WARM-UP PERIOD CHECK ---
+            # If this is the first day seen, allow us to set a start anchor
+            if "data_start_date" not in locals():
+                data_start_date = day
+                simulation_start_date = data_start_date + timedelta(days=WARMUP_DAYS)
+                log.info(f"🔥 Warm-up Period: {data_start_date} -> {simulation_start_date}")
 
-                # Prepare Inputs
-                vol = t['tradeAmount']
-                direction = 1.0 if t['outcomeTokensAmount'] > 0 else -1.0
-                is_yes = (m['idx'] == 1)
+            # If we are in the warm-up period, SKIP simulation, but proceed to Accumulation (D)
+            if day < simulation_start_date:
+                # Log progress occasionally so you know it's not frozen
+                if day.day == 1 or day.day == 15:
+                    log.info(f"   🔥 Warming up... ({day})")
+            else:
+                # C. SIMULATE SIGNALS (Only run this AFTER warm-up)
+                sim_rows = daily_trades.select([
+                    "user", "contract_id", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"
+                ]).to_dicts()
                 
-                # --- STRATEGY CALL ---
-                sig = engine.process_trade(
-                    wallet=t['user'], token_id=cid, usdc_vol=vol, 
-                    direction=direction, fpmm=m['fpmm'], is_yes_token=is_yes, 
-                    scorer=scorer
-                )
+                results = []
+                for t in sim_rows:
+                    cid = t['contract_id']
+                    if cid not in market_map: continue
+                    m = market_map[cid]
+                    
+                    # Start Date Check
+                    m_start = m.get('start')
+                    # Handle string vs timestamp comparison safely
+                    ts = t['timestamp']
+                    if m_start:
+                        if isinstance(m_start, str):
+                            if str(ts) < m_start: continue
+                        elif ts < m_start: 
+                            continue
+
+                    # Prepare Inputs
+                    vol = t['tradeAmount']
+                    direction = 1.0 if t['outcomeTokensAmount'] > 0 else -1.0
+                    is_yes = (m['idx'] == 1)
+                    
+                    # --- STRATEGY CALL ---
+                    sig = engine.process_trade(
+                        wallet=t['user'], token_id=cid, usdc_vol=vol, 
+                        direction=direction, fpmm=m['fpmm'], is_yes_token=is_yes, 
+                        scorer=scorer
+                    )
+                    
+                    results.append({
+                        "timestamp": t['timestamp'], 
+                        "fpmm": m['fpmm'], 
+                        "question": m['fpmm'],
+                        "outcome": m['outcome'], 
+                        "signal_strength": sig,
+                        "trade_price": t['price'], 
+                        "trade_volume": vol
+                    })
                 
-                results.append({
-                    "timestamp": t['timestamp'], "fpmm": m['fpmm'], "question": m['fpmm'], # prompt asked for question
-                    "outcome": m['outcome'], "signal_strength": sig,
-                    "trade_price": t['price'], "trade_volume": vol
-                })
-            
-            # Flush Results to CSV
-            if results:
-                pd.DataFrame(results).to_csv(OUTPUT_PATH, mode='a', header=not OUTPUT_PATH.exists(), index=False)
+                # Flush Results to CSV
+                if results:
+                    pd.DataFrame(results).to_csv(OUTPUT_PATH, mode='a', header=not OUTPUT_PATH.exists(), index=False)
 
             # D. ACCUMULATE POSITIONS (The "Backward" Pass - storing data for future training)
             # Logic from process_chunk_universal
