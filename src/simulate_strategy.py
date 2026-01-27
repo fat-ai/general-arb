@@ -156,6 +156,11 @@ def main():
 
         if batch.height == 0: continue
 
+        batch = batch.with_columns([
+            pl.col("contract_id").str.strip_chars().str.to_lowercase(),
+            pl.col("user").str.strip_chars().str.to_lowercase(),
+        ])
+
         # [FIX] Explicitly Parse Timestamp if it failed auto-parsing
         if batch["timestamp"].dtype != pl.Datetime:
              batch = batch.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
