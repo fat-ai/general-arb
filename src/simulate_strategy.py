@@ -28,8 +28,8 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
     Yields batches of raw bytes that can be parsed as CSV.
     """
     with open(file_path, 'rb') as f:
-        # Read header first
-        header = f.readline()
+        # [FIX] .rstrip() removes the trailing \n so we don't insert a double-newline later
+        header = f.readline().rstrip()
         
         # Go to end of file
         f.seek(0, 2)
@@ -38,7 +38,7 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
         remainder = b""
         
         # Read backwards until we hit the header
-        while pos > len(header):
+        while pos > len(header) + 1: # +1 accounts for the newline we stripped
             # Calculate next seek position
             step = min(chunk_size, pos - len(header))
             pos -= step
@@ -47,30 +47,28 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
             # Read chunk
             data = f.read(step)
             
-            # Combine with remainder from previous read (which was the start of a line)
+            # Combine with remainder from previous read
             block = data + remainder
             
             # Split into lines
             lines = block.split(b'\n')
             
-            # The first element is likely a partial line (start of the chunk), 
-            # save it for the next step (which reads the previous chunk)
+            # The first element is partial, save for next step
             remainder = lines.pop(0)
             
-            # Filter empty strings (e.g., from trailing newlines)
+            # Filter empty strings
             valid_lines = [l for l in lines if l.strip()]
             
             if valid_lines:
-                # Reverse lines inside the chunk so the batch itself is roughly Ascending
+                # Reverse lines inside the chunk so batch is Ascending
                 valid_lines.reverse()
-                
-                # Join back to CSV block with header
+                # Yield CSV block with header
                 yield header + b'\n' + b'\n'.join(valid_lines)
 
-        # Process final remainder (which is actually the top lines of file)
+        # Process final remainder (top of file)
         if remainder.strip():
             yield header + b'\n' + remainder
-
+            
 def main():
     if OUTPUT_PATH.exists():
         with open(OUTPUT_PATH, 'w') as f:
