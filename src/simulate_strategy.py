@@ -32,8 +32,12 @@ def main():
         pl.col('question').alias('fpmm'),
         pl.col('startDate'),
         pl.col('resolution_timestamp'),
-        pl.col('market_outcome'),
-        pl.col('token_index')
+        pl.col('outcome').alias('market_outcome'),
+        pl.when(pl.col('token_outcome_label') == "Yes")
+          .then(pl.lit(1))
+          .otherwise(pl.lit(0))
+          .cast(pl.UInt8)
+          .alias('token_index')
     ])
     
     # Create Python Maps for fast lookups in the loop
