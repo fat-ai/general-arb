@@ -78,7 +78,7 @@ def main():
     # We need to know: (a) When a market started, (b) When it ended, (c) The outcome
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
-        pl.col('contract_id').str.strip_chars().str.to_lowercase(),
+        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question').alias('fpmm'),
         pl.col('startDate'),
         pl.col('resolution_timestamp'),
@@ -157,8 +157,8 @@ def main():
         if batch.height == 0: continue
 
         batch = batch.with_columns([
-            pl.col("contract_id").str.strip_chars().str.to_lowercase(),
-            pl.col("user").str.strip_chars().str.to_lowercase(),
+            pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+            pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         ])
 
         # [FIX] Explicitly Parse Timestamp if it failed auto-parsing
@@ -192,7 +192,7 @@ def main():
                     just_resolved = active_positions.filter(pl.col("contract_id").is_in(resolved_ids))
                     
                     if just_resolved.height > 0:
-              
+                        # [FIX] Inject REAL token_index (idx) from market_map
                         outcomes_df = pl.DataFrame([
                             {
                                 "contract_id": cid, 
@@ -202,24 +202,31 @@ def main():
                             for cid in just_resolved["contract_id"].unique()
                         ])
                         
-                        # Use 'real_token_idx' for the check, NOT the 'token_index' column which is 0
+                        # [FIX] Calculate Payout using Long/Short Buckets (Matches wallet_scoring.py)
                         pnl_calc = just_resolved.join(outcomes_df, on="contract_id").with_columns([
-                            pl.when(pl.col("real_token_idx") == 1) # If this is a YES token
-                                .then(pl.col("quantity") * pl.col("outcome"))
-                            .otherwise(pl.col("quantity") * (1.0 - pl.col("outcome")))
-                            .alias("payout")
+                             (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+                             
+                             pl.when(pl.col("real_token_idx") == 1) # YES Token
+                               .then(
+                                   # If YES wins (1.0), Longs get paid, Shorts get 0
+                                   (pl.col("qty_long") * pl.col("outcome")) + 
+                                   (pl.col("qty_short") * (1.0 - pl.col("outcome")))
+                               )
+                               .otherwise( # NO Token
+                                   # If NO wins (0.0), Shorts get paid (via inversion), Longs get 0
+                                   (pl.col("qty_long") * (1.0 - pl.col("outcome"))) + 
+                                   (pl.col("qty_short") * pl.col("outcome"))
+                               ).alias("payout")
                         ]).group_by("user").agg([
-                            (pl.col("payout") - pl.col("cost")).sum().alias("pnl"),
-                            pl.col("cost").sum().alias("invested"),
+                            (pl.col("payout") - pl.col("invested")).sum().alias("pnl"),
+                            pl.col("invested").sum().alias("invested"),
                             pl.len().alias("count")
                         ])
 
-                        # Merge into User History
                         if user_history.height == 0:
                             user_history = pnl_calc.select(["user", "pnl", "invested", "count"]) \
                                 .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
                         else:
-                            # Concat and Sum
                             user_history = pl.concat([
                                 user_history,
                                 pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
@@ -323,29 +330,26 @@ def main():
             processed_trades = daily_trades.with_columns([
                 (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
                 pl.col("outcomeTokensAmount").abs().alias("quantity")
-            ]).with_columns([
-                pl.when(pl.col("is_buy")).then(pl.col("price") * pl.col("quantity"))
-                  .otherwise((1.0 - pl.col("price")) * pl.col("quantity")).alias("cost")
             ])
             
-            # 2. Add Token Index (needed for resolution later)
-            # We map it efficiently using the lookup logic or just store contract_id and join later.
-            # Storing contract_id is fine.
-            
-            # 3. Aggregate Daily to save RAM
             daily_agg = processed_trades.group_by(["user", "contract_id"]).agg([
-                pl.col("quantity").sum(),
-                pl.col("cost").sum()
-            ]).with_columns(pl.lit(0).cast(pl.UInt8).alias("token_index")) # Placeholder, we fix at resolution
+                # BUCKET 1: LONG (Buying YES)
+                pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0).alias("qty_long"),
+                (pl.col("price") * pl.col("quantity")).filter(pl.col("is_buy")).sum().fill_null(0).alias("cost_long"),
+                
+                # BUCKET 2: SHORT (Buying NO)
+                pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0).alias("qty_short"),
+                ((1.0 - pl.col("price")) * pl.col("quantity")).filter(~pl.col("is_buy")).sum().fill_null(0).alias("cost_short")
+            ]).with_columns(pl.lit(0).cast(pl.UInt8).alias("token_index"))
             
-            # 4. Merge into Active Positions
             if active_positions.height == 0:
                 active_positions = daily_agg
             else:
-                # Concat and re-agg
                 active_positions = pl.concat([active_positions, daily_agg]) \
                     .group_by(["user", "contract_id"]).agg([
-                        pl.col("quantity").sum(), pl.col("cost").sum(), pl.first("token_index")
+                        pl.col("qty_long").sum(), pl.col("cost_long").sum(),
+                        pl.col("qty_short").sum(), pl.col("cost_short").sum(),
+                        pl.first("token_index")
                     ])
 
             # 5. Capture Fresh Bets (Simplified)
