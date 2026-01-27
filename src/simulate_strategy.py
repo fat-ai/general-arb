@@ -105,6 +105,7 @@ def main():
     }
     
     # 2. INITIALIZE STATE
+    tracker_first_bets = {}
     # This replaces the "temp file" from wallet_scoring.py
     # It holds aggregated positions for markets that are currently ACTIVE in the sim
     active_positions = pl.DataFrame(schema={
@@ -162,8 +163,53 @@ def main():
             pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
             pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         ])
+      
+        batch_sorted = batch.sort("timestamp")
+        
+        # We need a set of KNOWN users to skip efficiently
+        # Combine DB history + Current Tracker + Current Active Positions
+        # (Optimization: We check these dynamically inside the loop)
+        
+        for row in batch_sorted.iter_rows(named=True):
+            uid = row["user"]
+            
+            # 1. SKIP if we already know this user (from DB or current tracker)
+            # user_history_set must be maintained (see note below) or check user_history
+            if uid in tracker_first_bets:
+                continue
+            
+            # Check if user exists in history (Lazy check)
+            # Note: For speed, you might want to maintain a 'known_users' set separately
+            is_known = not user_history.filter(pl.col("user") == uid).is_empty()
+            if is_known:
+                continue
 
-        # [FIX] Explicitly Parse Timestamp if it failed auto-parsing
+            # 2. This is a "Fresh Wallet". Capture exact metrics.
+            cid = row["contract_id"]
+            price = max(0.001, min(0.999, row["price"])) 
+            tokens = row["outcomeTokensAmount"]
+            trade_amt = row["tradeAmount"]
+            is_long = tokens > 0
+            
+            # Match Logic: Risk Volume Calculation
+            if is_long:
+                risk_vol = trade_amt
+            else:
+                risk_vol = abs(tokens) * (1.0 - price)
+            
+            # Filter: Ignore tiny noise trades
+            if risk_vol < 1.0:
+                continue
+                
+            # STORE SNAPSHOT (Immutable)
+            tracker_first_bets[uid] = {
+                "contract_id": cid,
+                "risk_vol": risk_vol,
+                "price": price,
+                "is_long": is_long
+            }  
+
+        
         if batch["timestamp"].dtype != pl.Datetime:
              batch = batch.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
              batch = batch.drop_nulls(subset=["timestamp"])
@@ -225,26 +271,41 @@ def main():
                             pl.len().alias("count")
                         ])
 
-                        if user_history.height > 0:
-                            fresh_candidates = pnl_calc.join(user_history, on="user", how="anti")
-                        else:
-                            fresh_candidates = pnl_calc
-
-                        if fresh_candidates.height > 0:
-                            # Extract X (Log Volume) and y (ROI)
-                            # We filter for reasonable volume to avoid noise ($10+)
-                            training_data = fresh_candidates.filter(
-                                pl.col("invested") > 10
-                            ).select([
-                                (pl.col("invested").log1p()).alias("x"),
-                                (pl.col("pnl") / pl.col("invested")).alias("y")
-                            ])
+                        resolved_ids = set(just_resolved["contract_id"].to_list())
+                        users_to_remove = []
+                        
+                        for uid, bet_data in tracker_first_bets.items():
+                            cid = bet_data["contract_id"]
                             
-                            # Add to training lists
-                            # Note: We iterate rows here because lists are efficient for OLS in loop
-                            for row in training_data.iter_rows():
-                                fresh_bets_X.append(row[0]) # Log Volume
-                                fresh_bets_y.append(row[1]) # ROI
+                            if cid in resolved_ids:
+                                # Get outcome
+                                outcome_row = outcomes_df.filter(pl.col("contract_id") == cid)
+                                if outcome_row.height == 0: continue
+                                final_outcome = outcome_row["outcome"][0] # 1.0 or 0.0
+                                
+                                # Retrieve Snapshot Data
+                                price = bet_data["price"]
+                                is_long = bet_data["is_long"]
+                                risk_vol = bet_data["risk_vol"]
+                                
+                                # EXACT ROI CALCULATION
+                                if is_long:
+                                    roi = (final_outcome - price) / price
+                                else:
+                                    roi = (price - final_outcome) / (1.0 - price)
+                                
+                                # EXACT LOG INPUT (Natural Log)
+                                x_val = math.log1p(risk_vol)
+                                y_val = roi
+                                
+                                fresh_bets_X.append(x_val)
+                                fresh_bets_y.append(y_val)
+                                
+                                users_to_remove.append(uid)
+                        
+                        # Cleanup resolved users from tracker
+                        for uid in users_to_remove:
+                            del tracker_first_bets[uid]
 
                         if user_history.height == 0:
                             user_history = pnl_calc.select(["user", "pnl", "invested", "count"]) \
