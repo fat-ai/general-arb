@@ -81,7 +81,16 @@ def main():
     log.info("Starting Simulation Stream...")
     
     # Use the same batch size as your files
-    reader = pl.read_csv_batched(TRADES_PATH, batch_size=500_000, try_parse_dates=True)
+    reader = pl.read_csv_batched(
+        TRADES_PATH, 
+        batch_size=500_000, 
+        try_parse_dates=True,
+        schema_overrides={
+            "contract_id": pl.String,
+            "user": pl.String,
+            "id": pl.String
+        }
+    )
     
     current_sim_day = None
     
