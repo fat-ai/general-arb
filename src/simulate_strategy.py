@@ -252,7 +252,7 @@ def main():
             
             # --- [FIX] WARM-UP PERIOD CHECK ---
             # If this is the first day seen, allow us to set a start anchor
-            if data_start_date is None:
+            if simulation_start_date is None:
                 data_start_date = day
                 simulation_start_date = data_start_date + timedelta(days=WARMUP_DAYS)
                 log.info(f"🔥 Warm-up Period: {data_start_date} -> {simulation_start_date}")
