@@ -6,6 +6,7 @@ import logging
 import gc
 from pathlib import Path
 from datetime import datetime, timedelta
+import subprocess
 
 # Import your Strategy Logic
 from strategy import SignalEngine, WalletScorer
@@ -80,28 +81,35 @@ def main():
     engine = SignalEngine()
 
     # 3. STREAMING LOOP
-    log.info("Starting Simulation Stream...")
+    log.info("Starting Reverse Simulation Stream (Oldest -> Newest)...")
     
-    # Use the same batch size as your files
-    reader = pl.read_csv_batched(
-        TRADES_PATH, 
-        batch_size=500_000, 
-        try_parse_dates=True,
-        schema_overrides={
-            "contract_id": pl.String,
-            "user": pl.String,
-            "id": pl.String
-        }
+    # Command: Output the Header first, then the rest of the file reversed
+    cmd = f"{{ head -n 1 {TRADES_PATH}; tail -n +2 {TRADES_PATH} | tac; }}"
+    
+    # Open the stream
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+    
+    # Use Pandas to read the stream in chunks (handles pipe input better)
+    # We specify dtype=str to fix the "Contract ID Overflow" error you saw earlier
+    chunk_iterator = pd.read_csv(
+        proc.stdout,
+        chunksize=500_000,
+        dtype={"contract_id": str, "user": str, "id": str},
+        parse_dates=["timestamp"] # Let Pandas handle the date parsing
     )
-    
+
+    # Variables for the loop
     current_sim_day = None
-    
-    while True:
-        chunks = reader.next_batches(1)
-        if not chunks: break
+    data_start_date = None
+    simulation_start_date = None
+
+    # Iterate through the Pandas chunks
+    for pd_chunk in chunk_iterator:
         
-        # Ensure correct types and sort by time (crucial for simulation)
-        batch = chunks[0]
+        # Convert to Polars to maintain compatibility with your existing logic
+        batch = pl.from_pandas(pd_chunk)
+        
+        # Ensure sorting within the chunk (tac reverses blocks, but we ensure strictness)
         batch = batch.sort("timestamp")
         
         # We process the batch row-by-row (or small group) to respect time
