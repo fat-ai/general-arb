@@ -7,6 +7,7 @@ import gc
 from pathlib import Path
 from datetime import datetime, timedelta
 import subprocess
+import math
 
 # Import your Strategy Logic
 from strategy import SignalEngine, WalletScorer
