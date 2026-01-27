@@ -20,7 +20,9 @@ MARKETS_PATH = Path("data-cache/polymarket_cache/gamma_markets_all_tokens.parque
 OUTPUT_PATH = Path("simulation_results.csv")
 
 def main():
-    if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
+    if OUTPUT_PATH.exists():
+        with open(OUTPUT_PATH, 'w') as f:
+            f.truncate(0)
     
     # 1. LOAD MARKETS (Static Data)
     # We need to know: (a) When a market started, (b) When it ended, (c) The outcome
