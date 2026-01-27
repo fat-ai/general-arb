@@ -78,7 +78,7 @@ def main():
     # We need to know: (a) When a market started, (b) When it ended, (c) The outcome
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
-        pl.col('contract_id').str.to_lowercase(),
+        pl.col('contract_id').str.strip_chars().str.to_lowercase(),
         pl.col('question').alias('fpmm'),
         pl.col('startDate'),
         pl.col('resolution_timestamp'),
@@ -192,21 +192,22 @@ def main():
                     just_resolved = active_positions.filter(pl.col("contract_id").is_in(resolved_ids))
                     
                     if just_resolved.height > 0:
-                        # Join with Outcome (we build a small DF for the join)
+              
                         outcomes_df = pl.DataFrame([
-                            {"contract_id": cid, "outcome": market_map[cid]['outcome']} 
+                            {
+                                "contract_id": cid, 
+                                "outcome": market_map[cid]['outcome'],
+                                "real_token_idx": market_map[cid]['idx']
+                            } 
                             for cid in just_resolved["contract_id"].unique()
                         ])
                         
+                        # Use 'real_token_idx' for the check, NOT the 'token_index' column which is 0
                         pnl_calc = just_resolved.join(outcomes_df, on="contract_id").with_columns([
-                            # Payout Logic: If Token Index matches Outcome (approx), payout 1.0
-                            pl.when(
-                                (pl.col("token_index") == 1) # YES Token
-                            ).then(
-                                pl.col("quantity") * pl.col("outcome")
-                            ).otherwise(
-                                pl.col("quantity") * (1.0 - pl.col("outcome"))
-                            ).alias("payout")
+                            pl.when(pl.col("real_token_idx") == 1) # If this is a YES token
+                                .then(pl.col("quantity") * pl.col("outcome"))
+                            .otherwise(pl.col("quantity") * (1.0 - pl.col("outcome")))
+                            .alias("payout")
                         ]).group_by("user").agg([
                             (pl.col("payout") - pl.col("cost")).sum().alias("pnl"),
                             pl.col("cost").sum().alias("invested"),
