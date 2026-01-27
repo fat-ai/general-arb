@@ -78,7 +78,7 @@ def main():
     # We need to know: (a) When a market started, (b) When it ended, (c) The outcome
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
-        pl.col('contract_id'),
+        pl.col('contract_id').str.to_lowercase(),
         pl.col('question').alias('fpmm'),
         pl.col('startDate'),
         pl.col('resolution_timestamp'),
