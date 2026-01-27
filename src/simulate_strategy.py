@@ -109,7 +109,9 @@ def main():
     # It holds aggregated positions for markets that are currently ACTIVE in the sim
     active_positions = pl.DataFrame(schema={
         "user": pl.String, "contract_id": pl.String, 
-        "quantity": pl.Float64, "cost": pl.Float64, "token_index": pl.UInt8
+        "qty_long": pl.Float64, "cost_long": pl.Float64,
+        "qty_short": pl.Float64, "cost_short": pl.Float64,
+        "token_index": pl.UInt8
     })
 
     # This holds the FINAL stats for users (after markets resolve)
@@ -223,6 +225,27 @@ def main():
                             pl.len().alias("count")
                         ])
 
+                        if user_history.height > 0:
+                            fresh_candidates = pnl_calc.join(user_history, on="user", how="anti")
+                        else:
+                            fresh_candidates = pnl_calc
+
+                        if fresh_candidates.height > 0:
+                            # Extract X (Log Volume) and y (ROI)
+                            # We filter for reasonable volume to avoid noise ($10+)
+                            training_data = fresh_candidates.filter(
+                                pl.col("invested") > 10
+                            ).select([
+                                (pl.col("invested").log(10)).alias("x"),
+                                (pl.col("pnl") / pl.col("invested")).alias("y")
+                            ])
+                            
+                            # Add to training lists
+                            # Note: We iterate rows here because lists are efficient for OLS in loop
+                            for row in training_data.iter_rows():
+                                fresh_bets_X.append(row[0]) # Log Volume
+                                fresh_bets_y.append(row[1]) # ROI
+
                         if user_history.height == 0:
                             user_history = pnl_calc.select(["user", "pnl", "invested", "count"]) \
                                 .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
@@ -253,7 +276,8 @@ def main():
                         model = sm.OLS(fresh_bets_y, sm.add_constant(fresh_bets_X)).fit()
                         scorer.slope = model.params[1]
                         scorer.intercept = model.params[0]
-                    except: pass
+                    except Exception as e:
+                        log.warning(f"⚠️ OLS Training Failed: {e}")
                 
                 log.info(f"   📅 {current_sim_day}: Trained on {user_history.height} users. Simulating next day...")
 
