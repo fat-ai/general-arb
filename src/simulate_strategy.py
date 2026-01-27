@@ -236,7 +236,7 @@ def main():
                             training_data = fresh_candidates.filter(
                                 pl.col("invested") > 10
                             ).select([
-                                (pl.col("invested").log(10)).alias("x"),
+                                (pl.col("invested").log1p()).alias("x"),
                                 (pl.col("pnl") / pl.col("invested")).alias("y")
                             ])
                             
