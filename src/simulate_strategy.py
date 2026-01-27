@@ -22,6 +22,55 @@ TRADES_PATH = Path("polymarket_cache/gamma_trades_stream.csv")
 MARKETS_PATH = Path("polymarket_cache/gamma_markets_all_tokens.parquet")
 OUTPUT_PATH = Path("simulation_results.csv")
 
+def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
+    """
+    Reads a file backwards in binary chunks to avoid high memory/disk usage.
+    Yields batches of raw bytes that can be parsed as CSV.
+    """
+    with open(file_path, 'rb') as f:
+        # Read header first
+        header = f.readline()
+        
+        # Go to end of file
+        f.seek(0, 2)
+        pos = f.tell()
+        
+        remainder = b""
+        
+        # Read backwards until we hit the header
+        while pos > len(header):
+            # Calculate next seek position
+            step = min(chunk_size, pos - len(header))
+            pos -= step
+            f.seek(pos)
+            
+            # Read chunk
+            data = f.read(step)
+            
+            # Combine with remainder from previous read (which was the start of a line)
+            block = data + remainder
+            
+            # Split into lines
+            lines = block.split(b'\n')
+            
+            # The first element is likely a partial line (start of the chunk), 
+            # save it for the next step (which reads the previous chunk)
+            remainder = lines.pop(0)
+            
+            # Filter empty strings (e.g., from trailing newlines)
+            valid_lines = [l for l in lines if l.strip()]
+            
+            if valid_lines:
+                # Reverse lines inside the chunk so the batch itself is roughly Ascending
+                valid_lines.reverse()
+                
+                # Join back to CSV block with header
+                yield header + b'\n' + b'\n'.join(valid_lines)
+
+        # Process final remainder (which is actually the top lines of file)
+        if remainder.strip():
+            yield header + b'\n' + remainder
+
 def main():
     if OUTPUT_PATH.exists():
         with open(OUTPUT_PATH, 'w') as f:
@@ -83,33 +132,38 @@ def main():
     # 3. STREAMING LOOP
     log.info("Starting Reverse Simulation Stream (Oldest -> Newest)...")
     
-    # Command: Output the Header first, then the rest of the file reversed
-    cmd = f"{{ head -n 1 {TRADES_PATH}; tail -n +2 {TRADES_PATH} | tac; }}"
-    
-    # Open the stream
-    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
-    
-    # Use Pandas to read the stream in chunks (handles pipe input better)
-    # We specify dtype=str to fix the "Contract ID Overflow" error you saw earlier
-    chunk_iterator = pd.read_csv(
-        proc.stdout,
-        chunksize=500_000,
-        dtype={"contract_id": str, "user": str, "id": str},
-        parse_dates=["timestamp"] # Let Pandas handle the date parsing
-    )
-
-    # Variables for the loop
     current_sim_day = None
     data_start_date = None
     simulation_start_date = None
 
-    # Iterate through the Pandas chunks
-    for pd_chunk in chunk_iterator:
-        
-        # Convert to Polars to maintain compatibility with your existing logic
-        batch = pl.from_pandas(pd_chunk)
-        
-        # Ensure sorting within the chunk (tac reverses blocks, but we ensure strictness)
+    # Use the new Python generator (No 'tac', no disk usage)
+    chunk_gen = reverse_file_chunk_generator(TRADES_PATH, chunk_size=1024*1024*32)
+
+    for csv_bytes in chunk_gen:
+        # Parse byte chunk directly into Polars
+        try:
+            batch = pl.read_csv(
+                csv_bytes,
+                has_header=True,
+                schema_overrides={
+                    "contract_id": pl.String,
+                    "user": pl.String,
+                    "id": pl.String
+                },
+                try_parse_dates=True
+            )
+        except Exception as e:
+            log.warning(f"Skipping corrupt chunk: {e}")
+            continue
+
+        if batch.height == 0: continue
+
+        # [FIX] Explicitly Parse Timestamp if it failed auto-parsing
+        if batch["timestamp"].dtype != pl.Datetime:
+             batch = batch.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
+             batch = batch.drop_nulls(subset=["timestamp"])
+
+        # Ensure sorting (Oldest -> Newest)
         batch = batch.sort("timestamp")
         
         # We process the batch row-by-row (or small group) to respect time
