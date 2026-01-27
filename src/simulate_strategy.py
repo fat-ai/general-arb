@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger("Sim")
 
 # Files
-TRADES_PATH = Path("polymarket_cache/gamma_trades_stream.csv")
-MARKETS_PATH = Path("polymarket_cache/gamma_markets_all_tokens.parquet")
+TRADES_PATH = Path("data-cache/polymarket_cache/gamma_trades_stream.csv")
+MARKETS_PATH = Path("data-cache/polymarket_cache/gamma_markets_all_tokens.parquet")
 OUTPUT_PATH = Path("simulation_results.csv")
 
 def main():
