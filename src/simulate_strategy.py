@@ -71,6 +71,9 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
             yield header + b'\n' + remainder
             
 def main():
+
+    pl.enable_string_cache()
+    
     if OUTPUT_PATH.exists():
         with open(OUTPUT_PATH, 'w') as f:
             f.truncate(0)
@@ -91,8 +94,6 @@ def main():
           .alias('token_index')
     ])
     
-    # Create Python Maps for fast lookups in the loop
-    # ID -> {fpmm, start, outcome, idx}
     market_map = {
         row['contract_id']: {
             'fpmm': row['fpmm'],
@@ -108,23 +109,32 @@ def main():
     # 2. INITIALIZE STATE
 
     tracker_first_bets = {}
-    
-    user_history = pl.DataFrame(schema={
-            "user": pl.String, "total_pnl": pl.Float64, 
-            "total_invested": pl.Float64, "trade_count": pl.UInt32
-        })
-    
     known_users = set()
-
-    if user_history.height > 0:
-        known_users.update(user_history["user"].to_list())
-
     updates_buffer = []
     
+    if 'user_history' not in locals() or user_history is None:
+        user_history = pl.DataFrame(schema={
+            "user": pl.Categorical,  # Changed from String
+            "total_pnl": pl.Float32, # Changed from Float64
+            "total_invested": pl.Float32,
+            "trade_count": pl.UInt32
+        })
+    
+    elif user_history.height > 0:
+        user_history = user_history.with_columns([
+            pl.col("user").cast(pl.Categorical),
+            pl.col("total_pnl").cast(pl.Float32),
+            pl.col("total_invested").cast(pl.Float32)
+        ])
+        known_users.update(user_history["user"].to_list())
+
     active_positions = pl.DataFrame(schema={
-        "user": pl.String, "contract_id": pl.String, 
-        "qty_long": pl.Float64, "cost_long": pl.Float64,
-        "qty_short": pl.Float64, "cost_short": pl.Float64,
+        "user": pl.Categorical,        
+        "contract_id": pl.Categorical, 
+        "qty_long": pl.Float32,        
+        "cost_long": pl.Float32,
+        "qty_short": pl.Float32,
+        "cost_short": pl.Float32,
         "token_index": pl.UInt8
     })
     
@@ -151,14 +161,12 @@ def main():
         if not updates_buffer:
             return
 
-        # 1. Combine all pending daily updates into one DF first (Fast)
         new_data = pl.concat(updates_buffer)
         
-        # 2. Merge into main storage (Expensive, done rarely)
         if active_positions.height == 0:
             active_positions = new_data
         else:
-            # Stack and reduce
+            # [FIX 4] Float32 aggregation
             active_positions = pl.concat([active_positions, new_data]) \
                 .group_by(["user", "contract_id"]).agg([
                     pl.col("qty_long").sum(), pl.col("cost_long").sum(),
@@ -166,8 +174,8 @@ def main():
                     pl.first("token_index")
                 ])
         
-        # 3. Clear buffer
         updates_buffer = []
+        # Force cleanup
         gc.collect()
 
     for csv_bytes in chunk_gen:
@@ -190,8 +198,11 @@ def main():
         if batch.height == 0: continue
 
         batch = batch.with_columns([
-            pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-            pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+            pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", "").cast(pl.Categorical),
+            pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", "").cast(pl.Categorical),
+            pl.col("tradeAmount").cast(pl.Float32),
+            pl.col("outcomeTokensAmount").cast(pl.Float32),
+            pl.col("price").cast(pl.Float32)
         ])
       
         batch_sorted = batch.sort("timestamp")
