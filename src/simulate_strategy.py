@@ -118,6 +118,8 @@ def main():
 
     if user_history.height > 0:
         known_users.update(user_history["user"].to_list())
+
+    updates_buffer = []
     
     active_positions = pl.DataFrame(schema={
         "user": pl.String, "contract_id": pl.String, 
@@ -143,6 +145,30 @@ def main():
 
     # Use the new Python generator (No 'tac', no disk usage)
     chunk_gen = reverse_file_chunk_generator(TRADES_PATH, chunk_size=1024*1024*32)
+
+    def flush_updates():
+        nonlocal active_positions, updates_buffer
+        if not updates_buffer:
+            return
+
+        # 1. Combine all pending daily updates into one DF first (Fast)
+        new_data = pl.concat(updates_buffer)
+        
+        # 2. Merge into main storage (Expensive, done rarely)
+        if active_positions.height == 0:
+            active_positions = new_data
+        else:
+            # Stack and reduce
+            active_positions = pl.concat([active_positions, new_data]) \
+                .group_by(["user", "contract_id"]).agg([
+                    pl.col("qty_long").sum(), pl.col("cost_long").sum(),
+                    pl.col("qty_short").sum(), pl.col("cost_short").sum(),
+                    pl.first("token_index")
+                ])
+        
+        # 3. Clear buffer
+        updates_buffer = []
+        gc.collect()
 
     for csv_bytes in chunk_gen:
         # Parse byte chunk directly into Polars
@@ -231,6 +257,9 @@ def main():
                     cid for cid, m in market_map.items() 
                     if m['end'] is not None and m['end'].date() <= current_sim_day
                 ]
+
+                if resolved_ids:
+                    flush_updates()
                 
                 if resolved_ids and active_positions.height > 0:
                     # CALCULATE PNL (Logic from wallet_scoring.py)
@@ -270,6 +299,7 @@ def main():
                         ])
 
                         resolved_ids = set(just_resolved["contract_id"].to_list())
+                        
                         users_to_remove = []
                         
                         for uid, bet_data in tracker_first_bets.items():
@@ -423,6 +453,11 @@ def main():
                 pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0).alias("qty_short"),
                 ((1.0 - pl.col("price")) * pl.col("quantity")).filter(~pl.col("is_buy")).sum().fill_null(0).alias("cost_short")
             ]).with_columns(pl.lit(0).cast(pl.UInt8).alias("token_index"))
+
+            updates_buffer.append(daily_agg)
+            
+            if len(updates_buffer) > 50:
+                flush_updates()
             
             if active_positions.height == 0:
                 active_positions = daily_agg
