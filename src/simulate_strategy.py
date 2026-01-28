@@ -81,8 +81,8 @@ def main():
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question').alias('fpmm'),
-        pl.col("startDate").cast(pl.String).str.to_datetime(strict=False).alias("start_date"),
-        pl.col("resolution_timestamp").cast(pl.String).str.to_datetime(strict=False).alias("resolution_timestamp"),
+        pl.col("startDate").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f%z", strict=False).alias("start_date"),
+        pl.col("resolution_timestamp").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f%z", strict=False).alias("resolution_timestamp"),
         pl.col('outcome').alias('market_outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
           .then(pl.lit(1))
