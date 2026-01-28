@@ -488,16 +488,6 @@ def main():
             if len(updates_buffer) > 50:
                 flush_updates()
             
-            if active_positions.height == 0:
-                active_positions = daily_agg
-            else:
-                active_positions = pl.concat([active_positions, daily_agg]) \
-                    .group_by(["user", "contract_id"]).agg([
-                        pl.col("qty_long").sum(), pl.col("cost_long").sum(),
-                        pl.col("qty_short").sum(), pl.col("cost_short").sum(),
-                        pl.first("token_index")
-                    ])
-
             # 5. Capture Fresh Bets (Simplified)
             # Just take the first row per user in this batch if they aren't in user_history
             # (Skipping detailed logic for brevity, but you'd add to fresh_bets_X/y here)
