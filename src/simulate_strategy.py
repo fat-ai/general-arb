@@ -106,21 +106,17 @@ def main():
     }
     
     # 2. INITIALIZE STATE
-    tracker_first_bets = {}
-    # This replaces the "temp file" from wallet_scoring.py
-    # It holds aggregated positions for markets that are currently ACTIVE in the sim
+    
+    known_users = set()
+
+    if user_history.height > 0:
+        known_users.update(user_history["user"].to_list())
+    
     active_positions = pl.DataFrame(schema={
         "user": pl.String, "contract_id": pl.String, 
         "qty_long": pl.Float64, "cost_long": pl.Float64,
         "qty_short": pl.Float64, "cost_short": pl.Float64,
         "token_index": pl.UInt8
-    })
-
-    # This holds the FINAL stats for users (after markets resolve)
-    # Used to calculate the score
-    user_history = pl.DataFrame(schema={
-        "user": pl.String, "total_pnl": pl.Float64, 
-        "total_invested": pl.Float64, "trade_count": pl.UInt32
     })
     
     # Fresh Wallet Calibration Data
@@ -181,8 +177,7 @@ def main():
             
             # Check if user exists in history (Lazy check)
             # Note: For speed, you might want to maintain a 'known_users' set separately
-            is_known = not user_history.filter(pl.col("user") == uid).is_empty()
-            if is_known:
+            if uid in known_users:
                 continue
 
             # 2. This is a "Fresh Wallet". Capture exact metrics.
@@ -251,21 +246,17 @@ def main():
                             for cid in just_resolved["contract_id"].unique()
                         ])
                         
-                        # [FIX] Calculate Payout using Long/Short Buckets (Matches wallet_scoring.py)
-                        pnl_calc = just_resolved.join(outcomes_df, on="contract_id").with_columns([
-                             (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                             
-                             pl.when(pl.col("real_token_idx") == 1) # YES Token
-                               .then(
-                                   # If YES wins (1.0), Longs get paid, Shorts get 0
-                                   (pl.col("qty_long") * pl.col("outcome")) + 
-                                   (pl.col("qty_short") * (1.0 - pl.col("outcome")))
-                               )
-                               .otherwise( # NO Token
-                                   # If NO wins (0.0), Shorts get paid (via inversion), Longs get 0
-                                   (pl.col("qty_long") * (1.0 - pl.col("outcome"))) + 
-                                   (pl.col("qty_short") * pl.col("outcome"))
-                               ).alias("payout")
+                        pnl_calc = resolved_positions.join(
+                            just_resolved, on="contract_id"
+                        ).select([
+                            pl.col("user"),
+                            (
+                                (pl.col("qty_long") * pl.col("outcome")) + 
+                                (pl.col("qty_short") * (1.0 - pl.col("outcome")))
+                            ).alias("payout"),
+                            
+                            # Total Invested (Cost Basis)
+                            (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
                         ]).group_by("user").agg([
                             (pl.col("payout") - pl.col("invested")).sum().alias("pnl"),
                             pl.col("invested").sum().alias("invested"),
@@ -316,7 +307,9 @@ def main():
                                 user_history,
                                 pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
                             ]).group_by("user").agg([pl.col("*").sum()])
-                    
+
+                    new_uids = pnl_calc["user"].to_list()
+                    known_users.update(new_uids)
                     # Remove resolved from Active Positions to free memory
                     active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
 
