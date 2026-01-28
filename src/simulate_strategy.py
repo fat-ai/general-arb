@@ -260,10 +260,7 @@ def main():
         for day in days_in_batch:
             # A. DETECT NEW DAY -> RETRAIN & RESOLVE
             if current_sim_day is not None and day > current_sim_day:
-                
-                # 1. Resolve Markets that ended yesterday
-                # Find markets in 'market_map' that ended <= current_sim_day
-                # (Optimization: We could pre-sort resolutions, but this is safe)
+
                 resolved_ids = [
                     cid for cid, m in market_map.items() 
                     if m['end'] is not None and m['end'].date() <= current_sim_day
@@ -273,35 +270,36 @@ def main():
                     flush_updates()
                 
                 if resolved_ids and active_positions.height > 0:
-                    # CALCULATE PNL (Logic from wallet_scoring.py)
-                    # Filter active positions for these resolved markets
-                    just_resolved = active_positions.filter(pl.col("contract_id").is_in(resolved_ids))
+
+                    unique_cids = just_resolved["contract_id"].unique().cast(pl.String).to_list()
+
+                    outcomes_df = pl.DataFrame([
+                        {
+                            "contract_id": cid, 
+                            "outcome": market_map[cid]['outcome'],
+                            "real_token_idx": market_map[cid]['idx']
+                        } 
+                        for cid in unique_cids
+                        if cid in market_map # Safety check
+                    ])
                     
-                    if just_resolved.height > 0:
-                        # [FIX] Inject REAL token_index (idx) from market_map
-                        outcomes_df = pl.DataFrame([
-                            {
-                                "contract_id": cid, 
-                                "outcome": market_map[cid]['outcome'],
-                                "real_token_idx": market_map[cid]['idx']
-                            } 
-                            for cid in just_resolved["contract_id"].unique()
-                        ])
+                    if outcomes_df.height > 0:
+                        outcomes_df = outcomes_df.with_columns(
+                            pl.col("contract_id").cast(pl.Categorical)
+                        )
 
                         resolved_with_outcome = just_resolved.join(
                              outcomes_df, on="contract_id", how="left"
                         )
                         
-                        pnl_calc = resolved_with_outcome.join(
-                            just_resolved, on="contract_id"
-                        ).select([
+                        pnl_calc = resolved_with_outcome.select([
                             pl.col("user"),
+                            # Payout Logic: Longs win on 1.0, Shorts win on 0.0
                             (
                                 (pl.col("qty_long") * pl.col("outcome")) + 
                                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))
                             ).alias("payout"),
-                            
-                            # Total Invested (Cost Basis)
+
                             (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
                         ]).group_by("user").agg([
                             (pl.col("payout") - pl.col("invested")).sum().alias("pnl"),
@@ -309,31 +307,27 @@ def main():
                             pl.len().alias("count")
                         ])
 
-                        resolved_ids = set(just_resolved["contract_id"].to_list())
-                        
                         users_to_remove = []
-                        
+
                         for uid, bet_data in tracker_first_bets.items():
                             cid = bet_data["contract_id"]
                             
                             if cid in resolved_ids:
-                                # Get outcome
+                                
                                 outcome_row = outcomes_df.filter(pl.col("contract_id") == cid)
+                                
                                 if outcome_row.height == 0: continue
                                 final_outcome = outcome_row["outcome"][0] # 1.0 or 0.0
                                 
-                                # Retrieve Snapshot Data
                                 price = bet_data["price"]
                                 is_long = bet_data["is_long"]
                                 risk_vol = bet_data["risk_vol"]
                                 
-                                # EXACT ROI CALCULATION
                                 if is_long:
                                     roi = (final_outcome - price) / price
                                 else:
                                     roi = (price - final_outcome) / (1.0 - price)
                                 
-                                # EXACT LOG INPUT (Natural Log)
                                 x_val = math.log1p(risk_vol)
                                 y_val = roi
                                 
@@ -342,23 +336,34 @@ def main():
                                 
                                 users_to_remove.append(uid)
                         
-                        # Cleanup resolved users from tracker
                         for uid in users_to_remove:
                             del tracker_first_bets[uid]
 
                         if user_history.height == 0:
                             user_history = pnl_calc.select(["user", "pnl", "invested", "count"]) \
                                 .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
+                            
+                            user_history = user_history.with_columns([
+                                pl.col("user").cast(pl.Categorical),
+                                pl.col("total_pnl").cast(pl.Float32),
+                                pl.col("total_invested").cast(pl.Float32)
+                            ])
                         else:
-                            user_history = pl.concat([
-                                user_history,
-                                pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
-                            ]).group_by("user").agg([pl.col("*").sum()])
+                            new_history = pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"}) \
+                                                  .with_columns([
+                                                      pl.col("user").cast(pl.Categorical),
+                                                      pl.col("total_pnl").cast(pl.Float32),
+                                                      pl.col("total_invested").cast(pl.Float32)
+                                                  ])
+                            
+                            user_history = pl.concat([user_history, new_history]).group_by("user").agg([pl.col("*").sum()])
 
-                        new_uids = pnl_calc["user"].to_list()
+                    if 'pnl_calc' in locals() and pnl_calc.height > 0:
+                        new_uids = pnl_calc["user"].cast(pl.String).to_list()
                         known_users.update(new_uids)
-                        active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
 
+                    active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
+                    
                 # 2. Update Scorer (Logic from wallet_scoring.py)
                 if user_history.height > 0:
                     scores_df = user_history.filter(
