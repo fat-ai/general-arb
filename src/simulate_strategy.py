@@ -84,7 +84,7 @@ def main():
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question').alias('fpmm'),
-        pl.col("startDate").cast(pl.String).str.to_datetime(strict=False).alias("start_date"),
+        pl.col("startDate").cast(pl.String).alias("start_date_str"),
         pl.col("resolution_timestamp"),
         pl.col('outcome').alias('market_outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
@@ -94,17 +94,27 @@ def main():
           .alias('token_index')
     ])
     
-    market_map = {
-        row['contract_id']: {
+    market_map = {}
+    for row in markets.iter_rows(named=True):
+        if row['resolution_timestamp'] is None: continue
+        
+        # Robust Date Parsing
+        s_date = row['start_date_str']
+        start_dt = None
+        if s_date:
+            try:
+                # Pandas is excellent at guessing formats (ISO, Z, +00:00, etc.)
+                start_dt = pd.to_datetime(s_date, utc=True)
+            except:
+                pass
+                
+        market_map[row['contract_id']] = {
             'fpmm': row['fpmm'],
-            'start': row['start_date'],
-            'end': row['resolution_timestamp'],
+            'start': start_dt, 
+            'end': row['resolution_timestamp'], # Already a timestamp
             'outcome': row['market_outcome'],
             'idx': row['token_index']
         }
-        for row in markets.iter_rows(named=True)
-        if row['resolution_timestamp'] is not None # Only use resolved markets
-    }
     
     # 2. INITIALIZE STATE
 
