@@ -40,8 +40,6 @@ class DataFetcher:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
 
-
-
         # 3. DEFINE FETCH HELPER
     def fetch_gamma_markets(self):
         import os
