@@ -166,7 +166,6 @@ def main():
         batch = batch.with_columns([
             pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
             pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-            pl.col("timestamp").str.to_datetime(strict=False),
         ])
       
         batch_sorted = batch.sort("timestamp")
