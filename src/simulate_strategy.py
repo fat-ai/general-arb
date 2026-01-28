@@ -95,26 +95,30 @@ def main():
     ])
     
     market_map = {}
-    for row in markets.iter_rows(named=True):
-        if row['resolution_timestamp'] is None: continue
+    
+    # Use valid_markets (dropped nulls) from previous step
+    for row in valid_markets.iter_rows(named=True):
+        cid = row['contract_id']
         
-        # Robust Date Parsing
-        s_date = row['start_date_str']
-        start_dt = None
-        if s_date:
-            try:
-                # Pandas is excellent at guessing formats (ISO, Z, +00:00, etc.)
-                start_dt = pd.to_datetime(s_date, utc=True)
-            except:
-                pass
-                
-        market_map[row['contract_id']] = {
+        # 1. Clean Start Date (Force Naive)
+        s_date = row['start_date']
+        if s_date is not None and s_date.tzinfo is not None:
+            s_date = s_date.replace(tzinfo=None)
+            
+        # 2. Clean Resolution Date (Force Naive)
+        e_date = row['resolution_timestamp']
+        if e_date is not None and e_date.tzinfo is not None:
+            e_date = e_date.replace(tzinfo=None)
+            
+        market_map[cid] = {
             'fpmm': row['fpmm'],
-            'start': start_dt, 
-            'end': row['resolution_timestamp'], # Already a timestamp
+            'start': s_date, 
+            'end': e_date,
             'outcome': row['market_outcome'],
             'idx': row['token_index']
         }
+    
+    log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     
     # 2. INITIALIZE STATE
 
