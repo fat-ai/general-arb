@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-FIXED_START_DATE = "2025-12-31"
+FIXED_START_DATE = pd.Timestamp("2025-12-31")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 
 # 3. Derived Constants
@@ -40,46 +40,10 @@ class DataFetcher:
         retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
 
-    def fetch_gamma_markets(self):
-        import os
-        import json
-        import pandas as pd
-        import numpy as np
-        import requests
-        from requests.adapters import HTTPAdapter, Retry
 
-        cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
-        
-        # 1. ANALYZE EXISTING CACHE
-        existing_df = pd.DataFrame()
-        min_created_at = None
-        max_created_at = None
-        
-        if cache_file.exists():
-            try:
-                print(f"   📂 Loading existing markets cache to determine update range...")
-                existing_df = pd.read_parquet(cache_file)
-                
-                # Ensure timestamps are actual datetimes for comparison
-                if not existing_df.empty and 'created_at' in existing_df.columns:
-                    # Convert to naive UTC for consistency
-                    dates = pd.to_datetime(existing_df['created_at'], utc=True).dt.tz_localize(None)
-                    min_created_at = dates.min()
-                    max_created_at = dates.max()
-                    print(f"      Existing Range: {min_created_at} <-> {max_created_at}")
-            except Exception as e:
-                print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
-                existing_df = pd.DataFrame()
-
-        # 2. SETUP SESSION
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        session.mount('https://', HTTPAdapter(max_retries=retries))
-        
-        all_new_rows = []
 
         # 3. DEFINE FETCH HELPER
-        def fetch_gamma_markets(self):
+    def fetch_gamma_markets(self):
         import os
         import json
         import pandas as pd
