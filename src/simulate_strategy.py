@@ -81,8 +81,8 @@ def main():
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question').alias('fpmm'),
-        pl.col('startDate'),
-        pl.col('resolution_timestamp'),
+        pl.col("start_date").cast(pl.String).str.to_datetime(strict=False).alias("start_date"),
+        pl.col("resolution_timestamp").cast(pl.String).str.to_datetime(strict=False).alias("resolution_timestamp")
         pl.col('outcome').alias('market_outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
           .then(pl.lit(1))
@@ -106,6 +106,13 @@ def main():
     }
     
     # 2. INITIALIZE STATE
+
+    tracker_first_bets = {}
+    
+    user_history = pl.DataFrame(schema={
+            "user": pl.String, "total_pnl": pl.Float64, 
+            "total_invested": pl.Float64, "trade_count": pl.UInt32
+        })
     
     known_users = set()
 
@@ -159,6 +166,7 @@ def main():
         batch = batch.with_columns([
             pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
             pl.col("user").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+            pl.col("timestamp").str.to_datetime(strict=False),
         ])
       
         batch_sorted = batch.sort("timestamp")
@@ -245,8 +253,12 @@ def main():
                             } 
                             for cid in just_resolved["contract_id"].unique()
                         ])
+
+                        resolved_with_outcome = just_resolved.join(
+                             outcomes_df, on="contract_id", how="left"
+                        )
                         
-                        pnl_calc = resolved_positions.join(
+                        pnl_calc = resolved_with_outcome.join(
                             just_resolved, on="contract_id"
                         ).select([
                             pl.col("user"),
@@ -371,9 +383,7 @@ def main():
                     # Handle string vs timestamp comparison safely
                     ts = t['timestamp']
                     if m_start:
-                        if isinstance(m_start, str):
-                            if str(ts) < m_start: continue
-                        elif ts < m_start: 
+                        if m_start is not None and ts is not None and ts < m_start:
                             continue
 
                     # Prepare Inputs
