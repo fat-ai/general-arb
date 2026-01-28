@@ -82,7 +82,7 @@ def main():
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question').alias('fpmm'),
         pl.col("start_date").cast(pl.String).str.to_datetime(strict=False).alias("start_date"),
-        pl.col("resolution_timestamp").cast(pl.String).str.to_datetime(strict=False).alias("resolution_timestamp")
+        pl.col("resolution_timestamp").cast(pl.String).str.to_datetime(strict=False).alias("resolution_timestamp"),
         pl.col('outcome').alias('market_outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
           .then(pl.lit(1))
@@ -96,7 +96,7 @@ def main():
     market_map = {
         row['contract_id']: {
             'fpmm': row['fpmm'],
-            'start': row['startDate'],
+            'start': row['start_date'],
             'end': row['resolution_timestamp'],
             'outcome': row['market_outcome'],
             'idx': row['token_index']
@@ -213,11 +213,6 @@ def main():
                 "is_long": is_long
             }  
 
-        
-        if batch["timestamp"].dtype != pl.Datetime:
-             batch = batch.with_columns(pl.col("timestamp").str.to_datetime(strict=False))
-             batch = batch.drop_nulls(subset=["timestamp"])
-
         # Ensure sorting (Oldest -> Newest)
         batch = batch.sort("timestamp")
         
@@ -320,10 +315,9 @@ def main():
                                 pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
                             ]).group_by("user").agg([pl.col("*").sum()])
 
-                    new_uids = pnl_calc["user"].to_list()
-                    known_users.update(new_uids)
-                    # Remove resolved from Active Positions to free memory
-                    active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
+                        new_uids = pnl_calc["user"].to_list()
+                        known_users.update(new_uids)
+                        active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
 
                 # 2. Update Scorer (Logic from wallet_scoring.py)
                 if user_history.height > 0:
