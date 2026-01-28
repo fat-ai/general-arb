@@ -96,8 +96,7 @@ def main():
     
     market_map = {}
     
-    # Use valid_markets (dropped nulls) from previous step
-    for row in valid_markets.iter_rows(named=True):
+    for row in markets.iter_rows(named=True):
         cid = row['contract_id']
         
         # 1. Clean Start Date (Force Naive)
