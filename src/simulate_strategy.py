@@ -101,6 +101,13 @@ def main():
         
         # 1. Clean Start Date (Force Naive)
         s_date = row['start_date']
+        
+        if isinstance(s_date, str):
+            try:
+                s_date = pd.to_datetime(s_date, utc=True)
+            except:
+                s_date = None
+                
         if s_date is not None and s_date.tzinfo is not None:
             s_date = s_date.replace(tzinfo=None)
             
