@@ -9,6 +9,7 @@ import sys
 import time
 import mmap
 from requests.adapters import HTTPAdapter, Retry
+from pathlib import Path
 from config import TRADES_FILE, TEMP_WALLET_STATS_FILE, WALLET_SCORES_FILE, MARKETS_FILE, GAMMA_API_URL
 CACHE_DIR = Path("/app/data")
 sys.stdout.reconfigure(line_buffering=True)
