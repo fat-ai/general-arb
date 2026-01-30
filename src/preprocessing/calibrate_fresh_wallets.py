@@ -7,20 +7,19 @@ import os
 import gc
 import warnings
 from datetime import datetime
+from config import TRADES_FILE, 
 
 warnings.filterwarnings("ignore")
 
 def main():
     print("--- Fresh Wallet Calibration (Production Version) ---")
-    
-    trades_path = 'gamma_trades_stream.csv'
-    # Assuming this file is already pre-filtered for valid markets
-    outcomes_path = 'market_outcomes_filtered.parquet'
-    output_file = 'model_params_audit.json'
+    trades_path = TRADES_FILE
+    outcomes_path = OUTCOMES_FILE
+    output_file = FRESH_SCORE_FILE
     BATCH_SIZE = 500_000 
 
     # 1. Load Outcomes (Simplified)
-    print(f"Loading outcomes from {outcomes_path}...")
+    print(f"Loading market outcomes from {outcomes_path}...")
     try:
         if not os.path.exists(outcomes_path):
             print(f"❌ Error: File '{outcomes_path}' not found.")
@@ -90,9 +89,6 @@ def main():
         # Inner join automatically filters out trades for markets not in our pre-filtered parquet
         joined = chunk.join(df_outcomes, on='contract_id', how='inner')
         if joined.height == 0: continue
-
-        # --- LOGIC FIX: Create columns INSIDE the DataFrame ---
-        # This prevents the "Length Mismatch" error by keeping everything aligned.
         
         joined = joined.with_columns([
             pl.col('bet_price').clip(0.001, 0.999).alias('safe_price'),
