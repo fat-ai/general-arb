@@ -37,8 +37,7 @@ class DataFetcher:
         self.session = requests.Session()
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=self.retries))
-        
-        
+         
     def fetch_gamma_markets(self):
         cache_file = CACHE_DIR / MARKETS_FILE
         existing_df = pd.DataFrame()
