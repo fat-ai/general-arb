@@ -16,6 +16,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- EXTERNAL SERVICES ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 RPC_URL = "https://polygon-bor.publicnode.com"
 EXCHANGE_CONTRACT = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
