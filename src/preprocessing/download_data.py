@@ -278,29 +278,13 @@ class DataFetcher:
                 print("➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
                 return pd.DataFrame()
 
-        try:
-            # We access the module-level globals if possible, or use the variable if it's in scope
-            if 'FIXED_END_DATE' in globals():
-                global_start_cursor = int(pd.Timestamp(globals()['FIXED_END_DATE']).timestamp())
-                print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
-            else:
-                # Fallback only if strictly necessary
-                global_start_cursor = int(time.time())
-                print(f"   ⚠️ Config End Date not found. Using NOW.")
+          
+        global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+        print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
 
-            if 'FIXED_START_DATE' in globals():
-                global_stop_ts = int(pd.Timestamp(globals()['FIXED_START_DATE']).timestamp())
-                print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
-            else:
-                # Fallback to days_back logic
-                global_stop_ts = global_start_cursor - (days_back * 86400)
-                print(f"   ⚠️ Config Start Date not found. Using days_back={days_back}.")
+        global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
+        print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
                 
-        except Exception as e:
-            print(f"   ⚠️ Date calculation error: {e}. Defaulting to safe 24h window.")
-            global_start_cursor = int(time.time())
-            global_stop_ts = global_start_cursor - 86400
-
         def fetch_segment(self, mstart_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
