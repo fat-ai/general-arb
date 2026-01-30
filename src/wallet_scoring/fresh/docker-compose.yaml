@@ -1,0 +1,11 @@
+services:
+  market-fetcher:
+    build: .
+    container_name: fwc
+    restart: unless-stopped
+    volumes:
+      - .../data-cache/polymarket_cache:/app/data
+      - .../config.py:/app/config.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
