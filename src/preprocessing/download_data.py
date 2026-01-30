@@ -20,37 +20,34 @@ log = logging.getLogger(__name__)
 # Constants
 FIXED_START_DATE = pd.Timestamp("2025-12-31")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
-
-# 3. Derived Constants
 today = pd.Timestamp.now().normalize()
-# Ensure we look back far enough to cover the start date
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
-
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+from config import MARKETS_FILE
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
 
 class DataFetcher:
-    def __init__(self, cache_dir: Path):
+    def __init__(self, cache_dir: Path, markets_file: String):
         self.cache_dir = cache_dir
+        self.markets_file = markets_file
         self.session = requests.Session()
-        retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
-
-        # 3. DEFINE FETCH HELPER
+        self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
+        
     def fetch_gamma_markets(self):
         import os
         import json
         import pandas as pd
         import numpy as np
         import requests
-        import gc  # Added for memory management
+        import gc
         from requests.adapters import HTTPAdapter, Retry
 
-        cache_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        cache_file = self.cache_dir / self.markets_file
         
         # 1. ANALYZE EXISTING CACHE
         existing_df = pd.DataFrame()
@@ -65,31 +62,33 @@ class DataFetcher:
                     dates = pd.to_datetime(existing_df['created_at'], utc=True).dt.tz_localize(None)
                     min_created_at = dates.min()
                     max_created_at = dates.max()
-                    print(f"      Existing Range: {min_created_at} <-> {max_created_at}")
+                    print(f"Existing Range: {min_created_at} <-> {max_created_at}")
             except Exception as e:
                 print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
                 existing_df = pd.DataFrame()
-
-        # 2. SETUP SESSION
-        session = requests.Session()
-        retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        session.mount('https://', HTTPAdapter(max_retries=retries))
         
         all_new_rows = []
 
-        # 3. DEFINE FETCH HELPER
+        # 2. DEFINE FETCH HELPER
         def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
             offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
-            print(f"   Fetching {mode_label} (closed={state})...", end=" ", flush=True)
+            print(f"Fetching {mode_label} (closed={state})...", end=" ", flush=True)
             local_rows = []
             while True:
                 params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
                 try:
-                    resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
-                    if resp.status_code != 200: break
+                    resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
+                    if resp.status_code != 200: 
+                        print("☠️ WARNING: Markets fetch failed! ☠️")
+                        print(f"Response code: {resp.status_code}")
+                        break
+                        
                     rows = resp.json()
-                    if not rows: break
+                    if not rows: 
+                        print("☠️ WARNING: Markets fetch returned invalid output! ☠️")
+                        print(resp)
+                        break
                     
                     if time_filter_func:
                         valid_batch = []
@@ -116,7 +115,7 @@ class DataFetcher:
             print(f" Done ({len(local_rows)}).")
             return local_rows
 
-        # 4. EXECUTE FETCHES
+        # 3. EXECUTE FETCHES
         all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
         
         if max_created_at:
@@ -129,15 +128,14 @@ class DataFetcher:
              stop_condition = lambda ts: ts >= min_created_at
              all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
 
-        # 5. PROCESS
+        # 4. PROCESS
         if not all_new_rows: 
-            print("   ✅ No new market updates found.")
-            # Clear memory before returning
+            print("✅ No new market updates found.")
             del existing_df, all_new_rows
             gc.collect()
             return
 
-        print(f"   Processing {len(all_new_rows)} new/updated market records...")
+        print(f"Processing {len(all_new_rows)} new/updated market records...")
         new_df = pd.DataFrame(all_new_rows)
 
         def extract_tokens(row):
@@ -201,7 +199,7 @@ class DataFetcher:
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
-        # 6. MERGE
+        # 5. MERGE
         if not existing_df.empty:
             print(f"   Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
             combined = pd.concat([existing_df, new_df])
@@ -213,8 +211,6 @@ class DataFetcher:
             combined.to_parquet(cache_file)
             print(f"✅ Saved total {len(combined)} market tokens.")
         
-        # --- MEMORY CLEANUP ---
-        # Explicitly delete large DataFrames to free RAM immediately
         del existing_df, new_df, combined, all_new_rows
         gc.collect()
         return
@@ -225,7 +221,7 @@ class DataFetcher:
         import time
         import os
         import shutil
-        import pandas as pd  # Explicit import to ensure pd.Timestamp works
+        import pandas as pd
         from datetime import datetime
         from decimal import Decimal
         from collections import defaultdict
@@ -833,15 +829,13 @@ class DataFetcher:
         return df
 
     def run(self):
-        import gc  # Ensure GC is imported
-
+        import gc
         print("Starting data collection...")
         
-        # 1. Fetch Markets (Saves to Disk, Returns None)
+        # 1. Fetch Markets
         print("\n--- Phase 1: Fetching Markets ---")
         self.fetch_gamma_markets()
         
-        # Force cleanup just in case
         gc.collect()
         
         market_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
@@ -874,5 +868,5 @@ class DataFetcher:
             print("No markets file found. Skipping trade fetch.")
             
 if __name__ == "__main__":
-    fetcher = DataFetcher(CACHE_DIR)
+    fetcher = DataFetcher(CACHE_DIR, MARKETS_FILE)
     fetcher.run()
