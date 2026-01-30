@@ -206,13 +206,13 @@ def main():
                 # Payout Logic (Dual Long / Inversion)
                 pl.when(pl.col("token_index") == 1) # YES Token
                   .then(
-                      (pl.col("qty_long") * pl.col("market_outcome")) + 
-                      (pl.col("qty_short") * (1.0 - pl.col("market_outcome")))
+                      (pl.col("qty_long") * pl.col("outcome")) + 
+                      (pl.col("qty_short") * (1.0 - pl.col("outcome")))
                   )
                   # NO Token (Inverted)
                   .otherwise(
-                      (pl.col("qty_long") * (1.0 - pl.col("market_outcome"))) + 
-                      (pl.col("qty_short") * pl.col("market_outcome"))
+                      (pl.col("qty_long") * (1.0 - pl.col("outcome"))) + 
+                      (pl.col("qty_short") * pl.col("outcome"))
                   )
                   .alias("payout")
             ])
@@ -223,6 +223,7 @@ def main():
                 pl.col("invested").sum().alias("chunk_invested"),
                 pl.col("trade_count").sum().alias("chunk_trades")
             ])
+            
             return user_totals
 
         # 2. Iterate and Aggregate
@@ -276,8 +277,8 @@ def main():
         print(f"   Scoring {final_df.height} unique users...", flush=True)
         
         scored_df = final_df.filter(
-            (pl.col("total_trades") >= 5) & 
-            (pl.col("total_invested") > 50.0) 
+            (pl.col("total_trades") >= 1) & 
+            (pl.col("total_invested") > 10.0) 
         ).with_columns([
             (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
             (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
@@ -289,7 +290,6 @@ def main():
 
         # 4. Save
         final_dict = {}
-        # Using iter_rows is safe now because result is aggregated (small)
         for row in scored_df.iter_rows(named=True):
             key = f"{row['user']}|default_topic"
             final_dict[key] = row['score'] 
