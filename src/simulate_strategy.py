@@ -12,7 +12,7 @@ import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE
 from strategy import SignalEngine, WalletScorer
 
-CACHE_DIR = Path("/app/data")
+CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WARMUP_DAYS = 30
