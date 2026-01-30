@@ -1,3 +1,4 @@
+import csv
 import polars as pl
 import pandas as pd
 import numpy as np
@@ -297,7 +298,9 @@ def main():
                 
                 if resolved_ids and active_positions.height > 0:
                 
-                    just_resolved = active_positions.filter(pl.col("contract_id").is_in(resolved_ids))
+                    just_resolved = active_positions.filter(
+                        pl.col("contract_id").is_in(pl.Series(resolved_ids).cast(pl.Categorical))
+                    )
                     
                     if just_resolved.height > 0:
 
