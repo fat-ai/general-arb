@@ -511,10 +511,6 @@ def main():
             
             if len(updates_buffer) > 50:
                 flush_updates()
-            
-            # 5. Capture Fresh Bets (Simplified)
-            # Just take the first row per user in this batch if they aren't in user_history
-            # (Skipping detailed logic for brevity, but you'd add to fresh_bets_X/y here)
 
         gc.collect()
 
