@@ -396,24 +396,26 @@ def main():
                                 
                                 user_history = pl.concat([user_history, new_history]).group_by("user").agg([pl.col("*").sum()])
     
-                        # Update Known Users
                         if 'pnl_calc' in locals() and pnl_calc.height > 0:
-                            new_uids = pnl_calc["user"].cast(pl.String).to_list()
-                            known_users.update(new_uids)
+                            # 1. Identify who changed
+                            affected_users = pnl_calc["user"].unique()
+                            
+                            # 2. Filter history for ONLY these users
+                            # We use the updated 'user_history' dataframe
+                            updates_df = user_history.filter(
+                                pl.col("user").is_in(affected_users) & 
+                                (pl.col("trade_count") >= 1) & 
+                                (pl.col("total_invested") > 10)
+                            ).with_columns([
+                                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
+                                (pl.col("trade_count").log(10) + 1).alias("vol_boost")
+                            ]).with_columns((pl.col("roi") * pl.col("vol_boost")).alias("score"))
     
-                    active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
-                    
-                # 2. Update Scorer
-                if user_history.height > 0:
-                    scores_df = user_history.filter(
-                        (pl.col("trade_count") >= 2) & (pl.col("total_invested") > 10)
-                    ).with_columns([
-                        (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                        (pl.col("trade_count").log(10) + 1).alias("vol_boost")
-                    ]).with_columns((pl.col("roi") * pl.col("vol_boost")).alias("score"))
-                    
-                    # Update strategy directly
-                    scorer.wallet_scores = dict(zip(scores_df["user"], scores_df["score"]))
+                            # 3. Update existing dictionary (Delta Update)
+                            # Instead of replacing the whole dict, we just update the specific keys
+                            if updates_df.height > 0:
+                                new_scores = dict(zip(updates_df["user"], updates_df["score"]))
+                                scorer.wallet_scores.update(new_scores)
                     
                 # 3. Update Fresh Wallet Params (OLS)
                 if len(fresh_bets_X) > 100:
