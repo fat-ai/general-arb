@@ -92,7 +92,8 @@ def main():
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-        pl.col('question').alias('fpmm'),
+        pl.col('question'),
+        pl.col('fpmm'),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
         pl.col('outcome').alias('market_outcome'),
@@ -126,7 +127,8 @@ def main():
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
-            'fpmm': row['fpmm'],
+            'question': row['question'],   
+            'fpmm': row['fpmm_id'],        
             'start': s_date, 
             'end': e_date,
             'outcome': row['market_outcome'],
@@ -434,7 +436,7 @@ def main():
             # B. GET TRADES FOR THIS DAY
             daily_trades = batch.filter(pl.col("day") == day)
             
-            # --- [FIX] WARM-UP PERIOD CHECK ---
+            # --- WARM-UP PERIOD CHECK ---
             # If this is the first day seen, allow us to set a start anchor
             if simulation_start_date is None:
                 data_start_date = day
@@ -479,8 +481,8 @@ def main():
                     
                     results.append({
                         "timestamp": t['timestamp'], 
-                        "fpmm": m['fpmm'], 
-                        "question": m['fpmm'],
+                        "fpmm": m['fpmm'],      
+                        "question": m['question'], 
                         "outcome": m['outcome'], 
                         "signal_strength": sig,
                         "trade_price": t['price'], 
