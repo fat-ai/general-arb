@@ -81,10 +81,6 @@ def process_chunk_universal(df_chunk, outcomes_df):
     )
     
     return stats
-    
-# ==========================================
-# 3. MAIN EXECUTION
-# ==========================================
 
 def main():
     print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
