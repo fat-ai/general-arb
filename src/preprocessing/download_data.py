@@ -36,7 +36,7 @@ class DataFetcher:
     def __init__(self):
         self.session = requests.Session()
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
-        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=self.retries))
         
         
     def fetch_gamma_markets(self):
@@ -434,7 +434,7 @@ class DataFetcher:
 
             elif not existing_high_ts:
                 print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                count = fetch_segment(self, global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
+                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
                 total_captured += count
 
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
@@ -449,7 +449,6 @@ class DataFetcher:
         return pd.DataFrame()
 
     def run(self):
-        import gc
         print("Starting data collection...")
         print("\n--- Phase 1: Fetching Markets ---")
         self.fetch_gamma_markets()
