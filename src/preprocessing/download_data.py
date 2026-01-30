@@ -288,7 +288,7 @@ class DataFetcher:
         global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
         print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
                 
-        def fetch_segment(mstart_ts, end_ts, writer_obj, segment_name):
+        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
             
