@@ -406,7 +406,7 @@ def main():
                 # 2. Update Scorer
                 if user_history.height > 0:
                     scores_df = user_history.filter(
-                        (pl.col("trade_count") >= 1) & (pl.col("total_invested") > 10)
+                        (pl.col("trade_count") >= 2) & (pl.col("total_invested") > 10)
                     ).with_columns([
                         (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
                         (pl.col("trade_count").log(10) + 1).alias("vol_boost")
