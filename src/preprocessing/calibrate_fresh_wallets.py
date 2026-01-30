@@ -7,14 +7,14 @@ import os
 import gc
 import warnings
 from datetime import datetime
-from config import TRADES_FILE, 
+from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
 
 warnings.filterwarnings("ignore")
 
 def main():
     print("--- Fresh Wallet Calibration (Production Version) ---")
     trades_path = TRADES_FILE
-    outcomes_path = OUTCOMES_FILE
+    outcomes_path = MARKETS_FILE
     output_file = FRESH_SCORE_FILE
     BATCH_SIZE = 500_000 
 
@@ -30,7 +30,7 @@ def main():
             pl.scan_parquet(outcomes_path)
             .select([
                 pl.col('contract_id').cast(pl.String).str.strip_chars(),
-                pl.col('final_outcome').cast(pl.Float64).alias('outcome')
+                pl.col('outcome').cast(pl.Float64)
             ])
             .unique(subset=['contract_id'], keep='last')
             .collect()
