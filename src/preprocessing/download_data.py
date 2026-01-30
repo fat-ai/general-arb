@@ -201,7 +201,7 @@ class DataFetcher:
 
         # 5. MERGE
         if not existing_df.empty:
-            print(f"   Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
+            print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
             combined = pd.concat([existing_df, new_df])
             combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
         else:
@@ -450,7 +450,7 @@ class DataFetcher:
             print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
             return seg_captured
 
-        # 6. MAIN ORCHESTRATION
+        # 5. MAIN ORCHESTRATION
         total_captured = 0
         
         with open(temp_file, 'w', newline='') as f:
@@ -502,7 +502,7 @@ class DataFetcher:
         
         return pd.DataFrame()
 
-        # 5. EXECUTION FUNCTION
+        # 6. EXECUTION FUNCTION
         def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
@@ -653,97 +653,11 @@ class DataFetcher:
                 try: os.remove(cache_file)
                 except: pass
             os.rename(temp_file, cache_file)
-            
-            # CRITICAL FIX: DO NOT LOAD CSV. Return empty DF.
-            # The 'run()' method ignores this return value anyway.
-            print("   ✅ File saved successfully. Returning empty DataFrame to save RAM.")
+
+            print("   ✅ File saved successfully.")
             return pd.DataFrame()
         
         return pd.DataFrame()
-
-    def fetch_subgraph_trades(self, days_back=365):
-        import time
-        
-        # ANCHOR: Current System Time (NOW)
-        time_cursor = int(time.time())
-        
-        # Stop fetching if we go past this date
-        cutoff_time = time_cursor - (days_back * 24 * 60 * 60)
-        
-        cache_file = self.cache_dir / f"subgraph_trades_recent_{days_back}d.pkl"
-        if cache_file.exists(): 
-            try:
-                return pickle.load(open(cache_file, "rb"))
-            except: pass
-            
-        url = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/fpmm-subgraph/0.0.1/gn"
-        
-        query_template = """
-        {{
-          fpmmTransactions(first: 1000, orderBy: timestamp, orderDirection: desc, where: {{ timestamp_lt: "{time_cursor}" }}) {{
-            id
-            timestamp
-            tradeAmount
-            outcomeTokensAmount
-            user {{ id }}
-            market {{ id }}
-          }}
-        }}
-        """
-        all_rows = []
-        
-        print(f"Fetching Trades from NOW ({time_cursor}) back to {cutoff_time}...", end="")
-        retry_count = 0
-        MAX_RETRIES = 5
-        while True:
-            try:
-                resp = self.session.post(url, json={'query': query_template.format(time_cursor=time_cursor)}, timeout=30)
-                if resp.status_code != 200:
-                    log.error(f"API Error {resp.status_code}: {resp.text[:100]}")
-                    retry_count += 1
-                    if retry_count > MAX_RETRIES:
-                        raise ValueError(f"❌ FATAL: Subgraph API failed after {MAX_RETRIES} attempts. Stopping to prevent partial data.")
-                    time.sleep(2 * retry_count)
-                    continue
-                    
-                retry_count = 0    
-                data = resp.json().get('data', {}).get('fpmmTransactions', [])
-                if not data: break
-                
-                all_rows.extend(data)
-                
-                # Update cursor
-                last_ts = int(data[-1]['timestamp'])
-                
-                # Stop if we passed the cutoff
-                if last_ts < cutoff_time: break
-                
-                # Stop if API returns partial page (end of data)
-                if len(data) < 1000: break
-                
-                # Safety break
-                if last_ts >= time_cursor: break
-                
-                time_cursor = last_ts
-                
-                if len(all_rows) % 5000 == 0: print(".", end="", flush=True)
-                
-            except Exception as e:
-                log.error(f"Fetch error: {e}")
-                break
-                
-        print(f" Done. Fetched {len(all_rows)} trades.")
-            
-        df = pd.DataFrame(all_rows)
-        
-        if not df.empty:
-            # Filter strictly to the requested window
-            df['ts_int'] = df['timestamp'].astype(int)
-            df = df[df['ts_int'] >= cutoff_time]
-            
-            with open(cache_file, 'wb') as f: pickle.dump(df, f)
-            
-        return df
 
     def fetch_orderbook_stats(self):
         """
@@ -841,8 +755,6 @@ class DataFetcher:
         market_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
         
         if market_file.exists():
-            # MEMORY FIX: Read ONLY the 'contract_id' column.
-            # This avoids loading huge string columns like 'question' or 'description'.
             print("   Loading contract IDs from disk (Lightweight Mode)...")
             market_ids_df = pd.read_parquet(market_file, columns=['contract_id'])
             
