@@ -128,7 +128,7 @@ def main():
             
         market_map[cid] = {
             'question': row['question'],   
-            'fpmm': row['fpmm_id'],        
+            'fpmm': row['fpmm'],        
             'start': s_date, 
             'end': e_date,
             'outcome': row['market_outcome'],
@@ -142,22 +142,13 @@ def main():
     known_users = set()
     updates_buffer = []
     
-    if 'user_history' not in locals() or user_history is None:
-        user_history = pl.DataFrame(schema={
-            "user": pl.Categorical,  # Changed from String
-            "total_pnl": pl.Float32, # Changed from Float64
-            "total_invested": pl.Float32,
-            "trade_count": pl.UInt32
-        })
+    user_history = pl.DataFrame(schema={
+        "user": pl.Categorical,  # Changed from String
+        "total_pnl": pl.Float32, # Changed from Float64
+        "total_invested": pl.Float32,
+        "trade_count": pl.UInt32
+    })
     
-    elif user_history.height > 0:
-        user_history = user_history.with_columns([
-            pl.col("user").cast(pl.Categorical),
-            pl.col("total_pnl").cast(pl.Float32),
-            pl.col("total_invested").cast(pl.Float32)
-        ])
-        known_users.update(user_history["user"].to_list())
-
     active_positions = pl.DataFrame(schema={
         "user": pl.Categorical,        
         "contract_id": pl.Categorical, 
@@ -220,6 +211,7 @@ def main():
                 },
                 try_parse_dates=True
             )
+            
         except Exception as e:
             log.warning(f"Skipping corrupt chunk: {e}")
             continue
@@ -237,10 +229,12 @@ def main():
         batch_sorted = batch.sort("timestamp")
         
         # We need a set of KNOWN users to skip efficiently
-        # Combine DB history + Current Tracker + Current Active Positions
-        # (Optimization: We check these dynamically inside the loop)
+        # Create a filter of users we DO NOT know yet
+        unknown_mask = ~batch_sorted["user"].is_in(known_users)
+        potential_fresh = batch_sorted.filter(unknown_mask)
         
-        for row in batch_sorted.iter_rows(named=True):
+        # Only iterate through the potential fresh candidates
+        for row in potential_fresh.iter_rows(named=True):
             uid = row["user"]
             
             # 1. SKIP if we already know this user (from DB or current tracker)
@@ -377,6 +371,7 @@ def main():
                             
                             for uid in users_to_remove:
                                 del tracker_first_bets[uid]
+                                known_users.add(uid)
     
                             # Update History
                             if user_history.height == 0:
