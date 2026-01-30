@@ -37,17 +37,8 @@ class DataFetcher:
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
         
     def fetch_gamma_markets(self):
-        import os
-        import json
-        import pandas as pd
-        import numpy as np
-        import requests
-        import gc
-        from requests.adapters import HTTPAdapter, Retry
 
         cache_file = CACHE_DIR / MARKETS_FILE
-        
-        # 1. ANALYZE EXISTING CACHE
         existing_df = pd.DataFrame()
         min_created_at = None
         max_created_at = None
@@ -67,7 +58,6 @@ class DataFetcher:
         
         all_new_rows = []
 
-        # 2. DEFINE FETCH HELPER
         def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
             offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
@@ -113,7 +103,6 @@ class DataFetcher:
             print(f" Done ({len(local_rows)}).")
             return local_rows
 
-        # 3. EXECUTE FETCHES
         all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
         
         if max_created_at:
@@ -126,7 +115,6 @@ class DataFetcher:
              stop_condition = lambda ts: ts >= min_created_at
              all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
 
-        # 4. PROCESS
         if not all_new_rows: 
             print("✅ No new market updates found.")
             del existing_df, all_new_rows
@@ -197,7 +185,6 @@ class DataFetcher:
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
-        # 5. MERGE
         if not existing_df.empty:
             print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
             combined = pd.concat([existing_df, new_df])
@@ -214,21 +201,10 @@ class DataFetcher:
         return
 
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
-        import requests
-        import csv
-        import time
-        import os
-        import shutil
-        import pandas as pd
-        from datetime import datetime
-        from decimal import Decimal
-        from collections import defaultdict
-        
-        # 1. SETUP CACHE
+
         cache_file = CACHE_DIR / TRADES_FILE
         temp_file = cache_file.with_suffix(".tmp.csv")
         
-        # 2. PARSE TARGETS
         valid_token_ints = set()
         for t in target_token_ids:
             try:
@@ -287,28 +263,25 @@ class DataFetcher:
             
             return high_ts, low_ts
 
-        # 4. DETERMINE FETCH STRATEGY
         existing_high_ts = None
         existing_low_ts = None
         
         if cache_file.exists():
-            print(f"   📂 Found existing cache. Checking bounds...")
+            print(f"📂 Found existing cache. Checking bounds...")
             existing_high_ts, existing_low_ts = get_csv_bounds(cache_file)
             
             if existing_high_ts is None or existing_low_ts is None:
-                print("   ❌ CRITICAL ERROR: Existing CSV is empty, corrupt, or unreadable.")
-                print("   ➡️  Action: Delete 'gamma_trades_stream.csv' manually and retry.")
+                print("❌ CRITICAL ERROR: Existing CSV is empty, corrupt, or unreadable.")
+                print("➡️  Action: Delete 'gamma_trades_stream.csv' manually and retry.")
                 return pd.DataFrame()
 
-            print(f"      Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
+            print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
             
             if existing_low_ts > existing_high_ts:
-                print("   ❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
-                print("   ➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
+                print("❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
+                print("➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
                 return pd.DataFrame()
 
-        # --- DATE CONFIGURATION (Robust) ---
-        # Explicitly look for globals if available, otherwise rely on hard error to warn user
         try:
             # We access the module-level globals if possible, or use the variable if it's in scope
             if 'FIXED_END_DATE' in globals():
@@ -332,13 +305,12 @@ class DataFetcher:
             global_start_cursor = int(time.time())
             global_stop_ts = global_start_cursor - 86400
 
-        # 5. EXECUTION FUNCTION
         def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
             
-            print(f"   🚀 Starting Segment: {segment_name}")
-            print(f"      Range: {datetime.utcfromtimestamp(cursor)} -> {datetime.utcfromtimestamp(stop_limit)}")
+            print(f"🚀 Starting Segment: {segment_name}")
+            print(f"Range: {datetime.utcfromtimestamp(cursor)} -> {datetime.utcfromtimestamp(stop_limit)}")
             
             seg_captured = 0
             seg_dropped = 0
@@ -443,7 +415,6 @@ class DataFetcher:
             print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
             return seg_captured
 
-        # 5. MAIN ORCHESTRATION
         total_captured = 0
         
         with open(temp_file, 'w', newline='') as f:
@@ -483,59 +454,12 @@ class DataFetcher:
                 count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
                 total_captured += count
 
-        # 7. COMMIT
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
         if total_captured > 0 or existing_high_ts:
             if cache_file.exists(): 
                 try: os.remove(cache_file)
                 except: pass
             os.rename(temp_file, cache_file)
-            print("   ✅ File saved successfully. Returning empty DataFrame to save RAM.")
-            return pd.DataFrame()
-        
-        return pd.DataFrame()
-
-        # 6. MAIN ORCHESTRATION
-        total_captured = 0
-        
-        with open(temp_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-            writer.writeheader()
-            
-            # PHASE 1: NEWER DATA
-            if existing_high_ts:
-                print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
-                total_captured += count
-
-            # PHASE 2: STREAM EXISTING
-            if existing_high_ts and existing_low_ts:
-                print(f"\n💾 PHASE 2: Streaming Existing Cache...")
-                f.flush()
-                with open(cache_file, 'r') as f_old:
-                    f_old.readline() # Skip header
-                    shutil.copyfileobj(f_old, f)
-                print(f"   ✅ Existing data merged.")
-                f.flush()
-
-            # PHASE 3: OLDER DATA
-            if existing_low_ts:
-                print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
-                total_captured += count
-            elif not existing_high_ts:
-                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
-                total_captured += count
-
-        # 7. COMMIT
-        print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
-        if total_captured > 0 or existing_high_ts:
-            if cache_file.exists(): 
-                try: os.remove(cache_file)
-                except: pass
-            os.rename(temp_file, cache_file)
-
             print("   ✅ File saved successfully.")
             return pd.DataFrame()
         
@@ -544,8 +468,6 @@ class DataFetcher:
     def run(self):
         import gc
         print("Starting data collection...")
-        
-        # 1. Fetch Markets
         print("\n--- Phase 1: Fetching Markets ---")
         self.fetch_gamma_markets()
         
