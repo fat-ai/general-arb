@@ -78,10 +78,16 @@ def main():
     
     if OUTPUT_PATH.exists():
         with open(OUTPUT_PATH, 'w') as f:
-            f.truncate(0)
+            f.truncate(1)
+    else:
+        headers = ["timestamp", "fpmm", "question", "outcome", "signal_strength", "trade_price", "trade_volume"]
+        with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        print(f"Output file created successfully at {OUTPUT_PATH}")
     
     # 1. LOAD MARKETS (Static Data)
-    # We need to know: (a) When a market started, (b) When it ended, (c) The outcome
+
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
@@ -101,7 +107,7 @@ def main():
     for row in markets.iter_rows(named=True):
         cid = row['contract_id']
         
-        # 1. Clean Start Date (Force Naive)
+        # Clean Start Date (Force Naive)
         s_date = row['start_date']
         
         if isinstance(s_date, str):
@@ -113,7 +119,7 @@ def main():
         if s_date is not None and s_date.tzinfo is not None:
             s_date = s_date.replace(tzinfo=None)
             
-        # 2. Clean Resolution Date (Force Naive)
+        # Clean Resolution Date (Force Naive)
         e_date = row['resolution_timestamp']
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
@@ -129,7 +135,6 @@ def main():
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     
     # 2. INITIALIZE STATE
-
     tracker_first_bets = {}
     known_users = set()
     updates_buffer = []
