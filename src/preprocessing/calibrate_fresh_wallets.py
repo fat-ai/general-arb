@@ -12,7 +12,7 @@ from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
 warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (Production Version) ---")
+    print("--- Fresh Wallet Calibration ---")
     trades_path = TRADES_FILE
     outcomes_path = MARKETS_FILE
     output_file = FRESH_SCORE_FILE
@@ -25,7 +25,6 @@ def main():
             print(f"❌ Error: File '{outcomes_path}' not found.")
             return
 
-        # We no longer need to check dates here since the file is pre-filtered
         df_outcomes = (
             pl.scan_parquet(outcomes_path)
             .select([
@@ -36,6 +35,7 @@ def main():
             .collect()
         )
         print(f"✅ Loaded outcomes for {df_outcomes.height} markets.")
+        
     except Exception as e:
         print(f"❌ Error loading outcomes: {e}")
         return
