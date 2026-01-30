@@ -9,15 +9,16 @@ import sys
 import time
 import mmap
 from requests.adapters import HTTPAdapter, Retry
+from config import TRADES_FILE, TEMP_WALLET_STATS_FILE, WALLET_SCORES_FILE, OUTCOMES_FILE, GAMMA_API_URL
 
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 
 # ==========================================
-# 1. FETCH & FILTER MARKETS
+# 1. FETCH MARKETS
 # ==========================================
 def fetch_filtered_outcomes(min_timestamp_str):
-    cache_file = "market_outcomes_filtered.parquet"
+    cache_file = OUTCOMES_FILE
     
     # 1. Check Cache
     if os.path.exists(cache_file):
@@ -35,7 +36,7 @@ def fetch_filtered_outcomes(min_timestamp_str):
     print("Fetching market outcomes from Polymarket API...", flush=True)
     all_rows = []
     session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    retries = Retry(total=None, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
     # 2. Fetch Data
@@ -45,7 +46,7 @@ def fetch_filtered_outcomes(min_timestamp_str):
         while True:
             params = {"limit": 500, "offset": offset, "closed": state}
             try:
-                resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=15)
+                resp = session.get(GAMMA_API_URL, params=params, timeout=30)
                 if resp.status_code != 200: break
                 rows = resp.json()
                 if not rows: break
@@ -230,18 +231,18 @@ def process_chunk_universal(df_chunk, outcomes_df):
 # ==========================================
 
 def main():
-    print("DEBUG: Starting Universal Mint Logic Script (Production Version)...", flush=True)
+    print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
     
-    csv_file = "gamma_trades_stream.csv"
-    temp_file = "temp_universal_stats.csv"
-    output_file = "wallet_scores.json"
+    csv_file = TRADES_FILE
+    temp_file = TEMP_WALLET_STATS_FILE
+    output_file = WALLET_SCORES_FILE
 
     if not os.path.exists(csv_file):
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
     # --- A. DETECT START DATE ---
-    print("👀 Detecting true start date (checking first and last rows)...", flush=True)
+    print("👀 Detecting start date (checking first and last rows)...", flush=True)
     try:
         # Read First Row
         df_head = pd.read_csv(csv_file, nrows=1)
