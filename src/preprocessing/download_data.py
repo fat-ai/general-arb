@@ -24,16 +24,14 @@ today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
 
 class DataFetcher:
-    def __init__(self, cache_dir: Path, markets_file: String):
-        self.cache_dir = cache_dir
-        self.markets_file = markets_file
+    def __init__(self):
         self.session = requests.Session()
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
@@ -47,7 +45,7 @@ class DataFetcher:
         import gc
         from requests.adapters import HTTPAdapter, Retry
 
-        cache_file = self.cache_dir / self.markets_file
+        cache_file = CACHE_DIR / MARKETS_FILE
         
         # 1. ANALYZE EXISTING CACHE
         existing_df = pd.DataFrame()
@@ -78,7 +76,7 @@ class DataFetcher:
             while True:
                 params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
                 try:
-                    resp = session.get("https://gamma-api.polymarket.com/markets", params=params, timeout=30)
+                    resp = session.get(GAMMA_API_URL, params=params, timeout=30)
                     if resp.status_code != 200: 
                         print("☠️ WARNING: Markets fetch failed! ☠️")
                         print(f"Response code: {resp.status_code}")
@@ -227,7 +225,7 @@ class DataFetcher:
         from collections import defaultdict
         
         # 1. SETUP CACHE
-        cache_file = self.cache_dir / "gamma_trades_stream.csv"
+        cache_file = CACHE_DIR / TRADES_FILE
         temp_file = cache_file.with_suffix(".tmp.csv")
         
         # 2. PARSE TARGETS
@@ -243,13 +241,8 @@ class DataFetcher:
                 valid_token_ints.add(val)
             except: continue
             
-        print(f"   🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
+        print(f"🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
         if not valid_token_ints: return pd.DataFrame()
-
-        # 3. SETUP SESSION & CONSTANTS
-        GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
-        session = requests.Session()
-        session.mount("https://", requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3)))
         
         def parse_iso_to_ts(iso_str):
             try: return pd.Timestamp(iso_str).timestamp()
@@ -502,117 +495,6 @@ class DataFetcher:
         
         return pd.DataFrame()
 
-        # 6. EXECUTION FUNCTION
-        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
-            cursor = int(start_ts)
-            stop_limit = int(end_ts)
-            
-            print(f"   🚀 Starting Segment: {segment_name}")
-            print(f"      Range: {datetime.utcfromtimestamp(cursor)} -> {datetime.utcfromtimestamp(stop_limit)}")
-            
-            seg_captured = 0
-            seg_dropped = 0
-            batch_num = 0
-            
-            while cursor > stop_limit:
-                try:
-                    batch_num += 1
-                    query = f"""
-                    query {{
-                        orderFilledEvents(
-                            first: 1000, 
-                            orderBy: timestamp, 
-                            orderDirection: desc, 
-                            where: {{ timestamp_lt: {cursor}, timestamp_gte: {stop_limit} }}
-                        ) {{
-                            id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
-                        }}
-                    }}
-                    """
-                    
-                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=10)
-                    if resp.status_code != 200:
-                        print(f" ❌ {resp.status_code}")
-                        time.sleep(2)
-                        continue
-
-                    data = resp.json().get('data', {}).get('orderFilledEvents', [])
-                    
-                    if not data:
-                        print(" Gap/Done.")
-                        break
-
-                    by_ts = defaultdict(list)
-                    for row in data:
-                        ts = int(row['timestamp'])
-                        by_ts[ts].append(row)
-                    
-                    sorted_ts = sorted(by_ts.keys(), reverse=True)
-                    oldest_ts = sorted_ts[-1]
-                    is_full_batch = (len(data) >= 1000)
-                    
-                    out_rows = []
-                    
-                    for ts in sorted_ts:
-                        if is_full_batch and ts == oldest_ts: continue
-                        
-                        for r in by_ts[ts]:
-                            if r.get('maker') == r.get('taker'):
-                                seg_dropped += 1; continue
-                            
-                            m_raw = str(r.get('makerAssetId', '0')).strip()
-                            if m_raw.startswith("0x"): m_int = int(m_raw, 16)
-                            else: m_int = int(Decimal(m_raw))
-                            
-                            t_raw = str(r.get('takerAssetId', '0')).strip()
-                            if t_raw.startswith("0x"): t_int = int(t_raw, 16)
-                            else: t_int = int(Decimal(t_raw))
-                            
-                            tid = None; mult = 0
-                            if m_int in valid_token_ints:
-                                tid = m_int; mult = 1
-                                val_usdc = float(r['takerAmountFilled']) / 1e6
-                                val_size = float(r['makerAmountFilled']) / 1e6
-                            elif t_int in valid_token_ints:
-                                tid = t_int; mult = -1
-                                val_usdc = float(r['makerAmountFilled']) / 1e6
-                                val_size = float(r['takerAmountFilled']) / 1e6
-                            
-                            if tid and val_usdc > 0 and val_size > 0:
-                                price = val_usdc / val_size
-                                if price > 1.00 or price < 0.000001:
-                                    seg_dropped += 1; continue
-                                    
-                                out_rows.append({
-                                    'id': r['id'], 
-                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
-                                    'tradeAmount': val_usdc, 
-                                    'outcomeTokensAmount': val_size * mult,
-                                    'user': r['taker'], 
-                                    'contract_id': str(tid),
-                                    'price': price, 
-                                    'size': val_size, 
-                                    'side_mult': mult
-                                })
-
-                    if out_rows:
-                        writer_obj.writerows(out_rows)
-                        seg_captured += len(out_rows)
-
-                    if is_full_batch:
-                         cursor = oldest_ts + 1 
-                    else:
-                        cursor = oldest_ts
-
-                    print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
-
-                except Exception as e:
-                    print(f" Err: {e}")
-                    time.sleep(1)
-            
-            print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
-            return seg_captured
-
         # 6. MAIN ORCHESTRATION
         total_captured = 0
         
@@ -659,89 +541,6 @@ class DataFetcher:
         
         return pd.DataFrame()
 
-    def fetch_orderbook_stats(self):
-        """
-        Fetches aggregate stats (Volume, Trade Count) for all Token IDs from the Subgraph.
-        Used to classify markets as 'Ghost', 'Thin', or 'Liquid'.
-        """
-        import requests
-        import pandas as pd
-        import time
-        
-        cache_file = self.cache_dir / "orderbook_stats.parquet"
-        if cache_file.exists():
-            print(f"   Loading cached orderbook stats...")
-            return pd.read_parquet(cache_file)
-            
-        print("   Fetching Orderbook Stats from Subgraph...")
-        
-        URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
-        all_stats = []
-        last_id = ""
-    
-        session = requests.Session()
-        # Retry connection errors/status codes (500, 502, 503, 504) automatically
-        retries = requests.adapters.Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
-        while True:
-            query = """
-            query($last_id: String!) {
-              orderbooks(
-                first: 1000
-                orderBy: id
-                orderDirection: asc
-                where: { id_gt: $last_id }
-              ) {
-                id
-                scaledCollateralVolume
-                tradesQuantity
-              }
-            }
-            """
-            
-            success = False
-            for attempt in range(5):  # Try up to 5 times
-                try:
-                    # Use 'session.post' instead of 'requests.post'
-                    resp = session.post(URL, json={'query': query, 'variables': {'last_id': last_id}}, timeout=60)
-                    
-                    if resp.status_code == 200:
-                        success = True
-                        break  # Success! Exit the retry loop
-                    else:
-                        print(f"   ⚠️ API Error {resp.status_code}. Retrying in {2**attempt}s...")
-                        time.sleep(2 ** attempt) # Exponential Backoff: 1s, 2s, 4s...
-                except Exception as e:
-                    print(f"   ⚠️ Network Error: {e}. Retrying in {2**attempt}s...")
-                    time.sleep(2 ** attempt)
-            
-            if not success:
-                print("   ❌ Critical: Max retries exceeded. Aborting fetch.")
-                break
-
-            # Proceed with processing (resp is guaranteed to be 200 OK here)
-            data = resp.json().get('data', {}).get('orderbooks', [])
-            if not data: break
-                
-            for row in data:
-                all_stats.append({
-                    'contract_id': row['id'],
-                    'total_volume': float(row.get('scaledCollateralVolume', 0) or 0),
-                    'total_trades': int(row.get('tradesQuantity', 0) or 0)
-                })
-                
-            last_id = data[-1]['id']
-            print(f"   Fetched {len(all_stats)} stats...", end='\r')
-                
-        
-        print(f"\n   ✅ Loaded stats for {len(all_stats)} tokens.")
-        df = pd.DataFrame(all_stats)
-        
-        if not df.empty:
-            df.to_parquet(cache_file)
-            
-        return df
-
     def run(self):
         import gc
         print("Starting data collection...")
@@ -751,34 +550,24 @@ class DataFetcher:
         self.fetch_gamma_markets()
         
         gc.collect()
-        
-        market_file = self.cache_dir / "gamma_markets_all_tokens.parquet"
+        market_file = self.cache_dir / self.markets_file
         
         if market_file.exists():
             print("   Loading contract IDs from disk (Lightweight Mode)...")
             market_ids_df = pd.read_parquet(market_file, columns=['contract_id'])
-            
-            # Normalize and convert to set
             market_ids_df['contract_id'] = market_ids_df['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
             valid_market_ids = set(market_ids_df['contract_id'].unique())
-            
-            # Free the single-column DF immediately
             del market_ids_df
             gc.collect()
             
             print(f"Found {len(valid_market_ids)} unique contract IDs.")
 
-            # 2. Fetch Trades (Parallel/Orderbook)
-            print("\n--- Phase 2: Fetching Trades (Goldsky Orderbook) ---")
+            print("\n--- Phase 2: Fetching Trades ---")
             self.fetch_gamma_trades_parallel(valid_market_ids, days_back=DAYS_BACK)
-            
-            # 3. Fetch Orderbook Stats
-            print("\n--- Phase 3: Fetching Orderbook Stats ---")
-            self.fetch_orderbook_stats()
             
         else:
             print("No markets file found. Skipping trade fetch.")
             
 if __name__ == "__main__":
-    fetcher = DataFetcher(CACHE_DIR, MARKETS_FILE)
+    fetcher = DataFetcher()
     fetcher.run()
