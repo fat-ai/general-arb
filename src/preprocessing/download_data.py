@@ -279,8 +279,7 @@ class DataFetcher:
                 print("❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
                 print("➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
                 return pd.DataFrame()
-
-          
+  
         global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
         print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
 
