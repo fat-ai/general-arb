@@ -8,9 +8,11 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import subprocess
 import math
-
-# Import your Strategy Logic
+from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE
 from strategy import SignalEngine, WalletScorer
+
+CACHE_DIR = Path("/app/data")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WARMUP_DAYS = 30
 
@@ -19,9 +21,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger("Sim")
 
 # Files
-TRADES_PATH = Path("polymarket_cache/gamma_trades_stream.csv")
-MARKETS_PATH = Path("polymarket_cache/gamma_markets_all_tokens.parquet")
-OUTPUT_PATH = Path("simulation_results.csv")
+TRADES_PATH = CACHE_DIR / TRADES_FILE
+MARKETS_PATH = CACHE_DIR / MARKETS_FILE
+OUTPUT_PATH = SIGNAL_FILE
 
 def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
     """
@@ -29,7 +31,7 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
     Yields batches of raw bytes that can be parsed as CSV.
     """
     with open(file_path, 'rb') as f:
-        # [FIX] .rstrip() removes the trailing \n so we don't insert a double-newline later
+    
         header = f.readline().rstrip()
         
         # Go to end of file
@@ -173,7 +175,6 @@ def main():
     data_start_date = None
     simulation_start_date = None
 
-    # Use the new Python generator (No 'tac', no disk usage)
     chunk_gen = reverse_file_chunk_generator(TRADES_PATH, chunk_size=1024*1024*32)
 
     def flush_updates():
@@ -199,7 +200,7 @@ def main():
         gc.collect()
 
     for csv_bytes in chunk_gen:
-        # Parse byte chunk directly into Polars
+
         try:
             batch = pl.read_csv(
                 csv_bytes,
@@ -290,15 +291,13 @@ def main():
                     flush_updates()
                 
                 if resolved_ids and active_positions.height > 0:
-                    # [FIX] Define 'just_resolved' FIRST (Missing line restored)
+                
                     just_resolved = active_positions.filter(pl.col("contract_id").is_in(resolved_ids))
                     
                     if just_resolved.height > 0:
-                        # [FIX] Extract String IDs for Python dict lookup
-                        # (just_resolved["contract_id"] is Categorical, so we cast to String first)
+
                         unique_cids = just_resolved["contract_id"].unique().cast(pl.String).to_list()
-    
-                        # Create Outcomes DataFrame (Strings initially)
+
                         outcomes_df = pl.DataFrame([
                             {
                                 "contract_id": cid, 
@@ -306,11 +305,11 @@ def main():
                                 "real_token_idx": market_map[cid]['idx']
                             } 
                             for cid in unique_cids
-                            if cid in market_map # Safety check
+                            if cid in market_map
                         ])
                         
                         if outcomes_df.height > 0:
-                            # [FIX] Cast to Categorical so it joins with active_positions
+                    
                             outcomes_df = outcomes_df.with_columns(
                                 pl.col("contract_id").cast(pl.Categorical)
                             )
@@ -394,10 +393,9 @@ def main():
                             new_uids = pnl_calc["user"].cast(pl.String).to_list()
                             known_users.update(new_uids)
     
-                    # [FIX] Final Cleanup
                     active_positions = active_positions.filter(~pl.col("contract_id").is_in(resolved_ids))
                     
-                # 2. Update Scorer (Logic from wallet_scoring.py)
+                # 2. Update Scorer
                 if user_history.height > 0:
                     scores_df = user_history.filter(
                         (pl.col("trade_count") >= 1) & (pl.col("total_invested") > 10)
@@ -435,7 +433,6 @@ def main():
 
             # If we are in the warm-up period, SKIP simulation, but proceed to Accumulation (D)
             if day < simulation_start_date:
-                # Log progress occasionally so you know it's not frozen
                 if day.day == 1 or day.day == 15:
                     log.info(f"   🔥 Warming up... ({day})")
             else:
@@ -485,7 +482,6 @@ def main():
                     pd.DataFrame(results).to_csv(OUTPUT_PATH, mode='a', header=not OUTPUT_PATH.exists(), index=False)
 
             # D. ACCUMULATE POSITIONS (The "Backward" Pass - storing data for future training)
-            # Logic from process_chunk_universal
             
             # 1. Calc Cost/Qty
             processed_trades = daily_trades.with_columns([
