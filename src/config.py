@@ -3,16 +3,12 @@ import logging
 from pathlib import Path
 
 # --- CONSTANTS & PATHS ---
-CACHE_DIR = Path("live_paper_cache")
 STATE_FILE = Path("paper_state.json")
 AUDIT_FILE = Path("trades_audit.jsonl")
 TRADES_FILE = Path("gamma_trades_stream.csv")
 OUTCOMES_FILE = Path("market_outcomes.parquet")
 EQUITY_FILE = Path("equity_curve.csv")
 MARKETS_FILE = Path("gamma_markets_all_tokens.parquet")
-
-# Ensure cache directory exists immediately
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- EXTERNAL SERVICES ---
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
