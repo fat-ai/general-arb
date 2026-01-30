@@ -274,7 +274,7 @@ def main():
         print(f"   Scoring {final_df.height} unique users...", flush=True)
         
         scored_df = final_df.filter(
-            (pl.col("total_trades") >= 1) & 
+            (pl.col("total_trades") >= 2) & 
             (pl.col("total_invested") > 10.0) 
         ).with_columns([
             (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
