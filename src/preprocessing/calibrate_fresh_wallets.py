@@ -8,13 +8,13 @@ import gc
 import warnings
 from datetime import datetime
 from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
-
+CACHE_DIR = Path("/app/data")
 warnings.filterwarnings("ignore")
 
 def main():
     print("--- Fresh Wallet Calibration ---")
-    trades_path = TRADES_FILE
-    outcomes_path = MARKETS_FILE
+    trades_path = CACHE_DIR / TRADES_FILE
+    outcomes_path = CACHE_DIR / MARKETS_FILE
     output_file = FRESH_SCORE_FILE
     BATCH_SIZE = 500_000 
 
