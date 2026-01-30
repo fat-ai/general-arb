@@ -9,7 +9,6 @@ WALLET_SCORES_FILE = Path("wallet_scores.json")
 FRESH_SCORE_FILE = Path("model_params_audit.json")
 TEMP_WALLET_STATS_FILE = Path("temp_universal_stats.csv")
 TRADES_FILE = Path("gamma_trades_stream.csv")
-OUTCOMES_FILE = Path("market_outcomes.parquet")
 EQUITY_FILE = Path("equity_curve.csv")
 MARKETS_FILE = Path("gamma_markets_all_tokens.parquet")
 
