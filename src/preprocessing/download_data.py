@@ -37,7 +37,6 @@ class DataFetcher:
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
         
     def fetch_gamma_markets(self):
-
         cache_file = CACHE_DIR / MARKETS_FILE
         existing_df = pd.DataFrame()
         min_created_at = None
@@ -56,9 +55,7 @@ class DataFetcher:
                 print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
                 existing_df = pd.DataFrame()
         
-        all_new_rows = []
-
-        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
+        def fetch_batch(self, state, mode_label, time_filter_func=None, sort_order="desc"):
             offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
             print(f"Fetching {mode_label} (closed={state})...", end=" ", flush=True)
@@ -66,7 +63,7 @@ class DataFetcher:
             while True:
                 params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
                 try:
-                    resp = session.get(GAMMA_API_URL, params=params, timeout=30)
+                    resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
                     if resp.status_code != 200: 
                         print("☠️ WARNING: Markets fetch failed! ☠️")
                         print(f"Response code: {resp.status_code}")
@@ -102,18 +99,19 @@ class DataFetcher:
                 except Exception: break
             print(f" Done ({len(local_rows)}).")
             return local_rows
-
-        all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
+            
+        all_new_rows = []
+        all_new_rows.extend(fetch_batch(self, "false", "ACTIVE Markets"))
         
         if max_created_at:
             stop_condition = lambda ts: ts <= max_created_at
-            all_new_rows.extend(fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
+            all_new_rows.extend(fetch_batch(self, "true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
         else:
-            all_new_rows.extend(fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc"))
+            all_new_rows.extend(fetch_batch(self, "true", "ALL CLOSED Markets", None, sort_order="desc"))
 
         if min_created_at:
              stop_condition = lambda ts: ts >= min_created_at
-             all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
+             all_new_rows.extend(fetch_batch(self, "true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
 
         if not all_new_rows: 
             print("✅ No new market updates found.")
@@ -201,10 +199,8 @@ class DataFetcher:
         return
 
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
-
         cache_file = CACHE_DIR / TRADES_FILE
         temp_file = cache_file.with_suffix(".tmp.csv")
-        
         valid_token_ints = set()
         for t in target_token_ids:
             try:
@@ -267,7 +263,7 @@ class DataFetcher:
         existing_low_ts = None
         
         if cache_file.exists():
-            print(f"📂 Found existing cache. Checking bounds...")
+            print(f"📂 Found existing trades cache. Checking bounds...")
             existing_high_ts, existing_low_ts = get_csv_bounds(cache_file)
             
             if existing_high_ts is None or existing_low_ts is None:
@@ -305,7 +301,7 @@ class DataFetcher:
             global_start_cursor = int(time.time())
             global_stop_ts = global_start_cursor - 86400
 
-        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
+        def fetch_segment(self, mstart_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
             
@@ -332,7 +328,7 @@ class DataFetcher:
                     }}
                     """
                     
-                    resp = session.post(GRAPH_URL, json={'query': query}, timeout=10)
+                    resp = self.session.post(GRAPH_URL, json={'query': query}, timeout=10)
                     if resp.status_code != 200:
                         print(f" ❌ {resp.status_code}")
                         time.sleep(2)
@@ -425,7 +421,7 @@ class DataFetcher:
             if existing_high_ts:
                 if global_start_cursor > existing_high_ts:
                     print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
+                    count = fetch_segment(self, global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
                     total_captured += count
                 else:
                     print(f"\n🌊 PHASE 1: Skipped (Configured End Date {datetime.utcfromtimestamp(global_start_cursor)} <= Existing Head)")
@@ -444,7 +440,7 @@ class DataFetcher:
             if existing_low_ts:
                 if existing_low_ts > global_stop_ts:
                     print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                    count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
+                    count = fetch_segment(self, existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
                     total_captured += count
                 else:
                     print(f"\n📜 PHASE 3: Skipped (Existing Tail {datetime.utcfromtimestamp(existing_low_ts)} covers request {datetime.utcfromtimestamp(global_stop_ts)})")
@@ -472,16 +468,15 @@ class DataFetcher:
         self.fetch_gamma_markets()
         
         gc.collect()
-        market_file = self.cache_dir / self.markets_file
+        market_file = CACHE_DIR / MARKETS_FILE
         
         if market_file.exists():
-            print("   Loading contract IDs from disk (Lightweight Mode)...")
+            print("Loading contract IDs...")
             market_ids_df = pd.read_parquet(market_file, columns=['contract_id'])
             market_ids_df['contract_id'] = market_ids_df['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
             valid_market_ids = set(market_ids_df['contract_id'].unique())
             del market_ids_df
             gc.collect()
-            
             print(f"Found {len(valid_market_ids)} unique contract IDs.")
 
             print("\n--- Phase 2: Fetching Trades ---")
