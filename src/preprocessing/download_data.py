@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from collections import defaultdict
 import logging
+import gc
+import shutil
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,7 +26,7 @@ today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
@@ -33,8 +35,9 @@ def normalize_contract_id(id_str):
 class DataFetcher:
     def __init__(self):
         self.session = requests.Session()
-        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
         self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
+        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=retries))
+        
         
     def fetch_gamma_markets(self):
         cache_file = CACHE_DIR / MARKETS_FILE
@@ -55,7 +58,7 @@ class DataFetcher:
                 print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
                 existing_df = pd.DataFrame()
         
-        def fetch_batch(self, state, mode_label, time_filter_func=None, sort_order="desc"):
+        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
             offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
             print(f"Fetching {mode_label} (closed={state})...", end=" ", flush=True)
@@ -101,17 +104,17 @@ class DataFetcher:
             return local_rows
             
         all_new_rows = []
-        all_new_rows.extend(fetch_batch(self, "false", "ACTIVE Markets"))
+        all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
         
         if max_created_at:
             stop_condition = lambda ts: ts <= max_created_at
-            all_new_rows.extend(fetch_batch(self, "true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
+            all_new_rows.extend(fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
         else:
-            all_new_rows.extend(fetch_batch(self, "true", "ALL CLOSED Markets", None, sort_order="desc"))
+            all_new_rows.extend(fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc"))
 
         if min_created_at:
-             stop_condition = lambda ts: ts >= min_created_at
-             all_new_rows.extend(fetch_batch(self, "true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
+            stop_condition = lambda ts: ts >= min_created_at
+            all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
 
         if not all_new_rows: 
             print("✅ No new market updates found.")
@@ -285,7 +288,7 @@ class DataFetcher:
         global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
         print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
                 
-        def fetch_segment(self, mstart_ts, end_ts, writer_obj, segment_name):
+        def fetch_segment(mstart_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
             
@@ -405,7 +408,7 @@ class DataFetcher:
             if existing_high_ts:
                 if global_start_cursor > existing_high_ts:
                     print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    count = fetch_segment(self, global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
+                    count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
                     total_captured += count
                 else:
                     print(f"\n🌊 PHASE 1: Skipped (Configured End Date {datetime.utcfromtimestamp(global_start_cursor)} <= Existing Head)")
@@ -424,14 +427,14 @@ class DataFetcher:
             if existing_low_ts:
                 if existing_low_ts > global_stop_ts:
                     print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                    count = fetch_segment(self, existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
+                    count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
                     total_captured += count
                 else:
                     print(f"\n📜 PHASE 3: Skipped (Existing Tail {datetime.utcfromtimestamp(existing_low_ts)} covers request {datetime.utcfromtimestamp(global_stop_ts)})")
 
             elif not existing_high_ts:
                 print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
+                count = fetch_segment(self, global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
                 total_captured += count
 
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
