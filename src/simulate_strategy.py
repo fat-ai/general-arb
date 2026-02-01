@@ -223,19 +223,9 @@ def main():
         for row in potential_fresh.iter_rows(named=True):
             uid = row["user"]
             
-            # 1. SKIP if we already know this user (from DB or current tracker)
-            # user_history_set must be maintained (see note below) or check user_history
-            if uid in tracker_first_bets:
-                continue
-            
-            # Check if user exists in history (Lazy check)
-            # Note: For speed, you might want to maintain a 'known_users' set separately
-            if uid in known_users:
-                continue
-
             # 2. This is a "Fresh Wallet". Capture exact metrics.
             cid = row["contract_id"]
-            price = max(0.001, min(0.999, row["price"])) 
+            price = max(0.00, min(1.0, row["price"])) 
             tokens = row["outcomeTokensAmount"]
             trade_amt = row["tradeAmount"]
             is_long = tokens > 0
@@ -250,7 +240,6 @@ def main():
             if risk_vol < 1.0:
                 continue
                 
-            # STORE SNAPSHOT (Immutable)
             tracker_first_bets[uid] = {
                 "contract_id": cid,
                 "risk_vol": risk_vol,
