@@ -28,49 +28,36 @@ OUTPUT_PATH = SIGNAL_FILE
 
 def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
     """
-    Reads a file backwards in binary chunks to avoid high memory/disk usage.
-    Yields batches of raw bytes that can be parsed as CSV.
+    Improved reverse generator to ensure full file coverage and 
+    robust header handling.
     """
     with open(file_path, 'rb') as f:
-    
+        # Read the header once to know what it is
         header = f.readline().rstrip()
+        header_len = len(header)
         
-        # Go to end of file
         f.seek(0, 2)
         pos = f.tell()
-        
         remainder = b""
-        
-        # Read backwards until we hit the header
-        while pos > len(header) + 1: # +1 accounts for the newline we stripped
-            # Calculate next seek position
-            step = min(chunk_size, pos - len(header))
-            pos -= step
+
+        while pos > header_len:
+            # Determine how much to read
+            to_read = min(chunk_size, pos - header_len)
+            pos -= to_read
             f.seek(pos)
             
-            # Read chunk
-            data = f.read(step)
-            
-            # Combine with remainder from previous read
-            block = data + remainder
-            
-            # Split into lines
-            lines = block.split(b'\n')
-            
-            # The first element is partial, save for next step
+            chunk = f.read(to_read) + remainder
+            lines = chunk.split(b'\n')
+
             remainder = lines.pop(0)
             
-            # Filter empty strings
-            valid_lines = [l for l in lines if l.strip()]
-            
-            if valid_lines:
-                # Reverse lines inside the chunk so batch is Ascending
-                valid_lines.reverse()
-                # Yield CSV block with header
-                yield header + b'\n' + b'\n'.join(valid_lines)
+            if lines:
+                lines.reverse()
+                valid_lines = [l for l in lines if l.strip()]
+                if valid_lines:
+                    yield header + b'\n' + b'\n'.join(valid_lines)
 
-        # Process final remainder (top of file)
-        if remainder.strip():
+        if remainder.strip() and remainder.rstrip() != header:
             yield header + b'\n' + remainder
             
 def main():
@@ -78,14 +65,13 @@ def main():
     pl.enable_string_cache()
     
     if OUTPUT_PATH.exists():
-        with open(OUTPUT_PATH, 'w') as f:
-            f.truncate(1)
-    else:
-        headers = ["timestamp", "fpmm", "question", "outcome", "signal_strength", "trade_price", "trade_volume"]
-        with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-        print(f"Output file created successfully at {OUTPUT_PATH}")
+        OUTPUT_PATH.unlink()
+    
+    headers = ["timestamp", "fpmm", "question", "outcome", "signal_strength", "trade_price", "trade_volume"]
+    with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+    print(f"Output file created successfully at {OUTPUT_PATH}")
     
     # 1. LOAD MARKETS (Static Data)
 
