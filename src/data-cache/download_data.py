@@ -49,7 +49,7 @@ class DataFetcher:
                 print(f"   📂 Loading existing markets cache to determine update range...")
                 existing_df = pd.read_parquet(cache_file)
                 if not existing_df.empty and 'created_at' in existing_df.columns:
-                    dates = pd.to_datetime(existing_df['created_at'], utc=True).dt.tz_localize(None)
+                    dates = pd.to_datetime(existing_df['created_at'], format='ISO8601', utc=True).dt.tz_localize(None)
                     min_created_at = dates.min()
                     max_created_at = dates.max()
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
