@@ -193,6 +193,10 @@ class DataFetcher:
                 existing_df = pd.read_parquet(cache_file)
                 print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
                 combined = pd.concat([existing_df, new_df])
+                for col in ['resolution_timestamp', 'created_at']:
+                    if col in combined.columns:
+                        combined[col] = pd.to_datetime(combined[col])
+                        
                 del existing_df
                 gc.collect()
                 
