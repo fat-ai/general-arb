@@ -91,7 +91,7 @@ def main():
         if joined.height == 0: continue
         
         joined = joined.with_columns([
-            pl.col('bet_price').clip(0.001, 0.999).alias('safe_price'),
+            pl.col('bet_price').clip(0.0, 1.0).alias('safe_price'),
             (pl.col('tokens') > 0).alias('is_long')
         ])
 
@@ -106,7 +106,7 @@ def main():
         
         # 6. FILTER
         # Now we filter based on the calculated risk volume
-        joined = joined.filter(pl.col('risk_vol') >= 1.0)
+        joined = joined.filter(pl.col('risk_vol') > 1.0)
         
         if joined.height == 0: continue
 
