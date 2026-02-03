@@ -270,7 +270,7 @@ def main():
                 if resolved_ids and active_positions.height > 0:
                 
                     just_resolved = active_positions.filter(
-                        pl.col("contract_id").is_in(pl.Series(resolved_ids).cast(pl.Categorical))
+                        pl.col("contract_id").implode(pl.Series(resolved_ids).cast(pl.Categorical))
                     )
                     
                     if just_resolved.height > 0:
