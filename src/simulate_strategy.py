@@ -375,7 +375,7 @@ def main():
                             # 2. Filter history for ONLY these users
                             # We use the updated 'user_history' dataframe
                             updates_df = user_history.filter(
-                                pl.col("user").is_in(affected_users) & 
+                                pl.col("user").implode(affected_users) & 
                                 (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
