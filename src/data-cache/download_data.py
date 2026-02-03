@@ -40,22 +40,24 @@ class DataFetcher:
          
     def fetch_gamma_markets(self):
         cache_file = CACHE_DIR / MARKETS_FILE
-        existing_df = pd.DataFrame()
         min_created_at = None
         max_created_at = None
         
         if cache_file.exists():
             try:
                 print(f"   📂 Loading existing markets cache to determine update range...")
-                existing_df = pd.read_parquet(cache_file)
-                if not existing_df.empty and 'created_at' in existing_df.columns:
-                    dates = pd.to_datetime(existing_df['created_at'], format='ISO8601', utc=True).dt.tz_localize(None)
+                date_df = pd.read_parquet(cache_file, columns=['created_at'])
+                if not date_df.empty and 'created_at' in date_df.columns:
+                    dates = pd.to_datetime(date_df['created_at'], format='ISO8601', utc=True).dt.tz_localize(None)
                     min_created_at = dates.min()
                     max_created_at = dates.max()
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
+
+                del date_df
+                gc.collect()
             except Exception as e:
                 print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
-                existing_df = pd.DataFrame()
+                date_df = pd.DataFrame()
         
         def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
             offset = 0; limit = 500
@@ -117,7 +119,7 @@ class DataFetcher:
 
         if not all_new_rows: 
             print("✅ No new market updates found.")
-            del existing_df, all_new_rows
+            del all_new_rows
             gc.collect()
             return
 
@@ -185,10 +187,19 @@ class DataFetcher:
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
-        if not existing_df.empty:
-            print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
-            combined = pd.concat([existing_df, new_df])
-            combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
+        if cache_file.exists():
+            print(f"   📂 Loading full history for merge...")
+            try:
+                existing_df = pd.read_parquet(cache_file)
+                print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
+                combined = pd.concat([existing_df, new_df])
+                del existing_df
+                gc.collect()
+                
+                combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
+            except Exception as e:
+                print(f"⚠️ Merge failed ({e}), saving new data only.")
+                combined = new_df
         else:
             combined = new_df
 
@@ -196,7 +207,7 @@ class DataFetcher:
             combined.to_parquet(cache_file)
             print(f"✅ Saved total {len(combined)} market tokens.")
         
-        del existing_df, new_df, combined, all_new_rows
+        del new_df, combined, all_new_rows
         gc.collect()
         return
 
