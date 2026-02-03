@@ -270,7 +270,7 @@ def main():
                 if resolved_ids and active_positions.height > 0:
                 
                     just_resolved = active_positions.filter(
-                        pl.col("contract_id").implode(pl.Series(resolved_ids).cast(pl.Categorical))
+                        pl.col("contract_id").is_in(pl.Series(resolved_ids).cast(pl.Categorical))
                     )
                     
                     if just_resolved.height > 0:
@@ -375,7 +375,7 @@ def main():
                             # 2. Filter history for ONLY these users
                             # We use the updated 'user_history' dataframe
                             updates_df = user_history.filter(
-                                pl.col("user").implode(affected_users) & 
+                                pl.col("user").is_in(affected_users) &
                                 (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
