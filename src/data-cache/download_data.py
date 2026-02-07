@@ -238,41 +238,53 @@ class DataFetcher:
             except: return 0.0
 
         def get_csv_bounds(filepath):
-            """Reads first and last data rows to get timestamp range. Assumes Descending Sort."""
+            """Memory-safe read of first and last timestamps."""
             high_ts = None
             low_ts = None
             
-            with open(filepath, 'rb') as f:
-                header = f.readline()
-                first_line = f.readline()
-                if not first_line: return None, None
-                
-                try:
-                    row = next(csv.reader([first_line.decode('utf-8')]))
-                    high_ts = parse_iso_to_ts(row[1])
-                    low_ts = high_ts 
-                except Exception as e:
-                    return None, None
-                
-                f.seek(0, os.SEEK_END)
-                try:
-                    while f.tell() > len(header) + len(first_line) + 1:
-                        f.seek(-2, os.SEEK_CUR)
-                        while f.read(1) != b'\n':
-                            f.seek(-2, os.SEEK_CUR)
-                        
-                        last_line = f.readline()
-                        if not last_line: break
-                        
+            if not os.path.exists(filepath) or os.path.getsize(filepath) < 50:
+                return None, None
+
+            # 1. Get Head (First Row) - Low Memory
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    header = f.readline() # Skip header
+                    first_line = f.readline()
+                    if first_line:
+                        # Parse first data row
+                        row = list(csv.reader([first_line]))[0]
+                        if len(row) > 1:
+                            high_ts = parse_iso_to_ts(row[1])
+            except Exception: pass
+
+            if high_ts is None: return None, None
+
+            # 2. Get Tail (Last Row) - Low Memory via Seek
+            try:
+                with open(filepath, 'rb') as f:
+                    f.seek(0, os.SEEK_END)
+                    file_size = f.tell()
+                    
+                    # Read only the last 4096 bytes
+                    offset = max(0, file_size - 4096)
+                    f.seek(offset)
+                    
+                    # Decode binary chunk, ignore partial chars at start
+                    lines = f.read().decode('utf-8', errors='ignore').splitlines()
+                    
+                    # Iterate backwards to find last valid row
+                    for line in reversed(lines):
+                        if not line.strip(): continue
                         try:
-                            row = next(csv.reader([last_line.decode('utf-8')]))
-                            parsed_low = parse_iso_to_ts(row[1])
-                            if parsed_low > 0:
-                                low_ts = parsed_low
-                                break 
+                            # Quick parse of last line
+                            row = list(csv.reader([line]))[0]
+                            if len(row) > 1:
+                                t = parse_iso_to_ts(row[1])
+                                if t > 0:
+                                    low_ts = t
+                                    break
                         except: continue
-                except Exception:
-                    pass 
+            except Exception: pass
             
             return high_ts, low_ts
 
@@ -352,6 +364,10 @@ class DataFetcher:
                     out_rows = []
                     
                     for ts in sorted_ts:
+                        
+                        if ts <= stop_limit: 
+                            continue
+                            
                         if is_full_batch and ts == oldest_ts: continue
                         
                         for r in by_ts[ts]:
