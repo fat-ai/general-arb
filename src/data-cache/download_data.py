@@ -413,10 +413,7 @@ class DataFetcher:
                         writer_obj.writerows(out_rows)
                         seg_captured += len(out_rows)
 
-                    if is_full_batch:
-                         cursor = oldest_ts + 1 
-                    else:
-                        cursor = oldest_ts
+                    cursor = oldest_ts
 
                     print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
 
