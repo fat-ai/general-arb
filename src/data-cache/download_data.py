@@ -307,11 +307,11 @@ class DataFetcher:
                 print("➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
                 return pd.DataFrame()
   
-        global_start_cursor = int(pd.Timestamp(FIXED_END_DATE).timestamp())
-        print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
-
-        global_stop_ts = int(pd.Timestamp(FIXED_START_DATE).timestamp())
+        global_start_cursor = int(pd.Timestamp(FIXED_START_DATE).timestamp())
         print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
+
+        global_stop_ts = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+        print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
                 
         def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
             cursor = int(start_ts)
