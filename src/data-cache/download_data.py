@@ -234,7 +234,11 @@ class DataFetcher:
         if not valid_token_ints: return pd.DataFrame()
         
         def parse_iso_to_ts(iso_str):
-            try: return pd.Timestamp(iso_str).timestamp()
+            try:
+                ts_obj = pd.to_datetime(iso_str, utc=False)
+                if ts_obj.tz is None:
+                    ts_obj = ts_obj.tz_localize('UTC')
+                return ts_obj.timestamp()
             except: return 0.0
 
         def get_csv_bounds(filepath):
@@ -460,7 +464,7 @@ class DataFetcher:
 
             elif not existing_high_ts:
                 print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
+                count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
                 total_captured += count
 
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
