@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-FIXED_START_DATE = pd.Timestamp("2025-12-31")
+FIXED_START_DATE = pd.Timestamp("2024-01-01")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
