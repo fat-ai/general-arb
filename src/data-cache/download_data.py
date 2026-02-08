@@ -432,9 +432,9 @@ class DataFetcher:
             
             # PHASE 1: NEWER DATA
             if existing_high_ts:
-                if global_start_cursor > existing_high_ts:
-                    print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    count = fetch_segment(global_start_cursor, existing_high_ts, writer, "NEW_HEAD")
+                if global_stop_ts > existing_high_ts:
+                    print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
+                    count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
                     total_captured += count
                 else:
                     print(f"\n🌊 PHASE 1: Skipped (Configured End Date {datetime.utcfromtimestamp(global_start_cursor)} <= Existing Head)")
@@ -451,15 +451,15 @@ class DataFetcher:
 
             # PHASE 3: OLDER DATA
             if existing_low_ts:
-                if existing_low_ts > global_stop_ts:
-                    print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                    count = fetch_segment(existing_low_ts, global_stop_ts, writer, "OLD_TAIL")
+                if existing_low_ts > global_start_cursor:
+                    print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
+                    count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
                     total_captured += count
                 else:
                     print(f"\n📜 PHASE 3: Skipped (Existing Tail {datetime.utcfromtimestamp(existing_low_ts)} covers request {datetime.utcfromtimestamp(global_stop_ts)})")
 
             elif not existing_high_ts:
-                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_start_cursor)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
                 count = fetch_segment(global_start_cursor, global_stop_ts, writer, "FULL_HISTORY")
                 total_captured += count
 
