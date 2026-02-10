@@ -427,8 +427,7 @@ def main():
 
             original_count = len(market_map)
             market_map = {k: v for k, v in market_map.items() 
-                          if v['start'] is not None and v['start'] >= data_start_date}
-            
+                          if v['start'] is not None and v['start'] >= pd.Timestamp(data_start_date)}
             filtered_count = original_count - len(market_map)
             log.info(f"🔍 Filtered out {filtered_count} markets that started before {data_start_date}")
 
