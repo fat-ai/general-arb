@@ -83,7 +83,7 @@ class WalletScorer:
             
         # DEBUG: Log MISSES for significant volume
         # This will tell us if we have a mismatch
-        if volume > 100: 
+        #if volume > 100: 
         #     log.warning(f"⚠️ MISS: Wallet {w_id} not found in DB. (Vol: ${volume:.2f})")
 
         # 2. FRESH WALLET HEURISTIC
