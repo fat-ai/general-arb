@@ -449,10 +449,15 @@ def main():
 
                     # Start Date Check
                     m_start = m.get('start')
+                    m_end = m.get('end')
                     # Handle string vs timestamp comparison safely
                     ts = t['timestamp']
                     if m_start:
                         if m_start is not None and ts is not None and ts < m_start:
+                            continue
+
+                    if m_end:
+                        if m_end is not None and ts is not None and ts > m_end:
                             continue
 
                     if m_start is None or m_start < pd.Timestamp(simulation_start_date):
