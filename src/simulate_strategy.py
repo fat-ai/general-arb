@@ -481,10 +481,10 @@ def main():
                         log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes}, "
                                  f"is_buying={is_buying}, direction={direction:+.1f}, vol=${vol:.2f}")
 
-                    if results:
-                        pos_signals = sum(1 for r in results if r['signal_strength'] > 0)
-                        neg_signals = sum(1 for r in results if r['signal_strength'] < 0)
-                        log.info(f"📊 Today's signals: {pos_signals} positive, {neg_signals} negative")
+                  #  if results:
+                  #      pos_signals = sum(1 for r in results if r['signal_strength'] > 0)
+                  #      neg_signals = sum(1 for r in results if r['signal_strength'] < 0)
+                  #      log.info(f"📊 Today's signals: {pos_signals} positive, {neg_signals} negative")
                     
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
