@@ -67,7 +67,7 @@ def main():
     if OUTPUT_PATH.exists():
         OUTPUT_PATH.unlink()
     
-    headers = ["timestamp", "fpmm", "question", "outcome", "signal_strength", "trade_price", "trade_volume"]
+    headers = ["timestamp", "fpmm", "question", "outcome", "bet_on", "signal_strength", "trade_price", "trade_volume"]
     with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(headers)
@@ -122,6 +122,8 @@ def main():
         }
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
+    sample_keys = list(market_map.keys())[:3]
+    log.info(f"📋 Sample market_map keys: {sample_keys}")
     
     # 2. INITIALIZE STATE
     tracker_first_bets = {}
@@ -428,8 +430,12 @@ def main():
                 results = []
                 for t in sim_rows:
                     cid = t['contract_id']
-                    if cid not in market_map: continue
-                    m = market_map[cid]
+                    cid_normalized = cid.lower().strip()
+                    
+                    if cid_normalized.startswith("0x"):
+                        cid_normalized = cid_normalized[2:]
+                        
+                    m = market_map[cid_normalized]
                     
                     # Start Date Check
                     m_start = m.get('start')
@@ -443,7 +449,15 @@ def main():
                     vol = t['tradeAmount']
                     direction = 1.0 if t['outcomeTokensAmount'] > 0 else -1.0
                     is_yes = (m['idx'] == 1)
-                    
+
+                    is_buying = (t['outcomeTokensAmount'] > 0)
+                    bet_on = "Yes" if (is_buying and is_yes) or (not is_buying and not is_yes) else "No"
+
+                    if is_yes:
+                        direction = 1.0 if is_buying else -1.0
+                    else:
+                        direction = -1.0 if is_buying else 1.0
+    
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
                         wallet=t['user'], token_id=cid, usdc_vol=vol, 
@@ -456,6 +470,7 @@ def main():
                         "fpmm": m['fpmm'],      
                         "question": m['question'], 
                         "outcome": m['outcome'], 
+                        "bet_on": bet_on, 
                         "signal_strength": sig,
                         "trade_price": t['price'], 
                         "trade_volume": vol
