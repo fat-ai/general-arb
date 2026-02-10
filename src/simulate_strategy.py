@@ -122,6 +122,9 @@ def main():
         }
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
+    yes_count = sum(1 for m in market_map.values() if m['idx'] == 1)
+    no_count = sum(1 for m in market_map.values() if m['idx'] == 0)
+    log.info(f"📊 Token distribution: {yes_count} YES tokens, {no_count} NO tokens")
     sample_keys = list(market_map.keys())[:3]
     log.info(f"📋 Sample market_map keys: {sample_keys}")
     
@@ -386,12 +389,17 @@ def main():
                                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
                                 (pl.col("trade_count").log(10) + 1).alias("vol_boost")
                             ]).with_columns((pl.col("roi") * pl.col("vol_boost")).alias("score"))
-    
+                            
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
                             if updates_df.height > 0:
                                 new_scores = dict(zip(updates_df["user"], updates_df["score"]))
                                 scorer.wallet_scores.update(new_scores)
+                                if len(scorer.wallet_scores) > 0:
+                                    scores_list = list(scorer.wallet_scores.values())
+                                    pos_count = sum(1 for s in scores_list if s > 0)
+                                    neg_count = sum(1 for s in scores_list if s < 0)
+                                    log.info(f"📊 Wallet scores: {pos_count} positive, {neg_count} negative")
                     
                 # 3. Update Fresh Wallet Params (OLS)
                 if len(fresh_bets_X) > 100:
@@ -453,7 +461,16 @@ def main():
                         direction = 1.0 if is_buying else -1.0
                     else:
                         direction = -1.0 if is_buying else 1.0
-    
+
+                    if len(results) < 20:
+                        log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes_token}, "
+                                 f"is_buying={is_buying}, direction={direction:+.1f}, vol=${vol:.2f}")
+
+                    if results:
+                        pos_signals = sum(1 for r in results if r['signal_strength'] > 0)
+                        neg_signals = sum(1 for r in results if r['signal_strength'] < 0)
+                        log.info(f"📊 Today's signals: {pos_signals} positive, {neg_signals} negative")
+                    
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
                         wallet=t['user'], token_id=cid, usdc_vol=vol, 
