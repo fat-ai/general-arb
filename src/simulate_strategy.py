@@ -432,8 +432,21 @@ def main():
                     cid = t['contract_id']
                     cid_normalized = cid.lower().strip()
                     
-                    if cid_normalized.startswith("0x"):
-                        cid_normalized = cid_normalized[2:]
+                    try:
+                        if isinstance(cid, (int, str)) and len(str(cid)) > 40:
+                            cid_normalized = hex(int(cid))[2:].lower()  # Convert to hex, remove '0x', lowercase
+                        else:
+                            # Otherwise treat as string and normalize
+                            cid_normalized = str(cid).lower().strip()
+                            if cid_normalized.startswith("0x"):
+                                cid_normalized = cid_normalized[2:]
+                    except (ValueError, TypeError):
+                        log.warning(f"Could not normalize contract_id: {cid}")
+                        continue
+
+                    if cid_normalized not in market_map:
+                       print(f"{cid_normalized} market not found")
+                       continue
                         
                     m = market_map[cid_normalized]
                     
