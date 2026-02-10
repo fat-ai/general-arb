@@ -425,6 +425,13 @@ def main():
                 simulation_start_date = data_start_date + timedelta(days=WARMUP_DAYS)
                 log.info(f"🔥 Warm-up Period: {data_start_date} -> {simulation_start_date}")
 
+            original_count = len(market_map)
+            market_map = {k: v for k, v in market_map.items() 
+                          if v['start'] is not None and v['start'] >= data_start_date}
+            
+            filtered_count = original_count - len(market_map)
+            log.info(f"🔍 Filtered out {filtered_count} markets that started before {data_start_date}")
+
             # If we are in the warm-up period, SKIP simulation, but proceed to Accumulation (D)
             if day < simulation_start_date:
                 if day.day == 1 or day.day == 15:
@@ -449,12 +456,16 @@ def main():
                         if m_start is not None and ts is not None and ts < m_start:
                             continue
 
+                    if m_start is None or m_start < simulation_start_date:
+                        continue
+
                     # Prepare Inputs
                     vol = t['tradeAmount']
-                    direction = 1.0 if t['outcomeTokensAmount'] > 0 else -1.0
+                  
                     is_yes = (m['idx'] == 1)
 
                     is_buying = (t['outcomeTokensAmount'] > 0)
+                    
                     bet_on = "Yes" if (is_buying and is_yes) or (not is_buying and not is_yes) else "No"
 
                     if is_yes:
