@@ -455,7 +455,7 @@ def main():
                         if m_start is not None and ts is not None and ts < m_start:
                             continue
 
-                    if m_start is None or m_start < simulation_start_date:
+                    if m_start is None or m_start < pd.Timestamp(simulation_start_date):
                         continue
 
                     # Prepare Inputs
