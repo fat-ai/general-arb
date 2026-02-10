@@ -111,6 +111,10 @@ class SignalEngine:
         # 1. Get Score
         score = scorer.get_score(wallet, usdc_vol)
 
+        if usdc_vol > 50 and abs(score) > 0.1:
+            log.info(f"🔍 Trade: vol=${usdc_vol:.0f}, direction={direction:+.1f}, "
+                 f"is_yes={is_yes_token}, score={score:.2f}")
+
         # Ignore bad traders rather than fade them
         score = max(0.0, score)
                           
@@ -135,9 +139,15 @@ class SignalEngine:
         
         # 5. Apply Direction
         final_impact = raw_impact * direction
-        
+
+        if usdc_vol > 50:
+            log.info(f"  → raw_impact={raw_impact:.0f}, final_impact={final_impact:+.0f}")
+    
         tracker['weight'] += final_impact
         tracker['last_ts'] = time.time()
+
+        if usdc_vol > 50:
+            log.info(f"  → tracker['weight'] now = {tracker['weight']:+.0f}")
         
         return tracker['weight']
 
