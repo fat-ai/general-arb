@@ -134,7 +134,7 @@ class SignalEngine:
         raw_impact = usdc_vol * weight_multiplier
         
         # 5. Apply Direction
-        final_impact = raw_impact * direction if is_yes_token else raw_impact * -direction
+        final_impact = raw_impact * direction
         
         tracker['weight'] += final_impact
         tracker['last_ts'] = time.time()
