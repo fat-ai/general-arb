@@ -463,7 +463,7 @@ def main():
                         direction = -1.0 if is_buying else 1.0
 
                     if len(results) < 20:
-                        log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes_token}, "
+                        log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes}, "
                                  f"is_buying={is_buying}, direction={direction:+.1f}, vol=${vol:.2f}")
 
                     if results:
