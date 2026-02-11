@@ -176,7 +176,7 @@ class DataFetcher:
         new_df = new_df.explode('contract_id_list')
         new_df['token_index'] = new_df.groupby('market_row_id').cumcount()
         new_df['contract_id'] = new_df['contract_id_list'].str.strip()
-        new_df['token_outcome_label'] = np.where(new_df['token_index'] == 1, "Yes", "No")
+        new_df['token_outcome_label'] = np.where(new_df['token_index'] == 0, "Yes", "No")
 
         def final_payout(row):
             winning_idx = int(round(row['outcome']))
