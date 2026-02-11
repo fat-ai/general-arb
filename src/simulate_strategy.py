@@ -145,8 +145,7 @@ def main():
     })
     
     # Fresh Wallet Calibration Data
-    fresh_bets_X = []
-    fresh_bets_y = []
+    calibration_data = [] # Stores {'x': log_vol, 'y': roi, 'date': timestamp}
 
     # Strategy Objects
     scorer = WalletScorer()
@@ -339,8 +338,11 @@ def main():
                                     x_val = math.log1p(risk_vol)
                                     y_val = roi
                                     
-                                    fresh_bets_X.append(x_val)
-                                    fresh_bets_y.append(y_val)
+                                    calibration_data.append({
+                                        'x': x_val,
+                                        'y': y_val,
+                                        'date': current_sim_day
+                                    })
                                     
                                     users_to_remove.append(uid)
                             
@@ -395,11 +397,17 @@ def main():
                                     log.info(f"📊 Wallet scores: {pos_count} positive, {neg_count} negative")
                     
                 # 3. Update Fresh Wallet Params (OLS)
-                if len(fresh_bets_X) > 100:
+                # Calculate the cutoff date (6 months ago)
+                cutoff_date = current_sim_day - timedelta(days=180)
+                recent_data = [d for d in calibration_data if d['date'] >= cutoff_date]
+                if len(recent_data) > 100:
                     try:
-                        model = sm.OLS(fresh_bets_y, sm.add_constant(fresh_bets_X)).fit()
+                        X_recent = [d['x'] for d in recent_data]
+                        y_recent = [d['y'] for d in recent_data]
+                        model = sm.OLS(y_recent, sm.add_constant(X_recent)).fit()
                         scorer.slope = model.params[1]
                         scorer.intercept = model.params[0]
+                        print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}"
                     except Exception as e:
                         log.warning(f"⚠️ OLS Training Failed: {e}")
                 
