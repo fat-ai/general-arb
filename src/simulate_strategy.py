@@ -82,7 +82,7 @@ def main():
         pl.col('id').alias("fpmm"),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
-        pl.col('outcome').alias('market_outcome'),
+        pl.col('outcome').alias('token_outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
           .then(pl.lit(1))
           .otherwise(pl.lit(0))
@@ -111,17 +111,13 @@ def main():
         e_date = row['resolution_timestamp']
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
-
-       # token_label = row['token_index']
-       # market_outcome = row['market_outcome']
-       # token_outcome = 1.0 if token_label == market_outcome else 0.0
             
         market_map[cid] = {
             'question': row['question'],   
             'fpmm': row['fpmm'],        
             'start': s_date, 
             'end': e_date,
-            'outcome': market_outcome,
+            'outcome': row['token_outcome'],
             'idx': row['token_index']
         }
     
@@ -481,9 +477,9 @@ def main():
                     else:
                         direction = -1.0 if is_buying else 1.0
 
-                    if len(results) < 20:
-                        log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes}, "
-                                 f"is_buying={is_buying}, direction={direction:+.1f}, vol=${vol:.2f}")
+                 #  if len(results) < 20:
+                 #       log.info(f"📊 Trade {len(results)+1}: is_yes_token={is_yes}, "
+                 #                f"is_buying={is_buying}, direction={direction:+.1f}, vol=${vol:.2f}")
 
                   #  if results:
                   #      pos_signals = sum(1 for r in results if r['signal_strength'] > 0)
