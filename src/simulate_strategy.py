@@ -280,7 +280,6 @@ def main():
                             {
                                 "contract_id": cid, 
                                 "outcome": market_map[cid]['outcome'],
-                                "real_token_idx": market_map[cid]['idx']
                             } 
                             for cid in unique_cids
                             if cid in market_map
