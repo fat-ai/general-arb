@@ -458,7 +458,7 @@ def main():
 
                     is_buying = (t['outcomeTokensAmount'] > 0)
                     
-                    bet_on = m['token_outcome_label']
+                    bet_on = m['outcome_label']
 
                     if bet_on == "yes":
                         direction = 1.0 if is_buying else -1.0
