@@ -112,16 +112,16 @@ def main():
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
 
-        token_label = row['token_index']
-        market_outcome = row['market_outcome']
-        token_outcome = 1.0 if token_label == market_outcome else 0.0
+       # token_label = row['token_index']
+       # market_outcome = row['market_outcome']
+       # token_outcome = 1.0 if token_label == market_outcome else 0.0
             
         market_map[cid] = {
             'question': row['question'],   
             'fpmm': row['fpmm'],        
             'start': s_date, 
             'end': e_date,
-            'outcome': token_outcome,
+            'outcome': market_outcome,
             'idx': row['token_index']
         }
     
