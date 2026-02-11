@@ -82,7 +82,7 @@ def main():
         pl.col('id').alias("fpmm"),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
-        pl.col('outcome').alias('token_outcome'),
+        pl.col('outcome'),
         pl.when(pl.col('token_outcome_label') == "Yes")
           .then(pl.lit(1))
           .otherwise(pl.lit(0))
@@ -117,7 +117,7 @@ def main():
             'fpmm': row['fpmm'],        
             'start': s_date, 
             'end': e_date,
-            'outcome': row['token_outcome'],
+            'outcome': row['outcome'],
             'idx': row['token_index']
         }
     
