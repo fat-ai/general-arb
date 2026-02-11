@@ -477,7 +477,7 @@ def main():
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
                         wallet=t['user'], token_id=cid, usdc_vol=vol, 
-                        direction=direction, is_yes_token=is_yes, 
+                        direction=direction,
                         scorer=scorer
                     )
                     
