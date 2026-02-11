@@ -111,9 +111,9 @@ class SignalEngine:
         # 1. Get Score
         score = scorer.get_score(wallet, usdc_vol)
 
-        if usdc_vol > 50 and abs(score) > 0.1:
-            log.info(f"🔍 Trade: vol=${usdc_vol:.0f}, direction={direction:+.1f}, "
-                 f"is_yes={is_yes_token}, score={score:.2f}")
+        # if usdc_vol > 50 and abs(score) > 0.1:
+        #     log.info(f"🔍 Trade: vol=${usdc_vol:.0f}, direction={direction:+.1f}, "
+        #          f"is_yes={is_yes_token}, score={score:.2f}")
 
         # Ignore bad traders rather than fade them
         score = max(0.0, score)
