@@ -112,7 +112,7 @@ def main():
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
 
-        token_label = row['token_outcome_label']
+        token_label = row['token_index']
         market_outcome = row['market_outcome']
         token_outcome = 1.0 if token_label == market_outcome else 0.0
             
