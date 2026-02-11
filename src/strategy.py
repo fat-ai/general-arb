@@ -140,14 +140,14 @@ class SignalEngine:
         # 5. Apply Direction
         final_impact = raw_impact * direction
 
-        if usdc_vol > 50:
-            log.info(f"  → raw_impact={raw_impact:.0f}, final_impact={final_impact:+.0f}")
+        #if usdc_vol > 50:
+        #    log.info(f"  → raw_impact={raw_impact:.0f}, final_impact={final_impact:+.0f}")
     
         tracker['weight'] += final_impact
         tracker['last_ts'] = time.time()
 
-        if usdc_vol > 50:
-            log.info(f"  → tracker['weight'] now = {tracker['weight']:+.0f}")
+        #if usdc_vol > 50:
+        #    log.info(f"  → tracker['weight'] now = {tracker['weight']:+.0f}")
         
         return tracker['weight']
 
