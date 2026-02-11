@@ -79,15 +79,10 @@ def main():
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question'),
-        pl.col('contract_id').alias("fpmm"),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
         pl.col('outcome'),
-        pl.when(pl.col('token_outcome_label') == "Yes")
-          .then(pl.lit(1))
-          .otherwise(pl.lit(0))
-          .cast(pl.UInt8)
-          .alias('token_index')
+        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
     ])
     
     market_map = {}
@@ -95,7 +90,6 @@ def main():
     for row in markets.iter_rows(named=True):
         cid = row['contract_id']
         
-        # Clean Start Date (Force Naive)
         s_date = row['start_date']
         
         if isinstance(s_date, str):
@@ -107,23 +101,21 @@ def main():
         if s_date is not None and s_date.tzinfo is not None:
             s_date = s_date.replace(tzinfo=None)
             
-        # Clean Resolution Date (Force Naive)
         e_date = row['resolution_timestamp']
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
-            'question': row['question'],   
-            'fpmm': row['fpmm'],        
+            'question': row['question'],
             'start': s_date, 
             'end': e_date,
             'outcome': row['outcome'],
-            'idx': row['token_index']
+            'outcome_label': row['token_outcome_label'],
         }
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
-    yes_count = sum(1 for m in market_map.values() if m['idx'] == 1)
-    no_count = sum(1 for m in market_map.values() if m['idx'] == 0)
+    yes_count = sum(1 for m in market_map.values() if m['token_outcome_label'] == "yes")
+    no_count = sum(1 for m in market_map.values() if m['token_outcome_label'] == "no")
     log.info(f"📊 Token distribution: {yes_count} YES tokens, {no_count} NO tokens")
     sample_keys = list(market_map.keys())[:3]
     log.info(f"📋 Sample market_map keys: {sample_keys}")
@@ -450,7 +442,6 @@ def main():
                     # Start Date Check
                     m_start = m.get('start')
                     m_end = m.get('end')
-                    # Handle string vs timestamp comparison safely
                     ts = t['timestamp']
                     if m_start:
                         if m_start is not None and ts is not None and ts < m_start:
@@ -465,14 +456,12 @@ def main():
 
                     # Prepare Inputs
                     vol = t['tradeAmount']
-                  
-                    is_yes = (m['idx'] == 1)
 
                     is_buying = (t['outcomeTokensAmount'] > 0)
                     
-                    bet_on = "Yes" if (is_buying and is_yes) or (not is_buying and not is_yes) else "No"
+                    bet_on = m['token_outcome_label']
 
-                    if is_yes:
+                    if bet_on == "yes":
                         direction = 1.0 if is_buying else -1.0
                     else:
                         direction = -1.0 if is_buying else 1.0
@@ -495,7 +484,6 @@ def main():
                     
                     results.append({
                         "timestamp": t['timestamp'], 
-                        "fpmm": m['fpmm'],      
                         "question": m['question'], 
                         "outcome": m['outcome'], 
                         "bet_on": bet_on, 
