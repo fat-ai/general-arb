@@ -114,8 +114,8 @@ def main():
         }
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
-    yes_count = sum(1 for m in market_map.values() if m['token_outcome_label'] == "yes")
-    no_count = sum(1 for m in market_map.values() if m['token_outcome_label'] == "no")
+    yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
+    no_count = sum(1 for m in market_map.values() if m['outcome_label'] == "no")
     log.info(f"📊 Token distribution: {yes_count} YES tokens, {no_count} NO tokens")
     sample_keys = list(market_map.keys())[:3]
     log.info(f"📋 Sample market_map keys: {sample_keys}")
