@@ -79,7 +79,7 @@ def main():
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('question'),
-        pl.col('id').alias("fpmm"),
+        pl.col('contract_id').alias("fpmm"),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
         pl.col('outcome'),
