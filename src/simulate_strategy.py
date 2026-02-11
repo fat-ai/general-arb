@@ -113,6 +113,7 @@ def main():
             'end': e_date,
             'outcome': row['outcome'],
             'outcome_label': row['token_outcome_label'],
+            'volume': 0,
         }
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
@@ -466,6 +467,10 @@ def main():
                     # Prepare Inputs
                     vol = t['tradeAmount']
 
+                    m['volume'] += vol
+
+                    cum_vol = m['volume']
+
                     is_buying = (t['outcomeTokensAmount'] > 0)
                     
                     bet_on = m['outcome_label']
@@ -490,6 +495,8 @@ def main():
                         direction=direction,
                         scorer=scorer
                     )
+
+                    sig = sig/cum_vol
                     
                     results.append({
                         "timestamp": t['timestamp'],
