@@ -407,7 +407,7 @@ def main():
                         model = sm.OLS(y_recent, sm.add_constant(X_recent)).fit()
                         scorer.slope = model.params[1]
                         scorer.intercept = model.params[0]
-                        print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}"
+                        print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}")
                     except Exception as e:
                         log.warning(f"⚠️ OLS Training Failed: {e}")
                 
