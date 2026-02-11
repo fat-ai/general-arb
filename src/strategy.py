@@ -105,7 +105,7 @@ class SignalEngine:
         self.trackers: Dict[str, Dict] = {}
 
     def process_trade(self, wallet: str, token_id: str, usdc_vol: float, 
-                      direction: float, fpmm: str, is_yes_token: bool, 
+                      direction: float, is_yes_token: bool, 
                       scorer: WalletScorer) -> float:
         
         # 1. Get Score
@@ -120,13 +120,13 @@ class SignalEngine:
                           
         # If score is still 0, we can't do anything
         if score == 0.0:
-            return self.get_signal(fpmm)
+            return self.get_signal(token_id)
               
         # 2. Initialize Tracker
-        if fpmm not in self.trackers:
-            self.trackers[fpmm] = {'weight': 0.0, 'last_ts': time.time()}
+        if token_id not in self.trackers:
+            self.trackers[token_id] = {'weight': 0.0, 'last_ts': time.time()}
         
-        tracker = self.trackers[fpmm]
+        tracker = self.trackers[token_id]
         
         # 3. Apply Decay
         #self._apply_decay(tracker)
@@ -151,9 +151,9 @@ class SignalEngine:
         
         return tracker['weight']
 
-    def get_signal(self, fpmm: str) -> float:
-        if fpmm not in self.trackers: return 0.0
-        tracker = self.trackers[fpmm]
+    def get_signal(self, token_id: str) -> float:
+        if token_id not in self.trackers: return 0.0
+        tracker = self.trackers[token_id]
         self._apply_decay(tracker)
         return tracker['weight']
 
