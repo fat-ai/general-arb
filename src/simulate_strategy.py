@@ -66,8 +66,8 @@ def main():
     
     if OUTPUT_PATH.exists():
         OUTPUT_PATH.unlink()
-    
-    headers = ["timestamp", "fpmm", "question", "outcome", "bet_on", "signal_strength", "trade_price", "trade_volume"]
+
+    headers = ["timestamp", "id", "cid", "question", "bet_on", "outcome", "trade_price", "trade_volume", "signal_strength"]
     with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(headers)
@@ -78,6 +78,7 @@ def main():
     log.info("Loading Market Metadata...")
     markets = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+        pl.col('id'),
         pl.col('question'),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
@@ -106,6 +107,7 @@ def main():
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
+            'id': row['id'],
             'question': row['question'],
             'start': s_date, 
             'end': e_date,
@@ -476,19 +478,21 @@ def main():
                     
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
-                        wallet=t['user'], token_id=cid, usdc_vol=vol, 
+                        wallet=t['user'], token_id=m['id'], usdc_vol=vol, 
                         direction=direction,
                         scorer=scorer
                     )
                     
                     results.append({
-                        "timestamp": t['timestamp'], 
+                        "timestamp": t['timestamp'],
+                        "id": m['id'],
+                        "cid": cid,
                         "question": m['question'], 
+                        "bet_on": bet_on,
                         "outcome": m['outcome'], 
-                        "bet_on": bet_on, 
-                        "signal_strength": sig,
                         "trade_price": t['price'], 
-                        "trade_volume": vol
+                        "trade_volume": vol,
+                        "signal_strength": sig
                     })
                 
                 # Flush Results to CSV
