@@ -429,7 +429,7 @@ def main():
             market_map = {k: v for k, v in market_map.items() 
                           if v['start'] is not None and v['start'] >= pd.Timestamp(data_start_date)}
             filtered_count = original_count - len(market_map)
-            log.info(f"🔍 Filtered out {filtered_count} markets that started before {data_start_date}")
+            #log.info(f"🔍 Filtered out {filtered_count} markets that started before {data_start_date}")
 
             # If we are in the warm-up period, SKIP simulation, but proceed to Accumulation (D)
             if day < simulation_start_date:
