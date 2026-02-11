@@ -126,11 +126,13 @@ class SignalEngine:
         # 3. Apply Decay
         #self._apply_decay(tracker)
 
-        skill_factor = np.log1p(score * 100)
-        weight_multiplier = 1.0 + min(skill_factor * 2.0, 10.0)
+        #skill_factor = np.log1p(score * 100)
+        #weight_multiplier = 1.0 + min(skill_factor * 2.0, 10.0)
         
         # 4. Calculate Impact
-        raw_impact = usdc_vol * weight_multiplier
+        #raw_impact = usdc_vol * weight_multiplier
+
+        raw_impact = usdc_vol * score
         
         # 5. Apply Direction
         final_impact = raw_impact * direction
