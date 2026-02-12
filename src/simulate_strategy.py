@@ -546,7 +546,7 @@ def main():
                           )
 
                           result_map['performance']['pnl'] = result_map['performance']['pnl'] + profit
-                          result_map['performance']['capital'] = result_map['performance']['capital'] + profit
+                          result_map['performance']['equity'] = result_map['performance']['equity'] + profit
                               
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
