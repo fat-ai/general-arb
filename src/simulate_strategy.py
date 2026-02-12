@@ -513,7 +513,7 @@ def main():
                             
                           verdicts = (
                                 mm["bet"]["verdict"] 
-                                for mm in markets_map.values() 
+                                for mm in market_map.values() 
                                 if "bet" in mm
                           )
                           counts = Counter(verdicts)
