@@ -111,7 +111,7 @@ class SignalEngine:
         score = scorer.get_score(wallet, usdc_vol)
 
         # Ignore bad traders rather than fade them
-        score = max(0.0, score)
+        #score = max(0.0, score)
                           
         # If score is still 0, we can't do anything
         if score == 0.0:
