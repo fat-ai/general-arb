@@ -491,6 +491,9 @@ def main():
                     if m_start is None or m_start < pd.Timestamp(simulation_start_date):
                         continue
 
+                    if t['price'] < 0.05 or t['price'] > 0.95:
+                        continue
+
                     # Prepare Inputs
                     vol = t['tradeAmount']
 
