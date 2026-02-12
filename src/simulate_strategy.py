@@ -504,11 +504,13 @@ def main():
                     if abs(sig_final) > 1:
                         if 'bet' not in m:
                           verdict = "WRONG!"
-                          if sig_final > 0 and outcome == 1:
+                          if sig_final > 0 and m['outcome'] == 1:
                             verdict = "RIGHT!"
-                          if sig_final < 0 and outcome == 0:
+                          if sig_final < 0 and m['outcome'] == 0:
                             verdict = "RIGHT!"
-                          m['bet'] = {'time': t['timestamp'], 'signal': sig_final, 'verdict': verdict}
+                              
+                          m['bet'] = {'time': t['timestamp'], 'signal': sig_final, 'price': t['price'], 'outcome': m['outcome'], 'verdict': verdict}
+                            
                           verdicts = (
                                 mm["bet"]["verdict"] 
                                 for mm in markets_map.values() 
