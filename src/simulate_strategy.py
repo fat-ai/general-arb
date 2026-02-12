@@ -521,7 +521,7 @@ def main():
                           wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
                           hit_rate = round(100*(rights/total_bets))
-                          print(f"{t['timestamp']}, {m['question']}, signal: {sig_final}, outcome: {m['outcome']}...{verdict} ... hit rate = {hit_rate}% out of {total_bets} bets")
+                          print(f"{t['timestamp']}, {m['question']}, price: {t['price']}, signal: {sig_final}, outcome: {m['outcome']}...{verdict} ... hit rate = {hit_rate}% out of {total_bets} bets")
                     
                     results.append({
                         "timestamp": t['timestamp'],
