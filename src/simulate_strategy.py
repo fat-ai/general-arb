@@ -519,18 +519,37 @@ def main():
                           result_map[m['id']]['price'] = t['price']
                           result_map[m['id']]['bet_on'] = bet_on
                           result_map[m['id']]['direction'] = direction
+                          result_map[m['id']]['end'] = m['end']
                             
+                          if verdict == "WRONG!":
+                              result_map[m['id']]['roi'] = -1.00
+                              result_map[m['id']]['pnl'] = -vol
+                          else:
+                              if direction = 1:
+                                  profit = 1 - t['price']    
+                              else:
+                                  profit = t['price']
+                                  
+                              result_map[m['id']]['pnl'] = profit * abs(t['outcomeTokensAmount'])
+                              result_map[m['id']]['roi'] = profit / vol
+                                  
                           verdicts = (
-                                result_map[m['id']]['verdict']
+                                mr['verdict'] 
                                 for mr in result_map.values() 
                                 if "verdict" in mr
+                          )
+
+                          total_profit = sum(
+                                mr['pnl'] 
+                                for mr in result_map.values() 
+                                if "pnl" in mr
                           )
                               
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
                           wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
-                          hit_rate = round(100*(rights/total_bets))
+                          hit_rate = 100*(rights/total_bets)
                           print(f"TRIGGER! {result_map[m['id']]}... hit rate = {hit_rate}% out of {total_bets} bets")
                     
                     results.append({
