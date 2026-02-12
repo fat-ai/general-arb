@@ -11,6 +11,7 @@ import subprocess
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE
 from strategy import SignalEngine, WalletScorer
+from collections import Counter
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -182,7 +183,7 @@ def main():
         updates_buffer = []
         # Force cleanup
         gc.collect()
-
+    
     for csv_bytes in chunk_gen:
 
         try:
@@ -498,7 +499,23 @@ def main():
                         scorer=scorer
                     )
 
-                    sig = sig/cum_vol
+                    sig_final = sig/cum_vol
+
+                    if abs(sig_final) > 1:
+                        if 'bet' not in m:
+                          verdict = "WRONG!"
+                          if sig_final > 0 and outcome == 1:
+                            verdict = "RIGHT!"
+                          if sig_final < 0 and outcome == 0:
+                            verdict = "RIGHT!"
+                          m['bet'] = {'time'= t['timestamp'], 'signal' = sig_final, 'verdict' = verdict}
+                          verdicts = [obj["verdict"] for obj in market_map.values() if "verdict" in obj]
+                          counts = Counter(verdicts)
+                          rights = {results.get('RIGHT!', 0)}
+                          wrongs = {results.get('WRONG!', 0)}
+                          total_bets = rights + wrongs
+                          hit_rate = round(100*(rights/total_bets))
+                          print(f"{t['timestamp']}, {m['question']}, signal: {sig_final}, outcome: {outcome}...{verdict} ... hit rate = {hit_rate}%")
                     
                     results.append({
                         "timestamp": t['timestamp'],
@@ -509,7 +526,7 @@ def main():
                         "outcome": m['outcome'], 
                         "trade_price": t['price'], 
                         "trade_volume": vol,
-                        "signal_strength": sig
+                        "signal_strength": sig_final
                     })
                 
                 # Flush Results to CSV
