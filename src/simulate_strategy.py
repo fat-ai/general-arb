@@ -507,7 +507,7 @@ def main():
 
                     sig_final = sig/cum_vol
 
-                    if abs(sig_final) > 1:
+                    if abs(sig_final) > 3:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
                           if sig_final > 0 and m['outcome'] == 1:
