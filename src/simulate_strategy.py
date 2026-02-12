@@ -119,7 +119,7 @@ def main():
         }
 
         if row['id'] not in result_map:
-            result_map[row['id]] = {'question': row['question'], 'start': s_date, 'end': e_date, 'outcome': row['outcome']}
+            result_map[row['id']] = {'question': row['question'], 'start': s_date, 'end': e_date, 'outcome': row['outcome']}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -513,7 +513,7 @@ def main():
                           if sig_final < 0 and m['outcome'] == 0:
                             verdict = "RIGHT!"
 
-                          result_map[m['id']]['timestamp'] = t['timestamp']},
+                          result_map[m['id']]['timestamp'] = t['timestamp'],
                           result_map[m['id']]['signal'] = sig_final, 
                           result_map[m['id']]['verdict'] = verdict
                           result_map[m['id']]['price'] = t['price']
