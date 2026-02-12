@@ -517,11 +517,11 @@ def main():
                                 if "bet" in mm
                           )
                           counts = Counter(verdicts)
-                          rights = {results.get('RIGHT!', 0)}
-                          wrongs = {results.get('WRONG!', 0)}
+                          rights = counts['RIGHT!']
+                          wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
                           hit_rate = round(100*(rights/total_bets))
-                          print(f"{t['timestamp']}, {m['question']}, signal: {sig_final}, outcome: {outcome}...{verdict} ... hit rate = {hit_rate}%")
+                          print(f"{t['timestamp']}, {m['question']}, signal: {sig_final}, outcome: {outcome}...{verdict} ... hit rate = {hit_rate}% out of {total_bets} bets")
                     
                     results.append({
                         "timestamp": t['timestamp'],
