@@ -523,7 +523,7 @@ def main():
                           result_map[m['id']]['direction'] = direction
                           result_map[m['id']]['end'] = m['end']
 
-                          bet_size = 0.025 * result_map['performance']['capital']
+                          bet_size = 0.025 * result_map['performance']['equity']
                             
                           if verdict == "WRONG!":
                               profit = -bet_size
