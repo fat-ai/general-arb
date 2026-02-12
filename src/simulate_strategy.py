@@ -508,8 +508,12 @@ def main():
                             verdict = "RIGHT!"
                           if sig_final < 0 and outcome == 0:
                             verdict = "RIGHT!"
-                          m['bet'] = {'time'= t['timestamp'], 'signal' = sig_final, 'verdict' = verdict}
-                          verdicts = [obj["verdict"] for obj in market_map.values() if "verdict" in obj]
+                          m['bet'] = {'time': t['timestamp'], 'signal': sig_final, 'verdict': verdict}
+                          verdicts = (
+                                mm["bet"]["verdict"] 
+                                for mm in markets_map.values() 
+                                if "bet" in mm
+                          )
                           counts = Counter(verdicts)
                           rights = {results.get('RIGHT!', 0)}
                           wrongs = {results.get('WRONG!', 0)}
