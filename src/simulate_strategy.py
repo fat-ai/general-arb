@@ -140,7 +140,7 @@ def main():
         "total_pnl": pl.Float32, # Changed from Float64
         "total_invested": pl.Float32,
         "trade_count": pl.UInt32,
-        "win_count": pl.UInt32
+        "sum_weighted_sq_neg_roi": pl.Float32
     })
     
     active_positions = pl.DataFrame(schema={
@@ -308,22 +308,34 @@ def main():
                                  outcomes_df, on="contract_id", how="left"
                             )
                             
-                            # Calculate PnL
-                            pnl_calc = resolved_with_outcome.select([
-                                pl.col("user"),
-                                # Payout Logic: Longs win on 1.0, Shorts win on 0.0
-                                (
-                                    (pl.col("qty_long") * pl.col("outcome")) + 
-                                    (pl.col("qty_short") * (1.0 - pl.col("outcome")))
-                                ).alias("payout"),
+                            trade_level_calc = resolved_with_outcome.with_columns([
+                                # Payout
+                                ((pl.col("qty_long") * pl.col("outcome")) + 
+                                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout"),
                                 
-                                # Total Invested
+                                # Invested
                                 (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
-                            ]).group_by("user").agg([
-                                (pl.col("payout") - pl.col("invested")).sum().alias("pnl"),
-                                pl.col("invested").sum().alias("invested"),
-                                pl.len().alias("count"),
-                                (pl.col("payout") > pl.col("invested")).cast(pl.UInt32).sum().alias("wins")
+                            ]).with_columns([
+                                # Raw PnL
+                                (pl.col("payout") - pl.col("invested")).alias("pnl"),
+                                
+                                # Individual Trade ROI
+                                ((pl.col("payout") - pl.col("invested")) / (pl.col("invested") + 1e-6)).alias("trade_roi")
+                            ]).with_columns([
+                                # Weighted Downside: (min(0, ROI)^2) * Invested_Amount
+                                pl.when(pl.col("trade_roi") < 0)
+                                  .then((pl.col("trade_roi")**2) * pl.col("invested"))
+                                  .otherwise(0.0)
+                                  .alias("weighted_sq_neg_roi")
+                            ])
+    
+                            # 2. Group by user to get the aggregates
+                            pnl_calc = trade_level_calc.group_by("user").agg([
+                                pl.col("pnl").sum().alias("total_pnl"),
+                                pl.col("invested").sum().alias("total_invested"),
+                                pl.len().alias("trade_count"),
+                                # Summing the WEIGHTED squared errors
+                                pl.col("weighted_sq_neg_roi").sum().alias("sum_weighted_sq_neg_roi")
                             ])
     
                             # --- Fresh Wallet Tracker Logic ---
@@ -363,41 +375,44 @@ def main():
                                 known_users.add(uid)
     
                             # Update History
+                            new_data = pnl_calc.select([
+                                "user", "total_pnl", "total_invested", "trade_count", "sum_weighted_sq_neg_roi"
+                            ]).with_columns([
+                                pl.col("user").cast(pl.Categorical),
+                                pl.col("total_pnl").cast(pl.Float32),
+                                pl.col("total_invested").cast(pl.Float32),
+                                pl.col("sum_weighted_sq_neg_roi").cast(pl.Float32)
+                            ])
                             if user_history.height == 0:
-                                user_history = pnl_calc.select(["user", "pnl", "invested", "count", "wins"]) \
-                                    .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count", "wins": "win_count"})
-                                
-                                user_history = user_history.with_columns([
-                                    pl.col("user").cast(pl.Categorical),
-                                    pl.col("total_pnl").cast(pl.Float32),
-                                    pl.col("total_invested").cast(pl.Float32)
-                                ])
+                                user_history = new_data
                             else:
-                                new_history = pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count", "wins": "win_count"}) \
-                                                      .with_columns([
-                                                          pl.col("user").cast(pl.Categorical),
-                                                          pl.col("total_pnl").cast(pl.Float32),
-                                                          pl.col("total_invested").cast(pl.Float32)
-                                                      ])
-                                
-                                user_history = pl.concat([user_history, new_history]).group_by("user").agg([pl.col("*").sum()])
+                                user_history = pl.concat([user_history, new_data]) \
+                                                 .group_by("user") \
+                                                 .agg([pl.col("*").sum()])
     
                         if 'pnl_calc' in locals() and pnl_calc.height > 0:
-                            # 1. Identify who changed
                             affected_users = pnl_calc["user"].unique()
                             
-                            # 2. Filter history for ONLY these users
-                            # We use the updated 'user_history' dataframe
+                            # --- VOLUME-WEIGHTED SORTINO LOGIC ---
                             updates_df = user_history.filter(
                                 pl.col("user").is_in(affected_users.implode()) &
-                                (pl.col("trade_count") >= 1) & 
+                                (pl.col("trade_count") >= 3) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
-                                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                                (pl.col("trade_count").log(10) + 1).alias("vol_boost"),
-                                (pl.col("win_count") / pl.col("trade_count")).alias("win_rate")
-                            ]).with_columns((pl.col("roi") * pl.col("vol_boost") * pl.col("win_rate")).alias("score"))
-                            
+                                # 1. Global ROI (Naturally Volume Weighted)
+                                # Total Profit / Total Capital Moved
+                                (pl.col("total_pnl") / pl.col("total_invested")).alias("global_roi"),
+                                
+                                # 2. Volume-Weighted Downside Deviation
+                                # Formula: sqrt( Sum(Invested * Loss^2) / Sum(Invested) )
+                                ((pl.col("sum_weighted_sq_neg_roi") / pl.col("total_invested")).sqrt()).alias("weighted_downside_dev")
+                            ]).with_columns([
+                                # 3. Sortino Ratio
+                                (pl.col("global_roi") / (pl.col("weighted_downside_dev") + 1e-6)).alias("sortino_raw")
+                            ]).with_columns([
+                                # 4. Normalize (-1 to 1)
+                                (pl.col("sortino_raw") * 0.5).tanh().alias("score")
+                            ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
                             if updates_df.height > 0:
