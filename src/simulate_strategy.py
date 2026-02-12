@@ -139,7 +139,8 @@ def main():
         "user": pl.Categorical,  # Changed from String
         "total_pnl": pl.Float32, # Changed from Float64
         "total_invested": pl.Float32,
-        "trade_count": pl.UInt32
+        "trade_count": pl.UInt32,
+        "win_count": pl.UInt32
     })
     
     active_positions = pl.DataFrame(schema={
@@ -321,7 +322,8 @@ def main():
                             ]).group_by("user").agg([
                                 (pl.col("payout") - pl.col("invested")).sum().alias("pnl"),
                                 pl.col("invested").sum().alias("invested"),
-                                pl.len().alias("count")
+                                pl.len().alias("count"),
+                                (pl.col("payout") > pl.col("invested")).cast(pl.UInt32).sum().alias("wins")
                             ])
     
                             # --- Fresh Wallet Tracker Logic ---
@@ -362,8 +364,8 @@ def main():
     
                             # Update History
                             if user_history.height == 0:
-                                user_history = pnl_calc.select(["user", "pnl", "invested", "count"]) \
-                                    .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"})
+                                user_history = pnl_calc.select(["user", "pnl", "invested", "count", "wins"]) \
+                                    .rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count", "wins": "win_count"})
                                 
                                 user_history = user_history.with_columns([
                                     pl.col("user").cast(pl.Categorical),
@@ -371,7 +373,7 @@ def main():
                                     pl.col("total_invested").cast(pl.Float32)
                                 ])
                             else:
-                                new_history = pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count"}) \
+                                new_history = pnl_calc.rename({"pnl": "total_pnl", "invested": "total_invested", "count": "trade_count", "wins": "win_count"}) \
                                                       .with_columns([
                                                           pl.col("user").cast(pl.Categorical),
                                                           pl.col("total_pnl").cast(pl.Float32),
@@ -392,8 +394,9 @@ def main():
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
                                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-                                (pl.col("trade_count").log(10) + 1).alias("vol_boost")
-                            ]).with_columns((pl.col("roi") * pl.col("vol_boost")).alias("score"))
+                                (pl.col("trade_count").log(10) + 1).alias("vol_boost"),
+                                (pl.col("win_count") / pl.col("trade_count")).alias("win_rate")
+                            ]).with_columns((pl.col("roi") * pl.col("vol_boost") * pl.col("win_rate")).alias("score"))
                             
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
