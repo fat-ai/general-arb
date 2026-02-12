@@ -88,6 +88,7 @@ def main():
     ])
     
     market_map = {}
+    result_map = {}
     
     for row in markets.iter_rows(named=True):
         cid = row['contract_id']
@@ -116,6 +117,9 @@ def main():
             'outcome_label': row['token_outcome_label'],
             'volume': 0,
         }
+
+        if row['id'] not in result_map:
+            result_map[row['id]] = {'question': row['question'], 'start': s_date, 'end': e_date, 'outcome': row['outcome']}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -502,26 +506,32 @@ def main():
                     sig_final = sig/cum_vol
 
                     if abs(sig_final) > 1:
-                        if 'bet' not in m:
+                        if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
                           if sig_final > 0 and m['outcome'] == 1:
                             verdict = "RIGHT!"
                           if sig_final < 0 and m['outcome'] == 0:
                             verdict = "RIGHT!"
-                              
-                          m['bet'] = {'time': t['timestamp'], 'signal': sig_final, 'price': t['price'], 'outcome': m['outcome'], 'verdict': verdict}
+
+                          result_map[m['id']]['timestamp'] = t['timestamp']},
+                          result_map[m['id']]['signal'] = sig_final, 
+                          result_map[m['id']]['verdict'] = verdict
+                          result_map[m['id']]['price'] = t['price']
+                          result_map[m['id']]['bet_on'] = bet_on
+                          result_map[m['id']]['direction'] = direction
                             
                           verdicts = (
-                                mm["bet"]["verdict"] 
-                                for mm in market_map.values() 
-                                if "bet" in mm
+                                result_map[m['id']]['verdict']
+                                for mr in result_map.values() 
+                                if "verdict" in mr
                           )
+                              
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
                           wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
                           hit_rate = round(100*(rights/total_bets))
-                          print(f"{t['timestamp']}, {m['question']}, price: {t['price']}, signal: {sig_final}, outcome: {m['outcome']}...{verdict} ... hit rate = {hit_rate}% out of {total_bets} bets")
+                          print(f"TRIGGER! {result_map[m['id']]}... hit rate = {hit_rate}% out of {total_bets} bets")
                     
                     results.append({
                         "timestamp": t['timestamp'],
