@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import subprocess
 import math
-from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE
+from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
 from collections import Counter
 
@@ -120,6 +120,8 @@ def main():
 
         if row['id'] not in result_map:
             result_map[row['id']] = {'question': row['question'], 'start': s_date, 'end': e_date, 'outcome': row['outcome']}
+
+        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'pnl': 0}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -520,18 +522,22 @@ def main():
                           result_map[m['id']]['bet_on'] = bet_on
                           result_map[m['id']]['direction'] = direction
                           result_map[m['id']]['end'] = m['end']
+
+                          bet_size = 0.025 * result_map['performance']['capital']
                             
                           if verdict == "WRONG!":
+                              profit = -bet_size
                               result_map[m['id']]['roi'] = -1.00
-                              result_map[m['id']]['pnl'] = -vol
+                              result_map[m['id']]['pnl'] = profit
                           else:
                               if direction == 1:
-                                  profit = 1 - t['price']    
+                                  profit = 1 - t['price']
                               else:
                                   profit = t['price']
-                                  
-                              result_map[m['id']]['pnl'] = profit * abs(t['outcomeTokensAmount'])
-                              result_map[m['id']]['roi'] = profit / vol
+
+                              contracts = bet_size / price
+                              result_map[m['id']]['pnl'] = profit * contracts
+                              result_map[m['id']]['roi'] = profit / bet_size
                                   
                           verdicts = (
                                 mr['verdict'] 
@@ -539,18 +545,15 @@ def main():
                                 if "verdict" in mr
                           )
 
-                          total_profit = sum(
-                                mr['pnl'] 
-                                for mr in result_map.values() 
-                                if "pnl" in mr
-                          )
+                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + profit
+                          result_map['performance']['capital'] = result_map['performance']['capital'] + profit
                               
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
                           wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
                           hit_rate = 100*(rights/total_bets)
-                          print(f"TRIGGER! {result_map[m['id']]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {total_profit}")
+                          print(f"TRIGGER! {result_map[m['id']]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
                     
                     results.append({
                         "timestamp": t['timestamp'],
