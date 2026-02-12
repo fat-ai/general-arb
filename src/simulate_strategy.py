@@ -136,11 +136,12 @@ def main():
     updates_buffer = []
     
     user_history = pl.DataFrame(schema={
-        "user": pl.Categorical,  # Changed from String
-        "total_pnl": pl.Float32, # Changed from Float64
+        "user": pl.Categorical,
+        "total_pnl": pl.Float32,
         "total_invested": pl.Float32,
         "trade_count": pl.UInt32,
-        "sum_weighted_sq_neg_roi": pl.Float32
+        "peak_pnl": pl.Float32,      # NEW: Highest Cumulative PnL ever reached
+        "max_drawdown": pl.Float32   # NEW: Maximum drop from Peak
     })
     
     active_positions = pl.DataFrame(schema={
@@ -330,12 +331,17 @@ def main():
                             ])
     
                             # 2. Group by user to get the aggregates
-                            pnl_calc = trade_level_calc.group_by("user").agg([
-                                pl.col("pnl").sum().alias("total_pnl"),
-                                pl.col("invested").sum().alias("total_invested"),
-                                pl.len().alias("trade_count"),
-                                # Summing the WEIGHTED squared errors
-                                pl.col("weighted_sq_neg_roi").sum().alias("sum_weighted_sq_neg_roi")
+                            pnl_calc = resolved_with_outcome.select([
+                                pl.col("user"),
+                                # Payout Logic
+                                ((pl.col("qty_long") * pl.col("outcome")) + 
+                                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout"),
+                                # Invested
+                                (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
+                            ]).group_by("user").agg([
+                                (pl.col("payout") - pl.col("invested")).sum().alias("delta_pnl"),
+                                pl.col("invested").sum().alias("delta_invested"),
+                                pl.len().alias("delta_count")
                             ])
     
                             # --- Fresh Wallet Tracker Logic ---
@@ -375,43 +381,71 @@ def main():
                                 known_users.add(uid)
     
                             # Update History
-                            new_data = pnl_calc.select([
-                                "user", "total_pnl", "total_invested", "trade_count", "sum_weighted_sq_neg_roi"
-                            ]).with_columns([
-                                pl.col("user").cast(pl.Categorical),
-                                pl.col("total_pnl").cast(pl.Float32),
-                                pl.col("total_invested").cast(pl.Float32),
-                                pl.col("sum_weighted_sq_neg_roi").cast(pl.Float32)
-                            ])
                             if user_history.height == 0:
-                                user_history = new_data
+                                # Initialize fresh history from the first batch
+                                user_history = pnl_calc.select([
+                                    pl.col("user").cast(pl.Categorical),
+                                    pl.col("delta_pnl").cast(pl.Float32).alias("total_pnl"),
+                                    pl.col("delta_invested").cast(pl.Float32).alias("total_invested"),
+                                    pl.col("delta_count").cast(pl.UInt32).alias("trade_count"),
+                                ]).with_columns([
+                                    # Peak PnL is max(0, total_pnl) for initialization
+                                    pl.max_horizontal(pl.col("total_pnl"), pl.lit(0.0)).alias("peak_pnl"),
+                                ]).with_columns([
+                                    # Drawdown = Peak - Current
+                                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("max_drawdown")
+                                ])
                             else:
-                                user_history = pl.concat([user_history, new_data]) \
-                                                 .group_by("user") \
-                                                 .agg([pl.col("*").sum()])
+                                # JOIN Logic: Merge History (Left) with New Deltas (Right)
+                                # We use full join to capture new users + existing users
+                                joined = user_history.join(
+                                    pnl_calc.with_columns(pl.col("user").cast(pl.Categorical)), 
+                                    on="user", 
+                                    how="full", 
+                                    coalesce=True
+                                )
+                                
+                                # Update State columns
+                                user_history = joined.select([
+                                    pl.col("user"),
+                                    
+                                    # 1. Update Accumulators (Fill nulls with 0)
+                                    (pl.col("total_pnl").fill_null(0) + pl.col("delta_pnl").fill_null(0)).alias("total_pnl"),
+                                    (pl.col("total_invested").fill_null(0) + pl.col("delta_invested").fill_null(0)).alias("total_invested"),
+                                    (pl.col("trade_count").fill_null(0) + pl.col("delta_count").fill_null(0)).alias("trade_count"),
+                                    
+                                    # Preserve previous peak/drawdown state
+                                    pl.col("peak_pnl").fill_null(0).alias("prev_peak"),
+                                    pl.col("max_drawdown").fill_null(0).alias("prev_max_dd")
+                                ]).with_columns([
+                                    # 2. Calculate NEW Peak (High Water Mark)
+                                    # Peak is Max(Previous Peak, New Total PnL, 0)
+                                    pl.max_horizontal("prev_peak", "total_pnl", pl.lit(0.0)).alias("peak_pnl")
+                                ]).with_columns([
+                                    # 3. Calculate NEW Max Drawdown
+                                    # Current Drawdown = Peak - Current PnL
+                                    # Max Drawdown = Max(Previous Max DD, Current Drawdown)
+                                    pl.max_horizontal("prev_max_dd", (pl.col("peak_pnl") - pl.col("total_pnl"))).alias("max_drawdown")
+                                ]).select([
+                                    "user", "total_pnl", "total_invested", "trade_count", "peak_pnl", "max_drawdown"
+                                ])
     
                         if 'pnl_calc' in locals() and pnl_calc.height > 0:
                             affected_users = pnl_calc["user"].unique()
                             
-                            # --- VOLUME-WEIGHTED SORTINO LOGIC ---
+                            # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
                                 pl.col("user").is_in(affected_users.implode()) &
                                 (pl.col("trade_count") >= 3) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
-                                # 1. Global ROI (Naturally Volume Weighted)
-                                # Total Profit / Total Capital Moved
-                                (pl.col("total_pnl") / pl.col("total_invested")).alias("global_roi"),
-                                
-                                # 2. Volume-Weighted Downside Deviation
-                                # Formula: sqrt( Sum(Invested * Loss^2) / Sum(Invested) )
-                                ((pl.col("sum_weighted_sq_neg_roi") / pl.col("total_invested")).sqrt()).alias("weighted_downside_dev")
+                                # Calmar Ratio = Total Return / Max Drawdown
+                                # We use a small epsilon to avoid division by zero
+                                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw")
                             ]).with_columns([
-                                # 3. Sortino Ratio
-                                (pl.col("global_roi") / (pl.col("weighted_downside_dev") + 1e-6)).alias("sortino_raw")
-                            ]).with_columns([
-                                # 4. Normalize (-1 to 1)
-                                (pl.col("sortino_raw") * 0.5).tanh().alias("score")
+                                # Normalize (-1 to 1) using Tanh
+                                # A Calmar ratio of 3.0 is excellent. tanh(3*0.25) ~ 0.6.
+                                (pl.col("calmar_raw") * 0.25).tanh().alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
