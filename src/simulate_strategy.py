@@ -245,6 +245,8 @@ def main():
                 "price": price,
                 "is_long": is_long
             }  
+            
+            known_users.add(uid)
 
         # Ensure sorting (Oldest -> Newest)
         batch = batch.sort("timestamp")
@@ -260,7 +262,7 @@ def main():
 
                 resolved_ids = [
                     cid for cid, m in market_map.items() 
-                    if m['end'] is not None and m['end'].date() <= current_sim_day
+                    if m['end'] is not None and m['end'].date() < current_sim_day
                 ]
 
                 if resolved_ids:
