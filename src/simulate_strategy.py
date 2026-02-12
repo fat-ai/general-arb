@@ -525,7 +525,7 @@ def main():
                               result_map[m['id']]['roi'] = -1.00
                               result_map[m['id']]['pnl'] = -vol
                           else:
-                              if direction = 1:
+                              if direction == 1:
                                   profit = 1 - t['price']    
                               else:
                                   profit = t['price']
