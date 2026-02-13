@@ -542,10 +542,11 @@ def main():
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
-                          o = float(m['outcome'])
-                          if sig_final > 0.0 and o == 1.0: 
+                          o = round(m['outcome'])
+                          s = round(sig_final)
+                          if s > 0.0 and o == 1.0: 
                               verdict = "RIGHT!"
-                          if sig_final < 0.0 and o == 0.0: 
+                          if s < 0.0 and o == 0.0: 
                               verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
