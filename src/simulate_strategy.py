@@ -539,6 +539,9 @@ def main():
 
                     sig_final = sig/cum_vol
 
+                    if isinstance(sig_final, (tuple, list)):
+                        sig_final = sig_final[0]
+
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
