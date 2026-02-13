@@ -425,7 +425,7 @@ def main():
                             ]).with_columns([
                                 # Normalize (-1 to 1) using Tanh
                                 # A Calmar ratio of 3.0 is excellent. tanh(3*0.25) ~ 0.6.
-                                ((pl.col("calmar_raw")/5).tanh() * pl.col("roi")).alias("score")
+                                ((abs(pl.col("calmar_raw"))/5).tanh() * pl.col("roi")).alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
