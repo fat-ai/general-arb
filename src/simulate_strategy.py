@@ -544,7 +544,7 @@ def main():
                           verdict = "WRONG!"
                           if int(sig_final) > 0 and int(m['outcome']) == 1: 
                               verdict = "RIGHT!"
-                          if int(sig_final) < 0 and int(m['outcome']) == 0: 
+                          elif int(sig_final) < 0 and int(m['outcome']) == 0: 
                               verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
