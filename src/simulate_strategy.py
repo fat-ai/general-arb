@@ -563,10 +563,11 @@ def main():
                           else:
                               if is_buying:
                                  profit = 1 - t['price']
+                                 contracts = bet_size / price
                               else:
                                  profit = t['price']
+                                 contracts = bet_size / (1 - price)
                 
-                              contracts = bet_size / price
                               profit = profit * contracts
                               result_map[m['id']]['pnl'] = profit
                               result_map[m['id']]['roi'] = profit / bet_size
