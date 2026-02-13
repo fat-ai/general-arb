@@ -558,17 +558,17 @@ def main():
                           bet_size = 0.025 * result_map['performance']['equity']
                             
                           if verdict == "WRONG!":
-                              profit = -bet_size
                               result_map[m['id']]['roi'] = -1.00
-                              result_map[m['id']]['pnl'] = profit
+                              result_map[m['id']]['pnl'] = -bet_size
                           else:
-                              if direction == 1:
-                                  profit = 1 - t['price']
+                              if is_buying:
+                                 profit = 1 - t['price']
                               else:
-                                  profit = t['price']
-
+                                 profit = t['price']
+                
                               contracts = bet_size / price
-                              result_map[m['id']]['pnl'] = profit * contracts
+                              profit = profit * contracts
+                              result_map[m['id']]['pnl'] = profit
                               result_map[m['id']]['roi'] = profit / bet_size
                                   
                           verdicts = (
