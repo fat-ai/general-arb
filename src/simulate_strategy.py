@@ -542,10 +542,16 @@ def main():
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
-                          if sig_final > 0 and m['outcome'] == 1:
-                            verdict = "RIGHT!"
-                          if sig_final < 0 and m['outcome'] == 0:
-                            verdict = "RIGHT!"
+                          if bet_on == "yes":
+                            if is_buying and sig_final > 0 and m['outcome'] == 1:
+                              verdict = "RIGHT!"
+                            elif not is_buying and sig_final < 0 and m['outcome'] == 0:
+                              verdict = "RIGHT!"
+                          else:
+                            if is_buying and sig_final < 0 and m['outcome'] == 0:
+                              verdict = "RIGHT!"
+                            elif not is_buying and sig_final > 0 and m['outcome'] == 1:
+                              verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp'],
                           result_map[m['id']]['signal'] = sig_final, 
