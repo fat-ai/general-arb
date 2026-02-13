@@ -543,10 +543,10 @@ def main():
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
                           if sig_final > 0.0:
-                              if m['outcome']) == 1.0: 
+                              if m['outcome'] == 1.0: 
                                   verdict = "RIGHT!"
                           elif sig_final < 0.0:
-                              if int(m['outcome']) == 0.0: 
+                              if m['outcome'] == 0.0: 
                                   verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
