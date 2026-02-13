@@ -544,7 +544,7 @@ def main():
                           verdict = "WRONG!"
                           if m['outcome'] == 1.0 and sig_final > 0.0:                        
                                   verdict = "RIGHT!"
-                          if m['outcome'] == 0.0 and sig_final < 0.0 and :
+                          if m['outcome'] == 0.0 and sig_final < 0.0:
                                   verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
