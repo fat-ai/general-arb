@@ -308,27 +308,6 @@ def main():
                             resolved_with_outcome = just_resolved.join(
                                  outcomes_df, on="contract_id", how="left"
                             )
-                            
-                            trade_level_calc = resolved_with_outcome.with_columns([
-                                # Payout
-                                ((pl.col("qty_long") * pl.col("outcome")) + 
-                                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout"),
-                                
-                                # Invested
-                                (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
-                            ]).with_columns([
-                                # Raw PnL
-                                (pl.col("payout") - pl.col("invested")).alias("pnl"),
-                                
-                                # Individual Trade ROI
-                                ((pl.col("payout") - pl.col("invested")) / (pl.col("invested") + 1e-6)).alias("trade_roi")
-                            ]).with_columns([
-                                # Weighted Downside: (min(0, ROI)^2) * Invested_Amount
-                                pl.when(pl.col("trade_roi") < 0)
-                                  .then((pl.col("trade_roi")**2) * pl.col("invested"))
-                                  .otherwise(0.0)
-                                  .alias("weighted_sq_neg_roi")
-                            ])
     
                             # 2. Group by user to get the aggregates
                             pnl_calc = resolved_with_outcome.select([
@@ -436,16 +415,17 @@ def main():
                             # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
                                 pl.col("user").is_in(affected_users.implode()) &
-                                (pl.col("trade_count") >= 3) & 
+                                (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
                                 # Calmar Ratio = Total Return / Max Drawdown
                                 # We use a small epsilon to avoid division by zero
-                                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw")
+                                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
+                                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                             ]).with_columns([
                                 # Normalize (-1 to 1) using Tanh
                                 # A Calmar ratio of 3.0 is excellent. tanh(3*0.25) ~ 0.6.
-                                (pl.col("calmar_raw") * 0.25).tanh().alias("score")
+                                (abs(pl.col("calmar_raw") / 3) * pl.col("roi")).alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
