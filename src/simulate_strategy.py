@@ -542,15 +542,7 @@ def main():
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
-                          if bet_on == "yes":
-                            if is_buying and sig_final > 0 and m['outcome'] == 1:
-                              verdict = "RIGHT!"
-                            elif not is_buying and sig_final < 0 and m['outcome'] == 0:
-                              verdict = "RIGHT!"
-                          else:
-                            if is_buying and sig_final < 0 and m['outcome'] == 0:
-                              verdict = "RIGHT!"
-                            elif not is_buying and sig_final > 0 and m['outcome'] == 1:
+                          if direction + m['outcome'] == -1 or direction + m['outcome'] == 2:
                               verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp'],
@@ -568,12 +560,12 @@ def main():
                               result_map[m['id']]['pnl'] = -bet_size
                           else:
                               if is_buying:
-                                 profit = 1 - t['price']
-                                 contracts = bet_size / price
+                                  profit = 1 - t['price']
+                                  contracts = bet_size / t['price']
                               else:
-                                 profit = t['price']
-                                 contracts = bet_size / (1 - price)
-                
+                                  profit = t['price']
+                                  contracts = bet_size / (1 - t['price'])
+                                  
                               profit = profit * contracts
                               result_map[m['id']]['pnl'] = profit
                               result_map[m['id']]['roi'] = profit / bet_size
