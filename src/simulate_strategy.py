@@ -550,8 +550,8 @@ def main():
                           if sig_final < 0.0 and m['outcome'] == 0.0: 
                               verdict = "RIGHT!"
 
-                          result_map[m['id']]['timestamp'] = t['timestamp'],
-                          result_map[m['id']]['signal'] = sig_final, 
+                          result_map[m['id']]['timestamp'] = t['timestamp']
+                          result_map[m['id']]['signal'] = sig_final
                           result_map[m['id']]['verdict'] = verdict
                           result_map[m['id']]['price'] = t['price']
                           result_map[m['id']]['bet_on'] = bet_on
