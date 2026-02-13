@@ -539,15 +539,13 @@ def main():
 
                     sig_final = sig/cum_vol
 
-                    if isinstance(sig_final, (tuple, list)):
-                        sig_final = sig_final[0]
-
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
-                          if sig_final > 0.0 and m['outcome'] == 1.0: 
+                          o = float(m['outcome'])
+                          if sig_final > 0.0 and o == 1.0: 
                               verdict = "RIGHT!"
-                          if sig_final < 0.0 and m['outcome'] == 0.0: 
+                          if sig_final < 0.0 and o == 0.0: 
                               verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
