@@ -83,7 +83,7 @@ def main():
         pl.col('question'),
         pl.col("startDate").cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
-        pl.col('outcome'),
+        pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
     ])
     
