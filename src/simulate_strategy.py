@@ -542,10 +542,12 @@ def main():
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
-                          if int(sig_final) > 0 and int(m['outcome']) == 1: 
-                              verdict = "RIGHT!"
-                          elif int(sig_final) < 0 and int(m['outcome']) == 0: 
-                              verdict = "RIGHT!"
+                          if sig_final > 0.0:
+                              if m['outcome']) == 1.0: 
+                                  verdict = "RIGHT!"
+                          elif sig_final < 0.0:
+                              if int(m['outcome']) == 0.0: 
+                                  verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
                           result_map[m['id']]['signal'] = sig_final
