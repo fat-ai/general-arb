@@ -577,8 +577,8 @@ def main():
                                 if "verdict" in mr
                           )
 
-                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + profit
-                          result_map['performance']['equity'] = result_map['performance']['equity'] + profit
+                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[m['id']]['pnl']
+                          result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[m['id']]['pnl']
                               
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
