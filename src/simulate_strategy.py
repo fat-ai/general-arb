@@ -414,18 +414,15 @@ def main():
                             
                             # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
-                                pl.col("user").is_in(affected_users.implode()) &
+                                pl.col("user").is_in(affected_users) &
                                 (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
-                                # Calmar Ratio = Total Return / Max Drawdown
-                                # We use a small epsilon to avoid division by zero
                                 (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
                                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                             ]).with_columns([
-                                # Normalize (-1 to 1) using Tanh
-                                # A Calmar ratio of 3.0 is excellent. tanh(3*0.25) ~ 0.6.
-                                ((pl.min_horizontal(6.0, pl.col("calmar_raw").abs()) * pl.col("roi")).alias("score")
+                                # Use pl.min_horizontal to cap the multiplier at 3.0
+                                (pl.min_horizontal(3.0, pl.col("calmar_raw").abs()) * pl.col("roi")).alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
