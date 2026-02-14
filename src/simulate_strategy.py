@@ -534,7 +534,7 @@ def main():
                         scorer=scorer
                     )
 
-                    sig_final = sig
+                    sig_final = sig * (vol/cum_vol)
 
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95 and cum_vol > 10000:
                         if 'verdict' not in result_map[m['id']]:
