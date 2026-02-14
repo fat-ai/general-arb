@@ -90,10 +90,10 @@ def main():
     market_map = {}
     result_map = {}
     
-    for row in markets.iter_rows(named=True):
-        cid = row['contract_id']
+    for market in markets.iter_rows(named=True):
+        cid = market['contract_id']
         
-        s_date = row['start_date']
+        s_date = market['start_date']
         
         if isinstance(s_date, str):
             try:
@@ -104,22 +104,22 @@ def main():
         if s_date is not None and s_date.tzinfo is not None:
             s_date = s_date.replace(tzinfo=None)
             
-        e_date = row['resolution_timestamp']
+        e_date = market['resolution_timestamp']
         if e_date is not None and e_date.tzinfo is not None:
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
-            'id': row['id'],
-            'question': row['question'],
+            'id': market['id'],
+            'question': market['question'],
             'start': s_date, 
             'end': e_date,
-            'outcome': row['outcome'],
-            'outcome_label': row['token_outcome_label'],
+            'outcome': market['outcome'],
+            'outcome_label': market['token_outcome_label'],
             'volume': 0,
         }
 
-        if row['id'] not in result_map:
-            result_map[row['id']] = {'question': row['question'], 'start': s_date, 'end': e_date, 'outcome': row['outcome']}
+        if market['id'] not in result_map:
+            result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
         result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'pnl': 0}
     
@@ -228,14 +228,14 @@ def main():
         potential_fresh = batch_sorted.filter(unknown_mask)
         
         # Only iterate through the potential fresh candidates
-        for row in potential_fresh.iter_rows(named=True):
+        for trade in potential_fresh.iter_rows(named=True):
             uid = row["user"]
             
             # 2. This is a "Fresh Wallet". Capture exact metrics.
-            cid = row["contract_id"]
-            price = max(0.00, min(1.0, row["price"])) 
-            tokens = row["outcomeTokensAmount"]
-            trade_amt = row["tradeAmount"]
+            cid = trade["contract_id"]
+            price = max(0.00, min(1.0, trade["price"])) 
+            tokens = trade["outcomeTokensAmount"]
+            trade_amt = trade["tradeAmount"]
             is_long = tokens > 0
             
             # Match Logic: Risk Volume Calculation
@@ -537,30 +537,33 @@ def main():
                         scorer=scorer
                     )
 
-                    sig_final = sig/cum_vol
+                    sig_final = round(sig/cum_vol,1)
 
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
+                          mid = m['id']
                           verdict = "WRONG!"
-                          m_outcome = float(m['outcome'])
-                          if m_outcome > 0.9 and sig_final > 1.0:                        
+                          if result_map[mid]['outcome'] > 0:
+                             if sig_final > 0:                        
                                   verdict = "RIGHT!"
-                          if m_outcome < 0.1 and sig_final < -1.0:
+                          elif sig_final < 0:
                                   verdict = "RIGHT!"
 
-                          result_map[m['id']]['timestamp'] = t['timestamp']
-                          result_map[m['id']]['signal'] = sig_final
-                          result_map[m['id']]['verdict'] = verdict
-                          result_map[m['id']]['price'] = t['price']
-                          result_map[m['id']]['bet_on'] = bet_on
-                          result_map[m['id']]['direction'] = direction
-                          result_map[m['id']]['end'] = m['end']
+                          
+                          result_map[mid]['id'] = mid
+                          result_map[mid]['timestamp'] = t['timestamp']
+                          result_map[mid]['signal'] = sig_final
+                          result_map[mid]['verdict'] = verdict
+                          result_map[mid]]['price'] = t['price']
+                          result_map[mid]['bet_on'] = bet_on
+                          result_map[mid]['direction'] = direction
+                          result_map[mid]['end'] = m_end
 
                           bet_size = 0.025 * result_map['performance']['equity']
                             
                           if verdict == "WRONG!":
-                              result_map[m['id']]['roi'] = -1.00
-                              result_map[m['id']]['pnl'] = -bet_size
+                              result_map[mid]['roi'] = -1.00
+                              result_map[mid]['pnl'] = -bet_size
                           else:
                               if is_buying:
                                   profit = 1 - t['price']
@@ -570,8 +573,8 @@ def main():
                                   contracts = bet_size / (1 - t['price'])
                                   
                               profit = profit * contracts
-                              result_map[m['id']]['pnl'] = profit
-                              result_map[m['id']]['roi'] = profit / bet_size
+                              result_map[mid]['pnl'] = profit
+                              result_map[mid]['roi'] = profit / bet_size
                                   
                           verdicts = (
                                 mr['verdict'] 
@@ -579,19 +582,20 @@ def main():
                                 if "verdict" in mr
                           )
 
-                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[m['id']]['pnl']
-                          result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[m['id']]['pnl']
+                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
+                          result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
                               
                           counts = Counter(verdicts)
                           rights = counts['RIGHT!']
                           wrongs = counts['WRONG!']
                           total_bets = rights + wrongs
                           hit_rate = 100*(rights/total_bets)
-                          print(f"TRIGGER! {result_map[m['id']]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
+                          hit_rate = round(hit_rate,1)
+                          print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
                     
                     results.append({
                         "timestamp": t['timestamp'],
-                        "id": m['id'],
+                        "id": mid,
                         "cid": cid,
                         "question": m['question'], 
                         "bet_on": bet_on,
