@@ -414,7 +414,7 @@ def main():
                             
                             # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
-                                pl.col("user").is_in(affected_users) &
+                                pl.col("user").is_in(affected_users.implode()) &
                                 (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
