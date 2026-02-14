@@ -610,7 +610,7 @@ def main():
                         "outcome": m['outcome'], 
                         "trade_price": t['price'], 
                         "trade_volume": vol,
-                        "signal_strength": sig_final
+                        "signal_strength": sig
                     })
                 
                 # Flush Results to CSV
