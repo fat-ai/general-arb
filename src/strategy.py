@@ -95,7 +95,40 @@ class WalletScorer:
             return score
             
         return 0.0
+        
+    def get_percentile_score(self, wallet_id: str, volume: float) -> float:
+        """
+        Returns a value between -1.0 and 1.0 based on the wallet's 
+        percentile rank among other traders.
+        """
+        raw_score = self.get_score(wallet_id, volume)
+        
+        if raw_score == 0.0 or not self.wallet_scores:
+            return 0.0
 
+        # Extract all scores
+        all_scores = list(self.wallet_scores.values())
+        
+        if raw_score > 0:
+            # Positive distribution
+            pos_scores = [s for s in all_scores if s > 0]
+            if not pos_scores: return 0.1 # Fallback for first entry
+            
+            # Rank: what % of positive scores are below this one?
+            rank = sum(1 for s in pos_scores if s <= raw_score) / len(pos_scores)
+            return rank  # Returns 0.0 to 1.0
+            
+        else:
+            # Negative distribution
+            neg_scores = [s for s in all_scores if s < 0]
+            if not neg_scores: return -0.1
+            
+            # Higher percentile for "more negative" (e.g., -5.0 is "better" than -1.0)
+            # We rank by absolute value
+            abs_raw = abs(raw_score)
+            neg_ranks = [abs(s) for s in neg_scores]
+            rank = sum(1 for s in neg_ranks if s <= abs_raw) / len(neg_ranks)
+            return -rank # Returns -1.0 to 0.0
 
 class SignalEngine:
     """
@@ -108,7 +141,7 @@ class SignalEngine:
                       direction: float, scorer: WalletScorer) -> float:
         
         # 1. Get Score
-        score = scorer.get_score(wallet, usdc_vol)
+        score = scorer.get_percentile_score(wallet, usdc_vol)
 
         # Ignore bad traders rather than fade them
         #score = max(0.0, score)
