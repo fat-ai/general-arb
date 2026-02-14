@@ -529,27 +529,25 @@ def main():
                     
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
-                        wallet=t['user'], token_id=m['id'], usdc_vol=vol, 
+                        wallet=t['user'], token_id=m['id'], usdc_vol=vol, total_vol=cum_vol,
                         direction=direction,
                         scorer=scorer
                     )
 
-                    sig_final = sig * (vol/cum_vol)
-
-                    if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95 and cum_vol > 10000:
+                    if abs(sig) > 3 and t['price'] > 0.05 and t['price'] < 0.95 and cum_vol > 10000:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
                           mid = m['id']
                           verdict = "WRONG!"
                           if result_map[mid]['outcome'] > 0:
-                             if sig_final > 0:                        
+                             if sig > 0:                        
                                   verdict = "RIGHT!"
-                          elif sig_final < 0:
+                          elif sig < 0:
                                   verdict = "RIGHT!"
 
                           result_map[mid]['id'] = mid
                           result_map[mid]['timestamp'] = t['timestamp']
-                          result_map[mid]['signal'] = sig_final
+                          result_map[mid]['signal'] = sig
                           result_map[mid]['verdict'] = verdict
                           result_map[mid]['price'] = t['price']
                           result_map[mid]['bet_on'] = bet_on
