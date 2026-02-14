@@ -569,12 +569,20 @@ def main():
                               result_map[mid]['roi'] = -1.00
                               result_map[mid]['pnl'] = -bet_size
                           else:
-                              if is_buying:
-                                  profit = 1 - t['price']
-                                  contracts = bet_size / t['price']
-                              else:
-                                  profit = t['price']
-                                  contracts = bet_size / (1 - t['price'])
+                              if result_map[mid]['outcome'] > 0:
+                                  if bet_on == "yes":
+                                    profit = 1 - t['price']
+                                    contracts = bet_size / t['price']
+                                  else:
+                                    profit = t['price']
+                                    contracts = bet_size / (1 - t['price'])
+                              else: 
+                                  if bet_on == "no":
+                                    profit = 1 - t['price']
+                                    contracts = bet_size / t['price']
+                                  else:
+                                    profit = t['price']
+                                    contracts = bet_size / (1 - t['price'])
                                   
                               profit = profit * contracts
                               result_map[mid]['pnl'] = profit
