@@ -88,13 +88,11 @@ class WalletScorer:
 
         # 2. FRESH WALLET HEURISTIC
         # NOTE: If you are testing with < $10 trades, this returns 0.0!
-        if volume > 10.0:
-            score = self.intercept + (self.slope * math.log1p(volume))
-            if volume > 1000:
-                log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
-            return score
-            
-        return 0.0
+       
+        score = self.intercept + (self.slope * math.log1p(volume))
+        if volume > 1000:
+            log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
+        return score
         
     def get_percentile_score(self, wallet_id: str, volume: float) -> float:
         """
@@ -137,7 +135,7 @@ class SignalEngine:
     def __init__(self):
         self.trackers: Dict[str, Dict] = {}
 
-    def process_trade(self, wallet: str, token_id: str, usdc_vol: float, 
+    def process_trade(self, wallet: str, token_id: str, usdc_vol: float, total_vol: float,
                       direction: float, scorer: WalletScorer) -> float:
         
         # 1. Get Score
@@ -165,7 +163,7 @@ class SignalEngine:
         # 4. Calculate Impact
         #raw_impact = usdc_vol * weight_multiplier
 
-        #raw_impact = usdc_vol * score
+        raw_impact = score * (usdc_vol / total_vol)
         
         # 5. Apply Direction
         #final_impact = raw_impact * direction
