@@ -537,7 +537,7 @@ def main():
                         scorer=scorer
                     )
 
-                    sig_final = round(sig/cum_vol,1)
+                    sig_final = sig
 
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
