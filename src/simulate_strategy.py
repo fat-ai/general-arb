@@ -559,7 +559,7 @@ def main():
                           result_map[mid]['direction'] = direction
                           result_map[mid]['end'] = m_end
                           result_map[mid]['user_score']=score
-                          result_map[mid]['user_p_score']=p_score 
+                    
                           result_map[mid]['user_vol']=vol
                           result_map[mid]['impact']= round(score * vol,1)
 
