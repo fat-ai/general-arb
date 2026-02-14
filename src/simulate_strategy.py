@@ -539,7 +539,7 @@ def main():
 
                     sig_final = sig
 
-                    if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
+                    if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95 and cum_vol > 10000:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
                           mid = m['id']
