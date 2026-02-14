@@ -425,7 +425,7 @@ def main():
                             ]).with_columns([
                                 # Normalize (-1 to 1) using Tanh
                                 # A Calmar ratio of 3.0 is excellent. tanh(3*0.25) ~ 0.6.
-                                ((abs(pl.col("calmar_raw"))/3) * pl.col("roi")).alias("score")
+                                ((abs(pl.col("calmar_raw"))/10) * pl.col("roi")).alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
@@ -537,14 +537,11 @@ def main():
                         scorer=scorer
                     )
 
-                    
-
                     sig_final = round(sig/cum_vol,1)
 
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
-                          p_score = scorer.get_percentile_score(t['user'], vol)
                           mid = m['id']
                           verdict = "WRONG!"
                           if result_map[mid]['outcome'] > 0:
@@ -553,7 +550,6 @@ def main():
                           elif sig_final < 0:
                                   verdict = "RIGHT!"
 
-                          
                           result_map[mid]['id'] = mid
                           result_map[mid]['timestamp'] = t['timestamp']
                           result_map[mid]['signal'] = sig_final
