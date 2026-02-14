@@ -595,7 +595,7 @@ def main():
                     
                     results.append({
                         "timestamp": t['timestamp'],
-                        "id": mid,
+                        "id":  m['id'],
                         "cid": cid,
                         "question": m['question'], 
                         "bet_on": bet_on,
