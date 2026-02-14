@@ -543,9 +543,9 @@ def main():
                         if 'verdict' not in result_map[m['id']]:
                           verdict = "WRONG!"
                           m_outcome = float(m['outcome'])
-                          m_outcome > 0.9 and sig_final > 0.0:                        
+                          if m_outcome > 0.9 and sig_final > 0.0:                        
                                   verdict = "RIGHT!"
-                          m_outcome] < 0.1 and sig_final < 0.0:
+                          if m_outcome < 0.1 and sig_final < 0.0:
                                   verdict = "RIGHT!"
 
                           result_map[m['id']]['timestamp'] = t['timestamp']
