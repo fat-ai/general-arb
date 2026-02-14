@@ -229,7 +229,7 @@ def main():
         
         # Only iterate through the potential fresh candidates
         for trade in potential_fresh.iter_rows(named=True):
-            uid = row["user"]
+            uid = trade["user"]
             
             # 2. This is a "Fresh Wallet". Capture exact metrics.
             cid = trade["contract_id"]
