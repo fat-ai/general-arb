@@ -554,7 +554,7 @@ def main():
                           result_map[mid]['timestamp'] = t['timestamp']
                           result_map[mid]['signal'] = sig_final
                           result_map[mid]['verdict'] = verdict
-                          result_map[mid]]['price'] = t['price']
+                          result_map[mid]['price'] = t['price']
                           result_map[mid]['bet_on'] = bet_on
                           result_map[mid]['direction'] = direction
                           result_map[mid]['end'] = m_end
