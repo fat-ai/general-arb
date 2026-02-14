@@ -544,6 +544,7 @@ def main():
                     if abs(sig_final) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
+                          p_score = scorer.get_percentile_score(wallet, usdc_vol)
                           mid = m['id']
                           verdict = "WRONG!"
                           if result_map[mid]['outcome'] > 0:
@@ -562,6 +563,7 @@ def main():
                           result_map[mid]['direction'] = direction
                           result_map[mid]['end'] = m_end
                           result_map[mid]['user_score']=score
+                          result_map[mid]['user_p_score']=p_score 
                           result_map[mid]['user_vol']=vol
                           result_map[mid]['impact']= round(score * vol,1)
 
