@@ -219,7 +219,8 @@ def main():
             pl.col("outcomeTokensAmount").cast(pl.Float32),
             pl.col("price").cast(pl.Float32)
         ])
-      
+        
+        batch = batch.unique()
         batch_sorted = batch.sort("timestamp")
         
         # We need a set of KNOWN users to skip efficiently
@@ -415,8 +416,8 @@ def main():
                             # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
                                 pl.col("user").is_in(affected_users.implode()) &
-                                (pl.col("trade_count") >= 1) & 
-                                (pl.col("total_invested") > 10)
+                                (pl.col("trade_count") > 1) #& 
+                            #    (pl.col("total_invested") > 10)
                             ).with_columns([
                                 #(pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
                                 (pl.col("total_pnl") / (pl.col("total_invested") + pl.col("max_drawdown"))).alias("roi") 
@@ -439,16 +440,16 @@ def main():
                 # Calculate the cutoff date (6 months ago)
                 cutoff_date = current_sim_day - timedelta(days=365)
                 recent_data = [d for d in calibration_data if d['date'] >= cutoff_date]
-                if len(recent_data) > 100:
-                    try:
-                        X_recent = [d['x'] for d in recent_data]
-                        y_recent = [d['y'] for d in recent_data]
-                        model = sm.OLS(y_recent, sm.add_constant(X_recent)).fit()
-                        scorer.slope = model.params[1]
-                        scorer.intercept = model.params[0]
-                        print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}")
-                    except Exception as e:
-                        log.warning(f"⚠️ OLS Training Failed: {e}")
+               
+                try:
+                    X_recent = [d['x'] for d in recent_data]
+                    y_recent = [d['y'] for d in recent_data]
+                    model = sm.OLS(y_recent, sm.add_constant(X_recent)).fit()
+                    scorer.slope = model.params[1]
+                    scorer.intercept = model.params[0]
+                    print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}")
+                except Exception as e:
+                    log.warning(f"⚠️ OLS Training Failed: {e}")
                 
                 log.info(f"   📅 {current_sim_day}: Trained on {user_history.height} users. Simulating next day...")
 
@@ -534,9 +535,9 @@ def main():
                         scorer=scorer
                     )
 
-                    sig = sig / cum_vol
+                    sig = sig / np.log1p(cum_vol)
 
-                    if abs(sig) > 1 and t['price'] > 0.1 and t['price'] < 0.9:
+                    if abs(sig) > 1 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
                           mid = m['id']
@@ -559,7 +560,7 @@ def main():
                           result_map[mid]['total_vol']=cum_vol
                     
                           result_map[mid]['user_vol']=vol
-                          result_map[mid]['impact']= round(score * vol,1)
+                          result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
 
                           bet_size = 0.025 * result_map['performance']['equity']
                             
