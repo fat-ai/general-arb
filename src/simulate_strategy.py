@@ -418,8 +418,8 @@ def main():
                                 (pl.col("trade_count") >= 1) & 
                                 (pl.col("total_invested") > 10)
                             ).with_columns([
-                                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
-                                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
+                                #(pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
+                                (pl.col("total_pnl") / (pl.col("total_invested") + pl.col("max_drawdown"))).alias("roi") 
                             ]).with_columns([
                                 #(pl.min_horizontal(10.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
                                 pl.col("roi").alias("score")
@@ -534,7 +534,9 @@ def main():
                         scorer=scorer
                     )
 
-                    if abs(sig) > 3 and t['price'] > 0.05 and t['price'] < 0.95:
+                    sig = sig / cum_vol
+
+                    if abs(sig) > 1 and t['price'] > 0.1 and t['price'] < 0.9:
                         if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol)
                           mid = m['id']
