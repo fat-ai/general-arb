@@ -421,8 +421,7 @@ def main():
                                 (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
                                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                             ]).with_columns([
-                                # Use pl.min_horizontal to cap the multiplier at 3.0
-                                (pl.min_horizontal(3.0, pl.col("calmar_raw").abs()) * pl.col("roi")).alias("score")
+                                (pl.min_horizontal(10.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
