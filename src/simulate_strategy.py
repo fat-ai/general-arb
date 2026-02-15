@@ -422,7 +422,7 @@ def main():
                                 (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                             ]).with_columns([
                                 #(pl.min_horizontal(10.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
-                                pl.col("roi")).alias("score")
+                                pl.col("roi").alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
