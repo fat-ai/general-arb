@@ -437,7 +437,7 @@ def main():
                     
                 # 3. Update Fresh Wallet Params (OLS)
                 # Calculate the cutoff date (6 months ago)
-                cutoff_date = current_sim_day - timedelta(days=180)
+                cutoff_date = current_sim_day - timedelta(days=365)
                 recent_data = [d for d in calibration_data if d['date'] >= cutoff_date]
                 if len(recent_data) > 100:
                     try:
