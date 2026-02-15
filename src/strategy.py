@@ -163,11 +163,11 @@ class SignalEngine:
         # 4. Calculate Impact
         #raw_impact = usdc_vol * weight_multiplier
 
-        raw_impact = score * (usdc_vol / total_vol)
+        raw_impact = score * usdc_vol
         
         # 5. Apply Direction
                           
-        final_impact = raw_impact * direction * min(1, total_vol / 100000)
+        final_impact = raw_impact * direction
     
         #if usdc_vol > 50:
         #    log.info(f"  → raw_impact={raw_impact:.0f}, final_impact={final_impact:+.0f}")
