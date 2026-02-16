@@ -42,14 +42,12 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
     # Helper to unify timezones and convert to seconds
-    def to_utc_seconds(series, default):
-        """Convert datetime series to Unix timestamp in seconds."""
-        # Convert to datetime, coerce errors, force UTC interpretation
-        dt_series = pd.to_datetime(series, errors='coerce', utc=True)
-        # Fill NaT with default (ensure default is timezone-aware)
-        dt_series = dt_series.fillna(pd.Timestamp(default, tz='UTC'))
-        # Convert to integer (nanoseconds) then to seconds
-        return (dt_series.astype('int64') // 10**9)
+    def to_utc_seconds(dt_series, default):
+        dt_series = pd.to_datetime(dt_series, errors='coerce', utc=True)
+        # Create default timestamp properly
+        default_ts = pd.to_datetime(default, utc=True)
+        dt_series = dt_series.fillna(default_ts)
+        return (dt_series - pd.Timestamp("1970-01-01", tz='UTC')).dt.total_seconds().astype(int)
 
     # 1. Process Start Date
     markets_df['start_ts'] = to_utc_seconds(markets_df['startDate'], DEFAULT_START_DATE)
