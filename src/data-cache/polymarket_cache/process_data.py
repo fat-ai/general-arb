@@ -45,9 +45,9 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     def to_utc_seconds(dt_series, default):
         dt_series = pd.to_datetime(dt_series, errors='coerce', utc=True)
         # Create default timestamp properly
-        default_ts = pd.to_datetime(default, utc=True)
-        dt_series = dt_series.fillna(pd.Timestamp(default))
-        return (dt_series - pd.Timestamp("1970-01-01", tz='UTC')).dt.total_seconds().astype(int)
+        default_ts = pd.Timestamp(default, tz='UTC') if pd.Timestamp(default).tz is None else pd.Timestamp(default)
+        dt_series = dt_series.fillna(default_ts)
+        return (dt_series - pd.Timestamp("1970-01-01", tz='UTC')).dt.total_seconds().astype('int64')
 
     # 1. Process Start Date
     markets_df['start_ts'] = to_utc_seconds(markets_df['startDate'], DEFAULT_START_DATE)
