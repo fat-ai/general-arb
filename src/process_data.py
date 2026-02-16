@@ -5,7 +5,7 @@ import shutil
 import json
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm import tqdm  # Standard progress bar
+from tqdm import tqdm 
 
 # --- Configuration & Constants ---
 DEFAULT_START_DATE = pd.Timestamp("1970-01-01")
@@ -145,13 +145,46 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         chunk_paths.append(temp_path)
 
     # --- PHASE 3: Reverse Assembly ---
-    print(f"--- PHASE 3: Final Assembly ---")
+    print(f"--- PHASE 3: Reverse Assembly ---")
+    
+    if not chunk_paths:
+        print("CRITICAL: No data processed. Check your input file.")
+        return
+        
+    # Validation: Check first chunk schema
     sample_chunk = pd.read_parquet(chunk_paths[0])
     schema = pa.Table.from_pandas(sample_chunk).schema
     
     with pq.ParquetWriter(output_file, schema=schema) as writer:
-        for path in tqdm(reversed(chunk_paths), desc="Merging Chunks", total=len(chunk_paths)):
-            writer.write_table(pa.Table.from_pandas(pd.read_parquet(path), schema=schema))
+        # Loop Reversed: Newest Chunk (Chunk 0) is written LAST.
+        # Oldest Chunk (Chunk N) is written FIRST.
+        for path in reversed(chunk_paths):
+            df_chunk = pd.read_parquet(path)
+            table = pa.Table.from_pandas(df_chunk, schema=schema)
+            writer.write_table(table)
 
     shutil.rmtree(temp_dir)
-    print(f"Done! Saved to {output_file}")
+    
+    # Final Validation Report
+    print("-" * 30)
+    print("PROCESSING COMPLETE")
+    print(f"Output File: {output_file}")
+    if os.path.exists(output_file):
+        print(f"File Size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
+    else:
+        print("ERROR: Output file was not created.")
+        
+    print(f"Rows Dropped (Unmapped ID): {total_dropped_rows}")
+    print(f"Rows Dropped (Date Error): {total_dropped_date_errors}")
+    print("-" * 30)
+
+# --- Run ---
+input_csv = 'gamma_trades_stream.csv'
+markets_pq = 'gamma_markets_all_tokens.parquet'
+output_file = 'polymarket_tgn_final.parquet'
+
+if __name__ == "__main__":
+    if os.path.exists(input_csv) and os.path.exists(markets_pq):
+        robust_pipeline_final(input_csv, markets_pq, output_file)
+    else:
+        print(f"Files not found. Check: {input_csv} or {markets_pq}")
