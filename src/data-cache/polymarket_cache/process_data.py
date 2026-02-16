@@ -112,14 +112,14 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     print(f"Built ID maps: {len(user_to_id)} users, {len(contract_to_id)} contracts")
     del unique_users, unique_contracts
 
-    # --- PHASE 2: Processing & Buffering ---
+   # --- PHASE 2: Processing & Buffering ---
     print(f"--- PHASE 2: Processing & Normalizing ---")
     chunk_paths = []
     total_dropped_rows = 0
     total_dropped_date_errors = 0
     
-    # Reference point for consistent Unix epoch calculation
-    epoch_rt = pd.Timestamp("1970-01-01", tz='UTC')
+    # 1. Define Epoch explicitly for safe subtraction
+    EPOCH_UTC = pd.Timestamp("1970-01-01", tz='UTC')
     
     reader = pd.read_csv(trades_csv, chunksize=chunk_size)
     for i, chunk in enumerate(tqdm(reader, desc="Processing Data", total=est_total_chunks, unit="chunk")):
@@ -127,19 +127,19 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         
         rows_start = len(chunk)
         
-        # 1. Reverse and Copy for safety (Existing logic: Newer data processed first)
+        # 2. Reverse and Copy
         chunk = chunk.iloc[::-1].copy()
         
-        # 2. Time Processing - Convert to UTC timestamp
+        # 3. Time Processing - OVERFLOW SAFE METHOD
+        # Converts to UTC, then safely calculates seconds without going through nanoseconds
         chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce', utc=True)
-        # Drop any trades where timestamp is corrupt
         chunk = chunk.dropna(subset=['timestamp'])
         
-        # FIX: Convert to Unix timestamp in SECONDS to avoid nanosecond OverflowError
-        # Using .dt.total_seconds() is the safest cross-platform way to get int64 seconds
-        chunk['ts'] = (chunk['timestamp'] - epoch_rt).dt.total_seconds().astype('int64')
+        # .dt.total_seconds() returns a float, which we then cast to int64.
+        # This avoids the int64 overflow that happens with nanoseconds for dates > 2262
+        chunk['ts'] = (chunk['timestamp'] - EPOCH_UTC).dt.total_seconds().astype('int64')
         
-        # 3. Map user and contract IDs
+        # 4. Map user and contract IDs
         chunk = chunk.dropna(subset=['user', 'contract_id'])
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
@@ -150,7 +150,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         rows_after_map = len(chunk)
         total_dropped_rows += (rows_start - rows_after_map)
         
-        # 4. Market Progress calculation
+        # 5. Market Progress calculation
         s_times = chunk['contract_id'].astype(str).map(start_map)
         e_times = chunk['contract_id'].astype(str).map(end_map)
         valid_dates = (s_times.notna()) & (e_times.notna()) & (e_times > s_times)
@@ -169,30 +169,41 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         duration = e_times - s_times
         chunk['feat_progress'] = ((chunk['ts'] - s_times) / duration).clip(0, 1).astype('float32')
 
-        # 5. Cyclical Time Features
+        # 6. Cyclical Time Features
         hours = chunk['timestamp'].dt.hour + (chunk['timestamp'].dt.minute / 60)
         chunk['feat_hour_sin'] = np.sin(2 * np.pi * hours / 24).astype('float32')
         chunk['feat_hour_cos'] = np.cos(2 * np.pi * hours / 24).astype('float32')
         
-        # 6. Normalization using Global Stats from Phase 1
-        norm_vals = (chunk[raw_feat_cols].fillna(0).values - global_mean) / global_std
+        # 7. Safe Numeric Conversion (Prevents PyArrow Overflow on "Wei" amounts)
+        # We cast raw large numbers to float64. This loses some precision for >15 digit integers
+        # but prevents the crash and is suitable for ML.
+        safe_cols = ['tradeAmount', 'size', 'price', 'outcomeTokensAmount']
+        for col in safe_cols:
+            if col in chunk.columns:
+                chunk[col] = pd.to_numeric(chunk[col], errors='coerce').fillna(0).astype('float64')
+
+        # 8. Normalization
+        norm_vals = (chunk[raw_feat_cols].values - global_mean) / global_std
         chunk['feat_tradeAmount'] = norm_vals[:, 0].astype('float32')
         chunk['feat_size'] = norm_vals[:, 1].astype('float32')
         chunk['feat_price'] = norm_vals[:, 2].astype('float32')
         
-        # 7. Log transform normalization
-        log_vals = np.log1p(chunk['tradeAmount'].fillna(0).values)
+        # 9. Log transform
+        log_vals = np.log1p(chunk['tradeAmount'].values)
         chunk['feat_logAmount'] = ((log_vals - log_mean) / log_std).astype('float32')
         
-        # 8. Side multiplier
-        chunk['feat_side_mult'] = chunk['side_mult'].fillna(0).astype('float32')
+        # 10. Side multiplier
+        chunk['feat_side_mult'] = pd.to_numeric(chunk['side_mult'], errors='coerce').fillna(0).astype('float32')
 
-        # 9. Save chunk to temporary Parquet
+        # 11. Save chunk
         out_cols = [
             'u_id', 'i_id', 'ts', 'feat_tradeAmount', 'feat_size', 'feat_price', 
             'feat_logAmount', 'feat_side_mult', 'feat_progress', 'feat_hour_sin', 
             'feat_hour_cos', 'tradeAmount', 'price', 'outcomeTokensAmount', 'contract_id'
         ]
+        
+        # Ensure contract_id is string to prevent mixed-type errors
+        chunk['contract_id'] = chunk['contract_id'].astype(str)
         
         temp_path = os.path.join(temp_dir, f"chunk_{i}.parquet")
         chunk[out_cols].to_parquet(temp_path, index=False)
