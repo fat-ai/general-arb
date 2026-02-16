@@ -118,13 +118,16 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     total_dropped_rows = 0
     total_dropped_date_errors = 0
     
+    # Reference point for consistent Unix epoch calculation
+    epoch_rt = pd.Timestamp("1970-01-01", tz='UTC')
+    
     reader = pd.read_csv(trades_csv, chunksize=chunk_size)
     for i, chunk in enumerate(tqdm(reader, desc="Processing Data", total=est_total_chunks, unit="chunk")):
         if chunk.empty: continue
         
         rows_start = len(chunk)
         
-        # 1. Reverse and Copy for safety
+        # 1. Reverse and Copy for safety (Existing logic: Newer data processed first)
         chunk = chunk.iloc[::-1].copy()
         
         # 2. Time Processing - Convert to UTC timestamp
@@ -132,8 +135,9 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         # Drop any trades where timestamp is corrupt
         chunk = chunk.dropna(subset=['timestamp'])
         
-        # Convert to Unix timestamp (seconds)
-        chunk['ts'] = chunk['timestamp'].astype('int64') // 10**9
+        # FIX: Convert to Unix timestamp in SECONDS to avoid nanosecond OverflowError
+        # Using .dt.total_seconds() is the safest cross-platform way to get int64 seconds
+        chunk['ts'] = (chunk['timestamp'] - epoch_rt).dt.total_seconds().astype('int64')
         
         # 3. Map user and contract IDs
         chunk = chunk.dropna(subset=['user', 'contract_id'])
@@ -156,10 +160,9 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         total_dropped_date_errors += (rows_after_map - rows_after_dates)
         
         if len(chunk) == 0:
-            # Skip empty chunks
             continue
         
-        # Recalculate after filtering
+        # Re-align s_times and e_times after filtering
         s_times = s_times[valid_dates]
         e_times = e_times[valid_dates]
         
@@ -171,20 +174,20 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         chunk['feat_hour_sin'] = np.sin(2 * np.pi * hours / 24).astype('float32')
         chunk['feat_hour_cos'] = np.cos(2 * np.pi * hours / 24).astype('float32')
         
-        # 6. Normalization
+        # 6. Normalization using Global Stats from Phase 1
         norm_vals = (chunk[raw_feat_cols].fillna(0).values - global_mean) / global_std
         chunk['feat_tradeAmount'] = norm_vals[:, 0].astype('float32')
         chunk['feat_size'] = norm_vals[:, 1].astype('float32')
         chunk['feat_price'] = norm_vals[:, 2].astype('float32')
         
-        # 7. Log transform
+        # 7. Log transform normalization
         log_vals = np.log1p(chunk['tradeAmount'].fillna(0).values)
         chunk['feat_logAmount'] = ((log_vals - log_mean) / log_std).astype('float32')
         
         # 8. Side multiplier
         chunk['feat_side_mult'] = chunk['side_mult'].fillna(0).astype('float32')
 
-        # 9. Save chunk
+        # 9. Save chunk to temporary Parquet
         out_cols = [
             'u_id', 'i_id', 'ts', 'feat_tradeAmount', 'feat_size', 'feat_price', 
             'feat_logAmount', 'feat_side_mult', 'feat_progress', 'feat_hour_sin', 
