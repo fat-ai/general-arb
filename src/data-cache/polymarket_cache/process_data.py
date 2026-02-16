@@ -41,19 +41,22 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
 
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
+    # Helper to unify timezones and convert to seconds
+    def to_utc_seconds(series, default):
+        # 1. Convert to datetime, coerce errors
+        dt_series = pd.to_datetime(series, errors='coerce').fillna(default)
+        # 2. Unify to UTC: localize naive to UTC, then convert aware to UTC
+        # This handles the "mixing" error by making everything aware first, then naive
+        return dt_series.dt.tz_localize('UTC', ambiguous='infer', nonexistent='shift_forward').dt.tz_convert(None).astype('int64') // 10**9
+
     # 1. Process Start Date
-    temp_start = pd.to_datetime(markets_df['startDate'], errors='coerce').fillna(DEFAULT_START_DATE)
-    # Force conversion to datetime64[ns] first, THEN to int64
-    markets_df['start_ts'] = temp_start.astype('datetime64[ns]').astype('int64') // 10**9
+    markets_df['start_ts'] = to_utc_seconds(markets_df['startDate'], DEFAULT_START_DATE)
     
     # 2. Process End Date
     temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce')
     fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce')
-    
-    # Fill missing closedTime with fallback, then remaining with default future
-    final_end = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
-    # Force conversion to datetime64[ns] first, THEN to int64
-    markets_df['end_ts'] = final_end.astype('datetime64[ns]').astype('int64') // 10**9
+    final_end_series = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
+    markets_df['end_ts'] = to_utc_seconds(final_end_series, DEFAULT_FUTURE_DATE)
 
     start_map = markets_df.set_index('contract_id')['start_ts'].to_dict()
     end_map = markets_df.set_index('contract_id')['end_ts'].to_dict()
@@ -108,11 +111,14 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         
         chunk = chunk.iloc[::-1].copy() # Reverse and Copy for safety
         
-        if chunk['timestamp'].dtype == 'O':
-            chunk['timestamp'] = pd.to_datetime(chunk['timestamp'])
+        # 2. Time Processing
+        # Ensure trades are also handled as UTC-Naive
+        chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce')
+        # Drop any trades where timestamp is corrupt
+        chunk = chunk.dropna(subset=['timestamp'])
         
-        # Explicitly cast to datetime64[ns] before casting to int64
-        chunk['ts'] = chunk['timestamp'].astype('datetime64[ns]').astype('int64') // 10**9
+        # Convert to UTC-Naive seconds
+        chunk['ts'] = chunk['timestamp'].dt.tz_localize('UTC', ambiguous='infer').dt.tz_convert(None).astype('int64') // 10**9
         
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
