@@ -43,8 +43,8 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
 
     # 1. Process Start Date
     temp_start = pd.to_datetime(markets_df['startDate'], errors='coerce').fillna(DEFAULT_START_DATE)
-    # Convert to numpy array (int64) which is nanoseconds, then divide to get seconds
-    markets_df['start_ts'] = temp_start.values.astype('int64') // 10**9
+    # pd.to_numeric converts datetime64 to nanoseconds (int64) safely
+    markets_df['start_ts'] = pd.to_numeric(temp_start) // 10**9
     
     # 2. Process End Date
     temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce')
@@ -52,7 +52,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     
     # Fill missing closedTime with fallback, then remaining with default future
     final_end = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
-    markets_df['end_ts'] = final_end.values.astype('int64') // 10**9
+    markets_df['end_ts'] = pd.to_numeric(final_end) // 10**9
 
     start_map = markets_df.set_index('contract_id')['start_ts'].to_dict()
     end_map = markets_df.set_index('contract_id')['end_ts'].to_dict()
@@ -107,9 +107,12 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         
         chunk = chunk.iloc[::-1].copy() # Reverse and Copy for safety
         
+        # 2. Time Processing
         if chunk['timestamp'].dtype == 'O':
             chunk['timestamp'] = pd.to_datetime(chunk['timestamp'])
-        chunk['ts'] = chunk['timestamp'].astype('int64') // 10**9
+        
+        # Use pd.to_numeric to avoid Timestamp-to-Int TypeError
+        chunk['ts'] = pd.to_numeric(chunk['timestamp']) // 10**9
         
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
