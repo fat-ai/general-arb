@@ -46,7 +46,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         dt_series = pd.to_datetime(dt_series, errors='coerce', utc=True)
         # Create default timestamp properly
         default_ts = pd.to_datetime(default, utc=True)
-        dt_series = dt_series.fillna(pd.Timestamp(default).tz_localize('UTC'))
+        dt_series = dt_series.fillna(pd.Timestamp(default))
         return (dt_series - pd.Timestamp("1970-01-01", tz='UTC')).dt.total_seconds().astype(int)
 
     # 1. Process Start Date
