@@ -42,20 +42,24 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
     # Helper to unify timezones and convert to seconds
+    # Helper to force UTC and convert to seconds
     def to_utc_seconds(series, default):
-        # 1. Convert to datetime, coerce errors
-        dt_series = pd.to_datetime(series, errors='coerce').fillna(default)
-        # 2. Unify to UTC: localize naive to UTC, then convert aware to UTC
-        # This handles the "mixing" error by making everything aware first, then naive
-        return dt_series.dt.tz_localize('UTC', ambiguous='infer', nonexistent='shift_forward').dt.tz_convert(None).astype('int64') // 10**9
+        # 1. Force UTC parsing. This handles mixed tz-aware/naive strings natively.
+        dt_series = pd.to_datetime(series, errors='coerce', utc=True)
+        # 2. Fill missing values with the default (ensure default is UTC-aware)
+        default_utc = pd.to_datetime(default, utc=True)
+        dt_series = dt_series.fillna(default_utc)
+        # 3. Strip TZ to make it naive (required for int64 conversion) and get seconds
+        return dt_series.dt.tz_localize(None).astype('int64') // 10**9
 
     # 1. Process Start Date
     markets_df['start_ts'] = to_utc_seconds(markets_df['startDate'], DEFAULT_START_DATE)
     
     # 2. Process End Date
-    temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce')
-    fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce')
-    final_end_series = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
+    temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce', utc=True)
+    fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce', utc=True)
+    final_end_series = temp_end.fillna(fallback_end)
+    
     markets_df['end_ts'] = to_utc_seconds(final_end_series, DEFAULT_FUTURE_DATE)
 
     start_map = markets_df.set_index('contract_id')['start_ts'].to_dict()
@@ -112,13 +116,13 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         chunk = chunk.iloc[::-1].copy() # Reverse and Copy for safety
         
         # 2. Time Processing
-        # Ensure trades are also handled as UTC-Naive
-        chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce')
+        # Force UTC=True during initial parsing to handle mixed formats in trades
+        chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce', utc=True)
         # Drop any trades where timestamp is corrupt
         chunk = chunk.dropna(subset=['timestamp'])
         
         # Convert to UTC-Naive seconds
-        chunk['ts'] = chunk['timestamp'].dt.tz_localize('UTC', ambiguous='infer').dt.tz_convert(None).astype('int64') // 10**9
+        chunk['ts'] = chunk['timestamp'].dt.tz_localize(None).astype('int64') // 10**9
         
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
