@@ -8,8 +8,8 @@ import pyarrow.parquet as pq
 from tqdm import tqdm 
 
 # --- Configuration & Constants ---
-DEFAULT_START_DATE = pd.Timestamp("1970-01-01")
-DEFAULT_FUTURE_DATE = pd.Timestamp("2100-01-01")
+DEFAULT_START_DATE = pd.Timestamp("1970-01-01", tz='UTC')
+DEFAULT_FUTURE_DATE = pd.Timestamp("2100-01-01", tz='UTC')
 
 REQUIRED_TRADE_COLS = ['user', 'contract_id', 'timestamp', 'tradeAmount', 'size', 'price', 'side_mult', 'outcomeTokensAmount']
 REQUIRED_MARKET_COLS = ['contract_id', 'startDate', 'closedTime', 'endDateIso']
@@ -42,29 +42,29 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
     # Helper to unify timezones and convert to seconds
-    # Helper to force UTC and convert to seconds
     def to_utc_seconds(series, default):
-        # 1. Force UTC parsing. This handles mixed tz-aware/naive strings natively.
+        """Convert datetime series to Unix timestamp in seconds."""
+        # Convert to datetime, coerce errors, force UTC interpretation
         dt_series = pd.to_datetime(series, errors='coerce', utc=True)
-        # 2. Fill missing values with the default (ensure default is UTC-aware)
-        default_utc = pd.to_datetime(default, utc=True)
-        dt_series = dt_series.fillna(default_utc)
-        # 3. Strip TZ to make it naive (required for int64 conversion) and get seconds
-        return dt_series.dt.tz_localize(None).astype('int64') // 10**9
+        # Fill NaT with default (ensure default is timezone-aware)
+        dt_series = dt_series.fillna(pd.Timestamp(default, tz='UTC'))
+        # Convert to integer (nanoseconds) then to seconds
+        return (dt_series.astype('int64') // 10**9)
 
     # 1. Process Start Date
     markets_df['start_ts'] = to_utc_seconds(markets_df['startDate'], DEFAULT_START_DATE)
     
     # 2. Process End Date
-    temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce', utc=True)
-    fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce', utc=True)
-    final_end_series = temp_end.fillna(fallback_end)
-    
+    temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce')
+    fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce')
+    final_end_series = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
     markets_df['end_ts'] = to_utc_seconds(final_end_series, DEFAULT_FUTURE_DATE)
 
     start_map = markets_df.set_index('contract_id')['start_ts'].to_dict()
     end_map = markets_df.set_index('contract_id')['end_ts'].to_dict()
     del markets_df
+
+    print(f"Loaded metadata for {len(start_map)} markets.")
 
     # --- PHASE 1: Global Statistics & Vocabulary Scan ---
     print(f"--- PHASE 1: Global Statistics Scan ---")
@@ -90,6 +90,10 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         log_sum += np.sum(log_vals)
         log_sq_sum += np.sum(log_vals ** 2)
 
+    if n_total == 0:
+        print("Error: No valid data found in CSV.")
+        return
+
     # Stats calculation
     global_mean = running_sum / n_total
     global_std = np.sqrt(np.maximum((running_sq_sum / n_total) - (global_mean ** 2), 0))
@@ -99,59 +103,90 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     log_std = np.sqrt(np.maximum((log_sq_sum / n_total) - (log_mean ** 2), 0))
     if log_std == 0: log_std = 1.0
 
+    print(f"Global Stats Ready. Mean Price: {global_mean[2]:.4f}, Std Price: {global_std[2]:.4f}")
+
     user_to_id = {u: int(i) for i, u in enumerate(sorted(list(unique_users)))}
     contract_to_id = {c: int(i) for i, c in enumerate(sorted(list(unique_contracts)))}
     
     with open(os.path.join(output_maps_dir, 'user_map.json'), 'w') as f: json.dump(user_to_id, f)
     with open(os.path.join(output_maps_dir, 'contract_map.json'), 'w') as f: json.dump(contract_to_id, f)
 
+    print(f"Built ID maps: {len(user_to_id)} users, {len(contract_to_id)} contracts")
+    del unique_users, unique_contracts
+
     # --- PHASE 2: Processing & Buffering ---
     print(f"--- PHASE 2: Processing & Normalizing ---")
     chunk_paths = []
+    total_dropped_rows = 0
+    total_dropped_date_errors = 0
     
     reader = pd.read_csv(trades_csv, chunksize=chunk_size)
     for i, chunk in enumerate(tqdm(reader, desc="Processing Data", total=est_total_chunks, unit="chunk")):
         if chunk.empty: continue
         
-        chunk = chunk.iloc[::-1].copy() # Reverse and Copy for safety
+        rows_start = len(chunk)
         
-        # 2. Time Processing
-        # Force UTC=True during initial parsing to handle mixed formats in trades
+        # 1. Reverse and Copy for safety
+        chunk = chunk.iloc[::-1].copy()
+        
+        # 2. Time Processing - Convert to UTC timestamp
         chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce', utc=True)
         # Drop any trades where timestamp is corrupt
         chunk = chunk.dropna(subset=['timestamp'])
         
-        # Convert to UTC-Naive seconds
-        chunk['ts'] = chunk['timestamp'].dt.tz_localize(None).astype('int64') // 10**9
+        # Convert to Unix timestamp (seconds)
+        chunk['ts'] = chunk['timestamp'].astype('int64') // 10**9
         
+        # 3. Map user and contract IDs
+        chunk = chunk.dropna(subset=['user', 'contract_id'])
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
         chunk = chunk.dropna(subset=['u_id', 'i_id'])
+        chunk['u_id'] = chunk['u_id'].astype('int32')
+        chunk['i_id'] = chunk['i_id'].astype('int32')
         
-        # Market Progress calculation
+        rows_after_map = len(chunk)
+        total_dropped_rows += (rows_start - rows_after_map)
+        
+        # 4. Market Progress calculation
         s_times = chunk['contract_id'].astype(str).map(start_map)
         e_times = chunk['contract_id'].astype(str).map(end_map)
         valid_dates = (s_times.notna()) & (e_times.notna()) & (e_times > s_times)
         
         chunk = chunk[valid_dates]
-        duration = e_times[valid_dates] - s_times[valid_dates]
-        chunk['feat_progress'] = ((chunk['ts'] - s_times[valid_dates]) / duration).clip(0, 1).astype('float32')
+        rows_after_dates = len(chunk)
+        total_dropped_date_errors += (rows_after_map - rows_after_dates)
+        
+        if len(chunk) == 0:
+            # Skip empty chunks
+            continue
+        
+        # Recalculate after filtering
+        s_times = s_times[valid_dates]
+        e_times = e_times[valid_dates]
+        
+        duration = e_times - s_times
+        chunk['feat_progress'] = ((chunk['ts'] - s_times) / duration).clip(0, 1).astype('float32')
 
-        # Cyclical Time Features
+        # 5. Cyclical Time Features
         hours = chunk['timestamp'].dt.hour + (chunk['timestamp'].dt.minute / 60)
         chunk['feat_hour_sin'] = np.sin(2 * np.pi * hours / 24).astype('float32')
         chunk['feat_hour_cos'] = np.cos(2 * np.pi * hours / 24).astype('float32')
         
-        # Normalization
+        # 6. Normalization
         norm_vals = (chunk[raw_feat_cols].fillna(0).values - global_mean) / global_std
         chunk['feat_tradeAmount'] = norm_vals[:, 0].astype('float32')
         chunk['feat_size'] = norm_vals[:, 1].astype('float32')
         chunk['feat_price'] = norm_vals[:, 2].astype('float32')
         
+        # 7. Log transform
         log_vals = np.log1p(chunk['tradeAmount'].fillna(0).values)
         chunk['feat_logAmount'] = ((log_vals - log_mean) / log_std).astype('float32')
+        
+        # 8. Side multiplier
         chunk['feat_side_mult'] = chunk['side_mult'].fillna(0).astype('float32')
 
+        # 9. Save chunk
         out_cols = [
             'u_id', 'i_id', 'ts', 'feat_tradeAmount', 'feat_size', 'feat_price', 
             'feat_logAmount', 'feat_side_mult', 'feat_progress', 'feat_hour_sin', 
@@ -176,7 +211,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     with pq.ParquetWriter(output_file, schema=schema) as writer:
         # Loop Reversed: Newest Chunk (Chunk 0) is written LAST.
         # Oldest Chunk (Chunk N) is written FIRST.
-        for path in reversed(chunk_paths):
+        for path in tqdm(reversed(chunk_paths), desc="Writing Output", total=len(chunk_paths)):
             df_chunk = pd.read_parquet(path)
             table = pa.Table.from_pandas(df_chunk, schema=schema)
             writer.write_table(table)
@@ -184,7 +219,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     shutil.rmtree(temp_dir)
     
     # Final Validation Report
-    print("-" * 30)
+    print("-" * 60)
     print("PROCESSING COMPLETE")
     print(f"Output File: {output_file}")
     if os.path.exists(output_file):
@@ -192,9 +227,21 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     else:
         print("ERROR: Output file was not created.")
         
-    print(f"Rows Dropped (Unmapped ID): {total_dropped_rows}")
-    print(f"Rows Dropped (Date Error): {total_dropped_date_errors}")
-    print("-" * 30)
+    print(f"\nData Quality Report:")
+    print(f"  Rows Dropped (Unmapped ID): {total_dropped_rows:,}")
+    print(f"  Rows Dropped (Date Error): {total_dropped_date_errors:,}")
+    print(f"  Total Users: {len(user_to_id):,}")
+    print(f"  Total Contracts: {len(contract_to_id):,}")
+    print("-" * 60)
+    
+    # Return summary
+    return {
+        'output_file': output_file,
+        'rows_dropped_unmapped': total_dropped_rows,
+        'rows_dropped_dates': total_dropped_date_errors,
+        'total_users': len(user_to_id),
+        'total_contracts': len(contract_to_id)
+    }
 
 # --- Run ---
 input_csv = 'gamma_trades_stream.csv'
@@ -203,6 +250,8 @@ output_file = 'polymarket_tgn_final.parquet'
 
 if __name__ == "__main__":
     if os.path.exists(input_csv) and os.path.exists(markets_pq):
-        robust_pipeline_final(input_csv, markets_pq, output_file)
+        result = robust_pipeline_final(input_csv, markets_pq, output_file)
+        if result:
+            print("\n✓ Pipeline completed successfully!")
     else:
         print(f"Files not found. Check: {input_csv} or {markets_pq}")
