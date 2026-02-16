@@ -27,9 +27,8 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     os.makedirs(temp_dir)
     if not os.path.exists(output_maps_dir): os.makedirs(output_maps_dir)
 
-    # Estimate total rows for tqdm (optional but helpful)
+    # Estimate total chunks (Just a guess for Phase 1)
     file_size = os.path.getsize(trades_csv)
-    # Rough estimate: ~200 bytes per row for this specific CSV structure
     est_total_chunks = (file_size // (chunk_size * 200)) + 1
 
     print(f"--- PHASE 0: Loading Market Metadata ---")
@@ -41,10 +40,9 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
 
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
-    # Helper to unify timezones and convert to seconds
+    # Helper: Safe UTC conversion
     def to_utc_seconds(dt_series, default):
         dt_series = pd.to_datetime(dt_series, errors='coerce', utc=True)
-        # Create default timestamp properly
         default_ts = pd.Timestamp(default, tz='UTC') if pd.Timestamp(default).tz is None else pd.Timestamp(default)
         dt_series = dt_series.fillna(default_ts)
         return (dt_series - pd.Timestamp("1970-01-01", tz='UTC')).dt.total_seconds().astype('int64')
@@ -71,20 +69,28 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     n_total, running_sum, running_sq_sum, log_sum, log_sq_sum = 0, np.zeros(3), np.zeros(3), 0, 0
     unique_users, unique_contracts = set(), set()
 
-    # Wrapped in tqdm
+    actual_chunks_count = 0
+
     reader = pd.read_csv(trades_csv, chunksize=chunk_size)
     for chunk in tqdm(reader, desc="Scanning for Stats", total=est_total_chunks, unit="chunk"):
         if chunk.empty: continue
+        actual_chunks_count += 1
         
         unique_users.update(chunk['user'].dropna().astype(str).unique())
         unique_contracts.update(chunk['contract_id'].dropna().astype(str).unique())
         
-        numeric_chunk = chunk[raw_feat_cols].fillna(0).values
+        # Safe numeric conversion for stats
+        for col in raw_feat_cols:
+             chunk[col] = pd.to_numeric(chunk[col], errors='coerce').fillna(0).astype('float64')
+
+        numeric_chunk = chunk[raw_feat_cols].values
         n_total += numeric_chunk.shape[0]
         running_sum += np.sum(numeric_chunk, axis=0)
         running_sq_sum += np.sum(numeric_chunk ** 2, axis=0)
         
-        log_vals = np.log1p(chunk['tradeAmount'].fillna(0).values)
+        # Safe log calculation
+        trade_amts = chunk['tradeAmount'].values
+        log_vals = np.log1p(trade_amts)
         log_sum += np.sum(log_vals)
         log_sq_sum += np.sum(log_vals ** 2)
 
@@ -112,7 +118,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     print(f"Built ID maps: {len(user_to_id)} users, {len(contract_to_id)} contracts")
     del unique_users, unique_contracts
 
-   # --- PHASE 2: Processing & Buffering ---
+    # --- PHASE 2: Processing & Buffering ---
     print(f"--- PHASE 2: Processing & Normalizing ---")
     chunk_paths = []
     total_dropped_rows = 0
@@ -121,8 +127,9 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     # 1. Define Epoch explicitly for safe subtraction
     EPOCH_UTC = pd.Timestamp("1970-01-01", tz='UTC')
     
+    # Use ACTUAL count for a perfect progress bar
     reader = pd.read_csv(trades_csv, chunksize=chunk_size)
-    for i, chunk in enumerate(tqdm(reader, desc="Processing Data", total=est_total_chunks, unit="chunk")):
+    for i, chunk in enumerate(tqdm(reader, desc="Processing Data", total=actual_chunks_count, unit="chunk")):
         if chunk.empty: continue
         
         rows_start = len(chunk)
@@ -131,15 +138,14 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         chunk = chunk.iloc[::-1].copy()
         
         # 3. Time Processing - OVERFLOW SAFE METHOD
-        # Converts to UTC, then safely calculates seconds without going through nanoseconds
         chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], errors='coerce', utc=True)
         chunk = chunk.dropna(subset=['timestamp'])
         
-        # .dt.total_seconds() returns a float, which we then cast to int64.
-        # This avoids the int64 overflow that happens with nanoseconds for dates > 2262
+        # Calculate seconds using .dt.total_seconds() (float) then cast to int64
+        # This prevents the "int64 is too small for nanoseconds" error for year 2262+
         chunk['ts'] = (chunk['timestamp'] - EPOCH_UTC).dt.total_seconds().astype('int64')
         
-        # 4. Map user and contract IDs
+        # 4. Map IDs
         chunk = chunk.dropna(subset=['user', 'contract_id'])
         chunk['u_id'] = chunk['user'].astype(str).map(user_to_id)
         chunk['i_id'] = chunk['contract_id'].astype(str).map(contract_to_id)
@@ -150,7 +156,7 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         rows_after_map = len(chunk)
         total_dropped_rows += (rows_start - rows_after_map)
         
-        # 5. Market Progress calculation
+        # 5. Market Progress
         s_times = chunk['contract_id'].astype(str).map(start_map)
         e_times = chunk['contract_id'].astype(str).map(end_map)
         valid_dates = (s_times.notna()) & (e_times.notna()) & (e_times > s_times)
@@ -159,30 +165,25 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         rows_after_dates = len(chunk)
         total_dropped_date_errors += (rows_after_map - rows_after_dates)
         
-        if len(chunk) == 0:
-            continue
+        if len(chunk) == 0: continue
         
-        # Re-align s_times and e_times after filtering
         s_times = s_times[valid_dates]
         e_times = e_times[valid_dates]
-        
         duration = e_times - s_times
         chunk['feat_progress'] = ((chunk['ts'] - s_times) / duration).clip(0, 1).astype('float32')
 
-        # 6. Cyclical Time Features
+        # 6. Cyclical Time
         hours = chunk['timestamp'].dt.hour + (chunk['timestamp'].dt.minute / 60)
         chunk['feat_hour_sin'] = np.sin(2 * np.pi * hours / 24).astype('float32')
         chunk['feat_hour_cos'] = np.cos(2 * np.pi * hours / 24).astype('float32')
         
         # 7. Safe Numeric Conversion (Prevents PyArrow Overflow on "Wei" amounts)
-        # We cast raw large numbers to float64. This loses some precision for >15 digit integers
-        # but prevents the crash and is suitable for ML.
         safe_cols = ['tradeAmount', 'size', 'price', 'outcomeTokensAmount']
         for col in safe_cols:
             if col in chunk.columns:
                 chunk[col] = pd.to_numeric(chunk[col], errors='coerce').fillna(0).astype('float64')
 
-        # 8. Normalization
+        # 8. Normalize
         norm_vals = (chunk[raw_feat_cols].values - global_mean) / global_std
         chunk['feat_tradeAmount'] = norm_vals[:, 0].astype('float32')
         chunk['feat_size'] = norm_vals[:, 1].astype('float32')
@@ -192,17 +193,15 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         log_vals = np.log1p(chunk['tradeAmount'].values)
         chunk['feat_logAmount'] = ((log_vals - log_mean) / log_std).astype('float32')
         
-        # 10. Side multiplier
         chunk['feat_side_mult'] = pd.to_numeric(chunk['side_mult'], errors='coerce').fillna(0).astype('float32')
 
-        # 11. Save chunk
+        # 10. Save chunk
         out_cols = [
             'u_id', 'i_id', 'ts', 'feat_tradeAmount', 'feat_size', 'feat_price', 
             'feat_logAmount', 'feat_side_mult', 'feat_progress', 'feat_hour_sin', 
             'feat_hour_cos', 'tradeAmount', 'price', 'outcomeTokensAmount', 'contract_id'
         ]
         
-        # Ensure contract_id is string to prevent mixed-type errors
         chunk['contract_id'] = chunk['contract_id'].astype(str)
         
         temp_path = os.path.join(temp_dir, f"chunk_{i}.parquet")
@@ -216,13 +215,10 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
         print("CRITICAL: No data processed. Check your input file.")
         return
         
-    # Validation: Check first chunk schema
     sample_chunk = pd.read_parquet(chunk_paths[0])
     schema = pa.Table.from_pandas(sample_chunk).schema
     
     with pq.ParquetWriter(output_file, schema=schema) as writer:
-        # Loop Reversed: Newest Chunk (Chunk 0) is written LAST.
-        # Oldest Chunk (Chunk N) is written FIRST.
         for path in tqdm(reversed(chunk_paths), desc="Writing Output", total=len(chunk_paths)):
             df_chunk = pd.read_parquet(path)
             table = pa.Table.from_pandas(df_chunk, schema=schema)
@@ -230,14 +226,12 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
 
     shutil.rmtree(temp_dir)
     
-    # Final Validation Report
+    # Final Report
     print("-" * 60)
     print("PROCESSING COMPLETE")
     print(f"Output File: {output_file}")
     if os.path.exists(output_file):
         print(f"File Size: {os.path.getsize(output_file) / (1024*1024):.2f} MB")
-    else:
-        print("ERROR: Output file was not created.")
         
     print(f"\nData Quality Report:")
     print(f"  Rows Dropped (Unmapped ID): {total_dropped_rows:,}")
@@ -246,7 +240,6 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
     print(f"  Total Contracts: {len(contract_to_id):,}")
     print("-" * 60)
     
-    # Return summary
     return {
         'output_file': output_file,
         'rows_dropped_unmapped': total_dropped_rows,
