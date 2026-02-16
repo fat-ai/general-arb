@@ -41,13 +41,18 @@ def robust_pipeline_final(trades_csv, markets_parquet, output_file,
 
     validate_columns(markets_df, REQUIRED_MARKET_COLS, "Markets Parquet")
 
-    temp_start = pd.to_datetime(markets_df['startDate'], errors='coerce')
-    markets_df['start_ts'] = temp_start.fillna(DEFAULT_START_DATE).astype('int64') // 10**9
+    # 1. Process Start Date
+    temp_start = pd.to_datetime(markets_df['startDate'], errors='coerce').fillna(DEFAULT_START_DATE)
+    # Convert to numpy array (int64) which is nanoseconds, then divide to get seconds
+    markets_df['start_ts'] = temp_start.values.astype('int64') // 10**9
     
+    # 2. Process End Date
     temp_end = pd.to_datetime(markets_df['closedTime'], errors='coerce')
     fallback_end = pd.to_datetime(markets_df['endDateIso'], errors='coerce')
-    temp_end = temp_end.fillna(fallback_end)
-    markets_df['end_ts'] = temp_end.fillna(DEFAULT_FUTURE_DATE).astype('int64') // 10**9
+    
+    # Fill missing closedTime with fallback, then remaining with default future
+    final_end = temp_end.fillna(fallback_end).fillna(DEFAULT_FUTURE_DATE)
+    markets_df['end_ts'] = final_end.values.astype('int64') // 10**9
 
     start_map = markets_df.set_index('contract_id')['start_ts'].to_dict()
     end_map = markets_df.set_index('contract_id')['end_ts'].to_dict()
