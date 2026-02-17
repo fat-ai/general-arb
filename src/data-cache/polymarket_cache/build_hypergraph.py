@@ -19,12 +19,13 @@ BATCH_SIZE = 128  # Increased for Small model (faster/lighter)
 MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
-    "Politician", "Political_Party", "Election_Race", 
-    "Sports_Team", "Athlete_Player", "League_Tournament",
-    "Crypto_Asset", "Blockchain_Protocol", "Financial_Metric",
-    "Company", "Economic_Indicator", "Nation_State", 
-    "Diplomatic_Entity", "AI_Model", "Public_Figure", 
-    "Media_Platform", "Scientific_Phenomenon"
+    "Politician", "Political_Party", "Election_Race", "National_Government_Institution", "International_Government_Institution", "Military_Action",
+    "Sport", "Sports_Team", "Athlete_Player", "Sports_League", "Competitor_Category",
+    "Cryptocurrency", "Stock_Exchange", "Stock_Ticker",
+    "Movie", "TV_Show", "Legal_Action", 
+    "Company", "Economic_Indicator", "Business_Metric", "Business_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Building",
+    "AI_Model", "Business_Executive", "Musician", "Actor", "Social_Media_Influencer",
+    "Media_Platform", "Natural_Disaster", "Disease", "Weather"
 ]
 
 def get_first_paragraph(text):
@@ -87,7 +88,7 @@ def build_hypergraph_ner_fast():
             # Update 2: Real-Time Pulse Check with Full Text & Scores
             if (i + idx) % 100 == 0:
                 # Show up to 200 chars so it doesn't look cut off
-                preview = text[:200].replace('\n', ' ') 
+                preview = text.replace('\n', ' ') 
                 
                 print(f"\n--- [Pulse Check #{i+idx}] ---")
                 print(f"Input: \"{preview}...\"")
