@@ -16,15 +16,9 @@ INPUT_MARKETS = 'gamma_markets_all_tokens.parquet'
 INPUT_MAPS_DIR = 'maps'
 OUTPUT_DIR = 'hypergraph_data_semantic'
 CHUNK_SIZE = 1_000_000
-MIN_MARKETS_PER_TOPIC = 5  # Lower threshold because clustering will merge fragments
-
-# Clustering Strictness
-# Euclidean Distance Threshold for Normalized Vectors:
-# 0.70 ~= 0.75 Cosine Similarity (Strict)
-# 0.60 ~= 0.82 Cosine Similarity (Very Strict)
+MIN_MARKETS_PER_TOPIC = 5 
 DISTANCE_THRESHOLD = 0.70 
 
-# Stop Words (Keep strict to avoid "The" clusters)
 STOP_WORDS = {
     'the', 'a', 'an', 'and', 'or', 'vs', 'versus', 'bet', 'prediction', 'market',
     'will', 'does', 'is', 'outcome', 'price', 'value', 'contract', 'shares',
@@ -35,28 +29,22 @@ STOP_WORDS = {
 def clean_tag(tag):
     tag = tag.lower().strip()
     if len(tag) < 3 or tag in STOP_WORDS: return None
-    if re.match(r'^\d+(\.\d+)?$', tag): return None # Skip pure numbers
+    if re.match(r'^\d+(\.\d+)?$', tag): return None
     return tag
 
 def extract_raw_tags(slug):
-    """Extracts raw candidates to be clustered later."""
     if not isinstance(slug, str): return []
     parts = slug.lower().strip().split('-')
     clean_parts = [p for p in parts if clean_tag(p)]
     if not clean_parts: return []
-
-    tags = []
-    # 1. Unigram (e.g. "trump")
-    tags.append(clean_parts[0]) 
-    # 2. Bigram (e.g. "trump-wins")
+    tags = [clean_parts[0]]
     if len(clean_parts) >= 2:
         tags.append(f"{clean_parts[0]}-{clean_parts[1]}")
-    
     return list(set(tags))
 
 def build_hypergraph_semantic():
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
-    print("--- Phase 1.2: Semantic Hypergraph Construction ---")
+    print("--- Phase 1.2: Semantic Hypergraph (Weighted) ---")
 
     # 1. Load Maps
     print("Loading ID Maps...")
@@ -65,14 +53,13 @@ def build_hypergraph_semantic():
     with open(os.path.join(INPUT_MAPS_DIR, 'user_map.json'), 'r') as f:
         num_users = len(json.load(f))
 
-    # 2. Extract Raw Tags
-    print("Extracting Raw Tags from Markets...")
+    # 2. Extract & Cluster Tags (Standard Semantic Flow)
+    print("Extracting & Clustering Tags...")
     markets_df = pd.read_parquet(INPUT_MARKETS, columns=['contract_id', 'slug'])
     markets_df['c_id'] = markets_df['contract_id'].astype(str).map(contract_str_to_id)
     markets_df = markets_df.dropna(subset=['c_id'])
     markets_df['c_id'] = markets_df['c_id'].astype(int)
 
-    # Count raw tag frequency
     raw_tag_counts = {}
     contract_to_raw_tags = {}
 
@@ -85,23 +72,13 @@ def build_hypergraph_semantic():
     
     del markets_df
 
-    # Initial Pruning (Remove extremely rare typos before embedding)
     valid_raw_tags = [t for t, c in raw_tag_counts.items() if c >= MIN_MARKETS_PER_TOPIC]
-    print(f"Unique Raw Tags (Frequency >= {MIN_MARKETS_PER_TOPIC}): {len(valid_raw_tags)}")
-
-    # 3. Vector Embedding & Clustering
-    print("Loading Sentence Transformer (all-MiniLM-L6-v2)...")
-    # This downloads the model (~80MB) automatically on first run
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
     print(f"Embedding {len(valid_raw_tags)} tags...")
-    embeddings = model.encode(valid_raw_tags, show_progress_bar=True, batch_size=1024)
     
-    # Normalize for Cosine-like Euclidean distance
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = model.encode(valid_raw_tags, show_progress_bar=True, batch_size=1024)
     embeddings = normalize(embeddings)
 
-    print("Clustering Tags...")
-    # Ward linkage minimizes variance within clusters
     clustering = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=DISTANCE_THRESHOLD, 
@@ -110,79 +87,85 @@ def build_hypergraph_semantic():
     )
     cluster_labels = clustering.fit_predict(embeddings)
     
-    # 4. Create Canonical Map
-    # Map Cluster ID -> Canonical Label (The most frequent tag in that cluster)
+    # Resolve Canonical Labels
     cluster_groups = {}
     for tag, label in zip(valid_raw_tags, cluster_labels):
         if label not in cluster_groups: cluster_groups[label] = []
         cluster_groups[label].append(tag)
     
-    canonical_map = {} # raw_tag -> canonical_tag
+    canonical_map = {}
     audit_rows = []
-
-    print("Resolving Canonical Labels...")
+    
     for label, group in cluster_groups.items():
-        # Pick the most frequent tag in the group as the "Name"
-        # Sort by frequency (descending), then length (shortest)
         best_tag = sorted(group, key=lambda t: (-raw_tag_counts[t], len(t)))[0]
-        
         for tag in group:
             canonical_map[tag] = best_tag
-        
-        # Add to audit log
-        audit_rows.append({
-            'canonical_tag': best_tag,
-            'cluster_size': len(group),
-            'raw_tags': str(group)
-        })
+        audit_rows.append({'canonical': best_tag, 'size': len(group), 'members': str(group)})
 
-    # Save Audit Log (CRITICAL STEP)
-    audit_df = pd.DataFrame(audit_rows).sort_values('cluster_size', ascending=False)
-    audit_path = os.path.join(OUTPUT_DIR, 'cluster_audit.csv')
-    audit_df.to_csv(audit_path, index=False)
-    print(f"Audit Log saved to: {audit_path} (CHECK THIS FILE!)")
-
-    # 5. Build Hypergraph
-    print("Building Incidence Matrix...")
-    unique_canonical_tags = sorted(list(set(canonical_map.values())))
-    tag_to_id = {tag: i for i, tag in enumerate(unique_canonical_tags)}
+    pd.DataFrame(audit_rows).sort_values('size', ascending=False).to_csv(os.path.join(OUTPUT_DIR, 'cluster_audit.csv'), index=False)
     
-    # Map Contracts -> Canonical IDs
+    unique_canonicals = sorted(list(set(canonical_map.values())))
+    tag_to_id = {tag: i for i, tag in enumerate(unique_canonicals)}
+    
+    # Map Contracts
     contract_to_hyperedges = {}
     for c_id, raw_tags in contract_to_raw_tags.items():
-        # Filter raw tags that survived pruning
-        valid_canonicals = set()
+        # Get unique Canonical IDs for this contract
+        c_tags = set()
         for t in raw_tags:
             if t in canonical_map:
-                valid_canonicals.add(tag_to_id[canonical_map[t]])
-        
-        if valid_canonicals:
-            contract_to_hyperedges[c_id] = list(valid_canonicals)
+                c_tags.add(tag_to_id[canonical_map[t]])
+        if c_tags:
+            contract_to_hyperedges[c_id] = list(c_tags)
 
-    # Stream Trades
-    unique_pairs = set()
+    # 3. Stream Trades with WEIGHTS (The Fix)
+    print("Scanning Trades & Accumulating Volume...")
+    
+    # Dictionary: (user_id, topic_id) -> total_volume
+    # Using a dict is memory efficient because the matrix is sparse (most users don't trade most topics)
+    edge_weights = {} 
+    
     parquet_file = pq.ParquetFile(INPUT_TRADES)
     pbar = tqdm(total=parquet_file.metadata.num_rows, unit='trades')
     
-    for batch in parquet_file.iter_batches(batch_size=CHUNK_SIZE, columns=['u_id', 'i_id']):
+    # We load 'tradeAmount' (USD volume)
+    for batch in parquet_file.iter_batches(batch_size=CHUNK_SIZE, columns=['u_id', 'i_id', 'tradeAmount']):
         df_chunk = batch.to_pandas()
+        # Filter relevant trades
         df_chunk = df_chunk[df_chunk['i_id'].isin(contract_to_hyperedges.keys())]
-        for u, i in df_chunk.values:
+        
+        # Fill NaN volume with 0 to be safe
+        df_chunk['tradeAmount'] = df_chunk['tradeAmount'].fillna(0)
+        
+        # Iterate and sum volume
+        for u, i, vol in df_chunk[['u_id', 'i_id', 'tradeAmount']].values:
+            # i is guaranteed to be in map due to filter
             for h in contract_to_hyperedges[i]:
-                unique_pairs.add((u, h))
+                pair = (int(u), int(h))
+                # Accumulate volume
+                edge_weights[pair] = edge_weights.get(pair, 0.0) + abs(float(vol))
+                
         pbar.update(batch.num_rows)
     pbar.close()
 
-    # 6. Save
-    if unique_pairs:
-        rows, cols = zip(*unique_pairs)
-        data = np.ones(len(rows), dtype=np.float32)
+    # 4. Build Weighted Matrix
+    print(f"Building Weighted Matrix ({len(edge_weights)} edges)...")
+    
+    if edge_weights:
+        rows = [k[0] for k in edge_weights.keys()]
+        cols = [k[1] for k in edge_weights.keys()]
+        
+        # Apply Log-Normalization: log(1 + volume)
+        # This compresses the range so whales don't break the gradient descent
+        raw_vols = np.array(list(edge_weights.values()))
+        data = np.log1p(raw_vols).astype(np.float32)
+        
         incidence_matrix = sp.coo_matrix(
             (data, (rows, cols)), 
-            shape=(num_users, len(unique_canonical_tags))
+            shape=(num_users, len(unique_canonicals))
         ).tocsr()
     else:
-        incidence_matrix = sp.csr_matrix((num_users, len(unique_canonical_tags)), dtype=np.float32)
+        incidence_matrix = sp.csr_matrix((num_users, len(unique_canonicals)), dtype=np.float32)
 
     sp.save_npz(os.path.join(OUTPUT_DIR, 'incidence_matrix.npz'), incidence_matrix)
     with open(os.path.join(OUTPUT_DIR, 'hyperedge_map.json'), 'w') as f:
