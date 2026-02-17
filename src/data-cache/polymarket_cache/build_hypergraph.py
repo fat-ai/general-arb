@@ -94,7 +94,7 @@ def build_hypergraph_ner_fast():
             # Real-Time Pulse Check
             if (i + idx) % 100 == 0:
                 # Show larger preview (200 chars) to see full Question
-                preview = text[:200].replace('\n', ' ')
+                preview = text.replace('\n', ' ')
                 
                 print(f"\n--- [Pulse Check #{i+idx}] ---")
                 print(f"Input: \"{preview}...\"")
