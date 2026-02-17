@@ -19,7 +19,7 @@ BATCH_SIZE = 128  # Increased for Small model (faster/lighter)
 MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
-    "Politician", "Political_Party", "Election_Race", "Government_Official", "US_State", "Government_Department", "Central_Bank", "Military_Action",
+    "Politician", "Political_Party", "Election_Race", "Job_Title", "US_State", "Government_Department", "Central_Bank", "Military_Action",
     "Game", "Sports_Team", "Athlete_Player", "Sports_Competition", "Sports_League",
     "Cryptocurrency", "Stock_Exchange", "Stock_Ticker",
     "Movie", "TV_Show", "Legal_Action",
