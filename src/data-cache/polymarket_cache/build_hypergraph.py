@@ -19,13 +19,13 @@ BATCH_SIZE = 128  # Increased for Small model (faster/lighter)
 MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
-    "Politician", "Political_Party", "Election_Race", "Political_Position", "US_State", "Government_Department", "Central_Bank", "Military_Action",
-    "A_Sport", "Sports_Team", "Athlete_Player", "Sports_League",
+    "Politician", "Political_Party", "Election_Race", "Government_Official", "US_State", "Government_Department", "Central_Bank", "Military_Action",
+    "Sport_Name", "Sports_Team", "Athlete_Player", "Sporting_Event", "Sports_League",
     "Cryptocurrency", "Stock_Exchange", "Stock_Ticker",
     "Movie", "TV_Show", "Legal_Action",
-    "Company", "Economic_Indicator", "Business_Metric", "Corporarte_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Landmark",
+    "Company_Name", "Economic_Indicator", "Business_Metric", "Corporate_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Address/Location",
     "AI_Model", "Business_Executive", "Musician", "Actor", "Social_Media_Influencer",
-    "Media_Platform", "Natural_Disaster", "Disease", "Weather_Metric"
+    "Media_Platform", "Natural_Disaster", "Disease", "Weather_Statistic"
 ]
 
 def get_first_paragraph(text):
