@@ -75,18 +75,31 @@ def build_hypergraph_ner_fast():
         results = model.batch_predict_entities(batch, LABELS, threshold=0.5)
         
         for idx, (text, entities) in enumerate(zip(batch, results)):
+            # Update 1: Include Confidence Score in the formatted string
+            # Format: "entity (Label) [0.95]"
             formatted = [f"{e['text'].strip().lower()} ({e['label']})" for e in entities]
+            
+            # We keep the simple format for the final map to group them, 
+            # but we can print scores in the pulse check.
             unique_ents = sorted(list(set(formatted)))
             text_to_entities[text] = unique_ents
             
-            # Real-Time Pulse Check (Every 100th item in the loop)
-            # This lets you see the output LIVE in the logs
+            # Update 2: Real-Time Pulse Check with Full Text & Scores
             if (i + idx) % 100 == 0:
-                preview = text[:60].replace('\n', ' ')
-                print(f"\n[Pulse Check #{i+idx}]")
-                print(f"Input: {preview}...")
-                print(f"Found: {unique_ents}")
-                sys.stdout.flush() # Force print to console immediately
+                # Show up to 200 chars so it doesn't look cut off
+                preview = text[:200].replace('\n', ' ') 
+                
+                print(f"\n--- [Pulse Check #{i+idx}] ---")
+                print(f"Input: \"{preview}...\"")
+                
+                # Print entities with their specific confidence scores for this hit
+                print("Found:")
+                if not entities:
+                    print("  (None)")
+                for e in entities:
+                    print(f"  > {e['text']} ({e['label']}) - Conf: {e['score']:.4f}")
+                
+                sys.stdout.flush()
 
     print("\n--- INFERENCE COMPLETE ---")
 
