@@ -25,7 +25,7 @@ LABELS = [
     "Movie", "TV_Show", "Legal_Action",
     "Company_Name", "Economic_Indicator", "Business_Metric", "Corporate_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Public_Place",
     "AI_Model", "Business_Executive", "Musician", "Actor", "Social_Media_Influencer",
-    "Media_Platform", "Natural_Disaster", "Disease", "Weather_Statistic"
+    "Natural_Disaster", "Disease", "Weather_Statistic"
 ]
 
 def get_first_paragraph(text):
