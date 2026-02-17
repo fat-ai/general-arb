@@ -11,7 +11,7 @@ from gliner import GLiNER
 INPUT_TRADES = 'polymarket_tgn_final.parquet'
 INPUT_MARKETS = 'gamma_markets_all_tokens.parquet'
 INPUT_MAPS_DIR = 'maps'
-OUTPUT_DIR = 'hypergraph_data_ner_baseline'
+OUTPUT_DIR = 'hypergraph_data'
 BATCH_SIZE = 16  # Adjust based on your RAM/GPU. Higher is faster but uses more memory.
 
 # The exhaustive taxonomy based on your requirements
