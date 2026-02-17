@@ -6,13 +6,17 @@ import os
 import pyarrow.parquet as pq
 from tqdm import tqdm
 from gliner import GLiNER
+import sys
 
 # --- Configuration ---
 INPUT_TRADES = 'polymarket_tgn_final.parquet'
 INPUT_MARKETS = 'gamma_markets_all_tokens.parquet'
 INPUT_MAPS_DIR = 'maps'
-OUTPUT_DIR = 'hypergraph_data'
-BATCH_SIZE = 64  # Increased batch size because we are processing unique texts
+OUTPUT_DIR = 'hypergraph_data_ner_fast'
+BATCH_SIZE = 128  # Increased for Small model (faster/lighter)
+
+# The "Small" model is 2-3x faster than Base
+MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
     "Politician", "Political_Party", "Election_Race", 
@@ -31,11 +35,16 @@ def get_first_paragraph(text):
 def build_hypergraph_ner_fast():
     if not os.path.exists(OUTPUT_DIR): os.makedirs(OUTPUT_DIR)
     
-    print("--- Phase 1.2: Fast NER Construction (Deduplicated) ---")
+    print(f"--- NER Hypergraph Construction (Model: {MODEL_NAME}) ---")
 
     # 1. Load GLiNER
-    print("Loading GLiNER...")
-    model = GLiNER.from_pretrained("urchade/gliner_base")
+    print(f"Loading {MODEL_NAME}...")
+    try:
+        model = GLiNER.from_pretrained(MODEL_NAME)
+        print("Model loaded successfully.")
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return
 
     # 2. Load Maps
     with open(os.path.join(INPUT_MAPS_DIR, 'contract_map.json'), 'r') as f:
@@ -43,64 +52,66 @@ def build_hypergraph_ner_fast():
     with open(os.path.join(INPUT_MAPS_DIR, 'user_map.json'), 'r') as f:
         num_users = len(json.load(f))
 
-    # 3. Load & Deduplicate Descriptions
+    # 3. Load & Deduplicate
     print("Reading Markets...")
     markets_df = pd.read_parquet(INPUT_MARKETS, columns=['contract_id', 'description'])
     markets_df['c_id'] = markets_df['contract_id'].astype(str).map(contract_str_to_id)
     markets_df = markets_df.dropna(subset=['c_id'])
     markets_df['c_id'] = markets_df['c_id'].astype(int)
     
-    # Extract First Paragraph
     markets_df['clean_desc'] = markets_df['description'].apply(get_first_paragraph)
-    
-    # FILTER: Drop empty descriptions immediately
     markets_df = markets_df[markets_df['clean_desc'] != ""]
     
-    # DEDUPLICATE: Get unique texts only
     unique_texts = markets_df['clean_desc'].unique().tolist()
-    print(f"Optimization: Reduced {len(markets_df)} markets to {len(unique_texts)} unique descriptions.")
+    print(f"Processing {len(unique_texts)} unique descriptions (reduced from {len(markets_df)})...")
     
-    # 4. Run NER on Unique Texts
+    # 4. Run NER with Real-Time Output
     text_to_entities = {}
     
-    print(f"Processing {len(unique_texts)} texts...")
-    for i in tqdm(range(0, len(unique_texts), BATCH_SIZE), desc="NER Inference"):
+    print("\n--- INFERENCE STREAM START ---")
+    
+    for i in tqdm(range(0, len(unique_texts), BATCH_SIZE), desc="Inference"):
         batch = unique_texts[i : i + BATCH_SIZE]
         results = model.batch_predict_entities(batch, LABELS, threshold=0.5)
         
-        for text, entities in zip(batch, results):
-            # Clean and Format
+        for idx, (text, entities) in enumerate(zip(batch, results)):
             formatted = [f"{e['text'].strip().lower()} ({e['label']})" for e in entities]
-            text_to_entities[text] = sorted(list(set(formatted)))
+            unique_ents = sorted(list(set(formatted)))
+            text_to_entities[text] = unique_ents
+            
+            # Real-Time Pulse Check (Every 100th item in the loop)
+            # This lets you see the output LIVE in the logs
+            if (i + idx) % 100 == 0:
+                preview = text[:60].replace('\n', ' ')
+                print(f"\n[Pulse Check #{i+idx}]")
+                print(f"Input: {preview}...")
+                print(f"Found: {unique_ents}")
+                sys.stdout.flush() # Force print to console immediately
 
-    # 5. Map Back to Contracts
+    print("\n--- INFERENCE COMPLETE ---")
+
+    # 5. Map Back
     print("Mapping results back to contracts...")
     contract_to_entities = {}
     audit_log = []
     
-    # We iterate the dataframe and look up the result from our cache
     for c_id, desc in zip(markets_df['c_id'], markets_df['clean_desc']):
         entities = text_to_entities.get(desc, [])
-        if entities:
-            contract_to_entities[c_id] = entities
-            audit_log.append({
+        # Only log non-empty to save space, or log all for full audit
+        contract_to_entities[c_id] = entities
+       
+        audit_log.append({
                 "c_id": c_id,
                 "desc_preview": desc[:50],
                 "entity_count": len(entities),
                 "entities": "|".join(entities)
-            })
-        else:
-             audit_log.append({
-                "c_id": c_id,
-                "desc_preview": desc[:50],
-                "entity_count": 0,
-                "entities": ""
-            })
+        })
 
     # Save Audit
     pd.DataFrame(audit_log).to_csv(os.path.join(OUTPUT_DIR, 'ner_audit_report.csv'), index=False)
+    print(f"Audit report saved (first 10k rows).")
 
-    # 6. Build Vocabulary & Matrix (Same as before)
+    # 6. Build Matrix (Weighted)
     all_unique_entities = sorted(list(set([ent for sublist in contract_to_entities.values() for ent in sublist])))
     entity_to_id = {ent: idx for idx, ent in enumerate(all_unique_entities)}
     print(f"Total Unique Entities: {len(all_unique_entities)}")
@@ -114,10 +125,11 @@ def build_hypergraph_ner_fast():
         chunk = chunk[chunk['i_id'].isin(contract_to_entities.keys())]
         
         for u, i, vol in chunk.values:
-            for entity_name in contract_to_entities[int(i)]:
-                h_id = entity_to_id[entity_name]
-                pair = (int(u), int(h_id))
-                edge_weights[pair] = edge_weights.get(pair, 0.0) + abs(float(vol))
+            if int(i) in contract_to_entities: # Safety check
+                for entity_name in contract_to_entities[int(i)]:
+                    h_id = entity_to_id[entity_name]
+                    pair = (int(u), int(h_id))
+                    edge_weights[pair] = edge_weights.get(pair, 0.0) + abs(float(vol))
 
     if edge_weights:
         rows = [k[0] for k in edge_weights.keys()]
