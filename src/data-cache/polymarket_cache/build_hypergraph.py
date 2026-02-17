@@ -12,16 +12,16 @@ import sys
 INPUT_TRADES = 'polymarket_tgn_final.parquet'
 INPUT_MARKETS = 'gamma_markets_all_tokens.parquet'
 INPUT_MAPS_DIR = 'maps'
-OUTPUT_DIR = 'hypergraph_data_ner_fast'
+OUTPUT_DIR = 'hypergraph_data'
 BATCH_SIZE = 128  # Increased for Small model (faster/lighter)
 
 # The "Small" model is 2-3x faster than Base
 MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
-    "Politician", "Political_Party", "Election_Race", "Job_Title", "US_State", "Government_Department", "Central_Bank", "Military_Action",
-    "Game", "Sports_Team", "Athlete_Player", "Sports_Competition", "Sports_League",
-    "Cryptocurrency", "Stock_Exchange", "Stock_Ticker",
+    "Politician_Name", "Political_Party", "Election", "Job_Title", "US_State", "Government_Department", "Central_Bank", "Military_Action",
+    "Type_of_Sport", "Sports_Team_Name", "Sports_Team_Type", "Athlete_Player", "Sports_Tournament", "Sports_League",
+    "Cryptocurrency", "Stock_Exchange", "Company_Stock_Ticker",
     "Movie", "TV_Show", "Legal_Action",
     "Company_Name", "Economic_Indicator", "Business_Metric", "Corporate_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Public_Place",
     "AI_Model", "Business_Executive", "Musician", "Actor", "Social_Media_Influencer",
@@ -55,16 +55,26 @@ def build_hypergraph_ner_fast():
 
     # 3. Load & Deduplicate
     print("Reading Markets...")
-    markets_df = pd.read_parquet(INPUT_MARKETS, columns=['contract_id', 'description'])
+    # UPDATE: Loading 'question' column
+    markets_df = pd.read_parquet(INPUT_MARKETS, columns=['contract_id', 'question', 'description'])
+    
     markets_df['c_id'] = markets_df['contract_id'].astype(str).map(contract_str_to_id)
     markets_df = markets_df.dropna(subset=['c_id'])
     markets_df['c_id'] = markets_df['c_id'].astype(int)
     
+    # Prepare Text
     markets_df['clean_desc'] = markets_df['description'].apply(get_first_paragraph)
-    markets_df = markets_df[markets_df['clean_desc'] != ""]
+    markets_df['question'] = markets_df['question'].fillna("").astype(str)
     
-    unique_texts = markets_df['clean_desc'].unique().tolist()
-    print(f"Processing {len(unique_texts)} unique descriptions (reduced from {len(markets_df)})...")
+    # UPDATE: Combine Question + Description
+    # We add a newline to separate the headline from the body
+    markets_df['full_text'] = markets_df['question'] + "\n" + markets_df['clean_desc']
+    
+    # Filter empty
+    markets_df = markets_df[markets_df['full_text'].str.strip() != ""]
+    
+    unique_texts = markets_df['full_text'].unique().tolist()
+    print(f"Processing {len(unique_texts)} unique texts (Question + Desc)...")
     
     # 4. Run NER with Real-Time Output
     text_to_entities = {}
@@ -76,54 +86,52 @@ def build_hypergraph_ner_fast():
         results = model.batch_predict_entities(batch, LABELS, threshold=0.5)
         
         for idx, (text, entities) in enumerate(zip(batch, results)):
-            # Update 1: Include Confidence Score in the formatted string
-            # Format: "entity (Label) [0.95]"
+            # Clean and Format
             formatted = [f"{e['text'].strip().lower()} ({e['label']})" for e in entities]
-            
-            # We keep the simple format for the final map to group them, 
-            # but we can print scores in the pulse check.
             unique_ents = sorted(list(set(formatted)))
             text_to_entities[text] = unique_ents
             
-            # Update 2: Real-Time Pulse Check with Full Text & Scores
+            # Real-Time Pulse Check
             if (i + idx) % 100 == 0:
-                # Show up to 200 chars so it doesn't look cut off
-                preview = text.replace('\n', ' ') 
+                # Show larger preview (200 chars) to see full Question
+                preview = text[:200].replace('\n', ' ')
                 
                 print(f"\n--- [Pulse Check #{i+idx}] ---")
                 print(f"Input: \"{preview}...\"")
                 
-                # Print entities with their specific confidence scores for this hit
-                print("Found:")
                 if not entities:
-                    print("  (None)")
-                for e in entities:
-                    print(f"  > {e['text']} ({e['label']}) - Conf: {e['score']:.4f}")
+                    print("Found: (None)")
+                else:
+                    print("Found:")
+                    for e in entities:
+                        # Show Confidence Score
+                        print(f"  > {e['text']} ({e['label']}) [Conf: {e['score']:.4f}]")
                 
                 sys.stdout.flush()
 
     print("\n--- INFERENCE COMPLETE ---")
 
-    # 5. Map Back
+    # 5. Map Back to Contracts
     print("Mapping results back to contracts...")
     contract_to_entities = {}
     audit_log = []
     
-    for c_id, desc in zip(markets_df['c_id'], markets_df['clean_desc']):
-        entities = text_to_entities.get(desc, [])
-        # Only log non-empty to save space, or log all for full audit
+    # Map using the 'full_text' column
+    for c_id, text in zip(markets_df['c_id'], markets_df['full_text']):
+        entities = text_to_entities.get(text, [])
         contract_to_entities[c_id] = entities
-       
-        audit_log.append({
+        
+        if len(audit_log) < 10000:
+            audit_log.append({
                 "c_id": c_id,
-                "desc_preview": desc[:50],
+                "text_preview": text[:100].replace('\n', ' '),
                 "entity_count": len(entities),
                 "entities": "|".join(entities)
-        })
+            })
 
     # Save Audit
     pd.DataFrame(audit_log).to_csv(os.path.join(OUTPUT_DIR, 'ner_audit_report.csv'), index=False)
-    print(f"Audit report saved (first 10k rows).")
+    print(f"Audit report saved.")
 
     # 6. Build Matrix (Weighted)
     all_unique_entities = sorted(list(set([ent for sublist in contract_to_entities.values() for ent in sublist])))
@@ -139,7 +147,7 @@ def build_hypergraph_ner_fast():
         chunk = chunk[chunk['i_id'].isin(contract_to_entities.keys())]
         
         for u, i, vol in chunk.values:
-            if int(i) in contract_to_entities: # Safety check
+            if int(i) in contract_to_entities:
                 for entity_name in contract_to_entities[int(i)]:
                     h_id = entity_to_id[entity_name]
                     pair = (int(u), int(h_id))
@@ -160,7 +168,7 @@ def build_hypergraph_ner_fast():
     with open(os.path.join(OUTPUT_DIR, 'hyperedge_map.json'), 'w') as f:
         json.dump(entity_to_id, f)
 
-    print("FAST HYPERGRAPH COMPLETE")
+    print("HYPERGRAPH COMPLETE")
 
 if __name__ == "__main__":
     build_hypergraph_ner_fast()
