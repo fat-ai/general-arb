@@ -1,4 +1,4 @@
-import pandas as pd
+rimport pandas as pd
 import numpy as np
 import scipy.sparse as sp
 import json
@@ -20,12 +20,12 @@ MODEL_NAME = "urchade/gliner_small-v2.1"
 
 LABELS = [
     "Politician", "Political_Party", "Election_Race", "Political_Position", "US_State", "National_Government_Institution", "International_Government_Institution", "Military_Action",
-    "Sport_Type", "Sports_Team", "Athlete_Player", "Sports_League", "Competitor_Category",
+    "Sport_Type", "Sports_Team", "Athlete_Player", "Sports_League", "Sports_Event", "Competitor_Category",
     "Cryptocurrency", "Stock_Exchange", "Stock_Ticker",
     "Movie", "TV_Show", "Legal_Action", 
-    "Company", "Economic_Indicator", "Business_Metric", "Business_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Landmark",
+    "Company", "Economic_Indicator", "Business_Metric", "Corporarte_Event", "Corporate_Action", "Awards_Show", "Celebrity_Event", "Country", "City", "Landmark",
     "AI_Model", "Business_Executive", "Musician", "Actor", "Social_Media_Influencer",
-    "Media_Platform", "Natural_Disaster", "Disease", "Weather"
+    "Media_Platform", "Natural_Disaster", "Disease", "Weather_Metric"
 ]
 
 def get_first_paragraph(text):
