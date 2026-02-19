@@ -17,8 +17,8 @@ CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WARMUP_DAYS = 30
-MAXIMUM_BET = 10000
-MAXIMUM_SLIPPAGE = 0.2
+MAX_BET = 10000
+MAX_SLIPPAGE = 0.2
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -569,9 +569,9 @@ def main():
                           elif sig < 0:
                                   verdict = "RIGHT!"
 
-                          bet_size = min(MAX_BET_SIZE, 0.01 * result_map['performance']['equity'])
+                          bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
                           min_irr = 2.0
-                          slippage = MAX_SLIPPAGE * (bet_size / MAX_BET_SIZE)
+                          slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
                           
                           if result_map[mid]['outcome'] > 0:
                               if bet_on == "yes":
