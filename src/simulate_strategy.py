@@ -121,7 +121,7 @@ def main():
         if market['id'] not in result_map:
             result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
-        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'peak_equity': CONFIG["initial_capital"], 'max_drawdown': (0,0) 'pnl': 0}
+        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'peak_equity': CONFIG["initial_capital"], 'max_drawdown': (0,0), 'pnl': 0}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
