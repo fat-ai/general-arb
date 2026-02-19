@@ -556,7 +556,7 @@ def main():
                     sig = sig / cum_vol
 
                     if abs(sig) > 1 and t['price'] > 0.05 and t['price'] < 0.95:
-                        if 'verdict' not in result_map[m['id']]:
+                      if 'verdict' not in result_map[m['id']]:
                           score = scorer.get_score(t['user'], vol, t['price'])
                           mid = m['id']
                           verdict = "WRONG!"
@@ -591,40 +591,41 @@ def main():
                           if result_map['performance']['cash'] < bet_size:  
                               result_map['performance']['ins_cash'] += 1
                               print("INSUFFICIENT CASH!" + " " + str(result_map['performance']['ins_cash']))
-                          if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:     
-                              if verdict == "WRONG!":
-                                  roi = -1.00
-                                  profit = -bet_size
-                                
-                              verdicts = (
-                                    mr['verdict'] 
-                                    for mr in result_map.values() 
-                                    if "verdict" in mr
-                              )
-                                
-                              result_map[mid]['id'] = mid
-                              result_map[mid]['timestamp'] = t['timestamp']
-                              result_map[mid]['days'] = duration.days
-                              result_map[mid]['signal'] = sig
-                              result_map[mid]['verdict'] = verdict
-                              result_map[mid]['price'] = t['price']
-                              result_map[mid]['bet_on'] = bet_on
-                              result_map[mid]['direction'] = direction
-                              result_map[mid]['end'] = m_end
-                              result_map[mid]['user_score']=score
-                              result_map[mid]['total_vol']=cum_vol
-                              result_map[mid]['user_vol']=vol
-                              result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
-                              result_map[mid]['pnl'] = profit
-                              result_map[mid]['roi'] = roi
-                              
-                         #     result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
+                          if roi / time_factor > min_irr: 
+                              if result_map['performance']['cash'] > bet_size:
+                                  if verdict == "WRONG!":
+                                      roi = -1.00
+                                      profit = -bet_size
+                                    
+                                  verdicts = (
+                                        mr['verdict'] 
+                                        for mr in result_map.values() 
+                                        if "verdict" in mr
+                                  )
+                                    
+                                  result_map[mid]['id'] = mid
+                                  result_map[mid]['timestamp'] = t['timestamp']
+                                  result_map[mid]['days'] = duration.days
+                                  result_map[mid]['signal'] = sig
+                                  result_map[mid]['verdict'] = verdict
+                                  result_map[mid]['price'] = t['price']
+                                  result_map[mid]['bet_on'] = bet_on
+                                  result_map[mid]['direction'] = direction
+                                  result_map[mid]['end'] = m_end
+                                  result_map[mid]['user_score']=score
+                                  result_map[mid]['total_vol']=cum_vol
+                                  result_map[mid]['user_vol']=vol
+                                  result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
+                                  result_map[mid]['pnl'] = profit
+                                  result_map[mid]['roi'] = roi
+
+                    
                               previous_equity = result_map['performance']['equity'] 
-                         #     result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
                               result_map['resolutions'].append([m_end, profit, bet_size])
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
                               now = t['timestamp']
+                              
                             # We'll sum up the PnL for those in the past
                               for res in result_map['resolutions']:
                                 if res[0] < now:
@@ -633,7 +634,7 @@ def main():
                                     result_map['performance']['cash'] += res[1]
                                     if result_map['performance']['pnl'] > 0:
                                         result_map['performance']['cash'] += res[2]
-                            
+
                             # 2. Keep only the resolutions that are still in the future
                               result_map['resolutions'] = [
                                 res for res in result_map['resolutions'] 
