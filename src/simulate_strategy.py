@@ -616,9 +616,9 @@ def main():
                          #     result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
                               previous_equity = result_map['performance']['equity'] 
                          #     result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
-                              result_map['performance']['resolutions'].append((m_end, profit, bet_size))
+                              result_map['performance']['resolutions'].append([m_end, profit, bet_size])
                               result_map['performance']['cash']-= bet_size
-                              now = datetime.now()
+                              now = t['timestamp']
                             # We'll sum up the PnL for those in the past
                               for res in result_map['performance']['resolutions']:
                                 if res[0] < now:
