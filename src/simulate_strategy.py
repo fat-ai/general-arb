@@ -17,6 +17,8 @@ CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WARMUP_DAYS = 30
+MAXIMUM_BET = 10000
+MAXIMUM_SLIPPAGE = 0.2
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -567,23 +569,28 @@ def main():
                           elif sig < 0:
                                   verdict = "RIGHT!"
 
-                          bet_size = 0.01 * result_map['performance']['equity']
+                          bet_size = min(MAX_BET_SIZE, 0.01 * result_map['performance']['equity'])
                           min_irr = 2.0
-
+                          slippage = MAX_SLIPPAGE * (bet_size / MAX_BET_SIZE)
+                          
                           if result_map[mid]['outcome'] > 0:
                               if bet_on == "yes":
-                                   profit = 1 - t['price']
-                                   contracts = bet_size / t['price']
+                                   execution_price = t['price'] * (1 + slippage)
+                                   profit = 1 - execution_price
+                                   contracts = bet_size / execution_price
                               else:
-                                   profit = t['price']
-                                   contracts = bet_size / (1 - t['price'])
+                                   execution_price = t['price'] * (1 - slippage)
+                                   profit = execution_price
+                                   contracts = bet_size / (1 - execution_price)
                           else:
                               if bet_on == "no":
-                                   profit = 1 - t['price']
-                                   contracts = bet_size / t['price']
+                                   execution_price = t['price'] * (1 + slippage)
+                                   profit = 1 - execution_price
+                                   contracts = bet_size / execution_price
                               else:
-                                   profit = t['price']
-                                   contracts = bet_size / (1 - t['price'])
+                                   execution_price = t['price'] * (1 - slippage)
+                                   execution_price
+                                   contracts = bet_size / (1 - execution_price)
 
                           profit = profit * contracts
                           roi = profit / bet_size
