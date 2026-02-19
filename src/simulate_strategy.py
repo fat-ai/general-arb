@@ -588,8 +588,8 @@ def main():
                           roi = profit / bet_size
                           duration = m_end - t['timestamp']
                           time_factor = max(duration.days,1) / 365
-                          if result_map['performance']['cash'] > bet_size:  
-                              result_map['performance'][ins_cash] += 1
+                          if result_map['performance']['cash'] < bet_size:  
+                              result_map['performance']['ins_cash'] += 1
                               print("INSUFFICIENT CASH!" + " " + result_map['performance']['ins_cash'])
                           if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:     
                               if verdict == "WRONG!":
