@@ -416,14 +416,14 @@ def main():
                             # --- CALMAR RATIO LOGIC ---
                             updates_df = user_history.filter(
                                 pl.col("user").is_in(affected_users.implode()) &
-                                (pl.col("trade_count") > 1) #& 
-                            #    (pl.col("total_invested") > 10)
+                                (pl.col("trade_count") > 1) & 
+                                (pl.col("total_invested") > 10)
                             ).with_columns([
-                                #(pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
-                                (pl.col("total_pnl") / (pl.col("total_invested") + pl.col("max_drawdown"))).alias("roi") 
+                                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
+                                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                             ]).with_columns([
-                                #(pl.min_horizontal(10.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
-                                pl.col("roi").alias("score")
+                                (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
+                                #pl.col("roi").alias("score")
                             ])
                             # 3. Update existing dictionary (Delta Update)
                             # Instead of replacing the whole dict, we just update the specific keys
@@ -535,7 +535,7 @@ def main():
                         scorer=scorer
                     )
 
-                    sig = sig / np.log1p(cum_vol)
+                    sig = sig / cum_vol
 
                     if abs(sig) > 1 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
@@ -562,7 +562,7 @@ def main():
                           result_map[mid]['user_vol']=vol
                           result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
 
-                          bet_size = 0.025 * result_map['performance']['equity']
+                          bet_size = 0.01 * result_map['performance']['equity']
                             
                           if verdict == "WRONG!":
                               result_map[mid]['roi'] = -1.00
