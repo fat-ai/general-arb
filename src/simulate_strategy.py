@@ -654,7 +654,7 @@ def main():
                               total_bets = rights + wrongs
                               hit_rate = 100*(rights/total_bets)
                               hit_rate = round(hit_rate,1)
-                              print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
+                              print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with performance {result_map['performance']}")
                         
                     results.append({
                         "timestamp": t['timestamp'],
