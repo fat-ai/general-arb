@@ -552,19 +552,19 @@ def main():
                           min_irr = 1.0
 
                           if result_map[mid]['outcome'] > 0:
-                                  if bet_on == "yes":
-                                    profit = 1 - t['price']
-                                    contracts = bet_size / t['price']
-                                  else:
-                                    profit = t['price']
-                                    contracts = bet_size / (1 - t['price'])
-                              else: 
-                                  if bet_on == "no":
-                                    profit = 1 - t['price']
-                                    contracts = bet_size / t['price']
-                                  else:
-                                    profit = t['price']
-                                    contracts = bet_size / (1 - t['price'])
+                              if bet_on == "yes":
+                                   profit = 1 - t['price']
+                                   contracts = bet_size / t['price']
+                              else:
+                                   profit = t['price']
+                                   contracts = bet_size / (1 - t['price'])
+                           else: 
+                              if bet_on == "no":
+                                   profit = 1 - t['price']
+                                   contracts = bet_size / t['price']
+                              else:
+                                   profit = t['price']
+                                   contracts = bet_size / (1 - t['price'])
 
                           profit = profit * contracts
                           roi = profit / bet_size
