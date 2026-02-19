@@ -355,8 +355,9 @@ def main():
                                     y_val = roi
                                     
                                     calibration_data.append({
-                                        'x': x_val,
-                                        'y': y_val,
+                                        'vol': math.log1p(risk_vol),  # Feature 1
+                                        'price': price,              # Feature 2
+                                        'y': roi,                    # Target
                                         'date': current_sim_day
                                     })
                                     
@@ -448,12 +449,21 @@ def main():
                 recent_data = [d for d in calibration_data if d['date'] >= cutoff_date]
                
                 try:
-                    X_recent = [d['x'] for d in recent_data]
+                    # Build a 2D array for your features: [ [vol1, price1], [vol2, price2], ... ]
+                    X_features = [[d['vol'], d['price']] for d in recent_data]
                     y_recent = [d['y'] for d in recent_data]
-                    model = sm.OLS(y_recent, sm.add_constant(X_recent)).fit()
-                    scorer.slope = model.params[1]
+                    
+                    # sm.add_constant automatically handles 2D arrays to add the intercept column
+                    X_recent = sm.add_constant(X_features)
+                    
+                    model = sm.OLS(y_recent, X_recent).fit()
+                    
+                    # Extract the new parameters
                     scorer.intercept = model.params[0]
-                    print(f"Fresh wallet intercept: {scorer.intercept}, slope: {scorer.slope}")
+                    scorer.slope_vol = model.params[1]
+                    scorer.slope_price = model.params[2]
+                    
+                    print(f"Fresh wallet intercept: {scorer.intercept:.4f}, vol_slope: {scorer.slope_vol:.4f}, price_slope: {scorer.slope_price:.4f}")
                 except Exception as e:
                     log.warning(f"⚠️ OLS Training Failed: {e}")
                 
