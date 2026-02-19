@@ -548,27 +548,10 @@ def main():
                           elif sig < 0:
                                   verdict = "RIGHT!"
 
-                          result_map[mid]['id'] = mid
-                          result_map[mid]['timestamp'] = t['timestamp']
-                          result_map[mid]['signal'] = sig
-                          result_map[mid]['verdict'] = verdict
-                          result_map[mid]['price'] = t['price']
-                          result_map[mid]['bet_on'] = bet_on
-                          result_map[mid]['direction'] = direction
-                          result_map[mid]['end'] = m_end
-                          result_map[mid]['user_score']=score
-                          result_map[mid]['total_vol']=cum_vol
-                    
-                          result_map[mid]['user_vol']=vol
-                          result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
-
                           bet_size = 0.01 * result_map['performance']['equity']
-                            
-                          if verdict == "WRONG!":
-                              result_map[mid]['roi'] = -1.00
-                              result_map[mid]['pnl'] = -bet_size
-                          else:
-                              if result_map[mid]['outcome'] > 0:
+                          min_irr = 1.0
+
+                          if result_map[mid]['outcome'] > 0:
                                   if bet_on == "yes":
                                     profit = 1 - t['price']
                                     contracts = bet_size / t['price']
@@ -582,17 +565,37 @@ def main():
                                   else:
                                     profit = t['price']
                                     contracts = bet_size / (1 - t['price'])
-                                  
-                              profit = profit * contracts
-                              result_map[mid]['pnl'] = profit
-                              result_map[mid]['roi'] = profit / bet_size
-                                  
+
+                          profit = profit * contracts
+                          roi = profit / bet_size
+                          duration = m_end - t['timestamp']
+                          time_factor = duration.days / 365
+                          if roi / time_factor < min_irr: continue
+                                    
+                          if verdict == "WRONG!":
+                              roi = -1.00
+                              profit = -bet_size
+                            
                           verdicts = (
                                 mr['verdict'] 
                                 for mr in result_map.values() 
                                 if "verdict" in mr
                           )
-
+                            
+                          result_map[mid]['id'] = mid
+                          result_map[mid]['timestamp'] = t['timestamp']
+                          result_map[mid]['signal'] = sig
+                          result_map[mid]['verdict'] = verdict
+                          result_map[mid]['price'] = t['price']
+                          result_map[mid]['bet_on'] = bet_on
+                          result_map[mid]['direction'] = direction
+                          result_map[mid]['end'] = m_end
+                          result_map[mid]['user_score']=score
+                          result_map[mid]['total_vol']=cum_vol
+                          result_map[mid]['user_vol']=vol
+                          result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
+                          result_map[mid]['pnl'] = profit
+                          result_map[mid]['roi'] = roi
                           result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
                           result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
                               
