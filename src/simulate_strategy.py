@@ -126,7 +126,7 @@ def main():
                                      'cash': CONFIG["initial_capital"], 
                                      'peak_equity': CONFIG["initial_capital"], 
                                      'max_drawdown': (0,0), 
-                                     'resolutions': []
+                                     'resolutions': [],
                                      'pnl': 0}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
