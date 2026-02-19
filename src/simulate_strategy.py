@@ -121,7 +121,7 @@ def main():
         if market['id'] not in result_map:
             result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
-        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'pnl': 0}
+        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'peak_equity': CONFIG["initial_capital"], 'max_drawdown': 0, 'pnl': 0}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -597,8 +597,14 @@ def main():
                               result_map[mid]['pnl'] = profit
                               result_map[mid]['roi'] = roi
                               result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
+                              previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
-                                  
+                              if result_map['performance']['equity'] > if result_map['performance']['peak_equity']:
+                                  result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                              drawdown = (result_map['performance']['peak_equity'] - result_map['performance']['equity']) / result_map['performance']['peak_equity']
+                              if round(drawdown,3) * 100 >  result_map['performance']['max_drawdown']:
+                                  result_map['performance']['max_drawdown'] = round(drawdown,3) * 100
+                              
                               counts = Counter(verdicts)
                               rights = counts['RIGHT!']
                               wrongs = counts['WRONG!']
