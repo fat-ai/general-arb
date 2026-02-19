@@ -607,12 +607,6 @@ def main():
                                       roi = -1.00
                                       profit = -bet_size
                                     
-                                  verdicts = (
-                                        mr['verdict'] 
-                                        for mr in result_map.values() 
-                                        if "verdict" in mr
-                                  )
-                                    
                                   result_map[mid]['id'] = mid
                                   result_map[mid]['timestamp'] = t['timestamp']
                                   result_map[mid]['days'] = duration.days
@@ -630,13 +624,11 @@ def main():
                                   result_map[mid]['roi'] = roi
                                   result_map['resolutions'].append([m_end, profit, bet_size])
 
-                    
                               previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
                               now = t['timestamp']
                               
-                            # We'll sum up the PnL for those in the past
                               for res in result_map['resolutions']:
                                 if res[0] < now:
                                     result_map['performance']['pnl'] += res[1]
@@ -651,7 +643,7 @@ def main():
                               ]
                               
                       wait = heartbeat - now                  
-                      if wait.seconds > 10:
+                      if wait.seconds > 10 and len(result_map['resolutions'] > 0:
                               heartbeat = now
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
@@ -666,6 +658,12 @@ def main():
                               calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001),100000)
                               
                               result_map['performance']['Calmar'] = round(calmar,1)
+
+                              verdicts = (
+                                        mr['verdict'] 
+                                        for mr in result_map.values() 
+                                        if "verdict" in mr
+                                  )
                               
                               counts = Counter(verdicts)
                               rights = counts['RIGHT!']
@@ -673,7 +671,7 @@ def main():
                               total_bets = rights + wrongs
                               hit_rate = 100*(rights/total_bets)
                               hit_rate = round(hit_rate,1)
-                              print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with performance {result_map['performance']}")
+                              print(f"RESULTS! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with performance {result_map['performance']}")
                         
                     results.append({
                         "timestamp": t['timestamp'],
