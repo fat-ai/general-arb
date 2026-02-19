@@ -599,13 +599,13 @@ def main():
                               result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
                               previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
-                              if result_map['performance']['equity'] > if result_map['performance']['peak_equity']:
+                              if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
                               drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
                               if drawdown > result_map['performance']['max_drawdown'][0]:
                                   result_map['performance']['max_drawdown'][0] = drawdown
                               percent_drawdown = drawdown / result_map['performance']['peak_equity']
-                              if round(percent_drawdown,3) * 100 >  result_map['performance']['max_drawdown'][1]:
+                              if round(percent_drawdown,3) * 100 > result_map['performance']['max_drawdown'][1]:
                                   result_map['performance']['max_drawdown'][1] = round(percent_drawdown,3) * 100
                               calmar = result_map['performance']['pnl'] / result_map['performance']['max_drawdown'][1]
                               result_map['performance']['Calmar'] = round(calmar,1)
