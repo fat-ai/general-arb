@@ -643,7 +643,7 @@ def main():
                               ]
                               
                       wait = heartbeat - now                  
-                      if wait.seconds > 10 and len(result_map['resolutions'] > 0:
+                      if wait.seconds > 10 and len(result_map['resolutions']) > 0:
                               heartbeat = now
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
