@@ -121,7 +121,13 @@ def main():
         if market['id'] not in result_map:
             result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
-        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 'equity': CONFIG["initial_capital"], 'peak_equity': CONFIG["initial_capital"], 'max_drawdown': (0,0), 'pnl': 0}
+        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 
+                                     'equity': CONFIG["initial_capital"], 
+                                     'cash': CONFIG["initial_capital"], 
+                                     'peak_equity': CONFIG["initial_capital"], 
+                                     'max_drawdown': (0,0), 
+                                     'resolutions': []
+                                     'pnl': 0}
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -596,18 +602,40 @@ def main():
                               result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
                               result_map[mid]['pnl'] = profit
                               result_map[mid]['roi'] = roi
-                              result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
+                              
+                         #     result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
                               previous_equity = result_map['performance']['equity'] 
-                              result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
+                         #     result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
+                              result_map['performance']['resolutions'].append((end, profit, bet_size))
+                              result_map['performance']['cash']-= bet_size
+                              now = datetime.datetime.now()
+                            # We'll sum up the PnL for those in the past
+                              for res in result_map['performance']['resolutions']:
+                                if res[0] < now:
+                                    result_map['performance']['pnl'] += res[1]
+                                    result_map['performance']['equity'] += res[1]
+                                    result_map['performance']['cash'] += res[1]
+                                    if result_map['performance']['pnl'] > 0:
+                                        result_map['performance']['cash'] += res[2]
+                            
+                            # 2. Keep only the resolutions that are still in the future
+                              result_map['performance']['resolutions'] = [
+                                res for res in result_map['performance']['resolutions'] 
+                                if res[0] >= now
+                              ]
+                                  
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                                  
                               drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
                               if drawdown > result_map['performance']['max_drawdown'][0]:
                                   result_map['performance']['max_drawdown'][0] = drawdown
+                                  
                               percent_drawdown = drawdown / result_map['performance']['peak_equity']
                               if round(percent_drawdown,3) * 100 > result_map['performance']['max_drawdown'][1]:
                                   result_map['performance']['max_drawdown'][1] = round(percent_drawdown,3) * 100
-                              calmar = result_map['performance']['pnl'] / result_map['performance']['max_drawdown'][1]
+                              calmar = min(result_map['performance']['pnl'] / result_map['performance']['max_drawdown'][1],1000000)
+                              
                               result_map['performance']['Calmar'] = round(calmar,1)
                               
                               counts = Counter(verdicts)
