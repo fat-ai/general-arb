@@ -125,9 +125,11 @@ def main():
                                      'equity': CONFIG["initial_capital"], 
                                      'cash': CONFIG["initial_capital"], 
                                      'peak_equity': CONFIG["initial_capital"], 
+                                     'ins_cash': 0,
                                      'max_drawdown': [0,0], 
-                                     'resolutions': [],
                                      'pnl': 0}
+        
+        results_map['resolutions'] = []
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -586,7 +588,10 @@ def main():
                           roi = profit / bet_size
                           duration = m_end - t['timestamp']
                           time_factor = max(duration.days,1) / 365
-                          if roi / time_factor > min_irr:     
+                          if result_map['performance']['cash'] > bet_size:  
+                              result_map['performance'][ins_cash] += 1
+                              print("INSUFFICIENT CASH!" + " " + result_map['performance']['ins_cash'])
+                          if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:     
                               if verdict == "WRONG!":
                                   roi = -1.00
                                   profit = -bet_size
@@ -616,11 +621,12 @@ def main():
                          #     result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
                               previous_equity = result_map['performance']['equity'] 
                          #     result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
-                              result_map['performance']['resolutions'].append([m_end, profit, bet_size])
+                              result_map['resolutions'].append([m_end, profit, bet_size])
+                              result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
                               now = t['timestamp']
                             # We'll sum up the PnL for those in the past
-                              for res in result_map['performance']['resolutions']:
+                              for res in result_map['resolutions']:
                                 if res[0] < now:
                                     result_map['performance']['pnl'] += res[1]
                                     result_map['performance']['equity'] += res[1]
@@ -629,8 +635,8 @@ def main():
                                         result_map['performance']['cash'] += res[2]
                             
                             # 2. Keep only the resolutions that are still in the future
-                              result_map['performance']['resolutions'] = [
-                                res for res in result_map['performance']['resolutions'] 
+                              result_map['resolutions'] = [
+                                res for res in result_map['resolutions'] 
                                 if res[0] >= now
                               ]
                                   
