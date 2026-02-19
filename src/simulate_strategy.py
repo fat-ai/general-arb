@@ -129,7 +129,7 @@ def main():
                                      'max_drawdown': [0,0], 
                                      'pnl': 0}
         
-        results_map['resolutions'] = []
+        result_map['resolutions'] = []
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
