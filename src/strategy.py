@@ -22,7 +22,8 @@ class WalletScorer:
         self.wallet_scores: Dict[str, float] = {}
         
         # Default Fresh Wallet Parameters (Linear Regression)
-        self.slope = 0.05
+        self.slope_vol = 0.05
+        self.slope_price = 0.00
         self.intercept = 0.01
 
     def load(self):
@@ -56,13 +57,14 @@ class WalletScorer:
                 with open(self.params_file, "r") as f:
                     params = json.load(f)
                     ols = params["ols"]
-                    self.slope = ols.get("slope", 0.05)
+                    self.slope_vol = ols.get("slope_vol", 0.05)
+                    self.slope_price = ols.get("slope_price", 0.00)
                     self.intercept = ols.get("intercept", 0.01)
-                log.info(f"⚙️ Model Params Loaded: Slope={self.slope}, Intercept={self.intercept}")
+                log.info(f"⚙️ Model Params Loaded: Vol_Slope={self.slope_vol}, Price_Slope={self.slope_price}, Intercept={self.intercept}")
             except Exception as e:
                 log.error(f"Error loading model params: {e}")
 
-    def get_score(self, wallet_id: str, volume: float) -> float:
+    def get_score(self, wallet_id: str, volume: float, price: float) -> float:
         # Normalize input
         w_id = wallet_id.strip().lower()
         
@@ -89,7 +91,7 @@ class WalletScorer:
         # 2. FRESH WALLET HEURISTIC
         # NOTE: If you are testing with < $10 trades, this returns 0.0!
        
-        score = self.intercept + (self.slope * math.log1p(volume))
+        score = self.intercept + (self.slope_vol * math.log1p(volume)) + (self.slope_price * price)
         if volume > 1000:
             log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
         return score
@@ -136,10 +138,10 @@ class SignalEngine:
         self.trackers: Dict[str, Dict] = {}
 
     def process_trade(self, wallet: str, token_id: str, usdc_vol: float, total_vol: float,
-                      direction: float, scorer: WalletScorer) -> float:
+                      direction: float, price: float, scorer: WalletScorer) -> float:
         
         # 1. Get Score
-        score = scorer.get_score(wallet, usdc_vol)
+        score = scorer.get_score(wallet, usdc_vol, price)
 
         # Ignore bad traders rather than fade them
         #score = max(0.0, score)
