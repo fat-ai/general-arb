@@ -634,7 +634,7 @@ def main():
                               percent_drawdown = drawdown / result_map['performance']['peak_equity']
                               if round(percent_drawdown,3) * 100 > result_map['performance']['max_drawdown'][1]:
                                   result_map['performance']['max_drawdown'][1] = round(percent_drawdown,3) * 100
-                              calmar = min(result_map['performance']['pnl'] / result_map['performance']['max_drawdown'][1],1000000)
+                              calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][1], 0.0001),100000)
                               
                               result_map['performance']['Calmar'] = round(calmar,1)
                               
