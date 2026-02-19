@@ -583,6 +583,7 @@ def main():
                                 
                               result_map[mid]['id'] = mid
                               result_map[mid]['timestamp'] = t['timestamp']
+                              result_map[mid]['days'] = duration.days
                               result_map[mid]['signal'] = sig
                               result_map[mid]['verdict'] = verdict
                               result_map[mid]['price'] = t['price']
