@@ -547,7 +547,7 @@ def main():
                     # --- STRATEGY CALL ---
                     sig = engine.process_trade(
                         wallet=t['user'], token_id=m['id'], usdc_vol=vol, total_vol=cum_vol,
-                        direction=direction,
+                        direction=direction, price=t['price'],
                         scorer=scorer
                     )
 
@@ -555,7 +555,7 @@ def main():
 
                     if abs(sig) > 1 and t['price'] > 0.05 and t['price'] < 0.95:
                         if 'verdict' not in result_map[m['id']]:
-                          score = scorer.get_score(t['user'], vol)
+                          score = scorer.get_score(t['user'], vol, t['price'])
                           mid = m['id']
                           verdict = "WRONG!"
                           if result_map[mid]['outcome'] > 0:
