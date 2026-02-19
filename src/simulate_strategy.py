@@ -567,7 +567,7 @@ def main():
                                   verdict = "RIGHT!"
 
                           bet_size = 0.01 * result_map['performance']['equity']
-                          min_irr = 1.0
+                          min_irr = 2.0
 
                           if result_map[mid]['outcome'] > 0:
                               if bet_on == "yes":
