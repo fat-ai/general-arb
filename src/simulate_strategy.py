@@ -570,43 +570,42 @@ def main():
                           roi = profit / bet_size
                           duration = m_end - t['timestamp']
                           time_factor = duration.days / 365
-                          if roi / time_factor < min_irr: continue
-                                    
-                          if verdict == "WRONG!":
-                              roi = -1.00
-                              profit = -bet_size
-                            
-                          verdicts = (
-                                mr['verdict'] 
-                                for mr in result_map.values() 
-                                if "verdict" in mr
-                          )
-                            
-                          result_map[mid]['id'] = mid
-                          result_map[mid]['timestamp'] = t['timestamp']
-                          result_map[mid]['signal'] = sig
-                          result_map[mid]['verdict'] = verdict
-                          result_map[mid]['price'] = t['price']
-                          result_map[mid]['bet_on'] = bet_on
-                          result_map[mid]['direction'] = direction
-                          result_map[mid]['end'] = m_end
-                          result_map[mid]['user_score']=score
-                          result_map[mid]['total_vol']=cum_vol
-                          result_map[mid]['user_vol']=vol
-                          result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
-                          result_map[mid]['pnl'] = profit
-                          result_map[mid]['roi'] = roi
-                          result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
-                          result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
-                              
-                          counts = Counter(verdicts)
-                          rights = counts['RIGHT!']
-                          wrongs = counts['WRONG!']
-                          total_bets = rights + wrongs
-                          hit_rate = 100*(rights/total_bets)
-                          hit_rate = round(hit_rate,1)
-                          print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
-                    
+                          if roi / time_factor < min_irr:     
+                              if verdict == "WRONG!":
+                                  roi = -1.00
+                                  profit = -bet_size
+                                
+                              verdicts = (
+                                    mr['verdict'] 
+                                    for mr in result_map.values() 
+                                    if "verdict" in mr
+                              )
+                                
+                              result_map[mid]['id'] = mid
+                              result_map[mid]['timestamp'] = t['timestamp']
+                              result_map[mid]['signal'] = sig
+                              result_map[mid]['verdict'] = verdict
+                              result_map[mid]['price'] = t['price']
+                              result_map[mid]['bet_on'] = bet_on
+                              result_map[mid]['direction'] = direction
+                              result_map[mid]['end'] = m_end
+                              result_map[mid]['user_score']=score
+                              result_map[mid]['total_vol']=cum_vol
+                              result_map[mid]['user_vol']=vol
+                              result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
+                              result_map[mid]['pnl'] = profit
+                              result_map[mid]['roi'] = roi
+                              result_map['performance']['pnl'] = result_map['performance']['pnl'] + result_map[mid]['pnl']
+                              result_map['performance']['equity'] = result_map['performance']['equity'] + result_map[mid]['pnl']
+                                  
+                              counts = Counter(verdicts)
+                              rights = counts['RIGHT!']
+                              wrongs = counts['WRONG!']
+                              total_bets = rights + wrongs
+                              hit_rate = 100*(rights/total_bets)
+                              hit_rate = round(hit_rate,1)
+                              print(f"TRIGGER! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with rough total profit {result_map['performance']['pnl']}")
+                        
                     results.append({
                         "timestamp": t['timestamp'],
                         "id":  m['id'],
