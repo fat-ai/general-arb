@@ -125,7 +125,7 @@ def main():
                                      'equity': CONFIG["initial_capital"], 
                                      'cash': CONFIG["initial_capital"], 
                                      'peak_equity': CONFIG["initial_capital"], 
-                                     'max_drawdown': (0,0), 
+                                     'max_drawdown': [0,0], 
                                      'resolutions': [],
                                      'pnl': 0}
     
