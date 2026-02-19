@@ -501,6 +501,7 @@ def main():
                 ]).to_dicts()
                 
                 results = []
+                heartbeat = datetime.now()
                 for t in sim_rows:
                     cid = t['contract_id']
                     if cid not in market_map: continue
@@ -588,9 +589,11 @@ def main():
                           roi = profit / bet_size
                           duration = m_end - t['timestamp']
                           time_factor = max(duration.days,1) / 365
+                          
                           if result_map['performance']['cash'] < bet_size:  
                               result_map['performance']['ins_cash'] += 1
                               print("INSUFFICIENT CASH!" + " " + str(result_map['performance']['ins_cash']))
+                              
                           if roi / time_factor > min_irr: 
                               if result_map['performance']['cash'] > bet_size:
                                   if verdict == "WRONG!":
@@ -618,10 +621,10 @@ def main():
                                   result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
                                   result_map[mid]['pnl'] = profit
                                   result_map[mid]['roi'] = roi
+                                  result_map['resolutions'].append([m_end, profit, bet_size])
 
                     
                               previous_equity = result_map['performance']['equity'] 
-                              result_map['resolutions'].append([m_end, profit, bet_size])
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
                               now = t['timestamp']
@@ -635,12 +638,14 @@ def main():
                                     if result_map['performance']['pnl'] > 0:
                                         result_map['performance']['cash'] += res[2]
 
-                            # 2. Keep only the resolutions that are still in the future
                               result_map['resolutions'] = [
                                 res for res in result_map['resolutions'] 
                                 if res[0] >= now
                               ]
-                                  
+                              
+                      wait = heartbeat - now                  
+                      if wait.seconds > 10:
+                              heartbeat = now
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
                                   
