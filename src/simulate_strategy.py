@@ -558,7 +558,7 @@ def main():
                               else:
                                    profit = t['price']
                                    contracts = bet_size / (1 - t['price'])
-                          else: 
+                          else:
                               if bet_on == "no":
                                    profit = 1 - t['price']
                                    contracts = bet_size / t['price']
