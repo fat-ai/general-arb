@@ -123,15 +123,14 @@ def main():
         if market['id'] not in result_map:
             result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
-        result_map['performance'] = {'initial_capital': CONFIG["initial_capital"], 
-                                     'equity': CONFIG["initial_capital"], 
-                                     'cash': CONFIG["initial_capital"], 
-                                     'peak_equity': CONFIG["initial_capital"], 
-                                     'ins_cash': 0,
-                                     'max_drawdown': [0,0], 
-                                     'pnl': 0}
+    result_map['performance'] = { 'equity': CONFIG["initial_capital"], 
+                                 'cash': CONFIG["initial_capital"], 
+                                 'peak_equity': CONFIG["initial_capital"], 
+                                 'ins_cash': 0,
+                                 'max_drawdown': [0,0], 
+                                 'pnl': 0}
         
-        result_map['resolutions'] = []
+    result_map['resolutions'] = []
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     yes_count = sum(1 for m in market_map.values() if m['outcome_label'] == "yes")
@@ -589,7 +588,7 @@ def main():
                                    contracts = bet_size / execution_price
                               else:
                                    execution_price = t['price'] * (1 - slippage)
-                                   execution_price
+                                   profit = execution_price
                                    contracts = bet_size / (1 - execution_price)
 
                           profit = profit * contracts
@@ -624,6 +623,7 @@ def main():
                                   result_map[mid]['roi'] = roi
                                   result_map[mid]['slippage'] = slippage
                                   result_map['resolutions'].append([m_end, profit, bet_size])
+                                  result_map['performance']['cash'] -= bet_size
 
                               
                       now = t['timestamp']     
@@ -633,19 +633,17 @@ def main():
 
                               previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
-                              result_map['performance']['cash']-= bet_size
                               
                               for res in result_map['resolutions']:
                                 if res[0] <= now:
                                     result_map['performance']['pnl'] += res[1]
                                     result_map['performance']['equity'] += res[1]
                                     result_map['performance']['cash'] += res[1]
-                                    if result_map['performance']['pnl'] > 0:
-                                        result_map['performance']['cash'] += res[2]
+                                    result_map['performance']['cash'] += res[2]
 
                               result_map['resolutions'] = [
                                 res for res in result_map['resolutions'] 
-                                if res[0] >= now
+                                if res[0] > now
                               ]
                           
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
