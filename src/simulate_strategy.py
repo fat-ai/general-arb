@@ -570,7 +570,7 @@ def main():
                                   verdict = "RIGHT!"
 
                           bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
-                          min_irr = 2.0
+                          min_irr = 5.0
                           slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
                           
                           if result_map[mid]['outcome'] > 0:
@@ -624,13 +624,19 @@ def main():
                                   result_map[mid]['roi'] = roi
                                   result_map['resolutions'].append([m_end, profit, bet_size])
 
+                              
+                              
+                      wait = heartbeat - now                  
+                      if wait.seconds > 10 and len(result_map['resolutions']) > 0:
+                              heartbeat = now
+
                               previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
                               now = t['timestamp']
                               
                               for res in result_map['resolutions']:
-                                if res[0] < now:
+                                if res[0] <= now:
                                     result_map['performance']['pnl'] += res[1]
                                     result_map['performance']['equity'] += res[1]
                                     result_map['performance']['cash'] += res[1]
@@ -641,10 +647,7 @@ def main():
                                 res for res in result_map['resolutions'] 
                                 if res[0] >= now
                               ]
-                              
-                      wait = heartbeat - now                  
-                      if wait.seconds > 10 and len(result_map['resolutions']) > 0:
-                              heartbeat = now
+                          
                               if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                                   result_map['performance']['peak_equity'] = result_map['performance']['equity']
                                   
@@ -655,6 +658,7 @@ def main():
                               percent_drawdown = drawdown / result_map['performance']['peak_equity']
                               if round(percent_drawdown,3) * 100 > result_map['performance']['max_drawdown'][1]:
                                   result_map['performance']['max_drawdown'][1] = round(percent_drawdown,3) * 100
+                                  
                               calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001),100000)
                               
                               result_map['performance']['Calmar'] = round(calmar,1)
