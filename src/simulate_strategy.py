@@ -654,7 +654,7 @@ def main():
                               if drawdown > result_map['performance']['max_drawdown'][0]:
                                   result_map['performance']['max_drawdown'][0] = drawdown
                                   
-                              percent_drawdown = drawdown / result_map['performance']['peak_equity']
+                              percent_drawdown = drawdown / (result_map['performance']['equity'] + drawdown)
                               if round(percent_drawdown,3) * 100 > result_map['performance']['max_drawdown'][1]:
                                   result_map['performance']['max_drawdown'][1] = round(percent_drawdown,3) * 100
                                   
