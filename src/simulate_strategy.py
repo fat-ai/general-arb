@@ -624,11 +624,12 @@ def main():
                                   result_map[mid]['slippage'] = slippage
                                   result_map['resolutions'].append([m_end, profit, bet_size])
                                   result_map['performance']['cash'] -= bet_size
+                                  print(F"TRADE TRIGGERED! {result_map[mid]})
 
                               
                       now = t['timestamp']     
                       wait = heartbeat - now                  
-                      if wait.seconds > 10 and len(result_map['resolutions']) > 0:
+                      if wait.seconds > 60 and len(result_map['resolutions']) > 0:
                               heartbeat = now
 
                               previous_equity = result_map['performance']['equity'] 
@@ -673,7 +674,7 @@ def main():
                               total_bets = rights + wrongs
                               hit_rate = 100*(rights/total_bets)
                               hit_rate = round(hit_rate,1)
-                              print(f"RESULTS! {result_map[mid]}... hit rate = {hit_rate}% out of {total_bets} bets with performance {result_map['performance']}")
+                              print(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets with performance {result_map['performance']}")
                         
                     results.append({
                         "timestamp": t['timestamp'],
