@@ -622,6 +622,7 @@ def main():
                                   result_map[mid]['impact']= round(direction * score * (vol/cum_vol),1)
                                   result_map[mid]['pnl'] = profit
                                   result_map[mid]['roi'] = roi
+                                  result_map[mid]['slippage'] = slippage
                                   result_map['resolutions'].append([m_end, profit, bet_size])
 
                               
