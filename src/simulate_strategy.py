@@ -626,7 +626,7 @@ def main():
                                   result_map['resolutions'].append([m_end, profit, bet_size])
 
                               
-                              
+                      now = t['timestamp']     
                       wait = heartbeat - now                  
                       if wait.seconds > 10 and len(result_map['resolutions']) > 0:
                               heartbeat = now
@@ -634,7 +634,6 @@ def main():
                               previous_equity = result_map['performance']['equity'] 
                               result_map['performance']['resolutions'] = len(result_map['resolutions'])
                               result_map['performance']['cash']-= bet_size
-                              now = t['timestamp']
                               
                               for res in result_map['resolutions']:
                                 if res[0] <= now:
