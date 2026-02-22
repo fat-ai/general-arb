@@ -189,24 +189,49 @@ def main():
         print(f"{bin_name:<10} | {int(row['Count']):<6} | {row['Win_Rate']:.1%}  | {row['Mean_ROI']:>7.2%}   | {row['Median_ROI']:>8.2%}   | {row['Mean_Price']:>7.3f}")
     print("="*95)
 
-    # 9. OLS REGRESSION
-    print("\n📉 RUNNING REGULAR OLS REGRESSION...")
-    X = df['log_vol'].values
-    y = df['roi'].values
-    X_const = sm.add_constant(X)
+    # 9. OLS REGRESSION (Aligned with simulate_strategy.py)
+    print("\n📉 RUNNING MULTIPLE OLS REGRESSION (365-DAY WINDOW)...")
+    
+    # Ensure ts_date is a datetime type in pandas for filtering
+    df['ts_date'] = pd.to_datetime(df['ts_date'])
+    
+    # 1. Apply the 365-day cutoff
+    # In live data, the 'current sim day' is just the most recent trade in the dataset
+    max_date = df['ts_date'].max()
+    cutoff_date = max_date - pd.Timedelta(days=365)
+    df_recent = df[df['ts_date'] >= cutoff_date]
+    
+    print(f"Filtered to recent trades: {len(df_recent)} rows (Cutoff: {cutoff_date.date()})")
+
+    if len(df_recent) < 50:
+        print("❌ Not enough recent data for stable regression.")
+        return
+
+    # 2. Define multiple features: log_vol AND bet_price
+    X_features = df_recent[['log_vol', 'bet_price']]
+    y = df_recent['roi']
+    
+    # Add constant for the intercept
+    X_const = sm.add_constant(X_features)
     model_ols = sm.OLS(y, X_const)
     results_ols = model_ols.fit()
     
-    slope = results_ols.params[1]
-    intercept = results_ols.params[0]
+    # Extract all three parameters
+    intercept = results_ols.params['const']
+    slope_vol = results_ols.params['log_vol']
+    slope_price = results_ols.params['bet_price']
     
-    print(f"OLS Slope:     {slope:.8f}")
-    print(f"OLS Intercept: {intercept:.8f}")
-    print(f"P-Value:       {results_ols.pvalues[1]:.6f}")
+    print(f"OLS Intercept:   {intercept:.8f}")
+    print(f"OLS Vol Slope:   {slope_vol:.8f}")
+    print(f"OLS Price Slope: {slope_price:.8f}")
 
     # 10. SAVE RESULTS
     results = {
-        "ols": {"slope": slope, "intercept": intercept},
+        "ols": {
+            "intercept": intercept, 
+            "slope_vol": slope_vol,
+            "slope_price": slope_price
+        },
         "buckets": stats.to_dict('index')
     }
     
@@ -218,6 +243,7 @@ def main():
     with open(output_file, 'w') as f:
         json.dump(clean_keys(results), f, indent=4)
     print(f"\n✅ Saved audit stats to {output_file}")
+
 
 if __name__ == "__main__":
     main()
