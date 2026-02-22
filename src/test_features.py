@@ -9,25 +9,35 @@ LLM_FEATURES = {
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "ferrari", "corporate"
         ],
-        "cryptocurrency_markets": [
-            r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
-            "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
-            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
-            "ethereum volatility", "mainnet", "token", "crypto"
+        "consumer_prices_and_housing": [
+            "egg prices", "dozen eggs", "median home value", "house prices", 
+            "cost of living", "rental", "inflation rate", r"8\.0%", "gas price",
+            "housing market", "real estate", "price of"
         ],
-        "global_conflict_and_defense": [
-            "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
-            "israel", "iran", "attack", "invasion", "military", "defense", "war", 
-            "territory", "border", "ceasefire", "peace treaty", "geopolitics"
+        "cryptocurrency_governance": [
+            r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap", "proposal", 
+            "governance", "daos", "layer-2", "rollup", "blob", "gas price per blob",
+            "mainnet launch", "testnet", "ethereum volatility"
+        ],
+        "global_politics_executive": [
+            "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
+            r"\bbsw\b", "government", "cabinet", "michel barnier", "macron", "scholz", 
+            "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
+        ],
+        "niche_athletics_and_stunts": [
+            "hot dogs", "eating contest", "nick wehry", "joey chestnut", "diplo", 
+            "5k", "run club", "strava", "marathon", "personal best", "half marathon",
+            "fact check", "robin westman"
         ],
         "public_health_and_science": [
             "measles", "covid-19", "coronavirus", "vaccination", "vaccinated", 
             "cases", "cdc", r"\bwho\b", "pandemic", "variant", "outbreak", 
-            "fda approval", "medical trial", "science"
+            "fda approval", "medical trial", "doses", "approved"
         ],
-        "auto_racing": [
-            "f1", "formula 1", "grand prix", "ferrari", "constructor score", 
-            "lewis hamilton", "verstappen", "nascar", "paddock", "liam lawson"
+        "global_conflict_and_defense": [
+            "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
+            "israel", "iran", "attack", "invasion", "military", "defense", "war", 
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason"
         ],
         "social_media_and_speech": [
             "tweet", "post", "x account", "follower", "views", "say", "mention", 
@@ -50,7 +60,7 @@ LLM_FEATURES = {
         ],
         "baseball_mlb": [
             "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
-            "world series", "aaron judge", "shohei ohtani", "baseball"
+            "world series", "aaron judge", "shohei ohtani", "baseball", "reds"
         ],
         "tennis_matches": [
             r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
@@ -80,7 +90,7 @@ LLM_FEATURES = {
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
             "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
-            "polling", "debate", "trump", "biden", "harris", "politics"
+            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
@@ -88,11 +98,11 @@ LLM_FEATURES = {
         ]
     },
     "structural_tags": {
-        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire"],
-        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b"],
-        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50"],
+        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire", "before election day"],
+        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b", r"\b>\$\d\b", "under"],
+        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
         "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
-        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+"],
+        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
 }
