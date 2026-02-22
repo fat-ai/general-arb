@@ -200,28 +200,20 @@ def main():
             calculated = joined.with_columns([
                 (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
                 
-                # Payout Logic (Dual Long / Inversion)
-                pl.when(pl.col("token_index") == 1) # YES Token
-                  .then(
-                      (pl.col("qty_long") * pl.col("outcome")) + 
-                      (pl.col("qty_short") * (1.0 - pl.col("outcome")))
-                  )
-                  # NO Token (Inverted)
-                  .otherwise(
-                      (pl.col("qty_long") * (1.0 - pl.col("outcome"))) + 
-                      (pl.col("qty_short") * pl.col("outcome"))
-                  )
-                  .alias("payout")
+                # Unified payout matching simulate_strategy.py
+                ((pl.col("qty_long") * pl.col("outcome")) + 
+                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
+            ]).with_columns([
+                (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
             ])
             
             # Reduce to User Totals immediately
-            user_totals = calculated.group_by("user").agg([
-                (pl.col("payout") - pl.col("invested")).sum().alias("chunk_pnl"),
-                pl.col("invested").sum().alias("chunk_invested"),
-                pl.col("trade_count").sum().alias("chunk_trades")
+            user_contract = calculated.group_by(["user", "contract_id", "resolution_timestamp"]).agg([
+                pl.col("contract_pnl").sum().alias("contract_pnl"),
+                pl.col("invested").sum().alias("invested"),
+                pl.col("trade_count").sum().alias("trade_count")
             ])
-            
-            return user_totals
+            return user_contract
 
         # 2. Iterate and Aggregate
         agg_chunk_size = 1_000_000 
@@ -250,25 +242,28 @@ def main():
             # Intermediate Merge to save RAM
             if len(partial_results) > 5:
                 merged = pl.concat(partial_results)
-                compacted = merged.group_by("user").agg([
-                    pl.col("chunk_pnl").sum(),
-                    pl.col("chunk_invested").sum(),
-                    pl.col("chunk_trades").sum()
+
+                # Sort chronologically to simulate time-series progression
+                merged = merged.sort(["user", "resolution_timestamp"])
+                
+                # Calculate rolling cumulative metrics per user exactly like the simulator
+                user_history = merged.with_columns([
+                    pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
+                ]).with_columns([
+                    # Peak PnL has a floor of 0.0
+                    pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
+                ]).with_columns([
+                    # Drawdown = Peak - Current
+                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
                 ])
-                partial_results = [compacted]
-                gc.collect()
-
-        print(f"\n   Merging final partials...", flush=True)
-        
-        if not partial_results:
-            print("❌ No data found after aggregation.")
-            return
-
-        final_df = pl.concat(partial_results).group_by("user").agg([
-            pl.col("chunk_pnl").sum().alias("total_pnl"),
-            pl.col("chunk_invested").sum().alias("total_invested"),
-            pl.col("chunk_trades").sum().alias("total_trades")
-        ])
+                
+                # Aggregate to final metrics
+                final_df = user_history.group_by("user").agg([
+                    pl.col("contract_pnl").sum().alias("total_pnl"),
+                    pl.col("invested").sum().alias("total_invested"),
+                    pl.col("trade_count").sum().alias("total_trades"),
+                    pl.col("current_drawdown").max().alias("max_drawdown") # The deepest drawdown seen
+                ])
         
         # 3. Scoring
         print(f"   Scoring {final_df.height} unique users...", flush=True)
@@ -277,12 +272,14 @@ def main():
             (pl.col("total_trades") >= 2) & 
             (pl.col("total_invested") > 10.0) 
         ).with_columns([
-            (pl.col("total_pnl") / pl.col("total_invested")).alias("roi"),
-            (pl.col("total_trades").log(10) + 1 ).alias("vol_boost")
+            # Add a 1e-6 buffer to drawdown to prevent division by zero
+            (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
+            (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
         ]).with_columns([
-            (pl.col("roi") * pl.col("vol_boost")).alias("score")
+            # Cap Calmar at 5.0 and add ROI
+            (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
         ])
-
+        
         scored_df = scored_df.sort("score", descending=True)
 
         # 4. Save
