@@ -1,6 +1,3 @@
-import pandas as pd
-import re
-
 LLM_FEATURES = {
     "topic_categories": {
         "cryptocurrency_markets": [r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", "chainlink", "all-time high", "halving", "etf", "grayscale", "on-chain", "gas fee", "depeg", "market cap", "listing", "mainnet", "testnet", "airdrop", "snapshot", "hard fork", "layer-2", "staking", "usdc", r"\bmog\b", r"\bpepe\b", r"\bwif\b", r"\bbonk\b", r"\bshib\b", r"\bdoge\b", r"\bpopcat\b", r"\bbrett\b", "memecoin"],
@@ -28,38 +25,40 @@ LLM_FEATURES = {
     }
 }
 
-def run_diagnostics_v2(file_path):
-    print(f"📦 Loading Data from {file_path}...")
+import pandas as pd
+import re
+from tqdm import tqdm # Optional: run 'pip install tqdm' for a progress bar
+
+def run_diagnostics_turbo(file_path):
+    print(f"📦 Loading Data...")
     df = pd.read_parquet(file_path, columns=['id', 'question', 'description'])
     df = df.drop_duplicates(subset=['id']).copy()
     
-    # Pre-clean the text column for reliable matching
+    # 1. Vectorized concatenation and lowercasing (Fast)
     df['text'] = (df['question'].fillna('') + " " + df['description'].fillna('')).str.lower()
-    
     total_markets = len(df)
-    print(f"📊 Total Unique Markets: {total_markets}")
     
-    # 1. Compile the regex patterns with IGNORECASE
-    compiled_topics = {}
-    for cat, phrases in LLM_FEATURES['topic_categories'].items():
-        pattern = "|".join(phrases)
-        compiled_topics[cat] = re.compile(pattern, re.IGNORECASE)
+    # 2. Compile the patterns into raw strings
+    # We use raw strings for str.contains instead of pre-compiled objects
+    topic_patterns = {
+        cat: "|".join(phrases) 
+        for cat, phrases in LLM_FEATURES['topic_categories'].items()
+    }
     
-    print("🔍 Applying Regex Tags...")
+    print(f"🔍 Scanning {total_markets} markets across {len(topic_patterns)} categories...")
     
-    # 2. Vectorized check for each category
     df['has_topic'] = False
     topic_results = {}
-    
-    for category, pattern in compiled_topics.items():
-        # Using a list comprehension + re.search is often more reliable than Series.str.contains 
-        # when dealing with complex word boundaries in huge datasets
-        hits = df['text'].apply(lambda x: bool(pattern.search(x)))
+
+    # 3. Use vectorized .str.contains (Much faster)
+    for category, pattern in topic_patterns.items():
+        print(f"   -> Processing: {category}...")
+        # na=False handles nulls; regex=True enables the pattern matching
+        hits = df['text'].str.contains(pattern, regex=True, na=False)
         topic_results[category] = hits.sum()
-        df['has_topic'] = df['has_topic'] | hits
+        df['has_topic'] |= hits # Bitwise OR update
         
-    tagged_count = df['has_topic'].sum()
-    coverage_ratio = (tagged_count / total_markets) * 100
+    coverage_ratio = (df['has_topic'].sum() / total_markets) * 100
     
     print("\n" + "="*50)
     print(f"🎯 COVERAGE RESULTS (V6)")
