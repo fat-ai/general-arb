@@ -27,7 +27,6 @@ LLM_FEATURES = {
 
 import pandas as pd
 import re
-from tqdm import tqdm # Optional: run 'pip install tqdm' for a progress bar
 
 def run_diagnostics_turbo(file_path):
     print(f"📦 Loading Data...")
