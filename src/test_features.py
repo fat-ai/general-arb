@@ -20,7 +20,9 @@ LLM_FEATURES = {
             "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
-            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield"
+            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
+            r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",, "$", "£", "€". "¥",
+            "fear & greed index", "gold (gc)", "silver (si)", "crude oil (cl)"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -59,7 +61,7 @@ LLM_FEATURES = {
         "soccer_and_football": [
             "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
             "world cup", "la liga", "bundesliga", "fa cup", "mls", "win", "draw",
-            "fcsb", "west ham", "rangers", "man city", "soccer"
+            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20"
         ],
         "basketball_markets": [
             r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
@@ -87,7 +89,7 @@ LLM_FEATURES = {
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
-            "engaged", "married", "divorced", "album", "rotten tomatoes"
+            "engaged", "married", "divorced", "album", "rotten tomatoes", "bafta", "santa"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
@@ -99,7 +101,7 @@ LLM_FEATURES = {
         ],
         "weather_and_climate": [
             "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
-            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather"
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", "typhoon", "megaquake"
         ],
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
