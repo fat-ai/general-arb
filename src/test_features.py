@@ -87,7 +87,7 @@ LLM_FEATURES = {
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
-            "engaged", "married", "divorced", "album", "rotten tomatoes
+            "engaged", "married", "divorced", "album", "rotten tomatoes"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
