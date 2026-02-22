@@ -42,7 +42,7 @@ class LiveTrader:
             'triggers_count': 0,
             'scores': []  
         }
-        
+        self.cumulative_volumes: Dict[str, float] = {}
         self.ws_client = None
 
     async def start(self):
@@ -417,8 +417,6 @@ class LiveTrader:
                     'maker': maker,
                     'makerAssetId': asset_a_str, 
                     'takerAssetId': asset_b_str,
-                    # We pass the CORRECTED volume into one of the slots to ensure 
-                    # _process_batch reads it correctly later.
                     'makerAmountFilled': str(final_vol_raw), 
                     'takerAmountFilled': str(final_vol_raw) 
                 }
@@ -557,24 +555,69 @@ class LiveTrader:
             token_id = None
             usdc_vol = 0.0
             wallet = t['taker'] 
-            direction = 0
+            is_yes_token = (str(token_id) == tokens[1])
+
+            if is_yes_token:
+                direction = 1.0 if is_buy else -1.0
+            else:
+                direction = -1.0 if is_buy else 1.0
             
             # We now trust makerAmountFilled/takerAmountFilled are normalized to the MAX value
-            raw_vol = float(t['makerAmountFilled']) 
+            raw_maker = float(t['makerAmountFilled'])
+            raw_taker = float(t['takerAmountFilled'])
 
             if is_usdc(maker_asset):
                 token_id = taker_asset
-                usdc_vol = raw_vol / 1e6 
-                direction = -1.0 
+                usdc_vol = raw_maker / 1e6 
+                token_vol = raw_taker / 1e6
+                is_buy = False # Taker gave Token, received USDC (Sell)
             elif is_usdc(taker_asset):
                 token_id = maker_asset
-                usdc_vol = raw_vol / 1e6
-                direction = 1.0 
+                usdc_vol = raw_taker / 1e6
+                token_vol = raw_maker / 1e6
+                is_buy = True # Taker gave USDC, received Token (Buy)
             else:
                 skipped_counts["not_usdc"] += 1
                 continue
+                
+            # Calculate execution price 
+            price = usdc_vol / token_vol if token_vol > 0 else 0.5
 
-            score_debug = self.scorer.get_score(wallet, usdc_vol)
+            # Update cumulative volume
+            self.cumulative_volumes[fpmm] = self.cumulative_volumes.get(fpmm, 0.0) + usdc_vol
+            cum_vol = self.cumulative_volumes[fpmm]
+
+            # Fix the get_score call
+            score_debug = self.scorer.get_score(wallet, usdc_vol, price)
+
+            # Fix the process_trade call to match strategy.py signature exactly
+            raw_weight = self.signal_engine.process_trade(
+                wallet=wallet, 
+                token_id=token_id, 
+                usdc_vol=usdc_vol, 
+                total_vol=cum_vol, 
+                direction=direction, 
+                price=price,
+                scorer=self.scorer
+            )
+            
+            # Normalize exactly like simulate_strategy.py
+            normalized_weight = raw_weight / cum_vol if cum_vol > 0 else 0
+            
+            self.stats['scores'].append(normalized_weight)
+            batch_scores.append((abs(normalized_weight), normalized_weight, fpmm))
+
+            # Actions (Only check entry if price is within safe bounds)
+            if 0.05 < price < 0.95:
+                action = TradeLogic.check_entry_signal(normalized_weight)
+                
+                if action == 'SPECULATE':
+                    self.sub_manager.add_speculative(tokens)
+                elif action == 'BUY':
+                    if token_id not in self.pending_orders:
+                        self.pending_orders.add(token_id)
+                        asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
+                        
             if score_debug == 0.0:
                 print(f"❌ ZERO SCORE DEBUG | Wallet: {wallet} | Vol: ${usdc_vol:.2f} | In DB: {wallet in self.scorer.wallet_scores}")
 
