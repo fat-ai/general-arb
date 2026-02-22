@@ -542,30 +542,20 @@ class LiveTrader:
         skipped_counts = {"not_usdc": 0, "no_fpmm": 0, "no_tokens": 0}
 
         for t in trades:
-            # 1. Normalize Data
+            # 1. Normalize Address Data
             maker_asset = str(t['makerAssetId']).lower()
             taker_asset = str(t['takerAssetId']).lower()
             
-            # Fix USDC check
             target_usdc_hex = USDC_ADDRESS.lower()
             target_usdc_dec = str(int(target_usdc_hex, 16)) 
             def is_usdc(a): 
                 return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
 
-            token_id = None
-            usdc_vol = 0.0
-            wallet = t['taker'] 
-            is_yes_token = (str(token_id) == tokens[1])
-
-            if is_yes_token:
-                direction = 1.0 if is_buy else -1.0
-            else:
-                direction = -1.0 if is_buy else 1.0
-            
-            # We now trust makerAmountFilled/takerAmountFilled are normalized to the MAX value
+            wallet = t['taker']
             raw_maker = float(t['makerAmountFilled'])
             raw_taker = float(t['takerAmountFilled'])
 
+            # 2. Identify Token, USDC Volume, and Trade Side
             if is_usdc(maker_asset):
                 token_id = taker_asset
                 usdc_vol = raw_maker / 1e6 
@@ -580,17 +570,37 @@ class LiveTrader:
                 skipped_counts["not_usdc"] += 1
                 continue
                 
-            # Calculate execution price 
+            # 3. Calculate execution price 
             price = usdc_vol / token_vol if token_vol > 0 else 0.5
 
-            # Update cumulative volume
+            # 4. Fetch Market Metadata (Must be done BEFORE calculating direction)
+            fpmm = self.metadata.token_to_fpmm.get(str(token_id))
+            if not fpmm: 
+                skipped_counts["no_fpmm"] += 1
+                continue 
+            
+            tokens = self.metadata.fpmm_to_tokens.get(fpmm)
+            if not tokens: 
+                skipped_counts["no_tokens"] += 1
+                continue
+            
+            # 5. Determine Directionality (Using fetched tokens!)
+            is_yes_token = (str(token_id) == tokens[1])
+            if is_yes_token:
+                direction = 1.0 if is_buy else -1.0
+            else:
+                direction = -1.0 if is_buy else 1.0
+
+            # 6. Update Cumulative Volume (Using fetched fpmm!)
             self.cumulative_volumes[fpmm] = self.cumulative_volumes.get(fpmm, 0.0) + usdc_vol
             cum_vol = self.cumulative_volumes[fpmm]
 
-            # Fix the get_score call
+            # 7. Process Signal with WalletScorer
             score_debug = self.scorer.get_score(wallet, usdc_vol, price)
+            
+            if score_debug == 0.0 and usdc_vol > 100:
+                log.debug(f"ℹ️ ZERO SCORE | Wallet: {wallet} | Vol: ${usdc_vol:.2f}")
 
-            # Fix the process_trade call to match strategy.py signature exactly
             raw_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
                 token_id=token_id, 
@@ -601,13 +611,17 @@ class LiveTrader:
                 scorer=self.scorer
             )
             
-            # Normalize exactly like simulate_strategy.py
+            # 8. Normalize exactly like simulate_strategy.py
             normalized_weight = raw_weight / cum_vol if cum_vol > 0 else 0
             
             self.stats['scores'].append(normalized_weight)
             batch_scores.append((abs(normalized_weight), normalized_weight, fpmm))
 
-            # Actions (Only check entry if price is within safe bounds)
+            # 9. Smart Exits
+            if CONFIG.get('use_smart_exit'):
+                await self._check_smart_exits_for_market(fpmm, normalized_weight)
+
+            # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
@@ -617,50 +631,8 @@ class LiveTrader:
                     if token_id not in self.pending_orders:
                         self.pending_orders.add(token_id)
                         asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
-                        
-            if score_debug == 0.0:
-                print(f"❌ ZERO SCORE DEBUG | Wallet: {wallet} | Vol: ${usdc_vol:.2f} | In DB: {wallet in self.scorer.wallet_scores}")
 
-            fpmm = self.metadata.token_to_fpmm.get(str(token_id))
-            
-            if not fpmm: 
-                skipped_counts["no_fpmm"] += 1
-                continue 
-            
-            tokens = self.metadata.fpmm_to_tokens.get(fpmm)
-            if not tokens: 
-                skipped_counts["no_tokens"] += 1
-                continue
-            
-            is_yes_token = (str(token_id) == tokens[1])
-
-            # 3. Process Signal
-            new_weight = self.signal_engine.process_trade(
-                wallet=wallet, 
-                token_id=token_id, 
-                usdc_vol=usdc_vol, 
-                direction=direction, 
-                fpmm=fpmm, 
-                is_yes_token=is_yes_token, 
-                scorer=self.scorer
-            )
-            
-            self.stats['scores'].append(new_weight)
-            batch_scores.append((abs(new_weight), new_weight, fpmm))
-
-            # 4. Actions
-            if CONFIG['use_smart_exit']:
-                await self._check_smart_exits_for_market(fpmm, new_weight)
-
-            action = TradeLogic.check_entry_signal(new_weight)
-            
-            if action == 'SPECULATE':
-                self.sub_manager.add_speculative(tokens)
-            elif action == 'BUY':
-                if token_id not in self.pending_orders:
-                    self.pending_orders.add(token_id)
-                    asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
-
+        # End of Batch Summary
         if batch_scores:
             batch_scores.sort(key=lambda x: x[0], reverse=True)
             top_3 = batch_scores[:3]
