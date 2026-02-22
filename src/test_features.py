@@ -1,5 +1,6 @@
 LLM_FEATURES = {
     "topic_categories": {
+        "company_earnings": ["earnings"],
         "cryptocurrency_markets": [r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", "chainlink", "all-time high", "halving", "etf", "grayscale", "on-chain", "gas fee", "depeg", "market cap", "listing", "mainnet", "testnet", "airdrop", "snapshot", "hard fork", "layer-2", "staking", "usdc", r"\bmog\b", r"\bpepe\b", r"\bwif\b", r"\bbonk\b", r"\bshib\b", r"\bdoge\b", r"\bpopcat\b", r"\bbrett\b", "memecoin"],
         "combat_sports_mma": [r"\bufc\b", r"\bmma\b", "fight night", "main card", "prelims", "submission", "knockout", r"\btko\b", "decision", "unanimous", "split decision", "heavyweight", "lightweight", "featherweight", "bantamweight", "flyweight", "welterweight", "middleweight", r"\bvs\.\b", r"\bvs\b", "bellator", "pfl"],
         "weather_and_climate": ["temperature", "highest temperature", "lowest temperature", "degrees", "celsius", "fahrenheit", r"\d+°[cf]", "hurricane", "landfall", "named storm", "noaa", "nhc advisory", "rainfall", "inches of snow", "precipitation", "arctic sea ice", "natural disaster", "earthquake", "magnitude", "heat wave", "tsa passengers"],
