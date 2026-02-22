@@ -1,5 +1,11 @@
 LLM_FEATURES = {
     "topic_categories": {
+        "cryptocurrency_markets": [
+            r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
+            "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
+            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
+            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap"
+        ],
         "business_and_finance": [
             "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
