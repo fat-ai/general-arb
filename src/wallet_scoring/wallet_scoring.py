@@ -215,7 +215,7 @@ def main():
             ])
             return user_contract
 
-        # 2. Iterate and Aggregate
+        # 2. Iterate and Aggregate (Map-Reduce Phase)
         agg_chunk_size = 1_000_000 
         partial_results = []
         
@@ -238,34 +238,46 @@ def main():
             
             counter += 1
             print(f"   Aggregating chunk {counter}...", end='\r', flush=True)
-            
-            # Intermediate Merge to save RAM
-            if len(partial_results) > 5:
-                merged = pl.concat(partial_results)
 
-                # Sort chronologically to simulate time-series progression
-                merged = merged.sort(["user", "resolution_timestamp"])
-                
-                # Calculate rolling cumulative metrics per user exactly like the simulator
-                user_history = merged.with_columns([
-                    pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
-                ]).with_columns([
-                    # Peak PnL has a floor of 0.0
-                    pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
-                ]).with_columns([
-                    # Drawdown = Peak - Current
-                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
-                ])
-                
-                # Aggregate to final metrics
-                final_df = user_history.group_by("user").agg([
-                    pl.col("contract_pnl").sum().alias("total_pnl"),
-                    pl.col("invested").sum().alias("total_invested"),
-                    pl.col("trade_count").sum().alias("total_trades"),
-                    pl.col("current_drawdown").max().alias("max_drawdown") # The deepest drawdown seen
-                ])
+        print(f"\n   Global Merge and Temporal Tracking...", flush=True)
         
-        # 3. Scoring
+        # 3. Global Merge & Temporal Tracking
+        if not partial_results:
+            print("❌ No valid results to score.", flush=True)
+            return
+            
+        global_merged = pl.concat(partial_results)
+        
+        # 3a. Final squash in case a user-contract was split across two different chunks
+        global_merged = global_merged.group_by(["user", "contract_id", "resolution_timestamp"]).agg([
+            pl.col("contract_pnl").sum(),
+            pl.col("invested").sum(),
+            pl.col("trade_count").sum()
+        ])
+        
+        # 3b. Temporal Tracking (MUST BE DONE GLOBALLY)
+        # Sort chronologically to simulate time-series progression exactly like the simulator
+        global_merged = global_merged.sort(["user", "resolution_timestamp"])
+        
+        user_history = global_merged.with_columns([
+            pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
+        ]).with_columns([
+            # Peak PnL has a floor of 0.0
+            pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
+        ]).with_columns([
+            # Drawdown = Peak - Current
+            (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
+        ])
+        
+        # 3c. Aggregate to final user metrics
+        final_df = user_history.group_by("user").agg([
+            pl.col("contract_pnl").sum().alias("total_pnl"),
+            pl.col("invested").sum().alias("total_invested"),
+            pl.col("trade_count").sum().alias("total_trades"),
+            pl.col("current_drawdown").max().alias("max_drawdown") # The deepest drawdown seen globally
+        ])
+        
+        # 4. Scoring
         print(f"   Scoring {final_df.height} unique users...", flush=True)
         
         scored_df = final_df.filter(
