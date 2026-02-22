@@ -6,6 +6,12 @@ LLM_FEATURES = {
             "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
             "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap"
         ],
+        "motorsports": [
+            "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
+            "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
+            "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
+            "red bull racing", "indycar", "moto gp"
+        ]
         "business_and_finance": [
             "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
@@ -79,7 +85,7 @@ LLM_FEATURES = {
         ],
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
-            "billboard", "taylor swift", "spotify", "one direction", "reunion", "entertainment"
+            "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
