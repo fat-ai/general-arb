@@ -4,7 +4,8 @@ LLM_FEATURES = {
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
             "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
-            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap"
+            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
+            "bitcoin", "ethereum", "solana", "dogecoin"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -19,12 +20,12 @@ LLM_FEATURES = {
             "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
-            r"\bvix\b", "construction score", "ferrari", "corporate"
+            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
             "cost of living", "rental", "inflation rate", r"8\.0%", "gas price",
-            "housing market", "real estate", "price of"
+            "housing market", "real estate", "price of", "jobs"
         ],
         "cryptocurrency_governance": [
             r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap", "proposal", 
@@ -85,7 +86,8 @@ LLM_FEATURES = {
         ],
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
-            "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment"
+            "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
+            "engaged", "married", "divorced", "album"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
@@ -106,7 +108,7 @@ LLM_FEATURES = {
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
-            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing"
+            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
         ]
     },
     "structural_tags": {
