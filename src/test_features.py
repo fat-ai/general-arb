@@ -80,4 +80,4 @@ def run_diagnostics_turbo(file_path):
             print(f"- {str(row['question'])[:120]}...")
 
 if __name__ == "__main__":
-    run_diagnostics_v2("gamma_markets_all_tokens.parquet")
+    run_diagnostics_turbo("gamma_markets_all_tokens.parquet")
