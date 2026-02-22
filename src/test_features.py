@@ -22,7 +22,7 @@ LLM_FEATURES = {
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
             r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
-            "fear & greed index", "gold", "silver", "crude oil", "(gc)", "(si)", "(cl)"
+            "fear & greed index", "gold", "silver", "crude oil", "(gc)", "(si)", "(cl)
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -64,6 +64,7 @@ LLM_FEATURES = {
             "world cup", "la liga", "bundesliga", "fa cup", "mls", "win", "draw",
             "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20"
         ],
+        "olympics_and_world_records": ["gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", "swimming", "athletics", "gymnastics", "track and field"],
         "basketball_markets": [
             r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
             "college basketball", "triple-double", "points o/u", "lebron", "curry",
