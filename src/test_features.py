@@ -22,7 +22,7 @@ LLM_FEATURES = {
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
             r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b", "$", "£", "€", "¥",
-            "fear & greed index", "gold (gc)", "silver (si)", "crude oil (cl)"
+            "fear & greed index", "gold (gc)", "silver (si)", "crude oil (cl)", "$"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -52,7 +52,8 @@ LLM_FEATURES = {
         "global_conflict_and_defense": [
             "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
             "israel", "iran", "attack", "invasion", "military", "defense", "war", 
-            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason"
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", "putin", "zelensky", 
+            "netenyahu", "hamas" 
         ],
         "social_media_and_speech": [
             "tweet", "post", "x account", "follower", "views", "say", "mention", 
@@ -89,7 +90,7 @@ LLM_FEATURES = {
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
-            "engaged", "married", "divorced", "album", "rotten tomatoes", "bafta", "santa"
+            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
@@ -101,12 +102,12 @@ LLM_FEATURES = {
         ],
         "weather_and_climate": [
             "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
-            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", "typhoon", "megaquake"
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", "typhoon", "megaquake", "earthquake"
         ],
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
             "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
-            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff"
+            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
