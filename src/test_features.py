@@ -5,88 +5,71 @@ LLM_FEATURES = {
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
             "ceo", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
             "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
-            "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback"
-        ],
-        "commodities_and_energy": [
-            "gold", "silver", "crude oil", "brent", "wti", "natural gas", "uranium", 
-            "copper", "lithium", "barrel", "ounce", r"\boz\b", "spot price", 
-            "inventory", "production cut", "opec", "energy", "electricity", "fusion"
+            "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
+            "tax", "capital gains", "interest rate", "fed", "fomc"
         ],
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
-            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin"
+            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
+            "listing", "mainnet", "token"
         ],
-        "combat_sports_mma": [
-            r"\bufc\b", r"\bmma\b", "fight night", "main card", "prelims", "knockout", 
-            r"\btko\b", "decision", "heavyweight", "lightweight", r"\bvs\.\b", r"\bvs\b"
-        ],
-        "weather_and_climate": [
-            "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
-            r"\d+°[cf]", "hurricane", "landfall", "named storm", "noaa", "rainfall"
-        ],
-        "basketball_markets": [
-            r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
-            "college basketball", "triple-double", "points o/u", "lebron", "curry"
-        ],
-        "us_domestic_elections": [
-            "senate", "house of representatives", "congress", "presidential", 
-            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
-            "polling", "debate", "trump", "biden", "harris", "speech", "presser"
+        "social_media_and_speech": [
+            "tweet", "post", "x account", "follower", "views", "say", "mention", 
+            "quote", "presser", "elon musk", "mrbeast", "youtube", "social media",
+            "swearing-in", "ceremony", "attend"
         ],
         "soccer_and_football": [
             "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
-            "world cup", "la liga", "bundesliga", "fa cup", "mls", "stoppage time"
+            "world cup", "la liga", "bundesliga", "fa cup", "mls", "stoppage time",
+            "win", "draw", "match", "fixture", "fcsb", "west ham", "rangers", "man city",
+            "liverpool", "arsenal", "real madrid", "barcelona"
+        ],
+        "baseball_mlb": [
+            "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
+            "world series", "aaron judge", "shohei ohtani", "yankees", "dodgers", 
+            "reds", "at bat", "rbi"
+        ],
+        "combat_sports_mma": [
+            r"\bufc\b", r"\bmma\b", "fight night", "main card", "prelims", "knockout", 
+            r"\btko\b", "decision", "heavyweight", "lightweight", r"\bvs\.\b", r"\bvs\b",
+            "shkreli", "lina khan" # Celebrity 'fights' or appearances often follow this logic
+        ],
+        "basketball_markets": [
+            r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
+            "college basketball", "triple-double", "points o/u", "lebron", "curry",
+            "games total", "games o/u"
         ],
         "american_football": [
             r"\bnfl\b", "super bowl", "touchdown", "quarterback", "passing yards", 
             "rushing yards", "interception", "field goal", r"\bafc\b", r"\bnfc\b", 
-            "heisman", "bowl game", r"\bcfb\b", "spread:", "spread "
+            "heisman", "bowl game", r"\bcfb\b", "spread:", "spread ", "byu", "tcu"
         ],
-        "auto_racing": [
-            "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
-            "verstappen", "hamilton", "podium finish", "chequered flag"
+        "weather_and_climate": [
+            "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers"
+        ],
+        "us_domestic_elections": [
+            "senate", "house of representatives", "congress", "presidential", 
+            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
+            "polling", "debate", "trump", "biden", "harris", "election day", "mark robinson"
         ],
         "esports_and_gaming": [
             "league of legends", r"\bdota\b", r"\bcs:go\b", "counter-strike", 
-            "valorant", "esports", "liquipedia", "twitch", "first blood", "map 1"
-        ],
-        "macroeconomic_indicators": [
-            r"\bcpi\b", "inflation", "federal reserve", r"\bfed\b", "interest rate", 
-            r"\bfomc\b", "basis point", r"\bbps\b", "unemployment", "payrolls", 
-            r"\bgdp\b", "retail sales", "powell", "rate hike", "rate cut", "treasury"
+            "valorant", "esports", "liquipedia", "twitch", "first blood", "map", 
+            "total kills", "nexus", "avulus"
         ],
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
-            "rotten tomatoes", "billboard", "taylor swift", "mrbeast", "views"
-        ],
-        "aerospace_and_exploration": [
-            "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
-            "lunar", "mars", "satellite", "orbital", "booster", "iss", "payload"
-        ],
-        "geopolitics_and_conflict": [
-            "un security council", r"\bnato\b", "ceasefire", "military", "border", 
-            "sanctions", "treaty", r"\bbrics\b", "missile", "drone", "invasion"
-        ],
-        "artificial_intelligence": [
-            "openai", "chatgpt", "gpt-4", "gpt-5", "claude", "gemini", "anthropic", 
-            "nvidia", r"\bagi\b", "llm", "sam altman", "grok", "xai"
-        ],
-        "olympics_and_world_records": [
-            "gold", "silver", "bronze", "medal", "freestyle", "olympic", 
-            "world record", "swimming", "athletics", "gymnastics"
-        ],
-        "tennis_matches": [
-            r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
-            "us open", "australian open", "tiebreak", "straight sets", "djokovic"
+            "rotten tomatoes", "billboard", "taylor swift", "miss universe"
         ]
     },
     "structural_tags": {
-        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire"],
-        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b"],
-        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50"],
+        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire", "march 2026", "week 1"],
+        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b", r"\b5\+\b"],
+        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
         "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
-        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal"],
+        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
 }
