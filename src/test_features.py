@@ -3,9 +3,9 @@ LLM_FEATURES = {
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
-            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "doge", "memecoin",
+            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
             "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", "ethereum", "solana", "dogecoin"
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -22,7 +22,7 @@ LLM_FEATURES = {
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
             r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
-            "fear & greed index", "gold (gc)", "silver (si)", "crude oil (cl)"
+            "fear & greed index", "gold", "silver", "crude oil", "(gc)", "(si)", "(cl)"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -102,12 +102,14 @@ LLM_FEATURES = {
         ],
         "weather_and_climate": [
             "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
-            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", "typhoon", "megaquake", "earthquake"
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
+            "typhoon", "megaquake", "earthquake", "tsunami", "flooding"
         ],
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
             "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
-            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani"
+            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
+            "city council"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
