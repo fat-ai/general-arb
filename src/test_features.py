@@ -11,7 +11,7 @@ LLM_FEATURES = {
             "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
             "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
             "red bull racing", "indycar", "moto gp"
-        ]
+        ],
         "business_and_finance": [
             "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
