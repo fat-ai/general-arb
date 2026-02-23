@@ -54,7 +54,7 @@ LLM_FEATURES = {
             "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
             "israel", "iran", "attack", "invasion", "military", "defense", "war", 
             "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", "putin", "zelensky", 
-            "netenyahu", "hamas" 
+            "netenyahu", "hamas", "maduro"
         ],
         "social_media_and_speech": [
             "tweet", "post", "x account", "follower", "views", "say", "mention", 
@@ -65,7 +65,10 @@ LLM_FEATURES = {
             "world cup", "la liga", "bundesliga", "fa cup", "mls",
             "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
         ],
-        "olympics_and_world_records": ["gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", "swimming", "athletics", "gymnastics", "track and field"],
+        "olympics_and_world_records": [
+            "gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", 
+            "swimming", "athletics", "gymnastics", "track and field"
+        ],
         "basketball_markets": [
             r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
             "college basketball", "triple-double", "points o/u", "lebron", "curry",
@@ -78,16 +81,20 @@ LLM_FEATURES = {
         ],
         "baseball_mlb": [
             "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
-            "world series", "aaron judge", "shohei ohtani", "baseball", "reds"
+            "world series", "aaron judge", "shohei ohtani", "baseball", "reds", "baseball"
         ],
         "tennis_matches": [
             r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
             "us open", "australian open", "tiebreak", "straight sets", "tennis"
         ],
+        "hockey_match_outcomes": [
+            "overtime periods", "puck line", "stanley cup", r"\bnhl\b", 
+            "empty net goal", "power play goals", "shots on goal o/u", "first period winner", "total goals o/u"
+        ],
         "esports_and_gaming": [
             "league of legends", r"\bdota\b", r"\bcs:go\b", "counter-strike", 
             "valorant", "esports", "liquipedia", "twitch", "first blood", "map", 
-            "total kills", "nexus", "avulus", "percival", "gaming"
+            "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
         ],
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
