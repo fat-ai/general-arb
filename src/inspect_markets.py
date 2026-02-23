@@ -11,7 +11,7 @@ LLM_FEATURES = {
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
             "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
             "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
-            "red bull racing", "indycar", "moto gp"
+            "red bull racing", "indycar", "moto gp", "indy 500"
         ],
         "business_and_finance": [
             "earnings", "revenue", r"\beps\b", r"\bipo\b", "listing", "stock price", "shares", 
@@ -59,7 +59,7 @@ LLM_FEATURES = {
             "military strike", "airstrike", "drone strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b"
         ],
         "social_media_and_speech": [
-            "tweet", "post", "x account", "follower", "views", "say", "mention", 
+            "tweet", "post", "x account", "follower", "views", "say", "said", "mention", 
             "quote", "presser", "elon musk", "mrbeast", "youtube", "tiktok", "social media"
         ],
         "soccer_and_football": [
@@ -103,7 +103,8 @@ LLM_FEATURES = {
             "oscars", "grammy", r"\bemmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
-            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads"
+            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads", "pga awards",
+            "big brother", "vogue", "literature"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
@@ -126,7 +127,7 @@ LLM_FEATURES = {
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
-            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
+            r"\btko\b", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
         ]
     },
     "structural_tags": {
@@ -192,22 +193,41 @@ def display_results(results):
 def analyze_market(row):
     print(f"\n--- Analysis for ID: {row['id']} ---")
     print(f"Question: {row['question']}")
+    
+    # Safely get and truncate the description so it doesn't flood your screen
+    desc = str(row.get('description', ''))
+    print(f"Description: {textwrap.shorten(desc, width=200)}")
     print("-" * 30)
     
-    active_topics = []
+    active_topics = {}
     for cat, phrases in LLM_FEATURES['topic_categories'].items():
         pattern = "|".join(phrases)
-        if re.search(pattern, row['text'], re.IGNORECASE):
-            active_topics.append(cat)
+        # Find ALL matches in the combined text
+        matches = re.findall(pattern, row['text'], re.IGNORECASE)
+        if matches:
+            # Deduplicate the matches and store them
+            active_topics[cat] = list(set([m.lower() for m in matches]))
             
-    active_struct = []
+    active_struct = {}
     for tag, phrases in LLM_FEATURES['structural_tags'].items():
         pattern = "|".join(phrases)
-        if re.search(pattern, row['text'], re.IGNORECASE):
-            active_struct.append(tag)
+        matches = re.findall(pattern, row['text'], re.IGNORECASE)
+        if matches:
+            active_struct[tag] = list(set([m.lower() for m in matches]))
 
-    print(f"✅ DETECTED TOPICS: {', '.join(active_topics) if active_topics else 'NONE (Orphan)'}")
-    print(f"✅ DETECTED STRUCTURE: {', '.join(active_struct) if active_struct else 'NONE'}")
+    print("✅ DETECTED TOPICS & TRIGGERS:")
+    if active_topics:
+        for cat, triggers in active_topics.items():
+            print(f"  - {cat}  <- Triggered by: {triggers}")
+    else:
+        print("  - NONE (Orphan)")
+
+    print("\n✅ DETECTED STRUCTURE & TRIGGERS:")
+    if active_struct:
+        for tag, triggers in active_struct.items():
+            print(f"  - {tag}  <- Triggered by: {triggers}")
+    else:
+        print("  - NONE")
 
 if __name__ == "__main__":
     run_path = "gamma_markets_all_tokens.parquet"
