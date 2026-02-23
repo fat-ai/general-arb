@@ -7,7 +7,7 @@ LLM_FEATURES = {
     "topic_categories": {
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
-            "chainlink", "all-time high", "halving", r"\betf\b", "on-chain", "gas fee", 
+            "chainlink", "all-time high", "halving", "on-chain", "gas fee", 
             "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin", "tether", "usdc", "usdt",
             "mainnet", r"\btoken\b", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
             "bitcoin", r"\bbtc", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
