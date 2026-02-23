@@ -100,10 +100,10 @@ LLM_FEATURES = {
             "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
         ],
         "pop_culture_and_awards": [
-            "oscars", "grammys", r"\bemmy", "golden globe", "box office", "gross", 
+            "oscars", "grammy", r"\bemmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
-            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice"
+            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
