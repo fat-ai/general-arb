@@ -10,7 +10,7 @@ LLM_FEATURES = {
             "chainlink", "all-time high", "halving", "on-chain", "gas fee", 
             "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin", "tether", "usdc", "usdt",
             "mainnet", r"\btoken\b", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", r"\bbtc", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump\.fun"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
