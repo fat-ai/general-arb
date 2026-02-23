@@ -142,7 +142,8 @@ LLM_FEATURES = {
         "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
-}ef run_diagnostics_turbo(file_path):
+}
+def run_diagnostics_turbo(file_path):
     print(f"📦 Loading Data...")
     df = pd.read_parquet(file_path, columns=['id', 'question', 'description'])
     df = df.drop_duplicates(subset=['id']).copy()
