@@ -16,7 +16,7 @@ LLM_FEATURES = {
         "business_and_finance": [
             "earnings", "revenue", r"\beps\b", r"\bipo\b", "listing", "stock price", "shares", 
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
-            r"\bceo\b", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
+            r"\bceo\b", "layoffs", "antitrust", "lawsuit", "s&p 500", 
             "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", r"\bapple\b", "tesla", 
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
             r"\btax\b", "capital gains", "silver", r"\bsi\b", "volatility index", 
