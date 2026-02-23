@@ -1,16 +1,11 @@
-import pandas as pd
-import re
-import textwrap
-
-# 1. Load your existing LLM_FEATURES dictionary here
 LLM_FEATURES = {
     "topic_categories": {
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
-            "chainlink", "all-time high", "halving", r"\betf\b", "on-chain", "gas fee", 
+            "chainlink", "all-time high", "halving", "on-chain", "gas fee", 
             "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin", "tether", "usdc", "usdt",
             "mainnet", r"\btoken\b", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", r"\bbtc", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump\.fun"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -105,10 +100,10 @@ LLM_FEATURES = {
             "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
         ],
         "pop_culture_and_awards": [
-            "oscars", "grammys", r"\bemmy", "golden globe", "box office", "gross", 
+            "oscars", "grammy", r"\bemmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
-            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice"
+            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
@@ -138,6 +133,11 @@ LLM_FEATURES = {
         "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire", "before election day"],
         "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b", r"\b>\$\d\b", "under"],
         "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
+        "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
+        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
+        "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
+    }
+}       "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
         "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
         "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
