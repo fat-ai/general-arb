@@ -3,7 +3,142 @@ import re
 import textwrap
 
 # 1. Load your existing LLM_FEATURES dictionary here
-from sim_strat_ml import LLM_FEATURES 
+LLM_FEATURES = {
+    "topic_categories": {
+        "cryptocurrency_markets": [
+            r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
+            "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
+            "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
+            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid"
+        ],
+        "motorsports": [
+            "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
+            "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
+            "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
+            "red bull racing", "indycar", "moto gp"
+        ],
+        "business_and_finance": [
+            "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
+            "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
+            "ceo", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
+            "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
+            "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
+            "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
+            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
+            r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
+            "fear & greed index", "gold", "silver", "crude oil", "public sale", "auction", "delisted",
+            "billion", "trillion", "msci"
+        ],
+        "consumer_prices_and_housing": [
+            "egg prices", "dozen eggs", "median home value", "house prices", 
+            "cost of living", "rental", "inflation rate", r"8\.0%", "gas price",
+            "housing market", "real estate", "price of", "jobs"
+        ],
+        "cryptocurrency_governance": [
+            r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap", "proposal", 
+            "governance", "daos", "layer-2", "rollup", "blob", "gas price per blob",
+            "mainnet launch", "testnet", "ethereum volatility"
+        ],
+        "global_politics_executive": [
+            "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
+            r"\bbsw\b", "government", "cabinet", "michel barnier", "macron", "scholz", 
+            "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
+        ],
+        "niche_athletics_and_stunts": [
+            "hot dogs", "eating contest", "nick wehry", "joey chestnut", "diplo", 
+            "5k", "run club", "strava", "marathon", "personal best", "half marathon",
+            "fact check", "robin westman"
+        ],
+        "public_health_and_science": [
+            "measles", "covid-19", "coronavirus", "vaccination", "vaccinated", 
+            "cases", "cdc", r"\bwho\b", "pandemic", "variant", "outbreak", 
+            "fda approval", "medical trial", "doses", "approved"
+        ],
+        "global_conflict_and_defense": [
+            "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
+            "israel", "iran", "attack", "invasion", "military", "defense", "war", 
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", "putin", "zelensky", 
+            "netenyahu", "hamas", "maduro"
+        ],
+        "social_media_and_speech": [
+            "tweet", "post", "x account", "follower", "views", "say", "mention", 
+            "quote", "presser", "elon musk", "mrbeast", "youtube", "tiktok", "social media"
+        ],
+        "soccer_and_football": [
+            "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
+            "world cup", "la liga", "bundesliga", "fa cup", "mls",
+            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
+        ],
+        "olympics_and_world_records": [
+            "gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", 
+            "swimming", "athletics", "gymnastics", "track and field"
+        ],
+        "basketball_markets": [
+            r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
+            "college basketball", "triple-double", "points o/u", "lebron", "curry",
+            "basketball"
+        ],
+        "american_football": [
+            r"\bnfl\b", "super bowl", "touchdown", "quarterback", "passing yards", 
+            "rushing yards", "interception", "field goal", r"\bafc\b", r"\bnfc\b", 
+            "bowl game", "cfb", "alabama crimson tide", "ryan day", "head coach", "football"
+        ],
+        "baseball_mlb": [
+            "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
+            "world series", "aaron judge", "shohei ohtani", "baseball", "reds", "baseball"
+        ],
+        "tennis_matches": [
+            r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
+            "us open", "australian open", "tiebreak", "straight sets", "tennis"
+        ],
+        "hockey_match_outcomes": [
+            "overtime periods", "puck line", "stanley cup", r"\bnhl\b", 
+            "empty net goal", "power play goals", "shots on goal o/u", "first period winner", "total goals o/u"
+        ],
+        "esports_and_gaming": [
+            "league of legends", r"\bdota\b", r"\bcs:go\b", "counter-strike", 
+            "valorant", "esports", "liquipedia", "twitch", "first blood", "map", 
+            "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
+        ],
+        "pop_culture_and_awards": [
+            "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
+            "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
+            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa", "boy name", "girl name"
+        ],
+        "aerospace_and_exploration": [
+            "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
+            "lunar", "mars", "satellite", "orbital", "booster", "iss", "payload", "space"
+        ],
+        "artificial_intelligence": [
+            "openai", "chatgpt", "gpt-4", "gpt-5", "claude", "gemini", "anthropic", 
+            "nvidia", r"\bagi\b", "llm", "sam altman", "grok", "xai", "artificial intelligence"
+        ],
+        "weather_and_climate": [
+            "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
+            "typhoon", "megaquake", "earthquake", "tsunami", "flooding"
+        ],
+        "us_domestic_elections": [
+            "senate", "house of representatives", "congress", "presidential", 
+            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
+            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
+            "city council"
+        ],
+        "combat_sports_mma": [
+            r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
+            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
+        ]
+    },
+    "structural_tags": {
+        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire", "before election day"],
+        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b", r"\b>\$\d\b", "under"],
+        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
+        "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
+        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
+        "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
+    }
+}
 
 def inspect_tool(file_path):
     print(f"📦 Loading data...")
