@@ -139,7 +139,9 @@ LLM_FEATURES = {
     }
 }  
 
-import pandas as pd 
+import pandas as pd
+import re
+import textwrap
 
 def inspect_tool(file_path):
     print(f"📦 Loading data...")
