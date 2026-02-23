@@ -128,7 +128,7 @@ LLM_FEATURES = {
             "military strike", "airstrike", "drone strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b"
         ],
         "social_media_and_speech": [
-            "tweet", "post", "x account", "follower", "views", "say", "said", "mention", 
+            r"\btweet", r"\bpost\b", "x account", "follower", "views", "say", "said", "mention", 
             "quote", "presser", "elon musk", "mrbeast", "youtube", "tiktok", "social media"
         ],
         "soccer_and_football": [
