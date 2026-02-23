@@ -3,9 +3,14 @@ LLM_FEATURES = {
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
-            "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
-            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
+LLM_FEATURES = {
+    "topic_categories": {
+        "cryptocurrency_markets": [
+            r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
+            "chainlink", "all-time high", "halving", r"\betf\b", "on-chain", "gas fee", 
+            "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin", "tether", "usdc", "usdt",
+            "mainnet", r"\btoken\b", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
+            "bitcoin", r"\bbtc", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -14,16 +19,16 @@ LLM_FEATURES = {
             "red bull racing", "indycar", "moto gp"
         ],
         "business_and_finance": [
-            "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
+            "earnings", "revenue", r"\beps\b", r"\bipo\b", "listing", "stock price", "shares", 
             "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
-            "ceo", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
-            "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
+            r"\bceo\b", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
+            "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", r"\bapple\b", "tesla", 
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
-            "tax", "capital gains", "silver", r"\bsi\b", "volatility index", 
+            r"\btax\b", "capital gains", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "corporate", "treasury yield",
             r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
-            "fear & greed index", "gold", "crude oil", "public sale", "auction", "delisted",
-            "billion", "trillion", "msci", "recession", "spacex ipo"
+            "fear & greed index", "gold", "silver" "crude oil", "public sale", "auction", "delisted",
+            "billion", "trillion", r"\bmsci\b", "recession"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -31,9 +36,9 @@ LLM_FEATURES = {
             "housing market", "real estate", "price of", "jobs"
         ],
         "cryptocurrency_governance": [
-            r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap", "proposal", 
-            "governance", "daos", "layer-2", "rollup", "blob", "gas price per blob",
-            "mainnet launch", "testnet", "ethereum volatility"
+            r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap",  
+            "governance", r"\bdao\b", "layer-2", "rollup", r"\bblob\b", "gas price per blob",
+            "mainnet launch", "testnet"
         ],
         "global_politics_executive": [
             "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
@@ -42,21 +47,21 @@ LLM_FEATURES = {
             "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
         ],
         "niche_athletics_and_stunts": [
-            "hot dogs", "eating contest", "nick wehry", "joey chestnut", "diplo", 
-            "5k", "run club", "strava", "marathon", "personal best", "half marathon",
+            "hot dogs", "eating contest", "nick wehry", "joey chestnut", r"\bdiplo\b", 
+            r"\b5k\b", "run club", "strava", "marathon", "personal best", "half marathon",
             "fact check", "robin westman"
         ],
         "public_health_and_science": [
             "measles", "covid-19", "coronavirus", "vaccination", "vaccinated", 
-            "cases", "cdc", r"\bwho\b", "pandemic", "variant", "outbreak", 
-            "fda approval", "medical trial", "doses", "approved"
+            "cases", r"\bcdc\b", "pandemic", "variant", "outbreak", 
+            r"\bfda\b", "medical trial", "doses", "research", "health", "medication", "medicine", r"\bnhs\b"
         ],
         "global_conflict_and_defense": [
             "missile test", "missile launch", "north korea", r"\bdprk\b", 
-            "israel", "iran", "attack", "invasion", "military", "defense", "war", 
-            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", 
-            "putin", "zelensky", "zelenskyy", "netanyahu", "hamas", "maduro", 
-            "military strike", "airstrike", "drone strike", "gaza", "lebanon"
+            "israel", r"\biran\b", "attack", "invasion", "military", "defense", r"\bwar\b", 
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror", "treason", 
+            "putin", "zelensky", "zelenskyy", "netanyahu", r"\bhamas\b", "maduro", 
+            "military strike", "airstrike", "drone strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b"
         ],
         "social_media_and_speech": [
             "tweet", "post", "x account", "follower", "views", "say", "mention", 
@@ -100,14 +105,14 @@ LLM_FEATURES = {
             "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
         ],
         "pop_culture_and_awards": [
-            "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
+            "oscars", "grammys", r"\bemmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
-            "santa", "boy name", "girl name", "warner bros", "netflix"
+            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice"
         ],
         "aerospace_and_exploration": [
-            "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
-            "lunar", "mars", "satellite", "orbital", "booster", "iss", "payload", "space"
+            "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
+            "lunar", r"\bmars\b", "satellite", "orbital", "booster", r"\biss\b", "payload", "in space", "to space"
         ],
         "artificial_intelligence": [
             "openai", "chatgpt", "gpt-4", "gpt-5", "claude", "gemini", "anthropic", 
@@ -137,12 +142,7 @@ LLM_FEATURES = {
         "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
-}
-
-import pandas as pd
-import re
-
-def run_diagnostics_turbo(file_path):
+}ef run_diagnostics_turbo(file_path):
     print(f"📦 Loading Data...")
     df = pd.read_parquet(file_path, columns=['id', 'question', 'description'])
     df = df.drop_duplicates(subset=['id']).copy()
