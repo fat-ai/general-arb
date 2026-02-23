@@ -21,7 +21,7 @@ LLM_FEATURES = {
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
             r"\btax\b", "capital gains", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "corporate", "treasury yield",
-            r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
+            r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b", r"\byuan\b",
             "fear & greed index", "gold", "silver" "crude oil", "public sale", "auction", "delisted",
             "billion", "trillion", r"\bmsci\b", "recession"
         ],
