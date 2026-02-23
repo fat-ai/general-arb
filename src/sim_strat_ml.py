@@ -69,38 +69,140 @@ def reverse_file_chunk_generator(file_path, chunk_size=1024*1024*32):
 # 1. Paste the FINAL integrated LLM Dictionary (V5)
 LLM_FEATURES = {
     "topic_categories": {
-        "cryptocurrency_markets": ["btc/usdt 1 hour candle", "eth/usd data stream", "sol/usdt 1 minute candle", "xrp/usd data stream", "binance 1 minute candle", "chainlink data stream", "bitcoin up or down", "solana up or down", "ethereum network gas fee", "coinbase listing announcement", "crypto market capitalization", "tether usdt depeg", "btc/usd", "eth/usdt", "spot markets", "candle will be used", "binance close prices", "xrp up or down", "sol/usd", "coingecko price", "coinmarketcap data", "candlestick", "all-time high", "ethereum gas", "bitcoin halving", "trading volume", "spot etf", "coinbase listing", "on-chain", "smart contract", "binance spot", "coinbase pro", "ethereum price", "bitcoin price", "solana price", "all-time high btc", "candlestick close", "1h candle", "1d candle", "satoshi", "coingecko api", "bitcoin etf flows", "spot btc etf", "ethereum etf approval", "grayscale bitcoin trust", "gbtc outflows", "blackrock ishares", "fidelity wise origin", "ark 21shares", "sec etf approval", "spot ether etf", "exchange traded fund", "etf net inflows", "usdt pair", "1m candles", "spot exchange rate", "ethereum etf flows", "bitcoin etf outflows", "net asset value", "authorized participant", "aum growth", "s-1 registration", "19b-4 filing", "grayscale trust", "fiat gateway", "mainnet launch event", "testnet deployment phase", "airdrop snapshot block", "token generation event date", "network hard fork", "protocol upgrade implementation", "smart contract audit passed", "total value locked metric", "layer-2 scaling solution", "staking yield percentage"],
-        "us_domestic_elections": ["new jersey governor election", "associated press definitive call", "electoral college votes", "presidential nominee primary", "gubernatorial race winner", "senate majority control", "house of representatives seat", "voter turnout percentage", "republican national convention", "democratic national convention", "swing state polling average", "presidential election winner", "popular vote margin", "swing state outcome", "republican presidential nominee", "democratic presidential nominee", "house of representatives control", "gubernatorial race", "primary election results", "turkey pardon ceremony", "congressional hearing testimony", "supreme court ruling", "executive order signed", "state of the union address", "bill signed into law", "cabinet confirmation vote", "impeachment articles", "veto override", "filibuster rule change", "senate confirmation", "campaign finance", "presidential debate", "gubernatorial election", "primary ballot", "press conference announced", "swing states", "gop nominee", "democratic nominee", "iowa caucuses", "new hampshire primary", "super tuesday", "senate majority", "swing state polls", "electoral votes", "presidential debate stage", "inauguration day", "ballot access deadline", "national polling average", "early voting turnout", "senate confirmation hearing", "house of representatives floor", "speaker of the house gavel", "veto override vote", "bipartisan infrastructure bill", "budget reconciliation process", "congressional district map", "midterm election cycle", "committee subpoena"],
-        "global_sovereign_elections": ["prime minister of the united kingdom", "french national assembly election", "indian lok sabha majority", "european parliament seats", "canadian federal election", "australian federal election", "brazilian presidential runoff", "mexican general election winner", "south african anc majority", "german bundestag coalition", "japanese ldp leadership"],
-        "basketball_markets": ["nba game scheduled for", "western conference finals", "eastern conference finals", "nba finals mvp", "total points rebounds assists", "nba regular season mvp", "nba draft first overall", "lakers vs celtics", "three point field goals made", "flagrant foul assessed", "nba play-in tournament", "rebounds o/u", "assists during the game", "points o/u", "records more than", "steals plus blocks", "triple double", "first basket scorer", "turnovers o/u", "points plus rebounds", "combine to score", "over if the", "under if the", "total points", r"o/u 152\.5", r"o/u 239\.5", "combined total is less than", "total score including overtime", "first half total", "second half total", "1h spread", "win the game by", "cover the spread", "against the spread", "spread cover", "favorite to win by", "underdog to lose by less than", "point differential", "margin of victory", "alternative spread", "cbb game", "free throws", "three-pointers", "rebound total", "assists over", "playoff series", "march madness", "ncaa tournament", "shot clock", "buzzer beater", "nba game", "assists o/u", "triple-double", "lebron james", "stephen curry", "nikola jokic", "draymond green", "nba finals", "free throws made", "three-pointers made", "blocks o/u", "final four", "elite eight", "sweet sixteen", "college basketball rankings", "ap top 25 men's", "acc tournament", "big east tournament", "sec tournament", "wooden award", "triple-double recorded", "offensive rebounds gathered", "defensive rebounds secured", "assists per game average", "nba playoffs series", "three-point field goals made", "shot clock violation"],
-        "american_football": ["nfl game", "receiving yards", "passing touchdowns", "super bowl", "interception thrown", "rushing attempts", "field goal", "point spread", "afc championship", "nfc championship", "two-point conversion", "sack total", "fumble recovery", "super bowl lviii", "patrick mahomes", "passing yards o/u", "rushing touchdowns", "lombardi trophy", "nfl draft first overall", "aaron rodgers", "nfl regular season", "cfb game", "college football playoff", "cfp national championship", "heisman trophy", "sec championship game", "big ten championship", "rose bowl game", "sugar bowl", "orange bowl", "cotton bowl", "fiesta bowl", "peach bowl", "touchdown pass thrown", "rushing yards accumulated", "super bowl mvp", "field goal attempt made", "interception thrown by", "passing yards total", "point after touchdown converted", "two-point conversion successful", "quarterback sack recorded"],
-        "tennis_matches": ["wta", "atp tour", "grand slam", "australian open", "wimbledon", "tiebreak", "straight sets", "match tie-break", "double fault", "service game", "first serve percentage", "match o/u", "roland garros", "wta tour", "grand slam title", "wimbledon final", "us open tennis", "set 1 winner", "tiebreak in match", "straight sets victory", "novak djokovic", "carlos alcaraz", "iga swiatek"],
-        "baseball_mlb_markets": ["official final score published on mlb.com", "number of innings completed", "world series champion", "american league pennant", "national league pennant", "mlb home run derby", "cy young award winner", "mlb regular season mvp", "shohei ohtani home runs", "strikeouts recorded by starting pitcher", "mlb wild card series"],
-        "soccer_and_football": ["africa cup of nations game", "uefa champions league final", "fifa world cup winner", "english premier league title", "la liga championship", "copa america knockout stage", "ballon d'or recipient", "total goals scored o/u", "yellow cards issued", "penalty kick awarded", "var review overturn", "first 90 minutes of regular play", "stoppage time", "premier league match", "la liga fixture", "goals scored by", "yellow cards drawn", "corner kicks awarded", "penalty shootout result", "clean sheet kept", "mls soccer", "champions league", "red card", "var decision", "fa cup", "bundesliga", "uefa", "serie a standings", "fifa world cup", "ballon d'or", "combine to score 4 or more goals", "fa cup final", "lionel messi", "cristiano ronaldo", "striker to score"],
-        "hockey_match_outcomes": ["overtime periods and shootouts", "puck line", "stanley cup playoffs", "nhl regular season", "goals scored in regulation", "empty net goal", "power play goals", "shots on goal o/u", "first period winner", "total goals o/u", "penalty kill", "faceoff win", "hat trick", "goaltender save", "icing call", "blue line", "nhl game", "power play goal", "empty netter", "connor mcdavid", "auston matthews", "vezina trophy", "hart memorial trophy", "nhl eastern conference", "nhl western conference", "nhl game scheduled", "overtime periods considered", "stanley cup finals", "puck line spread", "penalty kill percentage", "faceoff win rate", "empty net goal scored", "goals against average", "shootout winner"],
-        "golf_championships": ["baycurrent classic", "pga tour event", "masters tournament green jacket", "us open golf championship", "the open championship claret jug", "pga championship winner", "ryder cup points", "hole in one recorded", "cut line score", "fedex cup playoffs", "liv golf invitational", "liv riyadh event", "myrtle beach classic", "bogey free", "fairways hit", "greens in regulation", "stroke play", "sudden death playoff", "tee time"],
-        "macroeconomic_indicators": ["consumer price index cpi release", "federal reserve interest rate decision", "fomc meeting statement", "basis point rate hike", "us inflation rate yoy", "nonfarm payrolls report bls", "bureau of labor statistics data", "us gdp growth rate annualized", "ecb interest rate announcement", "bank of england base rate", "unemployment rate percentage", "cpi print", "inflation rate release", "nonfarm payrolls report", "unemployment rate data", "gdp growth estimate", "retail sales figures", "consumer sentiment index", "producer price index", "jobless claims weekly", "wage growth percentage", "interest rate cut", "basis points hike", "jerome powell press conference", "federal funds rate target", "quantitative tightening", "dot plot projections", "discount window rate", "balance sheet runoff", "emergency rate decision", "sovereign debt", "recession declaration", "treasury yield", "central bank", "cpi report", "consumer price index", "federal reserve rate cut", "basis points bps", "inflation rate yoy", "jerome powell speech", "fed funds rate", "fomc meeting minutes", "gross domestic product", "jobless claims report", "inflation targeting"],
-        "corporate_actions": ["earnings report release", "revenue estimate beat", "eps miss", "stock split announcement", "merger acquisition closure", "dividend yield change", "share buyback program", "ceo resignation", "bankruptcy filing chapter", "ipo pricing", "q1 earnings report", "q2 earnings report", "q3 earnings report", "q4 earnings report", "merger and acquisition", "antitrust lawsuit", "initial public offering ipo", "revenue guidance"],
-        "social_media_metrics": ["post counter figure", "xtracker.io data", "youtube video views", "twitter followers count", "instagram likes total", "tiktok follower growth", "elon musk tweet replies", "trending topic hashtag", "channel subscriber milestone", "retweet volume"],
-        "pop_culture_and_awards": ["box office opening weekend gross", "academy award for best picture", "grammy award for album of the year", "spotify global top 50 chart", "youtube 24 hour view count", "billboard hot 100 number one", "oscars best actor nominee", "emmy award outstanding drama", "rotten tomatoes critics consensus", "metacritic average critic score", "golden globe winner", "domestic box office totals", "worldwide gross revenue", "rotten tomatoes audience score", "streaming viewership hours", "box office mojo data", "theatrical release date", "box office gross", "grammy nomination", "emmy winner", "film festival", "ticket sales", "time person of the year", "best picture oscar", "golden globes", "emmy awards", "taylor swift eras tour", "mcu phase", "academy awards", "oscar for best picture", "grammy for album of the year", "emmy nominations announced", "golden globe recipient", "box office gross revenue", "opening weekend sales", "rotten tomatoes critic score", "metacritic rating average", "academy award winner"],
-        "aerospace_and_exploration": ["spacex starship orbital launch attempt", "nasa artemis mission schedule", "falcon 9 launch success", "james webb space telescope image", "isro chandrayaan lunar mission", "crewed mission to mars timeline", "blue origin new shepard flight", "virgin galactic commercial spaceflight", "lunar lander touchdown confirmation", "international space station crew rotation", "orbital payload deployment", "orbit reached successfully", "falcon 9 booster landing", "nasa mission crew", "international space station docking", "lunar surface landing", "mars rover deployment", "satellite deployment confirmed", "suborbital flight completed", "rocket stage separation", "orbital insertion", "iss resupply", "booster recovery", "satellite constellation", "nasa artemis", "super heavy booster", "orbital flight test", "orbital space launch", "low earth orbit reached", "payload successfully deployed", "crewed mars mission", "lunar landing module", "international space station docked", "starship super heavy", "rocket booster recovered", "splashdown confirmed"],
-        "climate_and_weather": ["national hurricane center nhc advisory", "saffir-simpson hurricane wind scale category", "noaa global surface temperature", "world meteorological organization wmo report", "hottest year on record confirmation", "atlantic hurricane season named storms", "category 5 hurricane landfall", "arctic sea ice minimum extent", "celsius above pre-industrial levels", "el nino southern oscillation enso", "usgs earthquake magnitude", "temperature anomaly", "rainfall total", "wildfire containment", "carbon emissions", "sea level rise", "heat wave", "tornado warning", "polar vortex", "drought index", "noaa hurricane prediction", "saffir-simpson scale", "named storm", "cat 5 hurricane", "heatwave record", "record high temperature", "national weather service", "hurricane category classification", "maximum sustained winds", "landfall location coordinates", "celsius temperature anomaly", "atmospheric pressure millibars", "millimetres of rainfall", "tropical cyclone path", "heat wave duration", "drought condition index"],
-        "geopolitics_and_conflict": ["un security council resolution vote", "nato article 5 invocation", "ceasefire agreement officially signed", "territorial control of region", "deployment of foreign military forces", "international criminal court arrest warrant", "geneva convention violation accusation", "diplomatic relations normalized agreement", "bilateral peace treaty ratification", "un general assembly emergency session", "economic sanctions imposed", "intercepted missile", "surface-to-air", "municipality territory", "border skirmish", "military aid", "drone strike", "peace treaty", "naval blockade", "troop deployment", "un security council resolution", "nato membership", "bilateral treaty", "g7 summit", "brics expansion", "border dispute", "israeli military", "law enforcement personnel", "physically board any vessel", "demilitarized zone", "ground invasion", "diplomatic relations severed", "peace treaty signed", "armed conflict escalation"],
-        "artificial_intelligence": ["openai gpt-5 public release", "anthropic claude model update", "google gemini ultra access", "apple mixed reality headset launch", "nvidia earnings report revenue beat", "artificial general intelligence agi achieved", "turing test passed conclusively", "sam altman ceo tenure", "open source llm parameter count", "chatgpt plus active subscribers", "ai regulatory legislation passed", "grok 4.20", "xai", "gpt-4", "openai api", "benchmark score", "open source release", "language model", "context window", "agi prediction", "compute cluster", "neural network", "openai chatgpt", "gpt-5 release", "google gemini advanced", "llm benchmark", "nvidia h100", "ai safety summit", "transformer model parameters"],
-        "legal_and_judicial": ["supreme court of the united states scotus opinion", "criminal indictment unsealed document", "guilty verdict formally reached", "department of justice doj lawsuit filing", "sec vs ripple labs ruling", "federal judge injunction granted", "extradition treaty officially invoked", "class action lawsuit final settlement", "appeals court overturns decision", "temporary restraining order tro issued", "subpoena compliance deadline", "scotus decision", "majority opinion authored", "strike down legislation", "writ of certiorari", "dissenting opinion filed", "federal appellate court", "criminal trial verdict", "grand jury indictment", "plea deal accepted", "preliminary injunction granted"],
-        "esports_and_gaming": ["league of legends world championship final", "cs:go major tournament grand final", "dota 2 the international aegis", "valorant champions tour vct winner", "twitch peak concurrent viewership", "steam concurrent players all-time record", "the game awards goty recipient", "call of duty league cdl championship", "evo championship series top 8", "overwatch league grand finals mvp", "rocket league championship series rlcs", "liquipedia.net", "sofascore.com/esports", "maps in this series", "league of legends match", "cs:go tournament", "dota 2 international", "first blood drawn", "baron nashor killed", "towers destroyed", "best of three series", "counter-strike match", "map 2", "valorant", "bomb plant", "hltv rating", "frag total", "major championship", "map advantage secured", "dragon soul claimed", "defuse the bomb", "plant the c4", "nexus destroyed", "best-of-five series format", "upper bracket finals"]
+        "cryptocurrency_markets": [
+            r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
+            "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
+            "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
+            "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid"
+        ],
+        "motorsports": [
+            "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
+            "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
+            "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
+            "red bull racing", "indycar", "moto gp"
+        ],
+        "business_and_finance": [
+            "earnings", "revenue", "eps", "ipo", "listing", "stock price", "shares", 
+            "dividend", "split", "acquisition", "merger", "bankruptcy", "chapter 11",
+            "ceo", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
+            "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
+            "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
+            "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
+            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
+            r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
+            "fear & greed index", "gold", "silver", "crude oil", "public sale", "auction", "delisted",
+            "billion", "trillion", "msci"
+        ],
+        "consumer_prices_and_housing": [
+            "egg prices", "dozen eggs", "median home value", "house prices", 
+            "cost of living", "rental", "inflation rate", r"8\.0%", "gas price",
+            "housing market", "real estate", "price of", "jobs"
+        ],
+        "cryptocurrency_governance": [
+            r"\beip-\d+\b", "hard fork", "upgrade", "vitalik", "roadmap", "proposal", 
+            "governance", "daos", "layer-2", "rollup", "blob", "gas price per blob",
+            "mainnet launch", "testnet", "ethereum volatility"
+        ],
+        "global_politics_executive": [
+            "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
+            r"\bbsw\b", "government", "cabinet", "michel barnier", "macron", "scholz", 
+            "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
+        ],
+        "niche_athletics_and_stunts": [
+            "hot dogs", "eating contest", "nick wehry", "joey chestnut", "diplo", 
+            "5k", "run club", "strava", "marathon", "personal best", "half marathon",
+            "fact check", "robin westman"
+        ],
+        "public_health_and_science": [
+            "measles", "covid-19", "coronavirus", "vaccination", "vaccinated", 
+            "cases", "cdc", r"\bwho\b", "pandemic", "variant", "outbreak", 
+            "fda approval", "medical trial", "doses", "approved"
+        ],
+        "global_conflict_and_defense": [
+            "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
+            "israel", "iran", "attack", "invasion", "military", "defense", "war", 
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", "putin", "zelensky", 
+            "netenyahu", "hamas", "maduro"
+        ],
+        "social_media_and_speech": [
+            "tweet", "post", "x account", "follower", "views", "say", "mention", 
+            "quote", "presser", "elon musk", "mrbeast", "youtube", "tiktok", "social media"
+        ],
+        "soccer_and_football": [
+            "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
+            "world cup", "la liga", "bundesliga", "fa cup", "mls",
+            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
+        ],
+        "olympics_and_world_records": [
+            "gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", 
+            "swimming", "athletics", "gymnastics", "track and field"
+        ],
+        "basketball_markets": [
+            r"\bnba\b", r"\bwnba\b", r"\bncaa\b", "march madness", "final four", 
+            "college basketball", "triple-double", "points o/u", "lebron", "curry",
+            "basketball"
+        ],
+        "american_football": [
+            r"\bnfl\b", "super bowl", "touchdown", "quarterback", "passing yards", 
+            "rushing yards", "interception", "field goal", r"\bafc\b", r"\bnfc\b", 
+            "bowl game", "cfb", "alabama crimson tide", "ryan day", "head coach", "football"
+        ],
+        "baseball_mlb": [
+            "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
+            "world series", "aaron judge", "shohei ohtani", "baseball", "reds", "baseball"
+        ],
+        "tennis_matches": [
+            r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
+            "us open", "australian open", "tiebreak", "straight sets", "tennis"
+        ],
+        "hockey_match_outcomes": [
+            "overtime periods", "puck line", "stanley cup", r"\bnhl\b", 
+            "empty net goal", "power play goals", "shots on goal o/u", "first period winner", "total goals o/u"
+        ],
+        "esports_and_gaming": [
+            "league of legends", r"\bdota\b", r"\bcs:go\b", "counter-strike", 
+            "valorant", "esports", "liquipedia", "twitch", "first blood", "map", 
+            "total kills", "nexus", "avulus", "percival", "gaming", "most kills"
+        ],
+        "pop_culture_and_awards": [
+            "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
+            "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
+            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa", "boy name", "girl name"
+        ],
+        "aerospace_and_exploration": [
+            "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
+            "lunar", "mars", "satellite", "orbital", "booster", "iss", "payload", "space"
+        ],
+        "artificial_intelligence": [
+            "openai", "chatgpt", "gpt-4", "gpt-5", "claude", "gemini", "anthropic", 
+            "nvidia", r"\bagi\b", "llm", "sam altman", "grok", "xai", "artificial intelligence"
+        ],
+        "weather_and_climate": [
+            "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
+            r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
+            "typhoon", "megaquake", "earthquake", "tsunami", "flooding"
+        ],
+        "us_domestic_elections": [
+            "senate", "house of representatives", "congress", "presidential", 
+            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
+            "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
+            "city council"
+        ],
+        "combat_sports_mma": [
+            r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
+            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
+        ]
     },
     "structural_tags": {
-        "is_time_bound": [r"by \d{1,2}:\d{2} [ap]m et", r"between \d{1,2}:\d{2} [ap]m and", "on the date specified in the title", r"scheduled for [a-z]+ \d{1,2}", "prior to the deadline", "end of the time range specified", "1 hour candle that begins on", "for the month specified", "by eoy", "before 11:59 pm", "end of the time range", "first 90 minutes", "scheduled for", "by the end of", "prior to the start of", "within the first", r"delayed beyond \d+ days", "deadline of", "no later than", r"within \d+ hours", "date without a winner", r"before (?:january|february|march|april|may|june|july|august|september|october|november|december)", r"by (?:january|february|march|april|may|june|july|august|september|october|november|december)", r"end of (?:january|february|march|april|may|june|july|august|september|october|november|december)", "on or before", "expires on", "will resolve on", "before the end of"],
-        "is_comparative": ["greater than or equal to", "higher than the price specified", "lower than the price specified", r"more than \d+", r"fewer than \d+", r"o/u \d+\.5", r"over/under \d+\.5", "total kills in game", "finish ahead of", "exceeds", "falls below", "higher than", "at least", "less than", "outscore", "finish above", "surpass", "exceed", "or fewer", "or more", r"by \d+ or more", r"score \d+ or more", r"at least \d+", "outperforms", "beats", "surpasses"],
-        "is_conditional_cancellation": ["otherwise,? it will resolve to", "if the listed player withdraws", "is disqualified", "otherwise becomes unable to achieve", "if the game is postponed", "remains open until completed", "in the event of a tie", 'will resolve to "no" immediately', "if the candidate drops out", "resolve to 50-50", "match is canceled", "game is postponed", "delayed beyond 7 days", "started but not completed", "voided if the", "refunded if the event", "does not play in the game", "canceled entirely", "no make-up game", "forfeiture, disqualification, or walkover", "ends in a tie", "mathematically eliminated", "not played at all", "clinches the match early", "begins but is not completed", "eliminated or otherwise has no path to victory", "if the match is concluded before", "listed as inactive", "will remain open until", "resolve 50-50", "otherwise, this market will resolve", "if the match is canceled", "if no winner is announced", "if the reported value falls", "unless specifically stated", "provided that"],
-        "is_source_dependent": ["resolution source for this market", "information from chainlink", "official final score published on", "data stream available at", r"associated press \(?ap\)? first makes", "according to the official rules", "definitive call of a winner", "scoring procedures of the", "published by the federal reserve", "consensus of credible reporting", "official information from", "public announcements from", "resolution source will be", "according to the official", "data stream from", "reporting by reputable", "confirmed by multiple sources", "statistics provided by", "specifically the", "verified by", "according to binance", "data for that candle", "official website", "used as the resolution", "based on data from", "published by the", "official statistics", "displayed at the top", "official website of", "data provided by", "api endpoint"],
-        "is_binary_direction": ['resolve to "up"', 'resolve to "down"', 'resolve to "yes"', 'resolve to "no"', "up or down", "yes or no", "close price is greater than", "final high price equal to", "above the price specified", "higher or lower", "greater than or equal to", "resolve to over if", "resolve to under if", "resolve to yes if", "resolve to no if", "price at the end of"],
-        "is_quantitative_bracket": ["exactly between two brackets", "higher range bracket", "lower range bracket", "inclusive of the bounds", "falls exactly on the boundary", "rounded to the nearest", "margin of error", "decimal places", "or less", "falls exactly between", "maximum of", "minimum of", "up to and including", "exactly", "bracket"],
-        "is_event_exclusive": ["explicitly about the", "occur outside of", "regardless of context", "regardless of whether", "will not qualify", "will not be sufficient", "refers only to the outcome within", "does not count toward", "not according to other sources", "solely based on"]
+        "is_time_bound": [r"by \d{4}", r"by (?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", "deadline", "expire", "before election day"],
+        "is_comparative": ["higher than", "greater than", "more than", "fewer than", "above", "below", r"\bo/u\b", r"\b>\$\d\b", "under"],
+        "is_conditional_resolution": ["otherwise", "postponed", "canceled", "tie", "void", "refund", "50-50", "draw"],
+        "is_source_dependent": ["source", "official", "according to", "data stream", "chainlink", "confirmed by"],
+        "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
+        "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
 }
-
 # 2. Pre-compile Regexes for speed
 COMPILED_REGEXES = {}
 DYNAMIC_FEATURE_NAMES = []
