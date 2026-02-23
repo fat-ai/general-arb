@@ -3,7 +3,7 @@ LLM_FEATURES = {
         "cryptocurrency_markets": [
             r"\bbtc\b", r"\beth\b", r"\bsol\b", r"\bxrp\b", "binance", "coinbase", 
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
-            "depeg", "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
+            "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
             "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
             "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid"
         ],
