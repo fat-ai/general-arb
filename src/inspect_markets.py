@@ -137,7 +137,9 @@ LLM_FEATURES = {
         "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
-}      
+}  
+
+import pandas as pd 
 
 def inspect_tool(file_path):
     print(f"📦 Loading data...")
