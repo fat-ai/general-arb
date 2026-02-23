@@ -22,7 +22,8 @@ LLM_FEATURES = {
             "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
             r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
             r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
-            "fear & greed index", "gold", "silver", "crude oil",
+            "fear & greed index", "gold", "silver", "crude oil", "public sale", "auction", "delisted",
+            "billion", "trillion", "msci"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -91,7 +92,7 @@ LLM_FEATURES = {
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
-            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa"
+            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa", "boy name", "girl name"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
