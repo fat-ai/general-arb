@@ -138,6 +138,8 @@ LLM_FEATURES = {
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
 }
+import pandas as pd
+
 def run_diagnostics_turbo(file_path):
     print(f"📦 Loading Data...")
     df = pd.read_parquet(file_path, columns=['id', 'question', 'description'])
