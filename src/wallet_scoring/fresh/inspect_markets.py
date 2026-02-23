@@ -10,7 +10,7 @@ LLM_FEATURES = {
             "chainlink", "all-time high", "halving", "etf", "on-chain", "gas fee", 
             "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin",
             "mainnet", "token", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid"
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump.fun"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -24,11 +24,11 @@ LLM_FEATURES = {
             "ceo", "resignation", "layoffs", "antitrust", "lawsuit", "s&p 500", 
             "nasdaq", "dow jones", r"\bspy\b", r"\bqqq\b", "nvidia", "apple", "tesla", 
             "microsoft", "google", "meta", "amazon", "guidance", "market cap", "buyback",
-            "tax", "capital gains", "gas price", "silver", r"\bsi\b", "volatility index", 
-            r"\bvix\b", "construction score", "ferrari", "corporate", "treasury yield",
-            r"\beur\b", r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
-            "fear & greed index", "gold", "silver", "crude oil", "public sale", "auction", "delisted",
-            "billion", "trillion", "msci"
+            "tax", "capital gains", "silver", r"\bsi\b", "volatility index", 
+            r"\bvix\b", "construction score", "corporate", "treasury yield",
+            r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b",
+            "fear & greed index", "gold", "crude oil", "public sale", "auction", "delisted",
+            "billion", "trillion", "msci", "recession", "spacex ipo"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -43,6 +43,7 @@ LLM_FEATURES = {
         "global_politics_executive": [
             "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
             r"\bbsw\b", "government", "cabinet", "michel barnier", "macron", "scholz", 
+            "friedrich merz", "merz", "keir starmer", "starmer",
             "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
         ],
         "niche_athletics_and_stunts": [
@@ -56,10 +57,11 @@ LLM_FEATURES = {
             "fda approval", "medical trial", "doses", "approved"
         ],
         "global_conflict_and_defense": [
-            "missile test", "missile launch", "north korea", r"\bdprk\b", "strike", 
+            "missile test", "missile launch", "north korea", r"\bdprk\b", 
             "israel", "iran", "attack", "invasion", "military", "defense", "war", 
-            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", "putin", "zelensky", 
-            "netenyahu", "hamas", "maduro"
+            "territory", "border", "ceasefire", r"\bpkk\b", "terror list", "treason", 
+            "putin", "zelensky", "zelenskyy", "netanyahu", "hamas", "maduro", 
+            "military strike", "airstrike", "drone strike", "gaza", "lebanon"
         ],
         "social_media_and_speech": [
             "tweet", "post", "x account", "follower", "views", "say", "mention", 
@@ -71,7 +73,8 @@ LLM_FEATURES = {
             "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
         ],
         "olympics_and_world_records": [
-            "gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", 
+            "gold medal", "win gold", "silver medal", "win silver", "bronze medal", "win bronze", 
+            "medal", "freestyle", "olympic", "world record", 
             "swimming", "athletics", "gymnastics", "track and field"
         ],
         "basketball_markets": [
@@ -86,7 +89,7 @@ LLM_FEATURES = {
         ],
         "baseball_mlb": [
             "mlb", "home run", "batter", "pitcher", "innings", "strikeout", 
-            "world series", "aaron judge", "shohei ohtani", "baseball", "reds", "baseball"
+            "world series", "aaron judge", "shohei ohtani", "baseball", "reds"
         ],
         "tennis_matches": [
             r"\batp\b", r"\bwta\b", "grand slam", "wimbledon", "roland garros", 
@@ -104,7 +107,8 @@ LLM_FEATURES = {
         "pop_culture_and_awards": [
             "oscars", "grammys", "emmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
-            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", "santa", "boy name", "girl name"
+            "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
+            "santa", "boy name", "girl name", "warner bros", "netflix"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", "nasa", "artemis", "blue origin", 
@@ -123,7 +127,7 @@ LLM_FEATURES = {
             "senate", "house of representatives", "congress", "presidential", 
             "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
             "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
-            "city council"
+            "city council", "jd vance", "tim walz"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
