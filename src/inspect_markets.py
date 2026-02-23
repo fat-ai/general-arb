@@ -117,17 +117,17 @@ LLM_FEATURES = {
         "weather_and_climate": [
             "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
             r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
-            "typhoon", "megaquake", "earthquake", "tsunami", "flooding"
+            "typhoon", "megaquake", "earthquake", "tsunami", "flooding", r"\bsnow\b"
         ],
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
-            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
+            "republican primary", "democrat primary", "democratic primary", "gop primary", "nominee", "nominate", r"\bgop\b", "democrat", "republican", "swing state", 
             "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
             "city council", "jd vance", "tim walz"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
-            r"\btko\b", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
+            r"\btko\b", "heavyweight", "boxing", "fight", "round"
         ]
     },
     "structural_tags": {
