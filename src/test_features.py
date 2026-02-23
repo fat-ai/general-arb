@@ -11,7 +11,7 @@ LLM_FEATURES = {
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
             "verstappen", "hamilton", "leclerc", "paddock", "podium finish", 
             "chequered flag", "constructor score", "ferrari", "mclaren", "mercedes",
-            "red bull racing", "indycar", "moto gp"
+            "red bull racing", "indycar", "moto gp", "indy 500"
         ],
         "business_and_finance": [
             "earnings", "revenue", r"\beps\b", r"\bipo\b", "listing", "stock price", "shares", 
@@ -59,7 +59,7 @@ LLM_FEATURES = {
             "military strike", "airstrike", "drone strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b"
         ],
         "social_media_and_speech": [
-            "tweet", "post", "x account", "follower", "views", "say", "mention", 
+            "tweet", "post", "x account", "follower", "views", "say", "said", "mention", 
             "quote", "presser", "elon musk", "mrbeast", "youtube", "tiktok", "social media"
         ],
         "soccer_and_football": [
@@ -103,7 +103,8 @@ LLM_FEATURES = {
             "oscars", "grammy", r"\bemmy", "golden globe", "box office", "gross", 
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
-            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads"
+            r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads", "pga awards",
+            "big brother", "vogue", "literature"
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
@@ -116,17 +117,17 @@ LLM_FEATURES = {
         "weather_and_climate": [
             "temperature", "highest temperature", "degrees", "celsius", "fahrenheit", 
             r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
-            "typhoon", "megaquake", "earthquake", "tsunami", "flooding"
+            "typhoon", "megaquake", "earthquake", "tsunami", "flooding", r"\bsnow\b"
         ],
         "us_domestic_elections": [
             "senate", "house of representatives", "congress", "presidential", 
-            "primary", "nominee", r"\bgop\b", "democrat", "republican", "swing state", 
+            "republican primary", "democrat primary", "democratic primary", "gop primary", "nominee", "nominate", r"\bgop\b", "democrat", "republican", "swing state", 
             "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
             "city council", "jd vance", "tim walz"
         ],
         "combat_sports_mma": [
             r"\bufc\b", r"\bmma\b", "fight night", "main card", "knockout", 
-            r"\btko\b", "decision", "heavyweight", r"\bvs\.\b", r"\bvs\b", "boxing", "fight", "round"
+            r"\btko\b", "heavyweight", "boxing", "fight", "round"
         ]
     },
     "structural_tags": {
@@ -137,7 +138,7 @@ LLM_FEATURES = {
         "is_quantitative_bracket": ["exactly", "between", "bracket", "range", "rounded", "margin", "decimal", r"\d+-\d+", r"\d+k and \d+k"],
         "is_event_exclusive": ["solely", "explicitly", "regardless", "not count", "exclusive"]
     }
-}  
+} 
 
 import pandas as pd
 
