@@ -62,8 +62,8 @@ LLM_FEATURES = {
         ],
         "soccer_and_football": [
             "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
-            "world cup", "la liga", "bundesliga", "fa cup", "mls", "win", "draw",
-            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20"
+            "world cup", "la liga", "bundesliga", "fa cup", "mls",
+            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
         ],
         "olympics_and_world_records": ["gold", "silver", "bronze", "medal", "freestyle", "olympic", "world record", "swimming", "athletics", "gymnastics", "track and field"],
         "basketball_markets": [
