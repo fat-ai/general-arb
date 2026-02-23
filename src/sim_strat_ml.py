@@ -74,7 +74,7 @@ LLM_FEATURES = {
             "chainlink", "all-time high", "halving", "on-chain", "gas fee", 
             "airdrop", "staking", r"\bmog\b", r"\bpepe\b", "memecoin", "tether", "usdc", "usdt",
             "mainnet", r"\btoken\b", r"\beip-\d+\b", "vitalik", "blockchain", "uniswap", 
-            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "polymarket", "pump\.fun"
+            "bitcoin", "ethereum", "solana", "dogecoin", "hyperliquid", "pump\.fun"
         ],
         "motorsports": [
             "grand prix", r"\bf1\b", "nascar", "formula 1", "liam lawson", 
@@ -92,7 +92,7 @@ LLM_FEATURES = {
             r"\bvix\b", "construction score", "corporate", "treasury yield",
             r"\busd\b", r"\bgbp\b", r"\beur\b", r"\byen\b", r"\byuan\b",
             "fear & greed index", "gold", "silver" "crude oil", "public sale", "auction", "delisted",
-            "billion", "trillion", r"\bmsci\b", "recession"
+            "billion", "trillion", r"\bmsci\b", "recession", "federal reserve", r"\bfomc\b"
         ],
         "consumer_prices_and_housing": [
             "egg prices", "dozen eggs", "median home value", "house prices", 
@@ -108,7 +108,7 @@ LLM_FEATURES = {
             "prime minister", "chancellor", "coalition", r"\bcdu/csu\b", r"\bspd\b", 
             r"\bbsw\b", "government", "cabinet", "michel barnier", "macron", "scholz", 
             "friedrich merz", "merz", "keir starmer", "starmer",
-            "narendra modi", "thailand", "parliament", "swearing-in", "lina khan"
+            "narendra modi", "thailand", "parliament", "swearing-in", "lina khan", "by-election"
         ],
         "niche_athletics_and_stunts": [
             "hot dogs", "eating contest", "nick wehry", "joey chestnut", r"\bdiplo\b", 
@@ -125,7 +125,8 @@ LLM_FEATURES = {
             "israel", r"\biran\b", "attack", "invasion", "military", "defense", r"\bwar\b", 
             "territory", "border", "ceasefire", r"\bpkk\b", "terror", "treason", 
             "putin", "zelensky", "zelenskyy", "netanyahu", r"\bhamas\b", "maduro", 
-            "military strike", "airstrike", "drone strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b"
+            "strike", r"\bgaza\b", "lebanon", r"\bisis\b", r"\bisil\b", "drone",
+            "hezbollah", "diplomatic"
         ],
         "social_media_and_speech": [
             r"\btweet", r"\bpost\b", "x account", "follower", "views", "say", "said", "mention", 
@@ -134,7 +135,7 @@ LLM_FEATURES = {
         "soccer_and_football": [
             "premier league", "champions league", r"\buefa\b", r"\bfifa\b", 
             "world cup", "la liga", "bundesliga", "fa cup", "mls",
-            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b"
+            "fcsb", "west ham", "rangers", "man city", "soccer", "euro 20", "messi", r"\bfc\b", "ligue 1"
         ],
         "olympics_and_world_records": [
             "gold medal", "win gold", "silver medal", "win silver", "bronze medal", "win bronze", 
@@ -173,7 +174,7 @@ LLM_FEATURES = {
             "billboard", "taylor swift", "pregnant", "spotify", "one direction", "reunion", "entertainment", 
             "engaged", "married", "marry", "divorce", "album", "rotten tomatoes", "bafta", 
             r"\bsanta\b", "boy name", "girl name", "warner bros", "netflix", "critics choice", "good reads", "pga awards",
-            "big brother", "vogue", "literature"
+            "big brother", "vogue", "literature", "sing for", "eurovision", 
         ],
         "aerospace_and_exploration": [
             "spacex", "starship", "falcon 9", r"\bnasa\b", "artemis", "blue origin", 
@@ -188,7 +189,7 @@ LLM_FEATURES = {
             r"\d+°[cf]", "hurricane", "landfall", "noaa", "rainfall", "tsa passengers", "weather", 
             "typhoon", "megaquake", "earthquake", "tsunami", "flooding", r"\bsnow\b"
         ],
-        "us_domestic_elections": [
+        "us_domestic_politics": [
             "senate", "house of representatives", "congress", "presidential", 
             "republican primary", "democrat primary", "democratic primary", "gop primary", "nominee", "nominate", r"\bgop\b", "democrat", "republican", "swing state", 
             "polling", "debate", "trump", "biden", "harris", "politics", "adam schiff", "mayor", "mamdani",
