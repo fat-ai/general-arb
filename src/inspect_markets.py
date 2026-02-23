@@ -196,7 +196,7 @@ def analyze_market(row):
     
     # Safely get and truncate the description so it doesn't flood your screen
     desc = str(row.get('description', ''))
-    print(f"Description: {textwrap.shorten(desc, width=200)}")
+    print(f"Description: {desc}")
     print("-" * 30)
     
     active_topics = {}
