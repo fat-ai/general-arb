@@ -558,7 +558,7 @@ def main():
                     sig = sig / cum_vol
 
                     if abs(sig) > 1 and t['price'] > 0.05 and t['price'] < 0.95:
-                      if 'verdict' not in result_map[m['id']]:
+                      if 'verdict' not in result_map[m['id']] and m_end < datetime.now():
                           score = scorer.get_score(t['user'], vol, t['price'])
                           mid = m['id']
                           verdict = "WRONG!"
