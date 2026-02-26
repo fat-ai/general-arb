@@ -436,49 +436,43 @@ class DataFetcher:
             return seg_captured
 
         total_captured = 0
-        
-        
-            
+           
         # PHASE 1: NEWER DATA
         if existing_high_ts:
-                if global_stop_ts > existing_high_ts:
-                    print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    with open(temp_file, 'w', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-                        writer.writeheader()
-                        count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
-                        total_captured += count
-            
-                    # Prepend: rename cache -> old, rename temp -> cache, stream old into cache, delete old
-                    old_cache = cache_file.with_suffix(".old.csv")
-                    os.rename(cache_file, old_cache)
-                    os.rename(temp_file, cache_file)
-                    with open(cache_file, 'a', newline='') as f_new, open(old_cache, 'r') as f_old:
-                        f_old.readline()  # skip header
-                        shutil.copyfileobj(f_old, f_new)
-                    os.remove(old_cache)
-                else:
-                    print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
-            
-        # PHASE 3: OLDER DATA (append directly)
-        if existing_low_ts:
-                if existing_low_ts > global_start_cursor:
-                    print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                    with open(cache_file, 'a', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-                        count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
-                        total_captured += count
-                else:
-                    print(f"\n📜 PHASE 3: Skipped (Existing Tail covers request)")
-            
-            elif not existing_high_ts:
-                # PHASE 0: Full fresh download
-                print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                with open(cache_file, 'w', newline='') as f:
+            if global_stop_ts > existing_high_ts:
+                print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
+                with open(temp_file, 'w', newline='') as f:
                     writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
                     writer.writeheader()
-                    count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
+                    count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
                     total_captured += count
+                old_cache = cache_file.with_suffix(".old.csv")
+                os.rename(cache_file, old_cache)
+                os.rename(temp_file, cache_file)
+                with open(cache_file, 'a', newline='') as f_new, open(old_cache, 'r') as f_old:
+                    f_old.readline()
+                    shutil.copyfileobj(f_old, f_new)
+                os.remove(old_cache)
+            else:
+                print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
+
+        # PHASE 3: OLDER DATA (append directly)
+        if existing_low_ts:
+            if existing_low_ts > global_start_cursor:
+                print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
+                with open(cache_file, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+                    count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
+                    total_captured += count
+            else:
+                print(f"\n📜 PHASE 3: Skipped (Existing Tail covers request)")
+        elif not existing_high_ts:
+            print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
+            with open(cache_file, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+                writer.writeheader()
+                count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
+                total_captured += count
 
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
         return pd.DataFrame()
