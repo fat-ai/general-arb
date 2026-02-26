@@ -437,12 +437,10 @@ class DataFetcher:
 
         total_captured = 0
         
-        with open(temp_file, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-            writer.writeheader()
+        
             
-            # PHASE 1: NEWER DATA
-            if existing_high_ts:
+        # PHASE 1: NEWER DATA
+        if existing_high_ts:
                 if global_stop_ts > existing_high_ts:
                     print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
                     with open(temp_file, 'w', newline='') as f:
@@ -462,8 +460,8 @@ class DataFetcher:
                 else:
                     print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
             
-            # PHASE 3: OLDER DATA (append directly)
-            if existing_low_ts:
+        # PHASE 3: OLDER DATA (append directly)
+        if existing_low_ts:
                 if existing_low_ts > global_start_cursor:
                     print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
                     with open(cache_file, 'a', newline='') as f:
