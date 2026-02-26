@@ -89,7 +89,8 @@ class DataFetcher:
                                     ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
                                     if time_filter_func(ts):
                                         stop_signal = True; continue
-                                except: pass
+                                except Exception as e:
+                                    log.warning(f"Failed to parse a time from c_date: {c_date}")
                             if not stop_signal: valid_batch.append(r)
                         
                         local_rows.extend(valid_batch)
@@ -130,7 +131,8 @@ class DataFetcher:
             raw = row.get('clobTokenIds') or row.get('tokens')
             if isinstance(raw, str):
                 try: raw = json.loads(raw)
-                except: pass
+                except:
+                     log.warning(f"Failed to parse json from {raw})
             if isinstance(raw, list):
                 clean_tokens = []
                 for t in raw:
@@ -149,7 +151,8 @@ class DataFetcher:
             val = row.get('outcome')
             if pd.notna(val):
                 try: return float(str(val).replace('"', '').strip())
-                except: pass
+                except:
+                     log.warning(f"Failed to parse value from {val}")
             prices = row.get('outcomePrices')
             if prices:
                 try:
@@ -158,7 +161,8 @@ class DataFetcher:
                         p_floats = [float(p) for p in prices]
                         for i, p in enumerate(p_floats):
                             if p >= 0.95: return float(i)
-                except: pass
+                except:
+                    log.warning(f"Failed to derive outcome from {prices}"
             return np.nan 
 
         new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
@@ -228,7 +232,8 @@ class DataFetcher:
                     elif s.startswith("0x"): val = int(s, 16)
                     else: val = int(Decimal(s))
                 valid_token_ints.add(val)
-            except: continue
+            except: 
+                log.warning(f"Failed to parse token from {t}")
             
         print(f"🎯 Global Fetcher targets: {len(valid_token_ints)} valid numeric IDs.")
         if not valid_token_ints: return pd.DataFrame()
@@ -239,7 +244,9 @@ class DataFetcher:
                 if ts_obj.tz is None:
                     ts_obj = ts_obj.tz_localize('UTC')
                 return ts_obj.timestamp()
-            except: return 0.0
+            except: 
+                log.warning("Failed to parse timestamp from {iso_str}"
+                return 0.0
 
         def get_csv_bounds(filepath):
             """Memory-safe read of first and last timestamps."""
@@ -280,14 +287,14 @@ class DataFetcher:
                     for line in reversed(lines):
                         if not line.strip(): continue
                         try:
-                            # Quick parse of last line
                             row = list(csv.reader([line]))[0]
                             if len(row) > 1:
                                 t = parse_iso_to_ts(row[1])
                                 if t > 0:
                                     low_ts = t
                                     break
-                        except: continue
+                        except:
+                            log.warning(f"Failed to parse {line}")
             except Exception: pass
             
             return high_ts, low_ts
@@ -438,44 +445,44 @@ class DataFetcher:
             if existing_high_ts:
                 if global_stop_ts > existing_high_ts:
                     print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
-                    total_captured += count
+                    with open(temp_file, 'w', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+                        writer.writeheader()
+                        count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
+                        total_captured += count
+            
+                    # Prepend: rename cache -> old, rename temp -> cache, stream old into cache, delete old
+                    old_cache = cache_file.with_suffix(".old.csv")
+                    os.rename(cache_file, old_cache)
+                    os.rename(temp_file, cache_file)
+                    with open(cache_file, 'a', newline='') as f_new, open(old_cache, 'r') as f_old:
+                        f_old.readline()  # skip header
+                        shutil.copyfileobj(f_old, f_new)
+                    os.remove(old_cache)
                 else:
-                    print(f"\n🌊 PHASE 1: Skipped (Configured End Date {datetime.utcfromtimestamp(global_start_cursor)} <= Existing Head)")
-
-            # PHASE 2: STREAM EXISTING
-            if existing_high_ts and existing_low_ts:
-                print(f"\n💾 PHASE 2: Streaming Existing Cache...")
-                f.flush()
-                with open(cache_file, 'r') as f_old:
-                    f_old.readline() # Skip header
-                    shutil.copyfileobj(f_old, f)
-                print(f"   ✅ Existing data merged.")
-                f.flush()
-
-            # PHASE 3: OLDER DATA
+                    print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
+            
+            # PHASE 3: OLDER DATA (append directly)
             if existing_low_ts:
                 if existing_low_ts > global_start_cursor:
                     print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                    count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
-                    total_captured += count
+                    with open(cache_file, 'a', newline='') as f:
+                        writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+                        count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
+                        total_captured += count
                 else:
-                    print(f"\n📜 PHASE 3: Skipped (Existing Tail {datetime.utcfromtimestamp(existing_low_ts)} covers request {datetime.utcfromtimestamp(global_stop_ts)})")
-
+                    print(f"\n📜 PHASE 3: Skipped (Existing Tail covers request)")
+            
             elif not existing_high_ts:
+                # PHASE 0: Full fresh download
                 print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
-                total_captured += count
+                with open(cache_file, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
+                    writer.writeheader()
+                    count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
+                    total_captured += count
 
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
-        if total_captured > 0 or existing_high_ts:
-            if cache_file.exists(): 
-                try: os.remove(cache_file)
-                except: pass
-            os.rename(temp_file, cache_file)
-            print("   ✅ File saved successfully.")
-            return pd.DataFrame()
-        
         return pd.DataFrame()
 
     def run(self):
