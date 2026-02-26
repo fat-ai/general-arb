@@ -360,7 +360,6 @@ def main():
     calibration_data = [] # Stores {'x': log_vol, 'y': roi, 'date': timestamp}
 
     # Strategy Objects
-    # Strategy Objects
     scorer = WalletScorer()
     engine = SignalEngine()
 
