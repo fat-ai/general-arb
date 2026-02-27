@@ -93,7 +93,7 @@ def main():
     for f in os.listdir(SHARDS_DIR):
         os.remove(os.path.join(SHARDS_DIR, f))
 
-    print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
+    print(f"🚀 Pass 1: Splitting trades into {NUM_SHARDS} physical shards...", flush=True)
 
     try:
         # read_csv_batched streams the file in low-memory chunks natively in Polars
