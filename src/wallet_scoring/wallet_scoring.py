@@ -187,114 +187,75 @@ def main():
 
     print(f"\n✅ Scan complete. Starting Memory-Safe Aggregation...", flush=True)
 
-    # --- D. FINAL CALCULATION (MEMORY SAFE MAP-REDUCE) ---
+    # --- D. FINAL CALCULATION (POLARS LAZY API) ---
+    print(f"\n✅ Scan complete. Starting Memory-Safe Aggregation via Polars Lazy API...", flush=True)
+    
     try:
-        # 1. Define Reduction Logic
-        def reduce_chunk(pd_chunk, outcomes_pl):
-            pl_chunk = pl.from_pandas(pd_chunk)
-            joined = pl_chunk.join(outcomes_pl, on="contract_id", how="inner")
-            
-            if joined.height == 0: return None
-            
-            # Calculate PnL per row
-            calculated = joined.with_columns([
-                (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                
-                # Unified payout matching simulate_strategy.py
-                ((pl.col("qty_long") * pl.col("outcome")) + 
-                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
-            ]).with_columns([
-                (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
-            ])
-            
-            # Reduce to User Totals immediately
-            user_contract = calculated.group_by(["user", "contract_id", "resolution_timestamp"]).agg([
-                pl.col("contract_pnl").sum().alias("contract_pnl"),
-                pl.col("invested").sum().alias("invested"),
-                pl.col("trade_count").sum().alias("trade_count")
-            ])
-            return user_contract
-
-        # 2. Iterate and Aggregate (Map-Reduce Phase)
-        agg_chunk_size = 1_000_000 
-        partial_results = []
-        
-        reader = pd.read_csv(
-            temp_file, 
-            chunksize=agg_chunk_size,
-            dtype={
-                "user": str, "contract_id": str, 
-                "qty_long": float, "cost_long": float, 
-                "qty_short": float, "cost_short": float, 
-                "trade_count": int
+        # 1. Create LazyFrames (Does not load data into memory)
+        lazy_trades = pl.scan_csv(
+            temp_file,
+            schema={
+                "user": pl.String, "contract_id": pl.String, 
+                "qty_long": pl.Float64, "cost_long": pl.Float64, 
+                "qty_short": pl.Float64, "cost_short": pl.Float64, 
+                "trade_count": pl.Int64
             }
         )
         
-        counter = 0
-        for pd_chunk in reader:
-            p_res = reduce_chunk(pd_chunk, outcomes)
-            if p_res is not None:
-                partial_results.append(p_res)
-            
-            counter += 1
-            print(f"   Aggregating chunk {counter}...", end='\r', flush=True)
-
-        print(f"\n   Global Merge and Temporal Tracking...", flush=True)
+        lazy_outcomes = outcomes.lazy()
         
-        # 3. Global Merge & Temporal Tracking
-        if not partial_results:
-            print("❌ No valid results to score.", flush=True)
-            return
-            
-        global_merged = pl.concat(partial_results)
+        # 2. Join and calculate PnL lazily
+        joined = lazy_trades.join(lazy_outcomes, on="contract_id", how="inner")
         
-        # 3a. Final squash in case a user-contract was split across two different chunks
-        global_merged = global_merged.group_by(["user", "contract_id", "resolution_timestamp"]).agg([
-            pl.col("contract_pnl").sum(),
-            pl.col("invested").sum(),
-            pl.col("trade_count").sum()
+        calculated = joined.with_columns([
+            (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+            ((pl.col("qty_long") * pl.col("outcome")) + 
+             (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
+        ]).with_columns([
+            (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
         ])
         
-        # 3b. Temporal Tracking (MUST BE DONE GLOBALLY)
-        # Sort chronologically to simulate time-series progression exactly like the simulator
-        global_merged = global_merged.sort(["user", "resolution_timestamp"])
+        # 3. Aggregate to User-Contract level
+        user_contract = calculated.group_by(["user", "contract_id", "resolution_timestamp"]).agg([
+            pl.col("contract_pnl").sum().alias("contract_pnl"),
+            pl.col("invested").sum().alias("invested"),
+            pl.col("trade_count").sum().alias("trade_count")
+        ])
         
-        user_history = global_merged.with_columns([
+        # 4. Temporal Tracking & Window Functions
+        user_history = user_contract.sort(["user", "resolution_timestamp"]).with_columns([
             pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
         ]).with_columns([
-            # Peak PnL has a floor of 0.0
             pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
         ]).with_columns([
-            # Drawdown = Peak - Current
             (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
         ])
         
-        # 3c. Aggregate to final user metrics
+        # 5. Final User Metrics
         final_df = user_history.group_by("user").agg([
             pl.col("contract_pnl").sum().alias("total_pnl"),
             pl.col("invested").sum().alias("total_invested"),
             pl.col("trade_count").sum().alias("total_trades"),
-            pl.col("current_drawdown").max().alias("max_drawdown") # The deepest drawdown seen globally
+            pl.col("current_drawdown").max().alias("max_drawdown")
         ])
         
-        # 4. Scoring
-        print(f"   Scoring {final_df.height} unique users...", flush=True)
-        
-        scored_df = final_df.filter(
+        # 6. Scoring
+        scored_lazy = final_df.filter(
             (pl.col("total_trades") >= 2) & 
             (pl.col("total_invested") > 10.0) 
         ).with_columns([
-            # Add a 1e-6 buffer to drawdown to prevent division by zero
             (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
             (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
         ]).with_columns([
-            # Cap Calmar at 5.0 and add ROI
             (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
-        ])
-        
-        scored_df = scored_df.sort("score", descending=True)
+        ]).sort("score", descending=True)
 
-        # 4. Save
+        # 7. EXECUTE THE GRAPH (Streaming engine avoids OOM)
+        print("   Executing lazy execution graph out-of-core...", flush=True)
+        scored_df = scored_lazy.collect(streaming=True)
+        
+        # 8. Save
+        print(f"   Scored {scored_df.height} unique users. Saving to disk...", flush=True)
         final_dict = {}
         for row in scored_df.iter_rows(named=True):
             key = f"{row['user']}|default_topic"
