@@ -84,7 +84,7 @@ def main():
     if os.path.exists(temp_file): 
         os.remove(temp_file)
 
-    NUM_SHARDS = 10
+    NUM_SHARDS = 100
     final_dict = {}
 
     try:
