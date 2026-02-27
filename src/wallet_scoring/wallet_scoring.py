@@ -84,29 +84,83 @@ def main():
     if os.path.exists(temp_file): 
         os.remove(temp_file)
 
-    NUM_SHARDS = 100
+    # --- C. PASS 1: MAP (PHYSICAL SHARDING) ---
+    NUM_SHARDS = 50
+    SHARDS_DIR = CACHE_DIR / "shards"
+    os.makedirs(SHARDS_DIR, exist_ok=True)
+
+    # Clean up any leftover shards from previous failed runs
+    for f in os.listdir(SHARDS_DIR):
+        os.remove(os.path.join(SHARDS_DIR, f))
+
+    print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
+
+    try:
+        # read_csv_batched streams the file in low-memory chunks natively in Polars
+        reader = pl.read_csv_batched(
+            csv_file,
+            dtypes={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
+            columns=["contract_id", "user", "price", "outcomeTokensAmount"]
+        )
+        
+        batch_count = 0
+        while True:
+            batches = reader.next_batches(10) # Process ~500k rows at a time
+            if not batches:
+                break
+            
+            df_chunk = pl.concat(batches)
+            
+            # Pre-filter to drop useless data before writing to disk
+            df_chunk = (
+                df_chunk
+                .filter(pl.col("price").is_between(0.001, 0.999))
+                .with_columns([
+                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+                    (pl.col("user").hash() % NUM_SHARDS).alias("shard_id")
+                ])
+            )
+            
+            # Partition the chunk in memory and append to the specific shard files
+            for s_id, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
+                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
+                write_header = not os.path.exists(shard_file)
+                
+                # 'ab' allows safe appending without keeping 50 files permanently open
+                with open(shard_file, "ab") as f:
+                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+            
+            batch_count += 10
+            # Rough estimate: each batch is usually 50k rows
+            print(f"   Processed ~{batch_count * 50_000:,} rows...", end='\r', flush=True)
+            
+        print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
+
+    except Exception as e:
+        print(f"\n❌ Sharding Error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return
+
+    # --- D. PASS 2: REDUCE (SCORE & AGGREGATE) ---
+    print(f"📊 Pass 2: Processing shards and calculating scores...", flush=True)
     final_dict = {}
 
     try:
-        # Load outcomes lazily once
         lazy_outcomes = outcomes.lazy().select(["contract_id", "outcome", "resolution_timestamp"])
-
+        
         for shard_id in range(NUM_SHARDS):
-            print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
-
-            # 1. Scan and instantly filter to just 10% of users
-            lazy_trades = pl.scan_csv(
-                csv_file,
-                dtypes={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
-            ).filter(
-                pl.col("user").hash() % NUM_SHARDS == shard_id
-            )
-
-            # 2. Clean, filter, and join
+            shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
+            if not os.path.exists(shard_file):
+                continue # Skip if no users hashed to this shard
+            
+            print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
+            
+            # This file is now guaranteed to be small (~1-2GB). Polars will eat it for breakfast.
+            lazy_trades = pl.scan_csv(shard_file)
+            
             calculated = (
                 lazy_trades
-                .with_columns(pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""))
-                .filter(pl.col("price").is_between(0.001, 0.999))
                 .join(lazy_outcomes, on="contract_id", how="inner")
                 .with_columns([
                     (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
@@ -120,7 +174,6 @@ def main():
                 ])
             )
 
-            # 3. Contract-Level Aggregation & PnL
             user_contract = (
                 calculated
                 .group_by(["user", "contract_id", "resolution_timestamp"])
@@ -142,9 +195,9 @@ def main():
                 ])
             )
 
-            # 4. Temporal Tracking & Window Functions (Safe here because data is small)
-            user_history = (
-                user_contract
+            # Eagerly collect here so the window functions run safely entirely in RAM
+            df_history = (
+                user_contract.collect()
                 .sort(["user", "resolution_timestamp"])
                 .with_columns([
                     pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
@@ -157,9 +210,8 @@ def main():
                 ])
             )
 
-            # 5. Final User Metrics
-            final_df = (
-                user_history
+            scored_shard = (
+                df_history
                 .group_by("user")
                 .agg([
                     pl.col("contract_pnl").sum().alias("total_pnl"),
@@ -167,11 +219,6 @@ def main():
                     pl.col("trade_count").sum().alias("total_trades"),
                     pl.col("current_drawdown").max().alias("max_drawdown")
                 ])
-            )
-
-            # 6. Scoring
-            scored_lazy = (
-                final_df
                 .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
                 .with_columns([
                     (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
@@ -181,23 +228,28 @@ def main():
                     (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
                 ])
             )
-
-            # 7. Collect this specific shard and append it
-            scored_shard = scored_lazy.collect()
             
+            # Store in the master dictionary
             for row in scored_shard.iter_rows(named=True):
                 final_dict[f"{row['user']}|default_topic"] = row['score']
 
+            # 🔥 Delete the shard immediately after scoring to free up disk space!
+            os.remove(shard_file)
+
         # --- E. SAVE RESULTS ---
-        print(f"\n✅ All shards complete! Scored {len(final_dict)} unique users.", flush=True)
+        print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
         
-        # Sort dictionary by score descending before saving
+        # Sort dictionary by score descending
         final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
 
         with open(output_file, "w") as f:
             json.dump(final_dict, f, indent=2)
         
         print(f"✅ Success! Saved scores to {output_file}", flush=True)
+        
+        # Clean up the empty directory
+        if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
+            os.rmdir(SHARDS_DIR)
 
     except Exception as e:
         print(f"\n❌ Pipeline Error: {e}", flush=True)
