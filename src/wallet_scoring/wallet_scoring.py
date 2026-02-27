@@ -89,64 +89,11 @@ def main():
     try:
         # Fixed deprecation warning by using scan_csv().collect_batches()
         reader = pl.scan_csv(
-            csv_file,
-            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
-        ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
-        
-        batch_count = 0
-        # collect_batches yields smaller DataFrames safely out-of-core
-        for df_chunk in reader.collect_batches(chunk_size=100_000):
-            df_chunk = (
-                df_chunk
-                .filter(pl.col("price").is_between(0.001, 0.999))
-                .with_columns([
-                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.strip_prefix("0x"),
-                    (pl.col("user").hash() % NUM_SHARDS).alias("shard_id")
-                ])
-            )
-            
-            for s_id_tuple, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
-                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
-                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
-                
-                # Fix 2: Prevent headerless appending if file was created but empty
-                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
-                
-                with open(shard_file, "ab") as f:
-                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
-            
-            batch_count += 1
-            print(f"   Processed batch {batch_count}...", end='\r', flush=True)
-            
-        print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
-
-    except Exception as e:
-        print(f"\n❌ Sharding Error: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return
-
-    # --- D. PASS 2: REDUCE (SCORE & AGGREGATE) ---
-    print(f"📊 Pass 2: Processing shards and calculating scores...", flush=True)
-    final_dict = {}
-
-    try:
-        df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"])
-        
-        for shard_id in range(NUM_SHARDS):
-            shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
-            if not os.path.exists(shard_file):
-                continue 
-            
-            print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
-            
-            # 1. STRICT BATCH REDUCTION: Force RAM limits by reading the shard in chunks
-            reader = pl.scan_csv(
                 shard_file, 
                 schema_overrides={"contract_id": pl.String, "user": pl.String}
             )
             
-            chunk_results = []
+            user_contract = None  # Master accumulator (replaces the chunk_results list)
             
             # Process exactly 250k rows at a time
             for df_chunk in reader.collect_batches(chunk_size=250_000):
@@ -187,24 +134,31 @@ def main():
                     ])
                     .select(["user", "contract_id", "resolution_timestamp", "contract_pnl", "invested", "trade_count"])
                 )
-                chunk_results.append(chunk_agg)
+                
+                # 🔥 THE FIX: Continuously squash data into the master dataframe to prevent list bloat
+                if user_contract is None:
+                    user_contract = chunk_agg
+                else:
+                    user_contract = (
+                        pl.concat([user_contract, chunk_agg])
+                        .group_by(["user", "contract_id", "resolution_timestamp"])
+                        .agg([
+                            pl.col("contract_pnl").sum().alias("contract_pnl"),
+                            pl.col("invested").sum().alias("invested"),
+                            pl.col("trade_count").sum().alias("trade_count")
+                        ])
+                        .rechunk() # Forces contiguous memory, preventing Arrow fragmentation leaks
+                    )
+                
+                # Force memory release of the current chunk immediately
+                del df_chunk, calculated, chunk_agg
             
-            if not chunk_results:
+            # If the shard had no valid trades after filtering
+            if user_contract is None:
                 os.remove(shard_file)
                 continue
 
-            # 2. GLOBAL SQUASH: Merge the compressed chunks
-            user_contract = (
-                pl.concat(chunk_results)
-                .group_by(["user", "contract_id", "resolution_timestamp"])
-                .agg([
-                    pl.col("contract_pnl").sum().alias("contract_pnl"),
-                    pl.col("invested").sum().alias("invested"),
-                    pl.col("trade_count").sum().alias("trade_count")
-                ])
-            )
-
-            # 3. EAGER MATH: The data is now tiny, so window functions are 100% safe
+            # 2. EAGER MATH: The data is globally squashed and tiny, window functions are safe
             df_history = (
                 user_contract
                 .sort(["user", "resolution_timestamp"])
