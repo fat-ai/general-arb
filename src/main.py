@@ -176,8 +176,12 @@ class LiveTrader:
                 async with self.sub_manager.lock:
                     final_list = list(self.sub_manager.mandatory_subs)
                     slots_left = CONFIG['max_ws_subs'] - len(final_list)
+                    
                     if slots_left > 0:
-                        final_list.extend(list(self.sub_manager.speculative_subs)[:slots_left])
+                        # NEW: Grab the NEWEST speculative subs first 
+                        # (Keys at the end of the dict are the most recent)
+                        recent_spec = list(self.sub_manager.speculative_subs.keys())[::-1]
+                        final_list.extend(recent_spec[:slots_left])
                     
                     # Push update to the thread
                     if self.ws_client:
