@@ -61,7 +61,7 @@ def main():
         ).select(["contract_id", "user", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"])
 
         batch_idx = 0
-        for df_chunk in reader.collect_batches(batch_size=100_000):
+        for df_chunk in reader.collect_batches(chunk_size=100_000):
             # Basic parsing
             df_chunk = df_chunk.with_columns([
                 pl.col('contract_id').str.strip_chars(),
@@ -94,7 +94,7 @@ def main():
             for s_id_tuple, part_df in joined.partition_by("shard_id", as_dict=True).items():
                 s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
                 shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
-                write_header = not os.path.exists(shard_file)
+                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
                 
                 with open(shard_file, "ab") as f:
                     part_df.drop("shard_id").write_csv(f, include_header=write_header)
@@ -113,6 +113,7 @@ def main():
     final_first_bets = []
 
     for shard_id in range(NUM_SHARDS):
+        print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
         shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
         if not os.path.exists(shard_file): continue
 
