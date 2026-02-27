@@ -800,7 +800,8 @@ class LiveTrader:
 
     async def _maintenance_loop(self):
         """
-        Refreshes market metadata hourly to catch NEW markets.
+        Refreshes market metadata hourly to catch NEW markets
+        and reloads Wallet Scorer files to catch daily updates.
         """
         last_metadata_refresh = time.time()
 
@@ -810,6 +811,12 @@ class LiveTrader:
             if time.time() - last_metadata_refresh > 3600:
                 log.info("🌍 Hourly Metadata Refresh...")
                 await self.metadata.refresh()
+                
+                # --- NEW: Reload the Wallet Brain safely ---
+                log.info("🧠 Hourly Brain Refresh: Reloading JSON parameters...")
+                # We use to_thread so reading/parsing heavy JSONs doesn't block the async loops
+                await asyncio.to_thread(self.scorer.load)
+                # -------------------------------------------
                 
                 all_tokens = []
                 for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
