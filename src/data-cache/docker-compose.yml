@@ -2,7 +2,7 @@ services:
   market-fetcher:
     build: .
     container_name: poly_fetcher
-    restart: unless-stopped
+    restart: on-failure
     volumes:
       - ./polymarket_cache:/app/data
       - ../config.py:/app/config.py
