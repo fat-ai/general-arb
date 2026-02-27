@@ -136,7 +136,7 @@ def main():
     # --- B. FETCH MARKETS ---
     outcomes = fetch_markets(start_ts_str)
 
-    if not outcomes or outcomes.height == 0:
+    if not outcomes or outcomes.is_empyty():
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
