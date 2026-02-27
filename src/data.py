@@ -78,6 +78,11 @@ class MarketMetadata:
                 if not mid: continue
                 mid = mid.lower()
 
+                # --- NEW: STRICT STATUS FILTER ---
+                if mkt.get('closed', False): 
+                    continue
+                # ---------------------------------
+
                 tokens = []
                 if 'clobTokenIds' in mkt: tokens = [str(t) for t in mkt['clobTokenIds']]
                 elif 'tokens' in mkt: tokens = [str(t.get('tokenId', '')) for t in mkt['tokens']]
@@ -85,7 +90,7 @@ class MarketMetadata:
                 if len(tokens) >= 2:
                     self.fpmm_to_data[mid] = {
                         "tokens": tokens,
-                        "active": not mkt.get('closed', False),
+                        "active": True, 
                         "question": mkt.get('question', 'Unknown'),
                         "source": "gamma"
                     }
@@ -155,6 +160,11 @@ class MarketMetadata:
                 if not mid: continue
                 mid = mid.lower()
 
+                # --- NEW: STRICT STATUS FILTER ---
+                if not mkt.get('active', True): 
+                    continue
+                # ---------------------------------
+
                 tokens = []
                 if 'tokens' in mkt:
                      for t in mkt['tokens']:
@@ -162,12 +172,10 @@ class MarketMetadata:
                         else: tokens.append(str(t))
                 
                 # We only add if this specific market ID is NOT yet known.
-                # This ensures Gamma (Rich Metadata) takes precedence, 
-                # but CLOB (Complete List) fills the gaps.
                 if mid not in self.fpmm_to_data and len(tokens) >= 2:
                     self.fpmm_to_data[mid] = {
                         "tokens": tokens,
-                        "active": mkt.get('active', True),
+                        "active": True, 
                         "question": mkt.get('question', 'Unknown (CLOB)'),
                         "source": "clob"
                     }
