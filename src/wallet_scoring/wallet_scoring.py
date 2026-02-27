@@ -140,48 +140,71 @@ def main():
             
             print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
             
-            # 1. LAZY REDUCTION: Stream the file and squash the hot wallets safely
-            lazy_trades = pl.scan_csv(
+            # 1. STRICT BATCH REDUCTION: Force RAM limits by reading the shard in chunks
+            reader = pl.scan_csv(
                 shard_file, 
                 schema_overrides={"contract_id": pl.String, "user": pl.String}
             )
             
-            user_contract_lazy = (
-                lazy_trades
-                .join(df_outcomes.lazy(), on="contract_id", how="inner")
-                .with_columns([
-                    (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
-                    (pl.col("outcomeTokensAmount").abs()).alias("quantity")
-                ])
-                .with_columns([
-                    pl.when(pl.col("is_buy"))
-                    .then(pl.col("price") * pl.col("quantity"))
-                    .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
-                    .alias("invested_amount")
-                ])
+            chunk_results = []
+            
+            # Process exactly 250k rows at a time
+            for df_chunk in reader.collect_batches(chunk_size=250_000):
+                calculated = (
+                    df_chunk
+                    .join(df_outcomes, on="contract_id", how="inner")
+                    .with_columns([
+                        (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
+                        (pl.col("outcomeTokensAmount").abs()).alias("quantity")
+                    ])
+                    .with_columns([
+                        pl.when(pl.col("is_buy"))
+                        .then(pl.col("price") * pl.col("quantity"))
+                        .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
+                        .alias("invested_amount")
+                    ])
+                )
+                
+                # Compress the 250k rows down to unique user-contracts
+                chunk_agg = (
+                    calculated
+                    .group_by(["user", "contract_id", "resolution_timestamp"])
+                    .agg([
+                        pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
+                        pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
+                        pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
+                        pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
+                        pl.len().alias("trade_count"),
+                        pl.col("outcome").first().alias("outcome")
+                    ])
+                    .with_columns([
+                        (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+                        ((pl.col("qty_long") * pl.col("outcome")) + 
+                         (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
+                    ])
+                    .with_columns([
+                        (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
+                    ])
+                    .select(["user", "contract_id", "resolution_timestamp", "contract_pnl", "invested", "trade_count"])
+                )
+                chunk_results.append(chunk_agg)
+            
+            if not chunk_results:
+                os.remove(shard_file)
+                continue
+
+            # 2. GLOBAL SQUASH: Merge the compressed chunks
+            user_contract = (
+                pl.concat(chunk_results)
                 .group_by(["user", "contract_id", "resolution_timestamp"])
                 .agg([
-                    pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
-                    pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
-                    pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
-                    pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
-                    pl.len().alias("trade_count"),
-                    pl.col("outcome").first().alias("outcome")
-                ])
-                .with_columns([
-                    (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                    ((pl.col("qty_long") * pl.col("outcome")) + 
-                     (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
-                ])
-                .with_columns([
-                    (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
+                    pl.col("contract_pnl").sum().alias("contract_pnl"),
+                    pl.col("invested").sum().alias("invested"),
+                    pl.col("trade_count").sum().alias("trade_count")
                 ])
             )
 
-            # Execute the heavy grouping out-of-core. The result easily fits in RAM.
-            user_contract = user_contract_lazy.collect(streaming=True)
-
-            # 2. EAGER MATH: Safely run window functions on the squashed data
+            # 3. EAGER MATH: The data is now tiny, so window functions are 100% safe
             df_history = (
                 user_contract
                 .sort(["user", "resolution_timestamp"])
@@ -215,15 +238,14 @@ def main():
                 ])
             )
             
-            # Store results
+            # 4. STORE & PURGE
             for row in scored_shard.iter_rows(named=True):
                 final_dict[f"{row['user']}|default_topic"] = row['score']
 
-            # Clean up disk AND RAM immediately
             os.remove(shard_file)
-            del lazy_trades, user_contract_lazy, user_contract, df_history, scored_shard
+            del chunk_results, user_contract, df_history, scored_shard
             gc.collect()
-
+            
         # --- E. SAVE RESULTS ---
         print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
         
