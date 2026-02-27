@@ -94,6 +94,7 @@ class LiveTrader:
             self._reporting_loop(),
             self._monitor_loop(),
             self._dashboard_loop(),
+            self._resolution_monitor_loop(),
         )
 
     async def shutdown(self):
@@ -658,28 +659,36 @@ class LiveTrader:
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
             
             if should_exit:
-                book = self.order_books.get(pos_token)
-                if book:
+                clean_book = self._prepare_clean_book(pos_token)
+                if clean_book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
-                    bids_dict = book.get('bids', {})
-                    asks_dict = book.get('asks', {})
-            
-                    if not bids_dict or not asks_dict:
-                        log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
-                        return
-            
-                    # Create Lists: [[price, size], [price, size], ...]
-                    bids_list = [[p, s] for p, s in bids_dict.items()]
-                    asks_list = [[p, s] for p, s in asks_dict.items()]
-            
-                    # Sort: Bids = Highest First, Asks = Lowest First
-                    sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
-                    sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
-                    
-                    clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
                     await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=clean_book)
+                else:
+                    log.warning(f"❌ Missed Opportunity: Empty Book for {pos_token}")
 
     # --- EXECUTION HELPERS ---
+
+    def _prepare_clean_book(self, token_id):
+        """Helper to convert dictionary order books to sorted lists."""
+        raw_book = self.order_books.get(str(token_id))
+        if not raw_book:
+            return None
+
+        bids_dict = raw_book.get('bids', {})
+        asks_dict = raw_book.get('asks', {})
+
+        if not bids_dict or not asks_dict:
+            return None
+
+        # Create Lists: [[price, size], [price, size], ...]
+        bids_list = [[p, s] for p, s in bids_dict.items()]
+        asks_list = [[p, s] for p, s in asks_dict.items()]
+
+        # Sort: Bids = Highest First, Asks = Lowest First
+        sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
+        sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+        
+        return {'bids': sorted_bids, 'asks': sorted_asks}
 
     async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
         token_id = str(token_id)
@@ -701,25 +710,24 @@ class LiveTrader:
                     self.sub_manager.dirty = True 
             await asyncio.sleep(1.0)
         
-        # 2. DATA CONVERSION (Dict -> List)
-        # We must convert the {price: size} dictionary into a sorted list [[price, size]]
-        # so the Broker can calculate VWAP and we can check the spread.
-        if not raw_book: return
-
-        bids_dict = raw_book.get('bids', {})
-        asks_dict = raw_book.get('asks', {})
-
-        if not bids_dict or not asks_dict:
+        # 2. DATA CONVERSION 
+        clean_book = self._prepare_clean_book(token_id)
+        if not clean_book:
             log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
             return
+            
+        sorted_bids = clean_book['bids']
+        sorted_asks = clean_book['asks']
 
-        # Create Lists: [[price, size], [price, size], ...]
-        bids_list = [[p, s] for p, s in bids_dict.items()]
-        asks_list = [[p, s] for p, s in asks_dict.items()]
-
-        # Sort: Bids = Highest First, Asks = Lowest First
-        sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
-        sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+        # 3. Final Validation
+        best_bid = float(sorted_bids[0][0])
+        best_ask = float(sorted_asks[0][0])
+        
+        if best_ask > 0:
+            spread = (best_ask - best_bid) / best_ask
+            if spread > 0.15: 
+                log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
+                return
         
         # 3. Final Validation
         best_bid = float(sorted_bids[0][0])
@@ -767,26 +775,9 @@ class LiveTrader:
         pnl = (price - avg) / avg
         
         if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
-            book = self.order_books.get(token_id)
-            if book:
+            clean_book = self._prepare_clean_book(token_id)
+            if clean_book:
                 log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
-
-                bids_dict = book.get('bids', {})
-                asks_dict = book.get('asks', {})
-        
-                if not bids_dict or not asks_dict:
-                    log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
-                    return
-        
-                # Create Lists: [[price, size], [price, size], ...]
-                bids_list = [[p, s] for p, s in bids_dict.items()]
-                asks_list = [[p, s] for p, s in asks_dict.items()]
-        
-                # Sort: Bids = Highest First, Asks = Lowest First
-                sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
-                sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
-                
-                clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
                 
                 success = await self.broker.execute_market_order(
                     token_id, "SELL", 0, pos['market_fpmm'], current_book=clean_book
@@ -795,6 +786,8 @@ class LiveTrader:
                 if success:
                     open_pos = list(self.persistence.state["positions"].keys())
                     self.sub_manager.set_mandatory(open_pos)
+            else:
+                log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
 
     # --- MAINTENANCE ---
 
