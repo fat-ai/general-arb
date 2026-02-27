@@ -41,129 +41,111 @@ def main():
         print(f"❌ Error loading outcomes: {e}")
         return
 
-    # 2. Initialize Reader
-    print(f"Initializing batch reader for {trades_path}...")
-    if not os.path.exists(trades_path):
-        print(f"❌ Error: File '{trades_path}' not found.")
+    # --- PASS 1: MAP (PHYSICAL SHARDING & FILTERING) ---
+    NUM_SHARDS = 50
+    SHARDS_DIR = CACHE_DIR / "fresh_shards"
+    os.makedirs(SHARDS_DIR, exist_ok=True)
+
+    for f in os.listdir(SHARDS_DIR):
+        os.remove(os.path.join(SHARDS_DIR, f))
+
+    print(f"🚀 Pass 1: Streaming trades, filtering, and sharding into {NUM_SHARDS} files...", flush=True)
+    
+    try:
+        reader = pl.scan_csv(
+            trades_path,
+            schema_overrides={
+                "contract_id": pl.String, "user": pl.String, "tradeAmount": pl.Float64,
+                "outcomeTokensAmount": pl.Float64, "price": pl.Float64, "timestamp": pl.String
+            }
+        ).select(["contract_id", "user", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"])
+
+        batch_idx = 0
+        for df_chunk in reader.collect_batches():
+            # Basic parsing
+            df_chunk = df_chunk.with_columns([
+                pl.col('contract_id').str.strip_chars(),
+                pl.col('outcomeTokensAmount').alias('tokens'),
+                pl.col('price').alias('bet_price'),
+                pl.col('user').alias('wallet_id'),
+                pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
+            ]).drop_nulls(subset=['ts_date'])
+
+            # Join immediately to drop ~90% of irrelevant trades before writing to disk
+            joined = df_chunk.join(df_outcomes, on='contract_id', how='inner')
+            if joined.height == 0: continue
+
+            joined = joined.with_columns([
+                pl.col('bet_price').clip(0.0, 1.0).alias('safe_price'),
+                (pl.col('tokens') > 0).alias('is_long')
+            ])
+
+            # Calculate Risk Volume and aggressively filter to save disk space
+            risk_vol_expr = pl.when(pl.col('is_long'))\
+                              .then(pl.col('tradeAmount'))\
+                              .otherwise(pl.col('tokens').abs() * (1.0 - pl.col('safe_price')))
+
+            joined = joined.with_columns(risk_vol_expr.alias('risk_vol')).filter(pl.col('risk_vol') > 1.0)
+            if joined.height == 0: continue
+
+            # Hash and partition
+            joined = joined.with_columns([(pl.col("wallet_id").hash() % NUM_SHARDS).alias("shard_id")])
+
+            for s_id_tuple, part_df in joined.partition_by("shard_id", as_dict=True).items():
+                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
+                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
+                write_header = not os.path.exists(shard_file)
+                
+                with open(shard_file, "ab") as f:
+                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+
+            batch_idx += 1
+            print(f"   Processed batch {batch_idx}...", end='\r', flush=True)
+            
+    except Exception as e:
+        print(f"\n❌ Sharding Error: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
-    reader = pl.read_csv_batched(
-        trades_path,
-        batch_size=BATCH_SIZE,
-        schema_overrides={
-            "contract_id": pl.String,
-            "user": pl.String,
-            "tradeAmount": pl.Float64,
-            "outcomeTokensAmount": pl.Float64,
-            "price": pl.Float64,
-            "timestamp": pl.String
-        },
-        low_memory=True
-    )
+    # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
+    print("\n📊 Pass 2: Finding global first bets per wallet...", flush=True)
+    final_first_bets = []
 
-    chunks_list = [] 
-    total_rows = 0
-    batch_idx = 0
-    
-    print("🚀 Starting Stream...")
-    
-    while True:
-        batches = reader.next_batches(1)
-        if not batches:
-            break
-            
-        chunk = batches[0]
-        batch_idx += 1
-        total_rows += len(chunk)
+    for shard_id in range(NUM_SHARDS):
+        shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
+        if not os.path.exists(shard_file): continue
 
-        # 3. Basic Setup & Parsing
-        chunk = chunk.with_columns([
-            pl.col('contract_id').str.strip_chars(),
-            pl.col('outcomeTokensAmount').alias('tokens'),
-            pl.col('price').alias('bet_price'),
-            pl.col('user').alias('wallet_id'),
-            pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
-        ])
-        chunk = chunk.drop_nulls(subset=['ts_date'])
+        # Read the small shard
+        df_shard = pl.read_csv(shard_file)
 
-        # 4. Join Outcome Data
-        # Inner join automatically filters out trades for markets not in our pre-filtered parquet
-        joined = chunk.join(df_outcomes, on='contract_id', how='inner')
-        if joined.height == 0: continue
-        
-        joined = joined.with_columns([
-            pl.col('bet_price').clip(0.0, 1.0).alias('safe_price'),
-            (pl.col('tokens') > 0).alias('is_long')
-        ])
-
-        # 5. Calculate Risk Volume (Outlay)
-        # Long Outlay = tradeAmount
-        # Short Outlay = |Tokens| * (1 - Price)
-        risk_vol_expr = pl.when(pl.col('is_long'))\
-                          .then(pl.col('tradeAmount'))\
-                          .otherwise(pl.col('tokens').abs() * (1.0 - pl.col('safe_price')))
-
-        joined = joined.with_columns(risk_vol_expr.alias('risk_vol'))
-        
-        # 6. FILTER
-        # Now we filter based on the calculated risk volume
-        joined = joined.filter(pl.col('risk_vol') > 1.0)
-        
-        if joined.height == 0: continue
-
-        # 7. ROI Calculation
-        # Long ROI: (Payout - Price) / Price
+        # Calculate final metrics just for this subset
         long_roi = (pl.col('outcome') - pl.col('safe_price')) / pl.col('safe_price')
-        
-        # Short ROI: (Price - Outcome) / (1 - Price)
         short_roi = (pl.col('safe_price') - pl.col('outcome')) / (1.0 - pl.col('safe_price'))
-        
         final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi)
-        
-        # Win/Loss Flag
+
         won_bet = (pl.col('is_long') & (pl.col('outcome') > 0.5)) | \
                   ((~pl.col('is_long')) & (pl.col('outcome') < 0.5))
 
-        # Apply final columns
-        joined = joined.with_columns([
-            final_roi.alias('roi'), 
+        df_shard = df_shard.with_columns([
+            final_roi.alias('roi'),
             pl.col('risk_vol').log1p().alias('log_vol'),
             won_bet.alias('won_bet')
-        ])
+        ]).select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
+
+        # Sort and deduplicate THIS shard. 
+        # Because all trades for a wallet live in this specific file, this is globally accurate!
+        shard_firsts = df_shard.sort("ts_date").unique(subset=["wallet_id"], keep="first")
+        final_first_bets.append(shard_firsts)
         
-        # Select Final Columns to save memory
-        joined = joined.select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
+        os.remove(shard_file) # Clean up disk space
 
-        # Deduplicate locally (keep first trade per wallet in this batch)
-        chunk_firsts = (
-            joined.sort("ts_date")
-                  .unique(subset=["wallet_id"], keep="first")
-        )
-        
-        chunks_list.append(chunk_firsts)
-        
-        if batch_idx % 10 == 0:
-            print(f"   Batch {batch_idx} | Rows: {total_rows:,} | Chunks: {len(chunks_list)}", end='\r')
-            gc.collect()
-
-    print("\n⚡ Merging and deduping all batches...")
-    if not chunks_list:
-        print("❌ No valid trades found.")
-        return
-
-    # FAST CONCAT
-    global_first_bets = pl.concat(chunks_list)
-    
-    # GLOBAL DEDUP: Resolve the true "first bet" across all batches
-    global_first_bets = (
-        global_first_bets
-        .sort("ts_date")
-        .unique(subset=["wallet_id"], keep="first")
-    )
-
+    # Safely concat at the end because we only hold exactly ONE row per user across the whole dataset
+    global_first_bets = pl.concat(final_first_bets)
     print(f"✅ Scan complete. Found {global_first_bets.height} unique first bets.")
 
     df = global_first_bets.to_pandas()
+    
     if len(df) < 100:
         print("❌ Not enough data for analysis.")
         return
