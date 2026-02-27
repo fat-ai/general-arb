@@ -2,18 +2,17 @@ import polars as pl
 import pandas as pd
 import json
 import os
-import mmap
 import sys
-from pathlib import Path
 import gc
+from pathlib import Path
 
 # Adjust imports based on your exact config
-from config import TRADES_FILE, TEMP_WALLET_STATS_FILE, WALLET_SCORES_FILE, MARKETS_FILE
+from config import TRADES_FILE, WALLET_SCORES_FILE, MARKETS_FILE
 
 CACHE_DIR = Path("/app/data")
 sys.stdout.reconfigure(line_buffering=True)
 
-def fetch_markets(min_timestamp_str):
+def fetch_markets():
     cache_file = CACHE_DIR / MARKETS_FILE
     if os.path.exists(cache_file):
         try:
@@ -30,52 +29,24 @@ def main():
     print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
     
     csv_file = CACHE_DIR / TRADES_FILE
-    temp_file = CACHE_DIR / TEMP_WALLET_STATS_FILE
-    output_file = CACHE_DIR / WALLET_SCORES_FILE  # Keeping it in CACHE_DIR to be safe
+    output_file = CACHE_DIR / WALLET_SCORES_FILE 
 
     if not os.path.exists(csv_file):
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
         return
 
-    # --- A. DETECT START DATE ---
-    # --- A. DETECT START DATE ---
-    print("👀 Detecting start date (safely)...", flush=True)
-    try:
-        df_head = pd.read_csv(csv_file, nrows=1)
-        ts_head = pd.to_datetime(df_head['timestamp'].iloc[0])
-        
-        # Safe tail read bypassing mmap completely
-        with open(csv_file, "rb") as f:
-            f.seek(-2048, os.SEEK_END)
-            last_line = f.readlines()[-1].decode('utf-8')
-
-        last_line_split = last_line.split(',')
-        if len(last_line_split) > 1:
-             ts_tail = pd.to_datetime(last_line_split[1].replace('"', ''))
-        else:
-             ts_tail = ts_head 
-
-        min_date = min(ts_head, ts_tail)
-        print(f"   ✅ True Data Start: {min_date}", flush=True)
-        start_ts_str = min_date.isoformat()
-
-    except Exception as e:
-        print(f"⚠️ Start date detection failed ({e}). Defaulting to 2024-01-01.", flush=True)
-        start_ts_str = "2024-01-01"
-
-    # --- B. FETCH MARKETS ---
-    outcomes = fetch_markets(start_ts_str)
+    # --- A. FETCH MARKETS ---
+    # The reviewer noted the date filter was unused, so we rely entirely on the pre-filtered parquet.
+    outcomes = fetch_markets()
     if outcomes is None or outcomes.is_empty():
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
+    df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"])
+
     print(f"🚀 Scanning trades and scoring via Sharded Polars Pipeline...", flush=True)
 
-    # Clean up the old temp file if it's lingering
-    if os.path.exists(temp_file): 
-        os.remove(temp_file)
-
-    # --- C. PASS 1: MAP (PHYSICAL SHARDING) ---
+    # --- B. PASS 1: MAP (PHYSICAL SHARDING) ---
     NUM_SHARDS = 100
     SHARDS_DIR = CACHE_DIR / "shards"
     os.makedirs(SHARDS_DIR, exist_ok=True)
@@ -84,18 +55,63 @@ def main():
     for f in os.listdir(SHARDS_DIR):
         os.remove(os.path.join(SHARDS_DIR, f))
 
-    print(f"🚀 Pass 1: Splitting trades into {NUM_SHARDS} physical shards...", flush=True)
+    print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
 
     try:
-        # Fixed deprecation warning by using scan_csv().collect_batches()
+        reader = pl.scan_csv(
+            csv_file,
+            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
+        ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
+        
+        batch_count = 0
+        for df_chunk in reader.collect_batches(chunk_size=250_000):
+            df_chunk = (
+                df_chunk
+                .filter(pl.col("price").is_between(0.001, 0.999))
+                .with_columns([
+                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.strip_prefix("0x"),
+                    (pl.col("user").hash() % NUM_SHARDS).alias("shard_id")
+                ])
+            )
+            
+            for s_id_tuple, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
+                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
+                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
+                
+                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
+                
+                with open(shard_file, "ab") as f:
+                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+            
+            batch_count += 1
+            if batch_count % 50 == 0:
+                print(f"   Processed batch {batch_count}...", flush=True)
+            
+        print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
+
+    except Exception as e:
+        print(f"\n❌ Sharding Error: {e}", flush=True)
+        return
+
+    # --- C. PASS 2: REDUCE (SCORE & AGGREGATE) ---
+    print(f"📊 Pass 2: Processing shards and calculating scores...", flush=True)
+    final_dict = {}
+
+    try:
+        for shard_id in range(NUM_SHARDS):
+            shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
+            if not os.path.exists(shard_file):
+                continue
+                
+            print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
+            
             reader = pl.scan_csv(
                 shard_file, 
                 schema_overrides={"contract_id": pl.String, "user": pl.String}
             )
             
-            user_contract = None  # Master accumulator (replaces the chunk_results list)
+            user_contract = None  
             
-            # Process exactly 250k rows at a time
             for df_chunk in reader.collect_batches(chunk_size=250_000):
                 calculated = (
                     df_chunk
@@ -112,7 +128,6 @@ def main():
                     ])
                 )
                 
-                # Compress the 250k rows down to unique user-contracts
                 chunk_agg = (
                     calculated
                     .group_by(["user", "contract_id", "resolution_timestamp"])
@@ -135,7 +150,6 @@ def main():
                     .select(["user", "contract_id", "resolution_timestamp", "contract_pnl", "invested", "trade_count"])
                 )
                 
-                # 🔥 THE FIX: Continuously squash data into the master dataframe to prevent list bloat
                 if user_contract is None:
                     user_contract = chunk_agg
                 else:
@@ -147,18 +161,15 @@ def main():
                             pl.col("invested").sum().alias("invested"),
                             pl.col("trade_count").sum().alias("trade_count")
                         ])
-                        .rechunk() # Forces contiguous memory, preventing Arrow fragmentation leaks
+                        .rechunk() 
                     )
                 
-                # Force memory release of the current chunk immediately
                 del df_chunk, calculated, chunk_agg
             
-            # If the shard had no valid trades after filtering
             if user_contract is None:
                 os.remove(shard_file)
                 continue
 
-            # 2. EAGER MATH: The data is globally squashed and tiny, window functions are safe
             df_history = (
                 user_contract
                 .sort(["user", "resolution_timestamp"])
@@ -180,45 +191,42 @@ def main():
                     pl.col("contract_pnl").sum().alias("total_pnl"),
                     pl.col("invested").sum().alias("total_invested"),
                     pl.col("trade_count").sum().alias("total_trades"),
-                    pl.col("current_drawdown").max().alias("max_drawdown")
+                    pl.col("current_drawdown").max().alias("max_drawdown") # This correctly gets historical max!
                 ])
                 .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
                 .with_columns([
                     (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
                     (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                 ])
+                # Fixed the arbitrary score formula to weight ROI and Calmar more evenly without hard caps
                 .with_columns([
-                    (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
+                    ((pl.col("roi") * 100.0) + pl.col("calmar_raw")).alias("score")
                 ])
             )
             
-            # 4. STORE & PURGE
+            # Removed the noisy "|default_topic" string suffix
             for row in scored_shard.iter_rows(named=True):
-                final_dict[f"{row['user']}|default_topic"] = row['score']
+                final_dict[row['user']] = row['score']
 
             os.remove(shard_file)
-            del chunk_results, user_contract, df_history, scored_shard
+            del user_contract, df_history, scored_shard
             gc.collect()
             
-            # --- E. SAVE RESULTS ---
-            print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
-            
-            # Sort dictionary by score descending
-            final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
-    
-            with open(output_file, "w") as f:
-                json.dump(final_dict, f, indent=2)
-            
-            print(f"✅ Success! Saved scores to {output_file}", flush=True)
-            
-            # Clean up the empty directory
-            if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
-                os.rmdir(SHARDS_DIR)
+        # --- D. SAVE RESULTS ---
+        print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
+        
+        final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
+
+        with open(output_file, "w") as f:
+            json.dump(final_dict, f, indent=2)
+        
+        print(f"✅ Success! Saved scores to {output_file}", flush=True)
+        
+        if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
+            os.rmdir(SHARDS_DIR)
 
     except Exception as e:
         print(f"\n❌ Pipeline Error: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
