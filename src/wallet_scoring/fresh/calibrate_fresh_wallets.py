@@ -42,7 +42,7 @@ def main():
         return
 
     # --- PASS 1: MAP (PHYSICAL SHARDING & FILTERING) ---
-    NUM_SHARDS = 50
+    NUM_SHARDS = 100
     SHARDS_DIR = CACHE_DIR / "fresh_shards"
     os.makedirs(SHARDS_DIR, exist_ok=True)
 
