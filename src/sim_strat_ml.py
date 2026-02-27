@@ -378,13 +378,13 @@ def main():
         # 1. KNOWN WALLET LOOKUP (Check both keys)
         if w_id in scorer.wallet_scores:
         #    log.info(f"✅ HIT: Found {w_id}... Score: {self.wallet_scores[w_id]:.2f}")
-            return scorer.wallet_scores:[w_id]
+            return scorer.wallet_scores[w_id]
         if w_id_no_prefix in scorer.wallet_scores:
         #    log.info(f"✅ HIT: Found {w_id_no_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
-            return scorer.wallet_scores:[w_id_no_prefix]
+            return scorer.wallet_scores[w_id_no_prefix]
         if w_id_with_prefix in scorer.wallet_scores:
         #     log.info(f"✅ HIT: Found {w_id_with_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
-             return scorer.wallet_scores:[w_id_with_prefix]
+             return scorer.wallet_scores[w_id_with_prefix]
         
         if getattr(scorer, 'xgb_model', None) is not None:
             m = scorer.current_m
