@@ -87,6 +87,7 @@ def main():
 
             joined = joined.with_columns(risk_vol_expr.alias('risk_vol')).filter(pl.col('risk_vol') > 1.0)
             if joined.height == 0: continue
+            joined = joined.sort("ts_date").unique(subset=["wallet_id"], keep="first")
 
             # Hash and partition
             joined = joined.with_columns([(pl.col("wallet_id").hash() % NUM_SHARDS).alias("shard_id")])
