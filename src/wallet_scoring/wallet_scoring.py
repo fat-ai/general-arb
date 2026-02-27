@@ -200,20 +200,20 @@ def main():
             del chunk_results, user_contract, df_history, scored_shard
             gc.collect()
             
-        # --- E. SAVE RESULTS ---
-        print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
-        
-        # Sort dictionary by score descending
-        final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
-
-        with open(output_file, "w") as f:
-            json.dump(final_dict, f, indent=2)
-        
-        print(f"✅ Success! Saved scores to {output_file}", flush=True)
-        
-        # Clean up the empty directory
-        if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
-            os.rmdir(SHARDS_DIR)
+            # --- E. SAVE RESULTS ---
+            print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
+            
+            # Sort dictionary by score descending
+            final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
+    
+            with open(output_file, "w") as f:
+                json.dump(final_dict, f, indent=2)
+            
+            print(f"✅ Success! Saved scores to {output_file}", flush=True)
+            
+            # Clean up the empty directory
+            if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
+                os.rmdir(SHARDS_DIR)
 
     except Exception as e:
         print(f"\n❌ Pipeline Error: {e}", flush=True)
