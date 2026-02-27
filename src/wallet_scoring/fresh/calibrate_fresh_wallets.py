@@ -8,6 +8,7 @@ import gc
 import warnings
 from datetime import datetime
 from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
+from pathlib import Path
 CACHE_DIR = Path("/app/data")
 warnings.filterwarnings("ignore")
 
