@@ -376,15 +376,15 @@ def main():
         w_id_with_prefix = w_id if w_id.startswith("0x") else f"0x{w_id}"
 
         # 1. KNOWN WALLET LOOKUP (Check both keys)
-        if w_id in self.wallet_scores:
+        if w_id in scorer.wallet_scores:
         #    log.info(f"✅ HIT: Found {w_id}... Score: {self.wallet_scores[w_id]:.2f}")
-            return self.wallet_scores[w_id]
-        if w_id_no_prefix in self.wallet_scores:
+            return scorer.wallet_scores:[w_id]
+        if w_id_no_prefix in scorer.wallet_scores:
         #    log.info(f"✅ HIT: Found {w_id_no_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
-            return self.wallet_scores[w_id_no_prefix]
-        if w_id_with_prefix in self.wallet_scores:
+            return scorer.wallet_scores:[w_id_no_prefix]
+        if w_id_with_prefix in scorer.wallet_scores:
         #     log.info(f"✅ HIT: Found {w_id_with_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
-             return self.wallet_scores[w_id_with_prefix]
+             return scorer.wallet_scores:[w_id_with_prefix]
         
         if getattr(scorer, 'xgb_model', None) is not None:
             m = scorer.current_m
