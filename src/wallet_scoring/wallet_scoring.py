@@ -93,24 +93,18 @@ def main():
     for f in os.listdir(SHARDS_DIR):
         os.remove(os.path.join(SHARDS_DIR, f))
 
-    print(f"🚀 Pass 1: Splitting trades into {NUM_SHARDS} physical shards...", flush=True)
+    print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
 
     try:
-        # read_csv_batched streams the file in low-memory chunks natively in Polars
-        reader = pl.read_csv_batched(
+        # Fixed deprecation warning by using scan_csv().collect_batches()
+        reader = pl.scan_csv(
             csv_file,
-            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
-            columns=["contract_id", "user", "price", "outcomeTokensAmount"]
-        )
+            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
+        ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
         
         batch_count = 0
-        while True:
-            batches = reader.next_batches(10) # Process ~500k rows at a time
-            if not batches:
-                break
-            
-            df_chunk = pl.concat(batches)
-            
+        # collect_batches yields smaller DataFrames safely out-of-core
+        for df_chunk in reader.collect_batches():
             # Pre-filter to drop useless data before writing to disk
             df_chunk = (
                 df_chunk
@@ -122,7 +116,10 @@ def main():
             )
             
             # Partition the chunk in memory and append to the specific shard files
-            for s_id, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
+            for s_id_tuple, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
+                # 🔥 FIX: Polars returns partition keys as tuples (e.g., (1,)). Extract the integer!
+                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
+                
                 shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
                 write_header = not os.path.exists(shard_file)
                 
@@ -130,9 +127,8 @@ def main():
                 with open(shard_file, "ab") as f:
                     part_df.drop("shard_id").write_csv(f, include_header=write_header)
             
-            batch_count += 10
-            # Rough estimate: each batch is usually 50k rows
-            print(f"   Processed ~{batch_count * 50_000:,} rows...", end='\r', flush=True)
+            batch_count += 1
+            print(f"   Processed batch {batch_count}...", end='\r', flush=True)
             
         print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
 
