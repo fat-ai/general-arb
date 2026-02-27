@@ -88,7 +88,7 @@ def main():
 
     try:
         # Fixed deprecation warning by using scan_csv().collect_batches()
-        reader = pl.scan_csv(
+            reader = pl.scan_csv(
                 shard_file, 
                 schema_overrides={"contract_id": pl.String, "user": pl.String}
             )
