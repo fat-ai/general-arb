@@ -140,7 +140,10 @@ def main():
             print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
             
             # This file is now guaranteed to be small (~1-2GB). Polars will eat it for breakfast.
-            lazy_trades = pl.read_csv(shard_file).lazy()
+            lazy_trades = pl.read_csv(
+                shard_file, 
+                schema_overrides={"contract_id": pl.String, "user": pl.String}
+            ).lazy()
             
             calculated = (
                 lazy_trades
