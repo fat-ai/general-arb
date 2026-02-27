@@ -37,30 +37,20 @@ def main():
         return
 
     # --- A. DETECT START DATE ---
-    print("👀 Detecting start date (checking first and last rows)...", flush=True)
+    # --- A. DETECT START DATE ---
+    print("👀 Detecting start date (safely)...", flush=True)
     try:
         df_head = pd.read_csv(csv_file, nrows=1)
         ts_head = pd.to_datetime(df_head['timestamp'].iloc[0])
         
+        # Safe tail read bypassing mmap completely
         with open(csv_file, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                end_pos = mm.rfind(b'\n', 0, mm.size() - 1)
-                if end_pos != -1:
-                    start_pos = mm.rfind(b'\n', 0, end_pos)
-                    if start_pos != -1:
-                        mm.seek(start_pos + 1)
-                        last_line = mm.read(end_pos - start_pos - 1).decode('utf-8')
-                    else:
-                        mm.seek(0)
-                        last_line = mm.read(end_pos).decode('utf-8')
-                else:
-                    mm.seek(0)
-                    last_line = mm.read().decode('utf-8')
+            f.seek(-2048, os.SEEK_END)
+            last_line = f.readlines()[-1].decode('utf-8')
 
         last_line_split = last_line.split(',')
         if len(last_line_split) > 1:
-             ts_tail_str = last_line_split[1].replace('"', '') 
-             ts_tail = pd.to_datetime(ts_tail_str)
+             ts_tail = pd.to_datetime(last_line_split[1].replace('"', ''))
         else:
              ts_tail = ts_head 
 
@@ -104,8 +94,7 @@ def main():
         
         batch_count = 0
         # collect_batches yields smaller DataFrames safely out-of-core
-        for df_chunk in reader.collect_batches():
-            # Pre-filter to drop useless data before writing to disk
+        for df_chunk in reader.collect_batches(chunk_size=100_000):
             df_chunk = (
                 df_chunk
                 .filter(pl.col("price").is_between(0.001, 0.999))
@@ -115,15 +104,13 @@ def main():
                 ])
             )
             
-            # Partition the chunk in memory and append to the specific shard files
             for s_id_tuple, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
-                # 🔥 FIX: Polars returns partition keys as tuples (e.g., (1,)). Extract the integer!
                 s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
-                
                 shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
-                write_header = not os.path.exists(shard_file)
                 
-                # 'ab' allows safe appending without keeping 50 files permanently open
+                # Fix 2: Prevent headerless appending if file was created but empty
+                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
+                
                 with open(shard_file, "ab") as f:
                     part_df.drop("shard_id").write_csv(f, include_header=write_header)
             
@@ -153,7 +140,7 @@ def main():
             print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
             
             # This file is now guaranteed to be small (~1-2GB). Polars will eat it for breakfast.
-            lazy_trades = pl.scan_csv(shard_file)
+            lazy_trades = pl.read_csv(shard_file).lazy()
             
             calculated = (
                 lazy_trades
