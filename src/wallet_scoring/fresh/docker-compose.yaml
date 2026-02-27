@@ -2,7 +2,7 @@ services:
   market-fetcher:
     build: .
     container_name: fwc
-    restart: unless-stopped
+    restart: on-failure
     volumes:
       - .../data-cache/polymarket_cache:/app/data
       - .../config.py:/app/config.py
