@@ -75,7 +75,7 @@ def main():
         os.remove(temp_file)
 
     # --- C. PASS 1: MAP (PHYSICAL SHARDING) ---
-    NUM_SHARDS = 50
+    NUM_SHARDS = 100
     SHARDS_DIR = CACHE_DIR / "shards"
     os.makedirs(SHARDS_DIR, exist_ok=True)
 
