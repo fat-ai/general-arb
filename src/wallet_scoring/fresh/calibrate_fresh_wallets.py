@@ -61,7 +61,7 @@ def main():
         ).select(["contract_id", "user", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"])
 
         batch_idx = 0
-        for df_chunk in reader.collect_batches():
+        for df_chunk in reader.collect_batches(batch_size=100_000):
             # Basic parsing
             df_chunk = df_chunk.with_columns([
                 pl.col('contract_id').str.strip_chars(),
