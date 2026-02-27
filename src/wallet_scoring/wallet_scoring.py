@@ -99,7 +99,7 @@ def main():
                 df_chunk
                 .filter(pl.col("price").is_between(0.001, 0.999))
                 .with_columns([
-                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.strip_prefix("0x"),
                     (pl.col("user").hash() % NUM_SHARDS).alias("shard_id")
                 ])
             )
