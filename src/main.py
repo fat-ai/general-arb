@@ -635,6 +635,24 @@ class LiveTrader:
 
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
+                market_meta = self.metadata.fpmm_to_data.get(fpmm, {})
+                end_ts = market_meta.get('end_timestamp', 0)
+                
+                passes_roi_filter = False
+                if end_ts > 0:
+                    # Calculate days remaining until market expires
+                    days_to_expiry = (end_ts - time.time()) / 86400.0
+                    
+                    if days_to_expiry > 0:
+                        absolute_roi = (1.0 - price) / price
+                        annualized_roi = absolute_roi * (365.0 / days_to_expiry)
+                        
+                        # Check if greater than 500% (5.0)
+                        if annualized_roi > 5.0:
+                            passes_roi_filter = True
+                
+                if not passes_roi_filter:
+                    continue # Skip this trade, ROI is too low or date is unknown
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
                 if action == 'SPECULATE':
