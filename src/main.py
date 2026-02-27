@@ -411,6 +411,13 @@ class LiveTrader:
 
                #  print(f"🔍 TRACE_PARSE: Tx={log_item.get('transactionHash')}... | RawVol={final_vol_raw} | Chunk2={amt_a_raw}")
 
+                # Raw Parsing
+                asset_a_str = str(int(chunks[0], 16))
+                asset_b_str = str(int(chunks[1], 16))
+                amt_a_raw = int(chunks[2], 16)
+                amt_b_raw = int(chunks[3], 16)
+
+                # --- FIX: Preserve the actual split to calculate Price ---
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
                     'timestamp': int(time.time()),
@@ -418,8 +425,8 @@ class LiveTrader:
                     'maker': maker,
                     'makerAssetId': asset_a_str, 
                     'takerAssetId': asset_b_str,
-                    'makerAmountFilled': str(final_vol_raw), 
-                    'takerAmountFilled': str(final_vol_raw) 
+                    'makerAmountFilled': str(amt_a_raw), # Actual Maker Vol
+                    'takerAmountFilled': str(amt_b_raw)  # Actual Taker Vol
                 }
                 
                 await self.trade_queue.put(trade_obj)
