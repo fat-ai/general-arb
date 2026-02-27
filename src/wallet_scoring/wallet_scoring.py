@@ -85,8 +85,8 @@ def process_chunk_universal(df_chunk, outcomes_df):
 def main():
     print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
     
-    csv_file = TRADES_FILE
-    temp_file = TEMP_WALLET_STATS_FILE
+    csv_file = CACHE_DIR / TRADES_FILE
+    temp_file = CACHE_DIR / TEMP_WALLET_STATS_FILE
     output_file = WALLET_SCORES_FILE
 
     if not os.path.exists(csv_file):
