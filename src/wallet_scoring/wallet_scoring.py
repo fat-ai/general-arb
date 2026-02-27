@@ -78,146 +78,129 @@ def main():
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
-    # --- C. PROCESS TRADES (LAZY STREAMING) ---
-    print(f"🚀 Scanning trades via Polars Streaming API...", flush=True)
-    if os.path.exists(temp_file): os.remove(temp_file)
+    print(f"🚀 Scanning trades and scoring via Sharded Polars Pipeline...", flush=True)
+
+    # Clean up the old temp file if it's lingering
+    if os.path.exists(temp_file): 
+        os.remove(temp_file)
+
+    NUM_SHARDS = 10
+    final_dict = {}
 
     try:
-        # We broadcast the much smaller markets dataframe as lazy for the join
-        lazy_outcomes = outcomes.lazy().select(["contract_id"]) 
+        # Load outcomes lazily once
+        lazy_outcomes = outcomes.lazy().select(["contract_id", "outcome", "resolution_timestamp"])
 
-        lazy_trades = pl.scan_csv(
-            csv_file,
-            dtypes={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
-        ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
-        
-        # Build the out-of-core execution graph
-        stats = (
-            lazy_trades
-            .with_columns(pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""))
-            .filter(pl.col("price").is_between(0.001, 0.999))
-            .join(lazy_outcomes, on="contract_id", how="inner")
-            .with_columns([
-                (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
-                (pl.col("outcomeTokensAmount").abs()).alias("quantity")
-            ])
-            .with_columns([
-                pl.when(pl.col("is_buy"))
-                .then(pl.col("price") * pl.col("quantity"))
-                .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
-                .alias("invested_amount")
-            ])
-            .group_by(["user", "contract_id"])
-            .agg([
-                pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
-                pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
-                pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
-                pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
-                pl.len().alias("trade_count")
-            ])
-        )
+        for shard_id in range(NUM_SHARDS):
+            print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
 
-        print(f"   Executing streaming sink to temp file (this handles RAM automatically)...", flush=True)
-        # sink_csv streams the data through memory in batches and writes directly to disk
-        stats.sink_csv(temp_file)
-        print(f"✅ Phase C Complete. Trade summaries saved temporarily.", flush=True)
+            # 1. Scan and instantly filter to just 10% of users
+            lazy_trades = pl.scan_csv(
+                csv_file,
+                dtypes={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
+            ).filter(
+                pl.col("user").hash() % NUM_SHARDS == shard_id
+            )
 
-    except Exception as e:
-        print(f"\n❌ Streaming Error in Phase C: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return
+            # 2. Clean, filter, and join
+            calculated = (
+                lazy_trades
+                .with_columns(pl.col("contract_id").str.strip_chars().str.to_lowercase().str.replace("0x", ""))
+                .filter(pl.col("price").is_between(0.001, 0.999))
+                .join(lazy_outcomes, on="contract_id", how="inner")
+                .with_columns([
+                    (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
+                    (pl.col("outcomeTokensAmount").abs()).alias("quantity")
+                ])
+                .with_columns([
+                    pl.when(pl.col("is_buy"))
+                    .then(pl.col("price") * pl.col("quantity"))
+                    .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
+                    .alias("invested_amount")
+                ])
+            )
 
-    # --- D. FINAL CALCULATION (MEMORY SAFE AGGREGATION) ---
-    print(f"📊 Starting Temporal Analysis & Scoring...", flush=True)
-    try:
-        # Load the heavily reduced temp file
-        reduced_trades = pl.scan_csv(temp_file)
-        full_outcomes = outcomes.lazy()
-        
-        # Calculate PnL and Group
-        user_contract = (
-            reduced_trades
-            .join(full_outcomes, on="contract_id", how="inner")
-            .with_columns([
-                (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                ((pl.col("qty_long") * pl.col("outcome")) + 
-                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
-            ])
-            .with_columns([
-                (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
-            ])
-            .group_by(["user", "contract_id", "resolution_timestamp"])
-            .agg([
-                pl.col("contract_pnl").sum().alias("contract_pnl"),
-                pl.col("invested").sum().alias("invested"),
-                pl.col("trade_count").sum().alias("trade_count")
-            ])
-        )
-        
-        # Sort and apply window functions
-        user_history = (
-            user_contract
-            .sort(["user", "resolution_timestamp"])
-            .with_columns([
-                pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
-            ])
-            .with_columns([
-                pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
-            ])
-            .with_columns([
-                (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
-            ])
-        )
-        
-        # Final aggregation
-        final_df = (
-            user_history
-            .group_by("user")
-            .agg([
-                pl.col("contract_pnl").sum().alias("total_pnl"),
-                pl.col("invested").sum().alias("total_invested"),
-                pl.col("trade_count").sum().alias("total_trades"),
-                pl.col("current_drawdown").max().alias("max_drawdown")
-            ])
-        )
-        
-        # Scoring Logic
-        scored_lazy = (
-            final_df
-            .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
-            .with_columns([
-                (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
-                (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
-            ])
-            .with_columns([
-                (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
-            ])
-            .sort("score", descending=True)
-        )
+            # 3. Contract-Level Aggregation & PnL
+            user_contract = (
+                calculated
+                .group_by(["user", "contract_id", "resolution_timestamp"])
+                .agg([
+                    pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
+                    pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
+                    pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
+                    pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
+                    pl.len().alias("trade_count"),
+                    pl.col("outcome").first().alias("outcome")
+                ])
+                .with_columns([
+                    (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+                    ((pl.col("qty_long") * pl.col("outcome")) + 
+                     (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
+                ])
+                .with_columns([
+                    (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
+                ])
+            )
 
-        print("   Executing final calculations...", flush=True)
-        # We collect here. Because we reduced the data massively in Phase C, 
-        # the temporal sorting and grouping here will easily fit in RAM.
-        scored_df = scored_lazy.collect(streaming=True)
+            # 4. Temporal Tracking & Window Functions (Safe here because data is small)
+            user_history = (
+                user_contract
+                .sort(["user", "resolution_timestamp"])
+                .with_columns([
+                    pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
+                ])
+                .with_columns([
+                    pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
+                ])
+                .with_columns([
+                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
+                ])
+            )
+
+            # 5. Final User Metrics
+            final_df = (
+                user_history
+                .group_by("user")
+                .agg([
+                    pl.col("contract_pnl").sum().alias("total_pnl"),
+                    pl.col("invested").sum().alias("total_invested"),
+                    pl.col("trade_count").sum().alias("total_trades"),
+                    pl.col("current_drawdown").max().alias("max_drawdown")
+                ])
+            )
+
+            # 6. Scoring
+            scored_lazy = (
+                final_df
+                .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
+                .with_columns([
+                    (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
+                    (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
+                ])
+                .with_columns([
+                    (pl.min_horizontal(5.0, pl.col("calmar_raw")) + pl.col("roi")).alias("score")
+                ])
+            )
+
+            # 7. Collect this specific shard and append it
+            scored_shard = scored_lazy.collect()
+            
+            for row in scored_shard.iter_rows(named=True):
+                final_dict[f"{row['user']}|default_topic"] = row['score']
+
+        # --- E. SAVE RESULTS ---
+        print(f"\n✅ All shards complete! Scored {len(final_dict)} unique users.", flush=True)
         
-        # Save to JSON
-        print(f"   Scored {scored_df.height} unique users. Saving to disk...", flush=True)
-        final_dict = {
-            f"{row['user']}|default_topic": row['score'] 
-            for row in scored_df.iter_rows(named=True)
-        }
+        # Sort dictionary by score descending before saving
+        final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
 
         with open(output_file, "w") as f:
             json.dump(final_dict, f, indent=2)
         
-        print(f"✅ Success! Saved {len(final_dict)} scores to {output_file}", flush=True)
-        
-        if os.path.exists(temp_file): 
-            os.remove(temp_file)
+        print(f"✅ Success! Saved scores to {output_file}", flush=True)
 
     except Exception as e:
-        print(f"❌ Error during final aggregation: {e}", flush=True)
+        print(f"\n❌ Pipeline Error: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
