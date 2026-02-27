@@ -5,6 +5,7 @@ import os
 import mmap
 import sys
 from pathlib import Path
+import gc
 
 # Adjust imports based on your exact config
 from config import TRADES_FILE, TEMP_WALLET_STATS_FILE, WALLET_SCORES_FILE, MARKETS_FILE
@@ -130,24 +131,24 @@ def main():
     final_dict = {}
 
     try:
-        lazy_outcomes = outcomes.lazy().select(["contract_id", "outcome", "resolution_timestamp"])
+        df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"])
         
         for shard_id in range(NUM_SHARDS):
             shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
             if not os.path.exists(shard_file):
-                continue # Skip if no users hashed to this shard
+                continue 
             
             print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
             
-            # This file is now guaranteed to be small (~1-2GB). Polars will eat it for breakfast.
-            lazy_trades = pl.read_csv(
+            # 1. LAZY REDUCTION: Stream the file and squash the hot wallets safely
+            lazy_trades = pl.scan_csv(
                 shard_file, 
                 schema_overrides={"contract_id": pl.String, "user": pl.String}
-            ).lazy()
+            )
             
-            calculated = (
+            user_contract_lazy = (
                 lazy_trades
-                .join(lazy_outcomes, on="contract_id", how="inner")
+                .join(df_outcomes.lazy(), on="contract_id", how="inner")
                 .with_columns([
                     (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
                     (pl.col("outcomeTokensAmount").abs()).alias("quantity")
@@ -158,10 +159,6 @@ def main():
                     .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
                     .alias("invested_amount")
                 ])
-            )
-
-            user_contract = (
-                calculated
                 .group_by(["user", "contract_id", "resolution_timestamp"])
                 .agg([
                     pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
@@ -181,9 +178,12 @@ def main():
                 ])
             )
 
-            # Eagerly collect here so the window functions run safely entirely in RAM
+            # Execute the heavy grouping out-of-core. The result easily fits in RAM.
+            user_contract = user_contract_lazy.collect(streaming=True)
+
+            # 2. EAGER MATH: Safely run window functions on the squashed data
             df_history = (
-                user_contract.collect()
+                user_contract
                 .sort(["user", "resolution_timestamp"])
                 .with_columns([
                     pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
@@ -215,12 +215,14 @@ def main():
                 ])
             )
             
-            # Store in the master dictionary
+            # Store results
             for row in scored_shard.iter_rows(named=True):
                 final_dict[f"{row['user']}|default_topic"] = row['score']
 
-            # 🔥 Delete the shard immediately after scoring to free up disk space!
+            # Clean up disk AND RAM immediately
             os.remove(shard_file)
+            del lazy_trades, user_contract_lazy, user_contract, df_history, scored_shard
+            gc.collect()
 
         # --- E. SAVE RESULTS ---
         print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
