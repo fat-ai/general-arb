@@ -694,7 +694,7 @@ def main():
                         y_recent = np.array(y_recent_list)
                         
                         model = xgb.XGBClassifier(
-                            max_depth=4, 
+                            max_depth=5, 
                             learning_rate=0.05, 
                             n_estimators=150,
                             subsample=0.8,
