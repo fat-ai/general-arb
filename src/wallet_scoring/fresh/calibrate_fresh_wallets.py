@@ -118,7 +118,6 @@ def main():
         shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
         if not os.path.exists(shard_file): continue
 
-        # Read the small shard
         df_shard = pl.read_csv(
             shard_file,
             schema_overrides={"contract_id": pl.String, "wallet_id": pl.String}
