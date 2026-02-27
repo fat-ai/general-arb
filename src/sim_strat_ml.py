@@ -370,8 +370,21 @@ def main():
     
     def custom_get_score(wallet_id, volume, price):
         w_id = wallet_id.strip().lower()
-        if w_id in scorer.wallet_scores:
-            return scorer.wallet_scores[w_id]
+        
+        # [FIX] Check both "0x" and raw versions
+        w_id_no_prefix = w_id[2:] if w_id.startswith("0x") else w_id
+        w_id_with_prefix = w_id if w_id.startswith("0x") else f"0x{w_id}"
+
+        # 1. KNOWN WALLET LOOKUP (Check both keys)
+        if w_id in self.wallet_scores:
+        #    log.info(f"✅ HIT: Found {w_id}... Score: {self.wallet_scores[w_id]:.2f}")
+            return self.wallet_scores[w_id]
+        if w_id_no_prefix in self.wallet_scores:
+        #    log.info(f"✅ HIT: Found {w_id_no_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
+            return self.wallet_scores[w_id_no_prefix]
+        if w_id_with_prefix in self.wallet_scores:
+        #     log.info(f"✅ HIT: Found {w_id_with_prefix}... Score: {self.wallet_scores[w_id]:.2f}")
+             return self.wallet_scores[w_id_with_prefix]
         
         if getattr(scorer, 'xgb_model', None) is not None:
             m = scorer.current_m
@@ -392,6 +405,9 @@ def main():
                 expected_roi = (prob_win - price) / price
             else:
                 expected_roi = (prob_win - (1.0 - price)) / (1.0 - price)
+
+            if volume > 1000:
+              print(f"Fresh Whale! Bet on {m['question']}, ending { m['end']}, dropped {volume} at ${price} with probability {prob_win} and expected roi {expected_roi}")
                 
             return float(expected_roi)
         return 0.0
