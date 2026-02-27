@@ -4,8 +4,8 @@ services:
     container_name: fwc
     restart: on-failure
     volumes:
-      - .../data-cache/polymarket_cache:/app/data
-      - .../config.py:/app/config.py
+      - ~/data-cache/polymarket_cache:/app/data
+      - ~/config.py:/app/config.py
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
