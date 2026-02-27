@@ -99,7 +99,7 @@ def main():
         # read_csv_batched streams the file in low-memory chunks natively in Polars
         reader = pl.read_csv_batched(
             csv_file,
-            dtypes={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
+            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
             columns=["contract_id", "user", "price", "outcomeTokensAmount"]
         )
         
