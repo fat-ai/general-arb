@@ -118,7 +118,10 @@ def main():
         if not os.path.exists(shard_file): continue
 
         # Read the small shard
-        df_shard = pl.read_csv(shard_file)
+        df_shard = pl.read_csv(
+            shard_file,
+            schema_overrides={"contract_id": pl.String, "wallet_id": pl.String}
+        )
 
         # Calculate final metrics just for this subset
         long_roi = (pl.col('outcome') - pl.col('safe_price')) / pl.col('safe_price')
