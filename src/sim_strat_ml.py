@@ -468,7 +468,7 @@ def main():
         # Only iterate through the potential fresh candidates
         for trade in potential_fresh.iter_rows(named=True):
             uid = trade["user"]
-            
+            m_id = trade["id"]
             # 2. This is a "Fresh Wallet". Capture exact metrics.
             cid = trade["contract_id"]
             price = max(0.00, min(1.0, trade["price"])) 
@@ -485,15 +485,15 @@ def main():
             # Filter: Ignore tiny noise trades
             if risk_vol < 1.0:
                 continue
-                
+            market_info = result_map.get(m_id, {})
             tracker_first_bets[uid] = {
                 "contract_id": cid,
                 "risk_vol": risk_vol,
                 "price": price,
                 "is_long": is_long,
                 "ts": trade["timestamp"],
-                "question": market_map[cid].get('question', ''),
-                "end": market_map[cid].get('end')
+                "question": market_info.get('question', ''),
+                "end": market_info.get('end')
             }  
             
             known_users.add(uid)
