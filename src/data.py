@@ -60,7 +60,7 @@ class MarketMetadata:
         for mkt in markets:
             try:
                 mid = mkt.get('id').lower()               
-                cid = mkt.get('contract_id').lower()
+                cid = mkt.get('conditionId').lower()
                 end_date_str = mkt.get('endDate', '')
                 end_ts = 0
                 if end_date_str:
