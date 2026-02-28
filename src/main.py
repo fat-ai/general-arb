@@ -635,26 +635,23 @@ class LiveTrader:
                 end_ts = market['end_timestamp']
                 passes_roi_filter = False
              
-                if end_ts > 0:
-                    # Calculate days remaining until market expires
-                    days_to_expiry = (end_ts - time.time()) / 86400.0
+                days_to_expiry = (end_ts - time.time()) / 86400.0
                     
-                    if days_to_expiry > 0:
-                        if normalized_weight > 0:
-                          if is_yes_token:
-                              absolute_roi = (1.0 - price) / price
-                          else:
-                              absolute_roi = price / (1 - price)
-                        else:
-                           if is_yes_token:
-                              absolute_roi = price / (1 - price)
-                           else:
-                              absolute_roi = (1.0 - price) / price 
+                if normalized_weight > 0:
+                    if is_yes_token:
+                        absolute_roi = (1.0 - price) / price
+                    else:
+                        absolute_roi = price / (1 - price)
+                else:
+                    if is_yes_token:
+                        absolute_roi = price / (1 - price)
+                    else:
+                        absolute_roi = (1.0 - price) / price 
                               
-                        annualized_roi = absolute_roi * (365.0 / days_to_expiry)
-                        # Check if greater than 500% (5.0)
-                        if annualized_roi > 5.0:
-                            passes_roi_filter = True
+                annualized_roi = absolute_roi * (365.0 / days_to_expiry)
+                        
+                if annualized_roi > 5.0:
+                        passes_roi_filter = True
                 
                 if not passes_roi_filter:
                     print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
