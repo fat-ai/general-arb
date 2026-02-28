@@ -2,11 +2,8 @@ import asyncio
 import aiohttp
 import time
 import logging
-from config import GAMMA_API_URL
+from config import GAMMA_API_URL, CLOB_API_URL 
 from datetime import datetime
-
-# CLOB API URL
-CLOB_API_URL = "https://clob.polymarket.com/markets"
 
 logger = logging.getLogger("PaperGold")
 
