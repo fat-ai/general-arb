@@ -73,7 +73,7 @@ class LiveTrader:
         
         # Collect ALL valid Token IDs
         all_tokens = []
-        for mkt in self.metadata.items():
+        for mkt in self.metadata.markets.values():
             for tok in mkt['tokens']:
                logger.info(tok)
                all_tokens.append(tok)
