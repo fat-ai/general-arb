@@ -78,9 +78,9 @@ class MarketMetadata:
                         "conditon_id": cid,
                         "tokens": tokens,
                         "active": True, 
-                        "question": mkt.get('question', ''),
+                        "question": mkt.get('question'),
                         "end_timestamp": end_ts,
-                        "market_maker_address": mkt.get("marketMakerAddress",''),
+                        "market_maker_address": mkt.get("marketMakerAddress"),
                      }
  
             except Exception as e:
@@ -151,23 +151,25 @@ class MarketMetadata:
                 if not mkt['active']==True: 
                     continue
 
+                end = mkt.get('end_date_iso')
+                dt = datetime.fromisoformat(end)
+                timestamp = dt.timestamp()
+                end_ts = int(timestamp)
+                
                 tokens_raw = mkt['tokens']
                 tokens = {}
-                tokenlist = []
                 for token in tokens_raw:
                     tokens[token['outcome'].lower()] = token['token_id']
-                    tokenlist.append([token['outcome'].lower(),token['token_id']])
                 # We only add if this specific market ID is NOT yet known.
                 if mid not in self.markets:
                     self.markets[mid] = {
+                        "condition_id": mkt.get('condition_id')
                         "tokens": tokens,
                         "active": True, 
                         "question": mkt.get('question', 'Unknown'),
+                        "end_timestamp": end_ts,
+                        "market_maker_address": mkt.get("fpmm")
                     }
-                else:
-                    for tok in tokenlist:
-                        if tok[0] not in self.markets[mid]['tokens']:
-                            self.markets[mid]['tokens'][tok[0]] = tok[1]
                         
             except: continue
 
