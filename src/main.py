@@ -639,6 +639,7 @@ class LiveTrader:
                 end_ts = market_meta.get('end_timestamp', 0)
                 
                 passes_roi_filter = False
+                print(f"End: {end_ts}")
                 if end_ts > 0:
                     # Calculate days remaining until market expires
                     days_to_expiry = (end_ts - datetime.datetime.utcnow()).total_seconds() / 86400.0
