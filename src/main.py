@@ -642,7 +642,7 @@ class LiveTrader:
              
                 if end_ts > 0:
                     # Calculate days remaining until market expires
-                    days_to_expiry = (end_ts - datetime.datetime.utcnow()).total_seconds() / 86400.0
+                    days_to_expiry = (end_ts - time.time()) / 86400.0
                     
                     if days_to_expiry > 0:
                         if normalized_weight > 0:
