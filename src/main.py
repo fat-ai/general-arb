@@ -73,7 +73,7 @@ class LiveTrader:
         
         # Collect ALL valid Token IDs
         all_tokens = []
-        for mkt in self.markets.items():
+        for mkt in self.metadata.items():
             for tok in mkt['tokens']:
                logger.info(tok)
                all_tokens.append(tok)
@@ -687,7 +687,7 @@ class LiveTrader:
         ]
         
         for pos_token, pos_data in relevant_positions:
-            tokens = self.markets['mkt_id']
+            tokens = self.metadata.markets['mkt_id']
             if not tokens: continue
             
             is_yes = (str(pos_token) == mkt['tokens'].get('yes'))
