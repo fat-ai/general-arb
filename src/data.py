@@ -9,9 +9,7 @@ logger = logging.getLogger("PaperGold")
 
 class MarketMetadata:
     def __init__(self):
-        self.token_to_fpmm = {}     # Maps TokenID -> MarketID
-        self.fpmm_to_data = {}      # Maps MarketID -> Metadata
-        self.fpmm_to_tokens = {}    # Maps MarketID -> Tokens List
+        self.markets = {}
         self.last_refresh = 0
 
     async def refresh(self):
@@ -19,7 +17,6 @@ class MarketMetadata:
         Blocking Metadata Refresh.
         The bot will NOT start until this completes successfully.
         """
-        start_time = time.time()
         logger.info("🌍 Starting Strict Metadata Index...")
         
         async with aiohttp.ClientSession() as session:
@@ -27,20 +24,10 @@ class MarketMetadata:
             await self._fetch_gamma_strict(session)
             
             # 2. Fetch CLOB (Trading Layer) - Strict, Deep Scan
-            # We scan until the API returns an empty list. No arbitrary page limits.
             await self._fetch_clob_strict(session)
 
-        count = len(self.fpmm_to_data)
-        tokens = len(self.token_to_fpmm)
-        logger.info(f"✅ Indexing Complete. Loaded {count} Markets ({tokens} Tokens) in {time.time() - start_time:.2f}s")
-        
-        # SELF-CHECK: Verify the "Elon Musk" token exists in our map
-        # This guarantees we solved the problem before running the strategy.
-        target_id = "105983398713597801788725523674983519534626045739886740412062803259294550362235"
-        if target_id in self.token_to_fpmm:
-            logger.info(f"🛡️ INTEGRITY CHECK PASSED: Found Target Token {target_id[:10]}...")
-        else:
-            logger.warning(f"⚠️ INTEGRITY CHECK FAILED: Target Token {target_id[:10]}... is MISSING from index.")
+        count = len(self.markets)
+        logger.info(f"✅ Indexing Complete. Loaded {count} Markets")
 
         self.last_refresh = time.time()
 
@@ -54,12 +41,12 @@ class MarketMetadata:
                 async with session.get(url) as response:
                     if response.status != 200:
                         logger.error(f"Gamma API Error: {response.status}")
-                        break
+                        continue
                     
                     data = await response.json()
                     chunk = data.get('data', []) if isinstance(data, dict) else data
                     
-                    if not chunk: break
+                    if not chunk: continue
                     
                     self._process_gamma_chunk(chunk)
                     
@@ -72,22 +59,8 @@ class MarketMetadata:
     def _process_gamma_chunk(self, markets):
         for mkt in markets:
             try:
-                mid = mkt.get('conditionId') 
-                if not mid: continue
-                mid = mid.lower()
-                    
-                raw_tokens = mkt.get('clobTokenIds') or mkt.get('tokens', [])
-                if isinstance(raw_tokens, str):
-                    try: raw_tokens = json.loads(raw_tokens)
-                    except: raw_tokens = []
-                tokens = []
-                for t in raw_tokens:
-                    if isinstance(t, dict):
-                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                        if tid: tokens.append(str(tid))
-                    else:
-                        tokens.append(str(t))
-                
+                mid = mkt.get('id').lower()               
+                cid = mkt.get('contract_id').lower()
                 end_date_str = mkt.get('endDate', '')
                 end_ts = 0
                 if end_date_str:
@@ -96,19 +69,19 @@ class MarketMetadata:
                         end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
                     except:
                         pass
-
-                if len(tokens) >= 2:
-                    self.fpmm_to_data[mid] = {
-                        "tokens": tokens,
+                        
+                 yes_no = mkt.get(token_outcome_label).lower()
+                
+                 if mid not in self.markets:
+                    self.markets[mid] = {
+                        "tokens": {yes_no : cid},
                         "active": True, 
                         "question": mkt.get('question', 'Unknown'),
                         "end_timestamp": end_ts,
-                        "source": "gamma"
-                    }
-                    self.fpmm_to_tokens[mid] = tokens
-                    for t in tokens:
-                        if t not in self.token_to_fpmm:
-                            self.token_to_fpmm[t] = mid
+                     }
+
+                 else:
+                     self.markets[mid]["tokens"][yes_no] = cid
  
             except Exception as e:
                 logger.error(f"Gamma chunk error: {e}")
@@ -172,31 +145,28 @@ class MarketMetadata:
         for mkt in markets:
             try:
                 # Primary Key: Condition ID
-                mid = mkt.get('condition_id')
-                if not mid: continue
-                mid = mid.lower()
-
-                # --- NEW: STRICT STATUS FILTER ---
-                if not mkt.get('active', True): 
+                mid = mkt['question_id'].lower()
+                if not mkt['active']==True: 
                     continue
-                # ---------------------------------
 
-                tokens = []
-                if 'tokens' in mkt:
-                     for t in mkt['tokens']:
-                        if isinstance(t, dict): tokens.append(str(t.get('token_id', '')))
-                        else: tokens.append(str(t))
-                
+                tokens_raw = mkt['tokens']
+                tokens = {}
+                tokenlist = []
+                for token in tokens_raw:
+                    tokens[token['outcome'].lower()] = token['token_id']
+                    tokenlist.append([token['outcome'].lower(),token['token_id']])
                 # We only add if this specific market ID is NOT yet known.
-                if mid not in self.fpmm_to_data and len(tokens) >= 2:
-                    self.fpmm_to_data[mid] = {
+                if mid not in self.markets:
+                    self.markets[mid] = {
                         "tokens": tokens,
                         "active": True, 
-                        "question": mkt.get('question', 'Unknown (CLOB)'),
-                        "source": "clob"
+                        "question": mkt.get('question', 'Unknown'),
                     }
-                    self.fpmm_to_tokens[mid] = tokens
-                    for t in tokens: self.token_to_fpmm[t] = mid
+                else:
+                    for tok in tokenlist:
+                        if tok[0] not in self.markets[mid]['tokens']:
+                            self.markets[mid]['tokens'][tok[0]] = tok[1]
+                        
             except: continue
 
 class SubscriptionManager:
