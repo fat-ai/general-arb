@@ -75,7 +75,6 @@ class LiveTrader:
         all_tokens = []
         for mkt in self.metadata.markets.values():
             for tok in mkt['tokens'].values():
-               log.info(tok)
                all_tokens.append(tok)
         
         print(f"✅ Metadata Loaded. Subscribing to ALL {len(all_tokens)} assets...")
