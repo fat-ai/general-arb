@@ -14,6 +14,7 @@ EQUITY_FILE = Path("equity_curve.csv")
 MARKETS_FILE = Path("gamma_markets_all_tokens.parquet")
 
 # --- EXTERNAL SERVICES ---
+CLOB_API_URL = "https://clob.polymarket.com/markets"
 GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 RPC_URL = "https://polygon-bor.publicnode.com"
