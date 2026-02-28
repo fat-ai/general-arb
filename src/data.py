@@ -72,14 +72,21 @@ class MarketMetadata:
     def _process_gamma_chunk(self, markets):
         for mkt in markets:
             try:
-                mid = mkt.get('fpmm') or mkt.get('marketMakerAddress')
+                mid = mkt.get('conditionId') 
                 if not mid: continue
                 mid = mid.lower()
-
-                if mkt.get('closed', False): 
-                    continue
-
-                tokens = [str(t.get('tokenId') or t.get('token_id') or t.get('id', '')) for t in mkt['tokens']]
+                    
+                raw_tokens = mkt.get('clobTokenIds') or mkt.get('tokens', [])
+                if isinstance(raw_tokens, str):
+                    try: raw_tokens = json.loads(raw_tokens)
+                    except: raw_tokens = []
+                tokens = []
+                for t in raw_tokens:
+                    if isinstance(t, dict):
+                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
+                        if tid: tokens.append(str(tid))
+                    else:
+                        tokens.append(str(t))
                 
                 end_date_str = mkt.get('endDate', '')
                 end_ts = 0
