@@ -163,12 +163,12 @@ class MarketMetadata:
                 # We only add if this specific market ID is NOT yet known.
                 if mid not in self.markets:
                     self.markets[mid] = {
-                        "condition_id": mkt.get('condition_id')
+                        "condition_id": mkt.get('condition_id'),
                         "tokens": tokens,
                         "active": True, 
                         "question": mkt.get('question', 'Unknown'),
                         "end_timestamp": end_ts,
-                        "market_maker_address": mkt.get("fpmm")
+                        "market_maker_address": mkt.get("fpmm"),
                     }
                         
             except: continue
