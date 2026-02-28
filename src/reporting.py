@@ -172,8 +172,8 @@ def generate_html_report(state, live_prices, metadata):
             
             # Metadata
             fpmm = pos.get('market_fpmm', 'Unknown')
-            tokens = metadata.fpmm_to_tokens.get(fpmm, [])
-            side = "YES" if (tokens and str(tid) == tokens[1]) else "NO"
+            tokens = metadata.markets.get(fpmm, [])
+            side = "YES" if (tokens and str(tid) == tokens['yes']) else "NO"
             
             # Prepare Chart Data (Price Trace)
             hist = pos.get('trace_price', [])
