@@ -73,9 +73,10 @@ class LiveTrader:
         
         # Collect ALL valid Token IDs
         all_tokens = []
-        for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
-            if tokens and len(tokens) >= 2:
-                all_tokens.extend(tokens)
+        for mkt in self.markets.items():
+            for tok in mkt['tokens']:
+               logger.info(tok)
+               all_tokens.append(tok)
         
         print(f"✅ Metadata Loaded. Subscribing to ALL {len(all_tokens)} assets...")
 
@@ -551,7 +552,7 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "no_fpmm": 0, "no_tokens": 0}
+        skipped_counts = {"not_usdc": 0, "no_id": 0, "no_tokens": 0}
 
         for t in trades:
             # 1. Normalize Address Data
@@ -583,29 +584,20 @@ class LiveTrader:
                 continue
                 
             # 3. Calculate execution price 
-            price = usdc_vol / token_vol if token_vol > 0 else 0.5
-
-            # 4. Fetch Market Metadata (Must be done BEFORE calculating direction)
-            fpmm = self.metadata.token_to_fpmm.get(str(token_id))
-            if not fpmm: 
-                skipped_counts["no_fpmm"] += 1
-                continue 
-            
-            tokens = self.metadata.fpmm_to_tokens.get(fpmm)
-            if not tokens: 
-                skipped_counts["no_tokens"] += 1
-                continue
-            
+            price = usdc_vol / token_vol
+            markets = self.metadata.markets
+            market = next((obj for obj in markets.values() if obj['tokens']['yes'] == token_id or obj['tokens']['no'] == token_id), None)
             # 5. Determine Directionality (Using fetched tokens!)
-            is_yes_token = (str(token_id) == tokens[1])
+            is_yes_token = (token_id = market['tokens']['yes'])
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
             else:
                 direction = -1.0 if is_buy else 1.0
-
-            # 6. Update Cumulative Volume (Using fetched fpmm!)
-            self.cumulative_volumes[fpmm] = self.cumulative_volumes.get(fpmm, 0.0) + usdc_vol
-            cum_vol = self.cumulative_volumes[fpmm]
+                
+            id = market['id']
+            # 6. Update Cumulative Volume
+            self.cumulative_volumes[id] = self.cumulative_volumes.get(id, 0.0) + usdc_vol
+            cum_vol = self.cumulative_volumes[id]
 
             # 7. Process Signal with WalletScorer
             score_debug = self.scorer.get_score(wallet, usdc_vol, price)
@@ -636,8 +628,7 @@ class LiveTrader:
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
       
-                market_meta = self.metadata.fpmm_to_data.get(fpmm, {})
-                end_ts = market_meta.get('end_timestamp', 0)
+                end_ts = market['end_timestamp']
                 passes_roi_filter = False
              
                 if end_ts > 0:
