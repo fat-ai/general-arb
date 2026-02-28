@@ -132,7 +132,7 @@ class DataFetcher:
             if isinstance(raw, str):
                 try: raw = json.loads(raw)
                 except:
-                     log.warning(f"Failed to parse json from {raw})
+                     log.warning(f"Failed to parse json from {raw}")
             if isinstance(raw, list):
                 clean_tokens = []
                 for t in raw:
