@@ -69,19 +69,19 @@ class MarketMetadata:
                         end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
                     except:
                         pass
-                        
-                yes_no = mkt.get(token_outcome_label).lower()
-                
+
+                yes_token = mkt.get('clobTokenIds')[0]
+                no_token = mkt.get('clobTokenIds')[1]
+                tokens = {"yes": yes_token, "no": no_token}
                 if mid not in self.markets:
                     self.markets[mid] = {
-                        "tokens": {yes_no : cid},
+                        "conditon_id": cid,
+                        "tokens": tokens,
                         "active": True, 
-                        "question": mkt.get('question', 'Unknown'),
+                        "question": mkt.get('question', ''),
                         "end_timestamp": end_ts,
+                        "market_maker_address": mkt.get("marketMakerAddress",''),
                      }
-
-                else:
-                     self.markets[mid]["tokens"][yes_no] = cid
  
             except Exception as e:
                 logger.error(f"Gamma chunk error: {e}")
@@ -146,6 +146,8 @@ class MarketMetadata:
             try:
                 # Primary Key: Condition ID
                 mid = mkt['question_id'].lower()
+                if mid in self.markets:
+                    continue
                 if not mkt['active']==True: 
                     continue
 
