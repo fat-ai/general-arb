@@ -644,15 +644,26 @@ class LiveTrader:
                     days_to_expiry = (end_ts - datetime.datetime.utcnow()).total_seconds() / 86400.0
                     
                     if days_to_expiry > 0:
-                        absolute_roi = (1.0 - price) / price
+                        if normalized_weight > 0:
+                          if is_yes_token:
+                              absolute_roi = (1.0 - price) / price
+                          else:
+                              absolute_roi = price / (1 - price)
+                        else:
+                           if is_yes_token:
+                              absolute_roi = price / (1 - price)
+                           else:
+                              absolute_roi = (1.0 - price) / price 
+                              
                         annualized_roi = absolute_roi * (365.0 / days_to_expiry)
-                        
                         # Check if greater than 500% (5.0)
                         if annualized_roi > 5.0:
                             passes_roi_filter = True
                 
                 if not passes_roi_filter:
+                    print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi})
                     continue # Skip this trade, ROI is too low or date is unknown
+                    
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
                 if action == 'SPECULATE':
