@@ -635,9 +635,9 @@ class LiveTrader:
     
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
-                log.info(f"Data: {self.metadata}")
+      
                 market_meta = self.metadata.fpmm_to_data.get(fpmm, {})
-                print(f"market_meta keys: {list(market_meta.keys())}")
+                log.info(f"market_meta keys: {list(market_meta.keys())}")
                 end_ts = market_meta.get('end_timestamp', 0)
                 
                 passes_roi_filter = False
