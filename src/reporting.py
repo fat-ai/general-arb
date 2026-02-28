@@ -173,14 +173,14 @@ def generate_html_report(state, live_prices, metadata):
             # Metadata
             fpmm = pos.get('market_fpmm', 'Unknown')
             tokens = metadata.markets.get(fpmm, [])
-            side = "YES" if (tokens and str(tid) == tokens['yes']) else "NO"
+            side = [key for key, value in tokens.items() if value == tid]
             
             # Prepare Chart Data (Price Trace)
             hist = pos.get('trace_price', [])
             if not hist: hist = [entry]
             
             pos_data[tid] = {
-                "market": fpmm[:6] + "...",
+                "market": fpmm,
                 "side": side,
                 "qty": round(qty, 1),
                 "entry": round(entry, 3),
