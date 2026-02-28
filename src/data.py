@@ -50,7 +50,7 @@ class MarketMetadata:
             offset = 0
             limit = 1000
             while True:
-                url = f"{GAMMA_API_URL}?limit={limit}&offset={offset}&active=true"
+                url = f"{GAMMA_API_URL}?limit={limit}&offset={offset}&closed=false"
                 async with session.get(url) as response:
                     if response.status != 200:
                         logger.error(f"Gamma API Error: {response.status}")
