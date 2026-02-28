@@ -70,9 +70,9 @@ class MarketMetadata:
                     except:
                         pass
                         
-                 yes_no = mkt.get(token_outcome_label).lower()
+                yes_no = mkt.get(token_outcome_label).lower()
                 
-                 if mid not in self.markets:
+                if mid not in self.markets:
                     self.markets[mid] = {
                         "tokens": {yes_no : cid},
                         "active": True, 
@@ -80,7 +80,7 @@ class MarketMetadata:
                         "end_timestamp": end_ts,
                      }
 
-                 else:
+                else:
                      self.markets[mid]["tokens"][yes_no] = cid
  
             except Exception as e:
