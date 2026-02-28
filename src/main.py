@@ -653,7 +653,7 @@ class LiveTrader:
                 if annualized_roi > 5.0:
                         passes_roi_filter = True
                 
-                if not passes_roi_filter:
+                if not passes_roi_filter and days > 0:
                     print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
                     continue 
                     
