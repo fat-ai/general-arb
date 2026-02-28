@@ -632,14 +632,15 @@ class LiveTrader:
             # 9. Smart Exits
             if CONFIG.get('use_smart_exit'):
                 await self._check_smart_exits_for_market(fpmm, normalized_weight)
-
+    
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
+                log.info(f"Data: {self.metadata}")
                 market_meta = self.metadata.fpmm_to_data.get(fpmm, {})
                 end_ts = market_meta.get('end_timestamp', 0)
                 
                 passes_roi_filter = False
-                print(f"End: {end_ts}")
+                log.info(f"End: {end_ts}")
                 if end_ts > 0:
                     # Calculate days remaining until market expires
                     days_to_expiry = (end_ts - datetime.datetime.utcnow()).total_seconds() / 86400.0
