@@ -69,7 +69,9 @@ class MarketMetadata:
                         end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
                     except:
                         pass
-
+                if end_ts < time.time():
+                    continue
+                    
                 yes_token = mkt.get('clobTokenIds')[0]
                 no_token = mkt.get('clobTokenIds')[1]
                 tokens = {"yes": yes_token, "no": no_token}
@@ -155,6 +157,9 @@ class MarketMetadata:
                 dt = datetime.fromisoformat(end)
                 timestamp = dt.timestamp()
                 end_ts = int(timestamp)
+
+                if end_ts < time.time():
+                    continue
                 
                 tokens_raw = mkt['tokens']
                 tokens = {}
