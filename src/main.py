@@ -552,7 +552,7 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "no_id": 0, "no_tokens": 0}
+        skipped_counts = {"not_usdc": 0, "no_tokens": 0}
 
         for t in trades:
             # 1. Normalize Address Data
@@ -586,18 +586,23 @@ class LiveTrader:
             # 3. Calculate execution price 
             price = usdc_vol / token_vol
             markets = self.metadata.markets
-            market = next((obj for obj in markets.values() if obj['tokens']['yes'] == token_id or obj['tokens']['no'] == token_id), None)
-            # 5. Determine Directionality (Using fetched tokens!)
-            is_yes_token = (token_id = market['tokens']['yes'])
+            market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
+            if not market:
+                skipped_counts["no_id"] += 1
+                continue
+                
+            mid = next(k for k, v in markets.items() if v is market)
+            
+            is_yes_token = (token_id == market['tokens'].get('yes'))
+            
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
             else:
                 direction = -1.0 if is_buy else 1.0
                 
-            id = market['id']
             # 6. Update Cumulative Volume
-            self.cumulative_volumes[id] = self.cumulative_volumes.get(id, 0.0) + usdc_vol
-            cum_vol = self.cumulative_volumes[id]
+            self.cumulative_volumes[mid] = self.cumulative_volumes.get(mid, 0.0) + usdc_vol
+            cum_vol = self.cumulative_volumes[mid]
 
             # 7. Process Signal with WalletScorer
             score_debug = self.scorer.get_score(wallet, usdc_vol, price)
@@ -607,7 +612,7 @@ class LiveTrader:
 
             raw_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
-                token_id=token_id, 
+                token_id=mid, 
                 usdc_vol=usdc_vol, 
                 total_vol=cum_vol, 
                 direction=direction, 
@@ -616,14 +621,14 @@ class LiveTrader:
             )
             
             # 8. Normalize exactly like simulate_strategy.py
-            normalized_weight = raw_weight / cum_vol if cum_vol > 0 else 0
+            normalized_weight = raw_weight / cum_vol
             
             self.stats['scores'].append(normalized_weight)
-            batch_scores.append((abs(normalized_weight), normalized_weight, fpmm))
+            batch_scores.append((abs(normalized_weight), normalized_weight, mid))
 
             # 9. Smart Exits
             if CONFIG.get('use_smart_exit'):
-                await self._check_smart_exits_for_market(fpmm, normalized_weight)
+                await self._check_smart_exits_for_market(mid, normalized_weight)
     
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
@@ -654,16 +659,16 @@ class LiveTrader:
                 
                 if not passes_roi_filter:
                     print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
-                    continue # Skip this trade, ROI is too low or date is unknown
+                    continue 
                     
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
                 if action == 'SPECULATE':
-                    self.sub_manager.add_speculative(tokens)
+                    self.sub_manager.add_speculative(list(market['tokens'].values()))
                 elif action == 'BUY':
                     if token_id not in self.pending_orders:
                         self.pending_orders.add(token_id)
-                        asyncio.create_task(self._execute_task(token_id, fpmm, "BUY", None))
+                        asyncio.create_task(self._execute_task(token_id, mid, "BUY", None))
 
         # End of Batch Summary
         if batch_scores:
@@ -674,18 +679,18 @@ class LiveTrader:
         else:
             log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
-    async def _check_smart_exits_for_market(self, fpmm_id, current_signal):
+    async def _check_smart_exits_for_market(self, mkt_id, current_signal):
         """Iterates over held positions in this market and checks for reversal exits."""
         relevant_positions = [
             (tid, p) for tid, p in self.persistence.state["positions"].items() 
-            if p.get("market_fpmm") == fpmm_id
+            if p.get("market_fpmm") == mkt_id
         ]
         
         for pos_token, pos_data in relevant_positions:
-            tokens = self.metadata.fpmm_to_tokens.get(fpmm_id)
+            tokens = self.markets['mkt_id']
             if not tokens: continue
             
-            is_yes = (str(pos_token) == tokens[1])
+            is_yes = (str(pos_token) == mkt['tokens'].get('yes'))
             pos_type = 'YES' if is_yes else 'NO'
             
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
@@ -694,7 +699,7 @@ class LiveTrader:
                 clean_book = self._prepare_clean_book(pos_token)
                 if clean_book:
                     log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
-                    await self.broker.execute_market_order(pos_token, "SELL", 0, fpmm_id, current_book=clean_book)
+                    await self.broker.execute_market_order(pos_token, "SELL", 0, mkt_id, current_book=clean_book)
                 else:
                     log.warning(f"❌ Missed Opportunity: Empty Book for {pos_token}")
 
@@ -722,7 +727,7 @@ class LiveTrader:
         
         return {'bids': sorted_bids, 'asks': sorted_asks}
 
-    async def _attempt_exec(self, token_id, fpmm, reset_tracker_key=None):
+    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None):
         token_id = str(token_id)
         
         if token_id in self.persistence.state["positions"]:
@@ -733,13 +738,11 @@ class LiveTrader:
         for i in range(5):
             raw_book = self.order_books.get(token_id) # Use self.order_books
             if raw_book and raw_book.get('asks') and raw_book.get('bids'): break
-            
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for {token_id}...")
-                tokens = self.metadata.fpmm_to_tokens.get(fpmm)
-                if tokens:
-                    self.sub_manager.add_speculative(tokens)
-                    self.sub_manager.dirty = True 
+                mkt = self.metadata.markets.get(mkt_id)
+                self.sub_manager.add_speculative(list(mkt['tokens'].values()))
+                self.sub_manager.dirty = True 
             await asyncio.sleep(1.0)
         
         # 2. DATA CONVERSION 
@@ -792,7 +795,7 @@ class LiveTrader:
                 trade_size = CONFIG['fixed_size']
                 
         success = await self.broker.execute_market_order(
-            token_id, "BUY", trade_size, fpmm, current_book=clean_book
+            token_id, "BUY", trade_size, mkt_id, current_book=clean_book
         )
         
         if success:
@@ -844,8 +847,8 @@ class LiveTrader:
                 # -------------------------------------------
                 
                 all_tokens = []
-                for fpmm, tokens in self.metadata.fpmm_to_tokens.items():
-                    if tokens: all_tokens.extend(tokens)
+                for mid, mkt in self.metadata.markets.items():
+                    all_tokens.extend(mkt['tokens'].values())
                 
                 self.sub_manager.set_mandatory(all_tokens)
                 self.sub_manager.dirty = True
