@@ -79,11 +79,8 @@ class MarketMetadata:
                 if mkt.get('closed', False): 
                     continue
 
-                tokens = []
-                if 'clobTokenIds' in mkt: tokens = [str(t) for t in mkt['clobTokenIds']]
-                elif 'tokens' in mkt: tokens = [str(t.get('tokenId', '')) for t in mkt['tokens']]
+                tokens = [str(t.get('tokenId') or t.get('token_id') or t.get('id', '')) for t in mkt['tokens']]
                 
-                # --- NEW: Parse the End Date ---
                 end_date_str = mkt.get('endDate', '')
                 end_ts = 0
                 if end_date_str:
@@ -92,14 +89,13 @@ class MarketMetadata:
                         end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
                     except:
                         pass
-                # -------------------------------
 
                 if len(tokens) >= 2:
                     self.fpmm_to_data[mid] = {
                         "tokens": tokens,
                         "active": True, 
                         "question": mkt.get('question', 'Unknown'),
-                        "end_timestamp": end_ts, # <--- Add the timestamp here
+                        "end_timestamp": end_ts,
                         "source": "gamma"
                     }
                     self.fpmm_to_tokens[mid] = tokens
@@ -107,8 +103,9 @@ class MarketMetadata:
                         if t not in self.token_to_fpmm:
                             self.token_to_fpmm[t] = mid
  
-            except: continue    
-        logger.info(f"Gamma indexed {len(self.fpmm_to_data)} markets")
+            except Exception as e:
+                logger.error(f"Gamma chunk error: {e}")
+                continue  
 
     async def _fetch_clob_strict(self, session):
         """
