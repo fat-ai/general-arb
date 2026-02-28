@@ -160,8 +160,6 @@ class MarketMetadata:
                     # Tiny sleep to be polite
                     await asyncio.sleep(0.05)
                     
-                logger.info(f"CLOB indexed {len(self.fpmm_to_data)} markets total")
-                
             except Exception as e:
                 logger.error(f"CLOB Network Error: {e}")
                 await asyncio.sleep(1)
