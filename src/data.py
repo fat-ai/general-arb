@@ -106,7 +106,9 @@ class MarketMetadata:
                     for t in tokens:
                         if t not in self.token_to_fpmm:
                             self.token_to_fpmm[t] = mid
+ 
             except: continue    
+        logger.info(f"Gamma indexed {len(self.fpmm_to_data)} markets")
 
     async def _fetch_clob_strict(self, session):
         """
@@ -158,6 +160,8 @@ class MarketMetadata:
                     # Tiny sleep to be polite
                     await asyncio.sleep(0.05)
                     
+                logger.info(f"CLOB indexed {len(self.fpmm_to_data)} markets total")
+                
             except Exception as e:
                 logger.error(f"CLOB Network Error: {e}")
                 await asyncio.sleep(1)
