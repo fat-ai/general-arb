@@ -547,6 +547,7 @@ class LiveTrader:
                 await self._process_batch([trade])
                 
             except Exception as e:
+                log.info(raw_trade)
                 log.error(f"❌ Processing Error: {e}")
                 
     async def _process_batch(self, trades):
@@ -653,7 +654,7 @@ class LiveTrader:
                 if annualized_roi > 5.0:
                         passes_roi_filter = True
                 
-                if not passes_roi_filter and days > 0:
+                if not passes_roi_filter and days_to_expiry > 0:
                     print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
                     continue 
                     
