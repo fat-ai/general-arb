@@ -637,11 +637,9 @@ class LiveTrader:
             if 0.05 < price < 0.95:
       
                 market_meta = self.metadata.fpmm_to_data.get(fpmm, {})
-                log.info(f"market_meta keys: {list(market_meta.keys())}")
                 end_ts = market_meta.get('end_timestamp', 0)
-                
                 passes_roi_filter = False
-                log.info(f"End: {end_ts}")
+             
                 if end_ts > 0:
                     # Calculate days remaining until market expires
                     days_to_expiry = (end_ts - datetime.datetime.utcnow()).total_seconds() / 86400.0
