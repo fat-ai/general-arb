@@ -106,7 +106,7 @@ class MarketMetadata:
                     for t in tokens:
                         if t not in self.token_to_fpmm:
                             self.token_to_fpmm[t] = mid
-                
+            except: continue    
 
     async def _fetch_clob_strict(self, session):
         """
