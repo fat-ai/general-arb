@@ -715,7 +715,9 @@ class LiveTrader:
         # 1. Wait for Liquidity
         raw_book = self.order_books.get(token_id)
         if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
-            log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
+            log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
+            await asyncio.sleep(0.5)
+            asyncio.create_task(self._attempt_exec(token_id, mkt_id))
             return
                 
         # 2. DATA CONVERSION 
