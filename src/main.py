@@ -413,14 +413,6 @@ class LiveTrader:
                 # regardless of which slot it sits in.
                 final_vol_raw = max(amt_a_raw, amt_b_raw)
 
-               #  print(f"🔍 TRACE_PARSE: Tx={log_item.get('transactionHash')}... | RawVol={final_vol_raw} | Chunk2={amt_a_raw}")
-
-                # Raw Parsing
-                asset_a_str = str(int(chunks[0], 16))
-                asset_b_str = str(int(chunks[1], 16))
-                amt_a_raw = int(chunks[2], 16)
-                amt_b_raw = int(chunks[3], 16)
-
                 # --- FIX: Preserve the actual split to calculate Price ---
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
@@ -754,16 +746,6 @@ class LiveTrader:
                 log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
                 return
         
-        # 3. Final Validation
-        best_bid = float(sorted_bids[0][0])
-        best_ask = float(sorted_asks[0][0])
-        
-        if best_ask > 0:
-            spread = (best_ask - best_bid) / best_ask
-            if spread > 0.15: 
-                log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
-                return
-
         # 4. Prepare "Clean" Book for Broker
         # The broker expects lists, not dictionaries.
         clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
