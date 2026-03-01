@@ -71,10 +71,13 @@ class MarketMetadata:
                         pass
                 if end_ts < time.time():
                     continue
-                    
-                yes_token = mkt.get('clobTokenIds')[0]
-                no_token = mkt.get('clobTokenIds')[1]
-                tokens = {"yes": yes_token, "no": no_token}
+
+                outcomes = mkt.get('outcomes')
+                token_ids = mkt.get('clobTokenIds')
+                tokens = {}
+                for outcome, i in outcomes:
+                    tokens[outcome.lower()] = token_ids[i]
+                
                 if mid not in self.markets:
                     self.markets[mid] = {
                         "conditon_id": cid,
