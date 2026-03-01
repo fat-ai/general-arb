@@ -61,6 +61,19 @@ class PolymarketWS:
             except Exception as e:
                 log.error(f"Failed to update subs: {e}")
 
+    def resubscribe_single(self, token_id):
+        """Sends a fresh subscription request for a single token to recover missing snapshot."""
+        if self.ws and self.ws.sock and self.ws.sock.connected:
+            payload = {
+                "assets_ids": [token_id],
+                "type": "market"
+            }
+            try:
+                self.ws.send(json.dumps(payload))
+                log.info(f"🔄 Re-subscribed single token: {token_id}")
+            except Exception as e:
+                log.error(f"Failed to resubscribe single token: {e}")
+
     def _keep_alive_loop(self):
         while self.running:
             try:
