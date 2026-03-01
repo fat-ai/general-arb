@@ -722,6 +722,11 @@ class LiveTrader:
         # 1. Wait for Liquidity
         raw_book = self.order_books.get(token_id)
         if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
+            if _retries >= 10:
+                log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
+                self.ws_client.resubscribe_single(token_id)
+                asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=0))
+                return
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
             await asyncio.sleep(0.5)
             asyncio.create_task(self._attempt_exec(token_id, mkt_id))
