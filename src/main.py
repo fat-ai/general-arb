@@ -102,7 +102,7 @@ class LiveTrader:
         """Polls midpoint prices via REST for all tokens not covered by WebSocket."""
         BATCH_SIZE = 500
         POLL_INTERVAL = 5.0
-        
+     
         while self.running:
             try:
                 # Get tokens currently covered by WebSocket
@@ -135,6 +135,7 @@ class LiveTrader:
                                 self.order_books[token_id] = {'bids': {}, 'asks': {}}
                             # Only write if not actively maintained by WS
                             if token_id not in ws_tokens:
+                                self.order_books[token_id]['_rest_only'] = True
                                 self.order_books[token_id]['bids'] = {str(mid): '1'}
                                 self.order_books[token_id]['asks'] = {str(mid): '1'}
                                 
@@ -142,6 +143,7 @@ class LiveTrader:
                 log.error(f"REST Price Poll Error: {e}")
                 
             await asyncio.sleep(POLL_INTERVAL)
+            
     async def shutdown(self):
         log.info("🛑 Shutting down...")
         self.running = False
@@ -764,7 +766,7 @@ class LiveTrader:
         raw_book = None
         for i in range(5):
             raw_book = self.order_books.get(token_id) # Use self.order_books
-            if raw_book and raw_book.get('asks') and raw_book.get('bids'): break
+            if raw_book and raw_book.get('asks') and raw_book.get('bids') and not raw_book.get('_rest_only'): break
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for {token_id}...")
                 mkt = self.metadata.markets.get(mkt_id)
@@ -863,9 +865,6 @@ class LiveTrader:
                 await asyncio.to_thread(self.scorer.load)
                 # -------------------------------------------
                 
-                all_tokens = []
-                for mid, mkt in self.metadata.markets.items():
-                    all_tokens.extend(mkt['tokens'].values())
                 
                 open_pos = list(self.persistence.state["positions"].keys())
                 self.sub_manager.set_mandatory(open_pos)
