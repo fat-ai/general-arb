@@ -713,7 +713,7 @@ class LiveTrader:
         
         return {'bids': sorted_bids, 'asks': sorted_asks}
 
-    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None):
+    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0):
         token_id = str(token_id)
         
         if token_id in self.persistence.state["positions"]:
