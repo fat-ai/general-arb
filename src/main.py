@@ -389,10 +389,10 @@ class LiveTrader:
             
             if len(chunks) >= 4:
                 # Raw Parsing
-                asset_a_str = str(int(chunks[0], 16))
-                asset_b_str = str(int(chunks[1], 16))
-                amt_a_raw = int(chunks[2], 16)
-                amt_b_raw = int(chunks[3], 16)
+                asset_a_str = chunks[0]
+                asset_b_str = chunks[1]
+                amt_a_raw = int(chunks[2])
+                amt_b_raw = int(chunks[3])
 
                 # --- CRITICAL FIX: VOLUME NORMALIZATION ---
                 # The logs show a 1000x difference between Amt A and Amt B.
