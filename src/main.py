@@ -552,34 +552,27 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "no_tokens": 0}
+        skipped_counts = {"not_usdc": 0, "no_id": 0, "no_tokens": 0}
 
         for t in trades:
             # 1. Normalize Address Data
-            maker_asset = str(t['makerAssetId']).lower()
-            taker_asset = str(t['takerAssetId']).lower()
-            
-            target_usdc_hex = USDC_ADDRESS.lower()
-            target_usdc_dec = str(int(target_usdc_hex, 16)) 
-            def is_usdc(a): 
-                return a in ["0", "0x0", target_usdc_hex, target_usdc_dec]
-
             wallet = t['taker']
             raw_maker = float(t['makerAmountFilled'])
             raw_taker = float(t['takerAmountFilled'])
 
             # 2. Identify Token, USDC Volume, and Trade Side
-            if maker_asset == '0':
+            if t.get('makerAssetId') == '0':
                 token_id = taker_asset
                 usdc_vol = raw_maker / 1e6 
                 token_vol = raw_taker / 1e6
                 is_buy = False # Taker gave Token, received USDC (Sell)
-            elif taker_asset == '0':
+            elif t.get('takerAssetId')  == '0':
                 token_id = maker_asset
                 usdc_vol = raw_taker / 1e6
                 token_vol = raw_maker / 1e6
                 is_buy = True # Taker gave USDC, received Token (Buy)
             else:
+                log.info(f"Could not identify token for trade: {t}")
                 skipped_counts["not_usdc"] += 1
                 continue
                 
@@ -588,6 +581,7 @@ class LiveTrader:
             markets = self.metadata.markets
             market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
             if not market:
+                log.info(f"Market not found for trade: {t}")
                 skipped_counts["no_id"] += 1
                 continue
                 
