@@ -107,7 +107,7 @@ class LiveTrader:
         """Helper to run trades in background and release lock."""
         try:
             if side == "BUY":
-                await self._attempt_exec(token_id, fpmm)
+                await self._attempt_exec(token_id, fpmm, signal_price=signal_price)
             else:
                 await self.broker.execute_market_order(token_id, "SELL", 0, fpmm, current_book=book)
         finally:
@@ -654,7 +654,7 @@ class LiveTrader:
                 elif action == 'BUY':
                     if token_id not in self.pending_orders:
                         self.pending_orders.add(token_id)
-                        asyncio.create_task(self._execute_task(token_id, mid, "BUY", None))
+                        asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
 
         # End of Batch Summary
         if batch_scores:
@@ -713,7 +713,7 @@ class LiveTrader:
         
         return {'bids': sorted_bids, 'asks': sorted_asks}
 
-    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0):
+    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, signal_price=None):
         token_id = str(token_id)
         
         if token_id in self.persistence.state["positions"]:
@@ -751,7 +751,14 @@ class LiveTrader:
             if spread > 0.15: 
                 log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
                 return
-        
+
+        vwap_price, _ = self.broker.calculate_vwap_execution("BUY", CONFIG['fixed_size'], clean_book)
+        if signal_price and vwap_price > 0:
+            slippage = (vwap_price - signal_price) / signal_price
+            if slippage > CONFIG.get('max_vwap_slippage', 0.05):
+                log.warning(f"🛡️ VWAP GUARD: Skipped {token_id}. Slippage {slippage:.1%}")
+                self.pending_orders.discard(token_id)
+                return
         # 4. Prepare "Clean" Book for Broker
         # The broker expects lists, not dictionaries.
         clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
