@@ -70,10 +70,13 @@ class LiveTrader:
         
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
-        
+
+        all_tokens = []
+        for mid, mkt in self.metadata.markets.items():
+            all_tokens.extend(mkt['tokens'].values())
+            
         # Force the subscription immediately
-        open_pos = list(self.persistence.state["positions"].keys())
-        self.sub_manager.set_mandatory(open_pos)
+        self.sub_manager.set_mandatory(all_tokens)
         self.sub_manager.dirty = True
 
         # 4. START LOOPS
@@ -88,53 +91,8 @@ class LiveTrader:
             self._monitor_loop(),
             self._dashboard_loop(),
             self._resolution_monitor_loop(),
-            self._rest_price_poll_loop(),
         )
-    async def _rest_price_poll_loop(self):
-        """Polls midpoint prices via REST for all tokens not covered by WebSocket."""
-        BATCH_SIZE = 500
-        POLL_INTERVAL = 5.0
-     
-        while self.running:
-            try:
-                # Get tokens currently covered by WebSocket
-                async with self.sub_manager.lock:
-                    ws_tokens = set(self.sub_manager.mandatory_subs) | set(self.sub_manager.speculative_subs.keys())
-                
-                # All known tokens not in WS
-                all_tokens = []
-                for mkt in self.metadata.markets.values():
-                    for tok in mkt['tokens'].values():
-                        if tok not in ws_tokens:
-                            all_tokens.append(tok)
-                
-                # Batch requests
-                for i in range(0, len(all_tokens), BATCH_SIZE):
-                    batch = all_tokens[i:i+BATCH_SIZE]
-                    token_ids_str = ",".join(batch)
-                    
-                    resp = await asyncio.to_thread(
-                        requests.get,
-                        f"https://clob.polymarket.com/midpoints",
-                        params={"token_ids": token_ids_str}
-                    )
-                    
-                    if resp.status_code == 200:
-                        prices = resp.json()
-                        for token_id, mid_str in prices.items():
-                            mid = float(mid_str)
-                            if token_id not in self.order_books:
-                                self.order_books[token_id] = {'bids': {}, 'asks': {}}
-                            # Only write if not actively maintained by WS
-                            if token_id not in ws_tokens:
-                                self.order_books[token_id]['_rest_only'] = True
-                                self.order_books[token_id]['bids'] = {str(mid): '1'}
-                                self.order_books[token_id]['asks'] = {str(mid): '1'}
-                                
-            except Exception as e:
-                log.error(f"REST Price Poll Error: {e}")
-                
-            await asyncio.sleep(POLL_INTERVAL)
+
             
     async def shutdown(self):
         log.info("🛑 Shutting down...")
@@ -758,7 +716,7 @@ class LiveTrader:
         raw_book = None
         for i in range(5):
             raw_book = self.order_books.get(token_id) # Use self.order_books
-            if raw_book and raw_book.get('asks') and raw_book.get('bids') and not raw_book.get('_rest_only'): break
+            if raw_book and raw_book.get('asks') and raw_book.get('bids'): break
             if i == 0:
                 log.info(f"⏳ Cold Start: Waiting for {token_id}...")
                 mkt = self.metadata.markets.get(mkt_id)
@@ -850,16 +808,12 @@ class LiveTrader:
             if time.time() - last_metadata_refresh > 3600:
                 log.info("🌍 Hourly Metadata Refresh...")
                 await self.metadata.refresh()
-                
-                # --- NEW: Reload the Wallet Brain safely ---
                 log.info("🧠 Hourly Brain Refresh: Reloading JSON parameters...")
-                # We use to_thread so reading/parsing heavy JSONs doesn't block the async loops
+
                 await asyncio.to_thread(self.scorer.load)
-                # -------------------------------------------
                 
                 
-                open_pos = list(self.persistence.state["positions"].keys())
-                self.sub_manager.set_mandatory(open_pos)
+                self.sub_manager.set_mandatory(all_tokens)
                 self.sub_manager.dirty = True
                 
                 last_metadata_refresh = time.time()
