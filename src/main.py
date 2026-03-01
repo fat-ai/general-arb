@@ -460,7 +460,7 @@ class LiveTrader:
                 await asyncio.sleep(60)
                 continue
             
-            chunk_size = 20
+            chunk_size = 5
             redeemed_any = False
             
             for i in range(0, len(unique_fpmms), chunk_size):
