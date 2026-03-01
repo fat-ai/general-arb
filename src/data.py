@@ -184,7 +184,6 @@ class MarketMetadata:
 class SubscriptionManager:
     def __init__(self):
         self.mandatory_subs = set()
-        # Use a dict to maintain insertion order (acts like an Ordered Set)
         self.speculative_subs = {} 
         self.lock = asyncio.Lock()
         self.dirty = False
