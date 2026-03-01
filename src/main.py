@@ -466,7 +466,7 @@ class LiveTrader:
             for i in range(0, len(unique_fpmms), chunk_size):
                 batch = unique_fpmms[i : i + chunk_size]
                 ids_str = ",".join(batch)
-                url = f"{GAMMA_API_URL}?id={ids_str}"
+                url = GAMMA_API_URL + "?" + "&".join([f"condition_ids={fpmm}" for fpmm in batch])
                 
                 try:
                     resp = await asyncio.to_thread(requests.get, url)
