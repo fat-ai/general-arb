@@ -730,7 +730,7 @@ class LiveTrader:
                 return
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
             await asyncio.sleep(0.5)
-            asyncio.create_task(self._attempt_exec(token_id, mkt_id))
+            asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=_retries+1))
             return
                 
         # 2. DATA CONVERSION 
