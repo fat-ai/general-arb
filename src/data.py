@@ -75,8 +75,10 @@ class MarketMetadata:
                 outcomes = mkt.get('outcomes')
                 token_ids = mkt.get('clobTokenIds')
                 tokens = {}
-                for outcome, i in outcomes:
+                i=0
+                for outcome in outcomes:
                     tokens[outcome.lower()] = token_ids[i]
+                    i+=1
                 
                 if mid not in self.markets:
                     self.markets[mid] = {
