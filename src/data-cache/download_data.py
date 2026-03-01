@@ -162,7 +162,7 @@ class DataFetcher:
                         for i, p in enumerate(p_floats):
                             if p >= 0.95: return float(i)
                 except:
-                    log.warning(f"Failed to derive outcome from {prices}"
+                    log.warning(f"Failed to derive outcome from {prices}")
             return np.nan 
 
         new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
@@ -245,7 +245,7 @@ class DataFetcher:
                     ts_obj = ts_obj.tz_localize('UTC')
                 return ts_obj.timestamp()
             except: 
-                log.warning("Failed to parse timestamp from {iso_str}"
+                log.warning("Failed to parse timestamp from {iso_str}")
                 return 0.0
 
         def get_csv_bounds(filepath):
