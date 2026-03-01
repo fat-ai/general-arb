@@ -562,12 +562,12 @@ class LiveTrader:
 
             # 2. Identify Token, USDC Volume, and Trade Side
             if t.get('makerAssetId') == '0':
-                token_id = taker_asset
+                token_id = t.get('takerAssetId')
                 usdc_vol = raw_maker / 1e6 
                 token_vol = raw_taker / 1e6
                 is_buy = False # Taker gave Token, received USDC (Sell)
             elif t.get('takerAssetId')  == '0':
-                token_id = maker_asset
+                token_id = t.get('makerAssetId')
                 usdc_vol = raw_taker / 1e6
                 token_vol = raw_maker / 1e6
                 is_buy = True # Taker gave USDC, received Token (Buy)
