@@ -725,6 +725,7 @@ class LiveTrader:
             if _retries >= 10:
                 log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
                 self.ws_client.resubscribe_single(token_id)
+                await asyncio.sleep(3.0)
                 asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=0))
                 return
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
