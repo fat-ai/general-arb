@@ -52,8 +52,8 @@ class PolymarketWS:
 
         if self.ws and self.ws.sock and self.ws.sock.connected:
             payload = {
-                "assets_ids": assets_ids, 
-                "type": "market"
+                "operation": "subscribe",
+                "assets_ids": assets_ids
             }
             try:
                 self.ws.send(json.dumps(payload))
@@ -62,11 +62,10 @@ class PolymarketWS:
                 log.error(f"Failed to update subs: {e}")
 
     def resubscribe_single(self, token_id):
-        """Sends a fresh subscription request for a single token to recover missing snapshot."""
         if self.ws and self.ws.sock and self.ws.sock.connected:
             payload = {
-                "assets_ids": [token_id],
-                "type": "market"
+                "operation": "subscribe",
+                "assets_ids": [token_id]
             }
             try:
                 self.ws.send(json.dumps(payload))
