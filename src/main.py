@@ -713,17 +713,11 @@ class LiveTrader:
             return
 
         # 1. Wait for Liquidity
-        raw_book = None
-        for i in range(5):
-            raw_book = self.order_books.get(token_id) # Use self.order_books
-            if raw_book and raw_book.get('asks') and raw_book.get('bids'): break
-            if i == 0:
-                log.info(f"⏳ Cold Start: Waiting for {token_id}...")
-                mkt = self.metadata.markets.get(mkt_id)
-                self.sub_manager.add_speculative(list(mkt['tokens'].values()))
-                self.sub_manager.dirty = True 
-            await asyncio.sleep(1.0)
-        
+        raw_book = self.order_books.get(token_id)
+        if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
+            log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
+            return
+                
         # 2. DATA CONVERSION 
         clean_book = self._prepare_clean_book(token_id)
         if not clean_book:
