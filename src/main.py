@@ -391,8 +391,14 @@ class LiveTrader:
                 # Raw Parsing
                 asset_a_str = chunks[0]
                 asset_b_str = chunks[1]
-                amt_a_raw = int(chunks[2])
-                amt_b_raw = int(chunks[3])
+                amt_a_raw = int(chunks[2], 16)
+                amt_b_raw = int(chunks[3], 16)
+
+                if asset_a_string.startswith("0000") and int(asset_a_str[:16]) == 0:
+                    asset_a_string = "0"
+
+                elif asset_b_string.startswith("0000") and int(asset_b_str[:16]) == 0:
+                    asset_b_string = "0"
 
                 # --- CRITICAL FIX: VOLUME NORMALIZATION ---
                 # The logs show a 1000x difference between Amt A and Amt B.
