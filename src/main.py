@@ -71,14 +71,6 @@ class LiveTrader:
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
         
-        # Collect ALL valid Token IDs
-        all_tokens = []
-        for mkt in self.metadata.markets.values():
-            for tok in mkt['tokens'].values():
-               all_tokens.append(tok)
-        
-        print(f"✅ Metadata Loaded. Subscribing to ALL {len(all_tokens)} assets...")
-
         # Force the subscription immediately
         open_pos = list(self.persistence.state["positions"].keys())
         self.sub_manager.set_mandatory(open_pos)
@@ -716,7 +708,7 @@ class LiveTrader:
         ]
         
         for pos_token, pos_data in relevant_positions:
-            tokens = self.metadata.markets['mkt_id']
+            tokens = self.metadata.markets[mkt_id]
             if not tokens: continue
             
             is_yes = (str(pos_token) == mkt['tokens'].get('yes'))
