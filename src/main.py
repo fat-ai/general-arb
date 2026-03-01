@@ -552,7 +552,7 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "no_id": 0, "no_tokens": 0}
+        skipped_counts = {"not_usdc": 0, "expired": 0, "no_tokens": 0}
 
         for t in trades:
             # 1. Normalize Address Data
@@ -581,8 +581,7 @@ class LiveTrader:
             markets = self.metadata.markets
             market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
             if not market:
-                log.info(f"Market not found for trade: {t}")
-                skipped_counts["no_id"] += 1
+                skipped_counts["expired"] += 1
                 continue
                 
             mid = next(k for k, v in markets.items() if v is market)
