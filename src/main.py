@@ -648,7 +648,7 @@ class LiveTrader:
                         passes_roi_filter = True
                 
                 if not passes_roi_filter and days_to_expiry > 0:
-                    print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
+                  #  print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
                     continue 
                     
                 action = TradeLogic.check_entry_signal(normalized_weight)
