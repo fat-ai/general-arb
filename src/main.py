@@ -325,7 +325,10 @@ class LiveTrader:
                 # 3. Scan Batch
                 if current_block_num < chain_tip:
                     end_block = min(current_block_num + 5, chain_tip)
-                    
+                    if current_block_num > end_block:
+                        log.warning(f"⏳ RPC Node is lagging behind (Tip: {chain_tip}). Waiting to catch up...")
+                        await asyncio.sleep(2.0)
+                        continue
                     # WILDCARD REQUEST (Safe Mode)
                     payload = {
                         "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
@@ -358,6 +361,8 @@ class LiveTrader:
                             
                             if trade_count > 0:
                                 log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                            else:
+                                log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
                             
                     current_block_num = end_block + 1
                     
