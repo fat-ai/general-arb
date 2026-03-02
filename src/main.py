@@ -572,9 +572,7 @@ class LiveTrader:
                 continue
                 
             # 3. Calculate execution price 
-            price = usdc_vol / token_vol
-            markets = self.metadata.markets
-            market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
+            market = self.metadata.token_to_market.get(token_id)
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = next((obj for obj in self.metadata.markets.values() if token_id in obj['tokens'].values()), None)
@@ -590,7 +588,7 @@ class LiveTrader:
 
             self.sub_manager.add_active(list(market['tokens'].values()))
                 
-            mid = next(k for k, v in markets.items() if v is market)
+            mid = market['id']
             
             is_yes_token = (token_id == market['tokens'].get('yes'))
             
