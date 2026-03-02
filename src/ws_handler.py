@@ -40,26 +40,32 @@ class PolymarketWS:
         else:
             log.info("💤 WS Idle (No assets to subscribe to yet)")
         
-        # FIX 2: Removed manual "PING" thread (caused disconnects)
 
     def update_subscriptions(self, assets_ids):
-        """Updates the internal list and sends 'subscribe' op if connected."""
+        """Updates the internal list and sends 'subscribe' op in chunks if connected."""
         self.assets_ids = assets_ids 
         
-        # FIX 3: Don't send empty lists
         if not assets_ids:
             return
 
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            payload = {
-                "operation": "subscribe",
-                "assets_ids": assets_ids
-            }
-            try:
-                self.ws.send(json.dumps(payload))
-                log.info(f"📤 Sent Subscription Update ({len(assets_ids)} assets)")
-            except Exception as e:
-                log.error(f"Failed to update subs: {e}")
+            chunk_size = 1000
+            chunks_sent = 0
+            
+            for i in range(0, len(assets_ids), chunk_size):
+                chunk = assets_ids[i:i + chunk_size]
+                payload = {
+                    "operation": "subscribe",
+                    "assets_ids": chunk
+                }
+                try:
+                    self.ws.send(json.dumps(payload))
+                    chunks_sent += 1
+                    time.sleep(0.05) 
+                except Exception as e:
+                    log.error(f"Failed to send sub chunk: {e}")
+                    
+            log.info(f"📤 Sent Subscription Update: {len(assets_ids)} assets across {chunks_sent} chunks")
 
     def resubscribe_single(self, token_id):
         if self.ws and self.ws.sock and self.ws.sock.connected:
