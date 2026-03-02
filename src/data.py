@@ -215,23 +215,46 @@ class MarketMetadata:
             except: continue
 
 class SubscriptionManager:
-    def __init__(self):
-        self.active_subs = set()
+    def __init__(self, max_subs=400):
+        self.max_subs = max_subs
+        self.held_tokens = set()
+        self.rolling_tokens = [] 
         self.lock = asyncio.Lock()
         self.dirty = False
 
-    def add_subs(self, tokens):
-        """Adds new tokens to the master list. Triggers update only if new."""
-        new_tokens = set(tokens) - self.active_subs
-        if new_tokens:
-            self.active_subs.update(new_tokens)
+    def set_held(self, tokens):
+        """Locks in tokens we currently own so they are never unsubscribed."""
+        new_held = set(tokens)
+        if self.held_tokens != new_held:
+            self.held_tokens = new_held
             self.dirty = True
 
-    def remove_subs(self, tokens):
-        """Removes expired tokens from the master list."""
-        to_remove = set(tokens) & self.active_subs
-        if to_remove:
-            self.active_subs.difference_update(to_remove)
+    def add_active(self, tokens):
+        """Adds newly traded tokens to the rolling window, evicting old ones if needed."""
+        changed = False
+        for t in tokens:
+            if t in self.held_tokens:
+                continue
+            
+            # If it's already in the window, bump it to the newest position
+            if t in self.rolling_tokens:
+                self.rolling_tokens.remove(t)
+                self.rolling_tokens.append(t)
+            else:
+                self.rolling_tokens.append(t)
+                changed = True
+                
+        # Prune the oldest tokens if we exceed our safety limit
+        available_slots = self.max_subs - len(self.held_tokens)
+        if len(self.rolling_tokens) > available_slots:
+            self.rolling_tokens = self.rolling_tokens[-available_slots:]
+            changed = True
+            
+        if changed:
             self.dirty = True
+
+    def get_all_subs(self):
+        """Returns the combined list of held and active tokens."""
+        return list(self.held_tokens) + self.rolling_tokens
 
 async def fetch_graph_trades(since): return []
