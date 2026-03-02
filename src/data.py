@@ -227,4 +227,11 @@ class SubscriptionManager:
             self.active_subs.update(new_tokens)
             self.dirty = True
 
+    def remove_subs(self, tokens):
+        """Removes expired tokens from the master list."""
+        to_remove = set(tokens) & self.active_subs
+        if to_remove:
+            self.active_subs.difference_update(to_remove)
+            self.dirty = True
+
 async def fetch_graph_trades(since): return []
