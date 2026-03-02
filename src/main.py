@@ -71,9 +71,12 @@ class LiveTrader:
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
 
+        current_time = time.time()
         all_tokens = []
         for mid, mkt in self.metadata.markets.items():
-            all_tokens.extend(mkt['tokens'].values())
+            # Only subscribe if the market hasn't expired yet
+            if mkt.get('end_timestamp', 0) > current_time:
+                all_tokens.extend(mkt['tokens'].values())
             
         # Force the subscription immediately
         self.sub_manager.add_subs(all_tokens)
