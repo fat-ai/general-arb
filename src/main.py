@@ -177,9 +177,6 @@ class LiveTrader:
                     final_list = list(self.sub_manager.active_subs)
                     
                     if self.ws_client:
-                        # Depending on your PolymarketWS implementation, you might 
-                        # just need to send the NEW tokens, or the whole list. 
-                        # Assuming update_subscriptions takes the full list:
                         self.ws_client.update_subscriptions(final_list)
                     
                     self.sub_manager.dirty = False
@@ -358,8 +355,9 @@ class LiveTrader:
                             
                     current_block_num = end_block + 1
                     
-                else:
-                    await asyncio.sleep(2.0)
+                elif 'error' in data:
+                        log.error(f"🚨 RPC JSON Error on blocks {current_block_num}-{end_block}: {data['error']}")
+                        await asyncio.sleep(2.0) # Wait a bit before retrying the same blocks
                     
             except Exception as e:
                 log.error(f"RPC Error: {e}")
