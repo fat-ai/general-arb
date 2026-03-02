@@ -170,16 +170,33 @@ class LiveTrader:
     # --- LOOPS ---
 
     async def _subscription_monitor_loop(self):
-        """Pushes the master subscription list to the WS client whenever it grows."""
+        """Calculates deltas and only pushes exact differences to the WS client."""
+        currently_subscribed = set()
+        
         while self.running:
             if self.sub_manager.dirty:
                 async with self.sub_manager.lock:
-                    final_list = list(self.sub_manager.active_subs)
-                    
-                    if self.ws_client:
-                        self.ws_client.update_subscriptions(final_list)
-                    
+                    # Get the exact list of what we WANT to be watching
+                    desired_list = set(self.sub_manager.get_all_subs())
                     self.sub_manager.dirty = False
+                
+                # 1. Find tokens that are in the desired list, but not currently subscribed
+                to_subscribe = list(desired_list - currently_subscribed)
+                
+                # 2. Find tokens we are subscribed to, but that fell out of the desired list
+                to_unsubscribe = list(currently_subscribed - desired_list)
+                
+                if self.ws_client:
+                    if to_subscribe:
+                        self.ws_client.subscribe(to_subscribe)
+                        await asyncio.sleep(0.05) 
+                        
+                    if to_unsubscribe:
+                        self.ws_client.unsubscribe(to_unsubscribe)
+                
+                # Update our local memory of what the WS is doing
+                currently_subscribed = desired_list
+                
             await asyncio.sleep(1.0)
 
     async def _dashboard_loop(self):
@@ -581,6 +598,8 @@ class LiveTrader:
             if market.get('end_timestamp', 0) < time.time():
                 skipped_counts["expired"] += 1
                 continue
+
+            self.sub_manager.add_active(list(market['tokens'].values()))
                 
             mid = next(k for k, v in markets.items() if v is market)
             
