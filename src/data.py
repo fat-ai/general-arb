@@ -11,6 +11,7 @@ class MarketMetadata:
     def __init__(self):
         self.markets = {}
         self.last_refresh = 0
+        self.token_to_market = {}
 
     async def refresh(self):
         """
@@ -84,9 +85,9 @@ class MarketMetadata:
                 tokens = {}
                 for outcome, token_id in zip(outcomes, token_ids):
                     tokens[str(outcome).lower()] = str(token_id)
-                
-                if mid not in self.markets:
-                    self.markets[mid] = {
+
+                mkt_obj = {
+                        "mid": mid,
                         "conditon_id": cid,
                         "tokens": tokens,
                         "active": True, 
@@ -95,6 +96,11 @@ class MarketMetadata:
                         "start_timestamp": start_ts,
                         "market_maker_address": mkt.get("marketMakerAddress"),
                      }
+                
+                if mid not in self.markets:
+                    self.markets[mid] = mkt_obj
+                    for t_id in tokens.values():
+                            self.token_to_market[t_id] = mkt_obj
  
             except Exception as e:
                 logger.error(f"Gamma chunk error: {e}")
@@ -200,9 +206,9 @@ class MarketMetadata:
                 tokens = {}
                 for token in tokens_raw:
                     tokens[token['outcome'].lower()] = token['token_id']
-                # We only add if this specific market ID is NOT yet known.
-                if mid not in self.markets:
-                    self.markets[mid] = {
+                    
+                mkt_obj =  {
+                        "mid": mid,
                         "condition_id": mkt.get('condition_id'),
                         "tokens": tokens,
                         "active": True, 
@@ -211,7 +217,12 @@ class MarketMetadata:
                         "end_timestamp": end_ts,
                         "market_maker_address": mkt.get("fpmm"),
                     }
-                        
+                
+                if mid not in self.markets:
+                    self.markets[mid] = mkt_obj
+                    for t_id in tokens.values():
+                            self.token_to_market[t_id] = mkt_obj
+         
             except: continue
 
 class SubscriptionManager:
