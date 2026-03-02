@@ -169,7 +169,7 @@ class MarketMetadata:
                 end = mkt.get('end_date_iso')
                 start = mkt.get('start_date_iso')
                 start_ts = int(datetime.fromisoformat(start).timestamp()) if start else 0
-                end_ts = int(datetime.fromisoformat(end).timestamp()) if start else 0
+                end_ts = int(datetime.fromisoformat(end).timestamp()) if end else 0
                 
                 if end_ts < time.time():
                     continue
