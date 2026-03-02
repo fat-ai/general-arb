@@ -62,6 +62,8 @@ class MarketMetadata:
                 mid = mkt.get('id').lower()               
                 cid = mkt.get('conditionId').lower()
                 end_date_str = mkt.get('endDate', '')
+                start_date_str = mkt.get('startDate', '')
+                
                 end_ts = 0
                 if end_date_str:
                     try:
@@ -71,6 +73,13 @@ class MarketMetadata:
                         pass
                 if end_ts < time.time():
                     continue
+
+                start_ts = 0
+                if start_date_str:
+                    try:
+                        start_ts = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).timestamp()
+                    except:
+                        pass
 
                 outcomes = mkt.get('outcomes')
                 token_ids = mkt.get('clobTokenIds')
@@ -85,6 +94,7 @@ class MarketMetadata:
                         "active": True, 
                         "question": mkt.get('question'),
                         "end_timestamp": end_ts,
+                        "start_timestamp": start_ts,
                         "market_maker_address": mkt.get("marketMakerAddress"),
                      }
  
@@ -157,10 +167,10 @@ class MarketMetadata:
                     continue
 
                 end = mkt.get('end_date_iso')
-                dt = datetime.fromisoformat(end)
-                timestamp = dt.timestamp()
-                end_ts = int(timestamp)
-
+                start = mkt.get('start_date_iso')
+                start_ts = int(datetime.fromisoformat(start).timestamp()) if start else 0
+                end_ts = int(datetime.fromisoformat(end).timestamp()) if start else 0
+                
                 if end_ts < time.time():
                     continue
                 
@@ -175,6 +185,7 @@ class MarketMetadata:
                         "tokens": tokens,
                         "active": True, 
                         "question": mkt.get('question', 'Unknown'),
+                        "start_timestamp": start_ts,
                         "end_timestamp": end_ts,
                         "market_maker_address": mkt.get("fpmm"),
                     }
