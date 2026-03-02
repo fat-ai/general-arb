@@ -71,17 +71,6 @@ class LiveTrader:
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
 
-        current_time = time.time()
-        all_tokens = []
-        for mid, mkt in self.metadata.markets.items():
-            # Only subscribe if the market hasn't expired yet
-            if mkt.get('end_timestamp', 0) > current_time:
-                all_tokens.extend(mkt['tokens'].values())
-            
-        # Force the subscription immediately
-        self.sub_manager.add_subs(all_tokens)
-        self.sub_manager.dirty = True
-
         # 4. START LOOPS
         await asyncio.gather(
             self._subscription_monitor_loop(), 
@@ -589,7 +578,7 @@ class LiveTrader:
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = next((obj for obj in self.metadata.markets.values() if token_id in obj['tokens'].values()), None)
-                self.sub_manager.add_subs(list(market['tokens'].values()))
+                self.sub_manager.add_active(list(market['tokens'].values()))
 
             if market.get('start_timestamp', 0) < self.start_time:
                 skipped_counts["old"] += 1
@@ -670,9 +659,7 @@ class LiveTrader:
                     
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
-                if action == 'SPECULATE':
-                    self.sub_manager.add_subs(list(market['tokens'].values()))
-                elif action == 'BUY':
+                if action == 'BUY':
                     if token_id not in self.pending_orders:
                         self.pending_orders.add(token_id)
                         asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
