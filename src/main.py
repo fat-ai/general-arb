@@ -833,7 +833,7 @@ class LiveTrader:
             
             if expired_tokens:
                 # remove_subs handles checking if they are actually in the active list
-                self.sub_manager.remove_subs(expired_tokens)
+                self.ws_client.unsubscribe(expired_tokens)
 
             if time.time() - last_metadata_refresh > 3600:
                 log.info("🌍 Hourly Metadata Refresh...")
