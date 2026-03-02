@@ -216,27 +216,15 @@ class MarketMetadata:
 
 class SubscriptionManager:
     def __init__(self):
-        self.mandatory_subs = set()
-        self.speculative_subs = {} 
+        self.active_subs = set()
         self.lock = asyncio.Lock()
         self.dirty = False
 
-    def set_mandatory(self, t): 
-        self.mandatory_subs = set(t)
-        self.dirty = True
-
-    def add_speculative(self, t): 
-        for x in t: 
-            # Remove and re-add to push it to the very end (newest)
-            self.speculative_subs.pop(x, None)
-            self.speculative_subs[x] = None
-
-        # Keep it bounded so it doesn't leak memory forever
-        while len(self.speculative_subs) > 200:
-            # Remove the oldest item (first key in the dict)
-            oldest_key = next(iter(self.speculative_subs))
-            self.speculative_subs.pop(oldest_key)
-
-        self.dirty = True
+    def add_subs(self, tokens):
+        """Adds new tokens to the master list. Triggers update only if new."""
+        new_tokens = set(tokens) - self.active_subs
+        if new_tokens:
+            self.active_subs.update(new_tokens)
+            self.dirty = True
 
 async def fetch_graph_trades(since): return []
