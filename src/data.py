@@ -102,6 +102,33 @@ class MarketMetadata:
                 logger.error(f"Gamma chunk error: {e}")
                 continue  
 
+    async def fetch_missing_token(self, token_id: str) -> bool:
+        """
+        Just-In-Time fetcher for brand new markets.
+        Queries Gamma for a specific token ID and adds it to the index.
+        """
+        logger.info(f"🔍 Unknown token {token_id} detected. Fetching new market data...")
+        
+        async with aiohttp.ClientSession() as session:
+            # Gamma allows filtering by clobTokenIds
+            url = f"{GAMMA_API_URL}?clobTokenIds={token_id}"
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        markets = data.get('data', []) if isinstance(data, dict) else data
+                        
+                        if markets:
+                            self._process_gamma_chunk(markets)
+                            logger.info(f"✅ Successfully loaded new market for token {token_id}")
+                            return True
+                    else:
+                        logger.error(f"⚠️ Failed to fetch new token {token_id}. Status: {response.status}")
+            except Exception as e:
+                logger.error(f"❌ Error fetching missing token {token_id}: {e}")
+                
+        return False
+        
     async def _fetch_clob_strict(self, session):
         """
         Robust CLOB Downloader.
