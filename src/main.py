@@ -571,6 +571,7 @@ class LiveTrader:
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = next((obj for obj in self.metadata.markets.values() if token_id in obj['tokens'].values()), None)
+                self.sub_manager.add_subs(list(market['tokens'].values()))
 
             if market.get('start_timestamp', 0) < self.start_time:
                 skipped_counts["old"] += 1
