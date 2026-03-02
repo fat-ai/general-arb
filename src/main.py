@@ -833,7 +833,8 @@ class LiveTrader:
                 await asyncio.to_thread(self.scorer.load)
                 
                 
-                self.sub_manager.set_mandatory(all_tokens)
+                open_pos = list(self.persistence.state["positions"].keys())
+                self.sub_manager.set_mandatory(open_pos)
                 self.sub_manager.dirty = True
                 
                 last_metadata_refresh = time.time()
