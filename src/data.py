@@ -71,8 +71,6 @@ class MarketMetadata:
                         end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
                     except:
                         pass
-                if end_ts < time.time():
-                    continue
 
                 start_ts = 0
                 if start_date_str:
@@ -197,9 +195,6 @@ class MarketMetadata:
                 start = mkt.get('start_date_iso')
                 start_ts = int(datetime.fromisoformat(start).timestamp()) if start else 0
                 end_ts = int(datetime.fromisoformat(end).timestamp()) if end else 0
-                
-                if end_ts < time.time():
-                    continue
                 
                 tokens_raw = mkt['tokens']
                 tokens = {}
