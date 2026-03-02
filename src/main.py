@@ -815,25 +815,12 @@ class LiveTrader:
 
     async def _maintenance_loop(self):
         """
-        Refreshes market metadata hourly to catch NEW markets
-        and reloads Wallet Scorer files to catch daily updates.
+        Refreshes market metadata hourly to catch NEW markets.
         """
         last_metadata_refresh = time.time()
 
         while self.running:
             await asyncio.sleep(60)
-
-            current_time = time.time()
-            expired_tokens = []
-            
-            for mid, mkt in self.metadata.markets.items():
-                end_ts = mkt.get('end_timestamp', 0)
-                if 0 < end_ts < current_time:
-                    expired_tokens.extend(mkt['tokens'].values())
-            
-            if expired_tokens:
-                # remove_subs handles checking if they are actually in the active list
-                self.ws_client.unsubscribe(expired_tokens)
 
             if time.time() - last_metadata_refresh > 3600:
                 log.info("🌍 Hourly Metadata Refresh...")
