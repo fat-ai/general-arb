@@ -29,7 +29,7 @@ class LiveTrader:
         self.sub_manager = SubscriptionManager()
         self.scorer = WalletScorer()
         self.signal_engine = SignalEngine()
-        
+       
         self.order_books: Dict[str, Dict] = {}
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
@@ -47,7 +47,7 @@ class LiveTrader:
 
     async def start(self):
         print("\n🚀 STARTING LIVE PAPER TRADER (FULL MARKET MODE)")
-        
+        self.start_time = time.time()
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
         
@@ -551,6 +551,7 @@ class LiveTrader:
         skipped_counts = {"not_usdc": 0, "expired": 0, "no_tokens": 0}
 
         for t in trades:
+            
             # 1. Normalize Address Data
             wallet = t['taker']
             raw_maker = float(t['makerAmountFilled'])
@@ -578,6 +579,9 @@ class LiveTrader:
             market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
             if not market:
                 skipped_counts["expired"] += 1
+                continue
+
+            if market.get('start_timestamp', 0) < self.start_time:
                 continue
                 
             mid = next(k for k, v in markets.items() if v is market)
