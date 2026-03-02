@@ -578,10 +578,14 @@ class LiveTrader:
             markets = self.metadata.markets
             market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
             if not market:
-                skipped_counts["expired"] += 1
+                found = await self.metadata.fetch_missing_token(token_id)
                 continue
 
             if market.get('start_timestamp', 0) < self.start_time:
+                continue
+
+            if market.get('end_timestamp', 0) < time.time():
+                skipped_counts["expired"] += 1
                 continue
                 
             mid = next(k for k, v in markets.items() if v is market)
