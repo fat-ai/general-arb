@@ -76,7 +76,7 @@ class LiveTrader:
             all_tokens.extend(mkt['tokens'].values())
             
         # Force the subscription immediately
-        self.sub_manager.set_mandatory(all_tokens)
+        self.sub_manager.add_subs(all_tokens)
         self.sub_manager.dirty = True
 
         # 4. START LOOPS
@@ -167,21 +167,16 @@ class LiveTrader:
     # --- LOOPS ---
 
     async def _subscription_monitor_loop(self):
-        """Watches for changes in subscriptions and pushes them to the threaded client."""
+        """Pushes the master subscription list to the WS client whenever it grows."""
         while self.running:
             if self.sub_manager.dirty:
                 async with self.sub_manager.lock:
-                    final_list = list(self.sub_manager.mandatory_subs)
-                    slots_left = CONFIG['max_ws_subs'] - len(final_list)
+                    final_list = list(self.sub_manager.active_subs)
                     
-                    if slots_left > 0:
-                        # NEW: Grab the NEWEST speculative subs first 
-                        # (Keys at the end of the dict are the most recent)
-                        recent_spec = list(self.sub_manager.speculative_subs.keys())[::-1]
-                        final_list.extend(recent_spec[:slots_left])
-                    
-                    # Push update to the thread
                     if self.ws_client:
+                        # Depending on your PolymarketWS implementation, you might 
+                        # just need to send the NEW tokens, or the whole list. 
+                        # Assuming update_subscriptions takes the full list:
                         self.ws_client.update_subscriptions(final_list)
                     
                     self.sub_manager.dirty = False
@@ -505,10 +500,6 @@ class LiveTrader:
                     log.error(f"Resolution Batch Error: {e}")
                 
                 await asyncio.sleep(0.5)
-            
-            if redeemed_any:
-                 open_pos = list(self.persistence.state["positions"].keys())
-                 self.sub_manager.set_mandatory(open_pos)
 
             await asyncio.sleep(60)
             
@@ -659,7 +650,7 @@ class LiveTrader:
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
                 if action == 'SPECULATE':
-                    self.sub_manager.add_speculative(list(market['tokens'].values()))
+                    self.sub_manager.add_subs(list(market['tokens'].values()))
                 elif action == 'BUY':
                     if token_id not in self.pending_orders:
                         self.pending_orders.add(token_id)
@@ -792,9 +783,6 @@ class LiveTrader:
             token_id, "BUY", trade_size, mkt_id, current_book=clean_book
         )
         
-        if success:
-             open_pos = list(self.persistence.state["positions"].keys())
-             self.sub_manager.set_mandatory(open_pos)
             
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
@@ -812,9 +800,6 @@ class LiveTrader:
                     token_id, "SELL", 0, pos['market_fpmm'], current_book=clean_book
                 )
                 
-                if success:
-                    open_pos = list(self.persistence.state["positions"].keys())
-                    self.sub_manager.set_mandatory(open_pos)
             else:
                 log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
 
@@ -837,9 +822,6 @@ class LiveTrader:
 
                 await asyncio.to_thread(self.scorer.load)
                 
-                
-                open_pos = list(self.persistence.state["positions"].keys())
-                self.sub_manager.set_mandatory(open_pos)
                 self.sub_manager.dirty = True
                 
                 last_metadata_refresh = time.time()
