@@ -548,7 +548,7 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "expired": 0, "no_tokens": 0}
+        skipped_counts = {"not_usdc": 0, "expired": 0, "no_tokens": 0, "old": 0}
 
         for t in trades:
             
@@ -579,9 +579,10 @@ class LiveTrader:
             market = next((obj for obj in markets.values() if token_id in obj['tokens'].values()), None)
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
-                continue
+                market = next((obj for obj in self.metadata.markets.values() if token_id in obj['tokens'].values()), None)
 
             if market.get('start_timestamp', 0) < self.start_time:
+                skipped_counts["old"] += 1
                 continue
 
             if market.get('end_timestamp', 0) < time.time():
