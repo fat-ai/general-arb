@@ -166,27 +166,62 @@ class DataFetcher:
             return np.nan 
 
         new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
-        rename_map = {'question': 'question', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at', 'volume': 'volume', 'conditionId': 'condition_id'}
+        
+        rename_map = {
+            'id': 'market_id',
+            'question': 'question', 
+            'conditionId': 'condition_id',
+            'slug': 'slug',
+            'endDate': 'resolution_timestamp', 
+            'createdAt': 'created_at',
+            'updatedAt': 'updated_at',
+            'volume': 'volume'
+        }
         new_df = new_df.rename(columns={k:v for k,v in rename_map.items() if k in new_df.columns})
         
-        if 'resolution_timestamp' in new_df.columns:
-            new_df['resolution_timestamp'] = pd.to_datetime(new_df['resolution_timestamp'], errors='coerce', utc=True).dt.tz_localize(None)
-        if 'created_at' in new_df.columns:
-            new_df['created_at'] = pd.to_datetime(new_df['created_at'], errors='coerce', utc=True).dt.tz_localize(None)
+        # 2. Extract easily readable helper columns for Categories and Tags
+        def extract_labels(item_list):
+            if isinstance(item_list, list):
+                # Pulls the 'label' from each dictionary in the list
+                return ", ".join([str(i.get('label', '')) for i in item_list if isinstance(i, dict) and i.get('label')])
+            return None
+
+        if 'categories' in new_df.columns:
+            new_df['category_names'] = new_df['categories'].apply(extract_labels)
+        if 'tags' in new_df.columns:
+            new_df['tag_names'] = new_df['tags'].apply(extract_labels)
+
+        # 3. Format timestamps safely
+        for col in ['resolution_timestamp', 'created_at', 'updated_at']:
+            if col in new_df.columns:
+                new_df[col] = pd.to_datetime(new_df[col], errors='coerce', utc=True).dt.tz_localize(None)
             
         new_df = new_df.dropna(subset=['resolution_timestamp', 'outcome'])
+        
+        # Explode the contract IDs so each token gets its own row
         new_df['contract_id_list'] = new_df['contract_id'].str.split(',')
         new_df['market_row_id'] = new_df.index 
         new_df = new_df.explode('contract_id_list')
         new_df['token_index'] = new_df.groupby('market_row_id').cumcount()
         new_df['contract_id'] = new_df['contract_id_list'].str.strip()
+
+        # --- MAINTAINING ORIGINAL LABEL LOGIC ---
         new_df['token_outcome_label'] = np.where(new_df['token_index'] == 0, "Yes", "No")
 
+        # Calculate final payout
         def final_payout(row):
             winning_idx = int(round(row['outcome']))
             return 1.0 if row['token_index'] == winning_idx else 0.0
 
         new_df['outcome'] = new_df.apply(final_payout, axis=1)
+        
+        # 4. Serialize complex nested objects to JSON strings for Parquet compatibility
+        # This is the magic step that saves 'events', 'chats', and nested dicts
+        for col in new_df.columns:
+            if new_df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                new_df[col] = new_df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+
+        # 5. Drop only the temporary/raw fields needed for our calculations
         drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
         new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
