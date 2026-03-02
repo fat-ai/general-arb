@@ -364,11 +364,11 @@ class LiveTrader:
                             else:
                                 log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
                             
-                    current_block_num = end_block + 1
+                        current_block_num = end_block + 1
                     
                 elif 'error' in data:
                         log.error(f"🚨 RPC JSON Error on blocks {current_block_num}-{end_block}: {data['error']}")
-                        await asyncio.sleep(2.0) # Wait a bit before retrying the same blocks
+                        await asyncio.sleep(2.0) 
                     
             except Exception as e:
                 log.error(f"RPC Error: {e}")
