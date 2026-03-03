@@ -310,7 +310,7 @@ class DataFetcher:
             # 8. Serialize any remaining nested structures
             # ------------------------------------------------------------------
             for col in df.columns:
-            df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+                df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
 
             # ------------------------------------------------------------------
             # 9. Clean up raw columns and save chunk
