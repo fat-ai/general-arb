@@ -152,7 +152,7 @@ class DataFetcher:
                 del date_df
                 gc.collect()
         else:
-            print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
+            print(f"   ⚠️ Could not read existing cache: Starting fresh.")
             date_df = pd.DataFrame()
 
         # Helper to process a batch and flush it to disk to save RAM
