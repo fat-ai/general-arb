@@ -142,7 +142,6 @@ class DataFetcher:
         max_created_at = None
 
         if cache_file.exists():
-            try:
                 print(f"   📂 Loading existing markets cache to determine update range...")
                 date_df = pd.read_parquet(cache_file, columns=['created_at'])
                 if not date_df.empty and 'created_at' in date_df.columns:
@@ -152,9 +151,9 @@ class DataFetcher:
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
                 del date_df
                 gc.collect()
-            except Exception as e:
-                print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
-                date_df = pd.DataFrame()
+        except else:
+            print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
+            date_df = pd.DataFrame()
 
         # Helper to process a batch and flush it to disk to save RAM
         temp_files = []
