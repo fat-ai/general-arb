@@ -333,11 +333,16 @@ class DataFetcher:
             # ------------------------------------------------------------------
             # 6. Dates
             # ------------------------------------------------------------------
-            date_cols = ['resolution_timestamp', 'created_at', 'updated_at',
-                         'start_date', 'closed_time', 'game_start_time']
-            for col in date_cols:
+            date_cols_iso = ['resolution_timestamp', 'created_at', 'updated_at', 'start_date']
+            date_cols_mixed = ['closed_time', 'game_start_time']
+            
+            for col in date_cols_iso:
                 if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_convert(None)
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='ISO8601').dt.tz_convert(None)
+            
+            for col in date_cols_mixed:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='mixed').dt.tz_convert(None)
 
             df = df.dropna(subset=['resolution_timestamp', 'outcome'])
             if df.empty:
