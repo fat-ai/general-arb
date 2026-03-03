@@ -58,26 +58,123 @@ class DataFetcher:
             except Exception as e:
                 print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
                 date_df = pd.DataFrame()
+
+        # Helper to process a batch and flush it to disk to save RAM
+        temp_files = []
+        def process_and_save_chunk(raw_rows, chunk_idx):
+            if not raw_rows: return
+            df = pd.DataFrame(raw_rows)
+            
+            # 1. Rename core columns
+            rename_map = {
+                'id': 'market_id', 'question': 'question', 'conditionId': 'condition_id',
+                'slug': 'slug', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at',
+                'updatedAt': 'updated_at', 'volume': 'volume'
+            }
+            df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+            
+            # 2. Extract Categories and Tags
+            def extract_labels(item_list):
+                if isinstance(item_list, list):
+                    return ", ".join([str(i.get('label', '')) for i in item_list if isinstance(i, dict) and i.get('label')])
+                return None
+            if 'categories' in df.columns: df['category_names'] = df['categories'].apply(extract_labels)
+            if 'tags' in df.columns: df['tag_names'] = df['tags'].apply(extract_labels)
+
+            # 3. Extract Contract IDs
+            def extract_tokens(row):
+                raw = row.get('clobTokenIds') or row.get('tokens')
+                if isinstance(raw, str):
+                    try: raw = json.loads(raw)
+                    except: pass
+                if isinstance(raw, list):
+                    clean_tokens = []
+                    for t in raw:
+                        if isinstance(t, dict):
+                            tid = t.get('token_id') or t.get('id') or t.get('tokenId')
+                            if tid: clean_tokens.append(str(tid).strip())
+                        else:
+                            clean_tokens.append(str(t).strip())
+                    if len(clean_tokens) >= 2: return ",".join(clean_tokens)
+                return None
+            
+            df['contract_id'] = df.apply(extract_tokens, axis=1)
+            df = df.dropna(subset=['contract_id'])
+
+            # 4. Derive Outcomes
+            def derive_outcome(row):
+                val = row.get('outcome')
+                if pd.notna(val):
+                    try: return float(str(val).replace('"', '').strip())
+                    except: pass
+                prices = row.get('outcomePrices')
+                if prices:
+                    try:
+                        if isinstance(prices, str): prices = json.loads(prices)
+                        if isinstance(prices, list):
+                            p_floats = [float(p) for p in prices]
+                            for i, p in enumerate(p_floats):
+                                if p >= 0.95: return float(i)
+                    except: pass
+                return np.nan 
+            df['outcome'] = df.apply(derive_outcome, axis=1)
+
+            # 5. Dates and Drops
+            for col in ['resolution_timestamp', 'created_at', 'updated_at']:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_localize(None)
+            df = df.dropna(subset=['resolution_timestamp', 'outcome'])
+            if df.empty: return
+            
+            # 6. Explode and label tokens
+            df['contract_id_list'] = df['contract_id'].str.split(',')
+            df['market_row_id'] = df.index 
+            df = df.explode('contract_id_list')
+            df['token_index'] = df.groupby('market_row_id').cumcount()
+            df['contract_id'] = df['contract_id_list'].str.strip()
+            df['token_outcome_label'] = np.where(df['token_index'] == 0, "Yes", "No")
+
+            def final_payout(row):
+                winning_idx = int(round(row['outcome']))
+                return 1.0 if row['token_index'] == winning_idx else 0.0
+            df['outcome'] = df.apply(final_payout, axis=1)
+            
+            # 7. Serialize nested structures
+            for col in df.columns:
+                if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
+                    df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+
+            # 8. Clean up and save chunk
+            drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
+            df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
+            df = df.drop_duplicates(subset=['contract_id'], keep='last')
+            
+            temp_path = CACHE_DIR / f"temp_market_chunk_{chunk_idx}.parquet"
+            df.to_parquet(temp_path)
+            temp_files.append(temp_path)
+            
+            # Free RAM!
+            del df
+            gc.collect()
         
-        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc"):
+        # Modified fetch batch to use chunks
+        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc", chunk_idx_start=0):
             offset = 0; limit = 500
             is_ascending = "true" if sort_order == "asc" else "false"
             print(f"Fetching {mode_label} (closed={state})...", end=" ", flush=True)
+            
             local_rows = []
+            chunk_idx = chunk_idx_start
+            total_fetched = 0
+            
             while True:
                 params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
                 try:
                     resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
-                    if resp.status_code != 200: 
-                        print("☠️ WARNING: Markets fetch failed! ☠️")
-                        print(f"Response code: {resp.status_code}")
-                        break
+                    if resp.status_code != 200: break
                         
                     rows = resp.json()
-                    if not rows: 
-                        print("☠️ WARNING: Markets fetch returned invalid output! ☠️")
-                        print(resp)
-                        break
+                    if not rows: break
                     
                     if time_filter_func:
                         valid_batch = []
@@ -89,8 +186,7 @@ class DataFetcher:
                                     ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
                                     if time_filter_func(ts):
                                         stop_signal = True; continue
-                                except Exception as e:
-                                    log.warning(f"Failed to parse a time from c_date: {c_date}")
+                                except Exception: pass
                             if not stop_signal: valid_batch.append(r)
                         
                         local_rows.extend(valid_batch)
@@ -99,146 +195,69 @@ class DataFetcher:
                         local_rows.extend(rows)
                     
                     offset += len(rows)
+                    total_fetched += len(rows)
+                    
+                    # -> THE MAGIC BULLET: Save every 10,000 rows to disk and clear RAM
+                    if len(local_rows) >= 10000:
+                        process_and_save_chunk(local_rows, chunk_idx)
+                        chunk_idx += 1
+                        local_rows.clear()
+                        gc.collect()
+                        
                     if len(rows) < limit: break 
                     print(".", end="", flush=True)
                 except Exception: break
-            print(f" Done ({len(local_rows)}).")
-            return local_rows
             
-        all_new_rows = []
-        all_new_rows.extend(fetch_batch("false", "ACTIVE Markets"))
+            # Flush whatever is left
+            if local_rows:
+                process_and_save_chunk(local_rows, chunk_idx)
+                chunk_idx += 1
+                
+            print(f" Done ({total_fetched}).")
+            return chunk_idx
+            
+        # Run the fetches
+        next_idx = fetch_batch("false", "ACTIVE Markets", chunk_idx_start=0)
         
         if max_created_at:
             stop_condition = lambda ts: ts <= max_created_at
-            all_new_rows.extend(fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc"))
+            next_idx = fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc", chunk_idx_start=next_idx)
         else:
-            all_new_rows.extend(fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc"))
+            next_idx = fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc", chunk_idx_start=next_idx)
 
         if min_created_at:
             stop_condition = lambda ts: ts >= min_created_at
-            all_new_rows.extend(fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc"))
+            fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc", chunk_idx_start=next_idx)
 
-        if not all_new_rows: 
+        if not temp_files: 
             print("✅ No new market updates found.")
-            del all_new_rows
-            gc.collect()
             return
 
-        print(f"Processing {len(all_new_rows)} new/updated market records...")
-        new_df = pd.DataFrame(all_new_rows)
-
-        def extract_tokens(row):
-            raw = row.get('clobTokenIds') or row.get('tokens')
-            if isinstance(raw, str):
-                try: raw = json.loads(raw)
-                except:
-                     log.warning(f"Failed to parse json from {raw}")
-            if isinstance(raw, list):
-                clean_tokens = []
-                for t in raw:
-                    if isinstance(t, dict):
-                        tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                        if tid: clean_tokens.append(str(tid).strip())
-                    else:
-                        clean_tokens.append(str(t).strip())
-                if len(clean_tokens) >= 2: return ",".join(clean_tokens)
-            return None
-
-        new_df['contract_id'] = new_df.apply(extract_tokens, axis=1)
-        new_df = new_df.dropna(subset=['contract_id'])
-
-        def derive_outcome(row):
-            val = row.get('outcome')
-            if pd.notna(val):
-                try: return float(str(val).replace('"', '').strip())
-                except:
-                     log.warning(f"Failed to parse value from {val}")
-            prices = row.get('outcomePrices')
-            if prices:
-                try:
-                    if isinstance(prices, str): prices = json.loads(prices)
-                    if isinstance(prices, list):
-                        p_floats = [float(p) for p in prices]
-                        for i, p in enumerate(p_floats):
-                            if p >= 0.95: return float(i)
-                except:
-                    log.warning(f"Failed to derive outcome from {prices}")
-            return np.nan 
-
-        new_df['outcome'] = new_df.apply(derive_outcome, axis=1)
-        
-        rename_map = {
-            'id': 'market_id',
-            'question': 'question', 
-            'conditionId': 'condition_id',
-            'slug': 'slug',
-            'endDate': 'resolution_timestamp', 
-            'createdAt': 'created_at',
-            'updatedAt': 'updated_at',
-            'volume': 'volume'
-        }
-        new_df = new_df.rename(columns={k:v for k,v in rename_map.items() if k in new_df.columns})
-        
-        # 2. Extract easily readable helper columns for Categories and Tags
-        def extract_labels(item_list):
-            if isinstance(item_list, list):
-                # Pulls the 'label' from each dictionary in the list
-                return ", ".join([str(i.get('label', '')) for i in item_list if isinstance(i, dict) and i.get('label')])
-            return None
-
-        if 'categories' in new_df.columns:
-            new_df['category_names'] = new_df['categories'].apply(extract_labels)
-        if 'tags' in new_df.columns:
-            new_df['tag_names'] = new_df['tags'].apply(extract_labels)
-
-        # 3. Format timestamps safely
-        for col in ['resolution_timestamp', 'created_at', 'updated_at']:
-            if col in new_df.columns:
-                new_df[col] = pd.to_datetime(new_df[col], errors='coerce', utc=True).dt.tz_localize(None)
+        print(f"Merging {len(temp_files)} chunks from disk...")
+        chunk_dfs = []
+        for f in temp_files:
+            try:
+                chunk_dfs.append(pd.read_parquet(f))
+                f.unlink() # Clean up temp file
+            except Exception as e:
+                log.warning(f"Failed to read temp chunk {f}: {e}")
+                
+        if not chunk_dfs: return
             
-        new_df = new_df.dropna(subset=['resolution_timestamp', 'outcome'])
-        
-        # Explode the contract IDs so each token gets its own row
-        new_df['contract_id_list'] = new_df['contract_id'].str.split(',')
-        new_df['market_row_id'] = new_df.index 
-        new_df = new_df.explode('contract_id_list')
-        new_df['token_index'] = new_df.groupby('market_row_id').cumcount()
-        new_df['contract_id'] = new_df['contract_id_list'].str.strip()
-
-        # --- MAINTAINING ORIGINAL LABEL LOGIC ---
-        new_df['token_outcome_label'] = np.where(new_df['token_index'] == 0, "Yes", "No")
-
-        # Calculate final payout
-        def final_payout(row):
-            winning_idx = int(round(row['outcome']))
-            return 1.0 if row['token_index'] == winning_idx else 0.0
-
-        new_df['outcome'] = new_df.apply(final_payout, axis=1)
-        
-        # 4. Serialize complex nested objects to JSON strings for Parquet compatibility
-        # This is the magic step that saves 'events', 'chats', and nested dicts
-        for col in new_df.columns:
-            if new_df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                new_df[col] = new_df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
-
-        # 5. Drop only the temporary/raw fields needed for our calculations
-        drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
-        new_df = new_df.drop(columns=[c for c in drops if c in new_df.columns], errors='ignore')
+        new_df = pd.concat(chunk_dfs, ignore_index=True)
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
+        del chunk_dfs
+        gc.collect()
 
         if cache_file.exists():
             print(f"   📂 Loading full history for merge...")
             try:
                 existing_df = pd.read_parquet(cache_file)
-                print(f"Merging {len(new_df)} new tokens with {len(existing_df)} existing tokens...")
                 combined = pd.concat([existing_df, new_df])
                 for col in ['resolution_timestamp', 'created_at']:
-                    if col in combined.columns:
-                        combined[col] = pd.to_datetime(combined[col])
-                        
+                    if col in combined.columns: combined[col] = pd.to_datetime(combined[col])
                 del existing_df
                 gc.collect()
-                
                 combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
             except Exception as e:
                 print(f"⚠️ Merge failed ({e}), saving new data only.")
@@ -250,7 +269,7 @@ class DataFetcher:
             combined.to_parquet(cache_file)
             print(f"✅ Saved total {len(combined)} market tokens.")
         
-        del new_df, combined, all_new_rows
+        del new_df, combined
         gc.collect()
         return
 
