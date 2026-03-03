@@ -146,7 +146,7 @@ class DataFetcher:
                 print(f"   📂 Loading existing markets cache to determine update range...")
                 date_df = pd.read_parquet(cache_file, columns=['created_at'])
                 if not date_df.empty and 'created_at' in date_df.columns:
-                    dates = pd.to_datetime(date_df['created_at'], format='ISO8601', utc=True).dt.tz_localize(None)
+                    dates = pd.to_datetime(date_df['created_at'], format='ISO8601', utc=True).dt.tz_convert(None)
                     min_created_at = dates.min()
                     max_created_at = dates.max()
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
@@ -337,7 +337,7 @@ class DataFetcher:
                          'start_date', 'closed_time', 'game_start_time']
             for col in date_cols:
                 if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_localize(None)
+                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_convert(None)
 
             df = df.dropna(subset=['resolution_timestamp', 'outcome'])
             if df.empty:
@@ -460,29 +460,6 @@ class DataFetcher:
             p.unlink(missing_ok=True)
             
 
-        if cache_file.exists():
-            print(f"   📂 Loading full history for merge...")
-            try:
-                existing_df = pd.read_parquet(cache_file)
-                combined = pd.concat([existing_df, new_df])
-                for col in ['resolution_timestamp', 'created_at']:
-                    if col in combined.columns: combined[col] = pd.to_datetime(combined[col])
-                del existing_df
-                gc.collect()
-                combined = combined.drop_duplicates(subset=['contract_id'], keep='last')
-            except Exception as e:
-                print(f"⚠️ Merge failed ({e}), saving new data only.")
-                combined = new_df
-        else:
-            combined = new_df
-
-        if not combined.empty:
-            combined.to_parquet(cache_file)
-            print(f"✅ Saved total {len(combined)} market tokens.")
-        
-        del new_df, combined
-        gc.collect()
-        return
 
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
         cache_file = CACHE_DIR / TRADES_FILE
