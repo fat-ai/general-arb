@@ -32,6 +32,104 @@ def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
     return str(id_str).strip().lower().replace('0x', '')
 
+# ---------------------------------------------------------------------------
+# Schema helpers
+# ---------------------------------------------------------------------------
+
+def _safe_is_null(val):
+    """
+    Return True if val is None, NaN, or an empty string.
+    Avoids the ValueError that pd.isna() raises on list/dict values.
+    """
+    if val is None:
+        return True
+    if isinstance(val, (list, dict)):
+        return False          # non-null even if empty
+    try:
+        return pd.isna(val)
+    except (TypeError, ValueError):
+        return False
+
+
+def _extract_labels(item_list):
+    """
+    Extract the 'label' field from a list of category/tag dicts.
+    Handles: actual Python list (after DataFrame construction), JSON string,
+    or already-scalar string.
+    Returns a comma-separated string of labels, or None.
+    """
+    if _safe_is_null(item_list):
+        return None
+
+    # If the API returned a JSON string, decode it first
+    if isinstance(item_list, str):
+        try:
+            item_list = json.loads(item_list)
+        except (json.JSONDecodeError, ValueError):
+            return item_list.strip() or None  # bare string → return as-is
+
+    if isinstance(item_list, list):
+        labels = [
+            str(i.get('label', '')).strip()
+            for i in item_list
+            if isinstance(i, dict) and i.get('label')
+        ]
+        return ", ".join(labels) if labels else None
+
+    return None
+
+
+def _extract_event_field(events_col_value, field: str):
+    """
+    Pull a scalar field out of the first entry in the 'events' array.
+    Useful for grabbing event-level category, subcategory, negRisk, etc.
+    """
+    if _safe_is_null(events_col_value):
+        return None
+
+    events = events_col_value
+    if isinstance(events, str):
+        try:
+            events = json.loads(events)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    if isinstance(events, list) and events:
+        first = events[0]
+        if isinstance(first, dict):
+            return first.get(field)
+
+    return None
+
+
+def _extract_event_labels(events_col_value, sub_field: str):
+    """
+    Pull a label list (categories / tags) from the first event entry.
+    """
+    if _safe_is_null(events_col_value):
+        return None
+    events = events_col_value
+    if isinstance(events, str):
+        try:
+            events = json.loads(events)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if isinstance(events, list) and events:
+        first = events[0]
+        if isinstance(first, dict):
+            return _extract_labels(first.get(sub_field))
+    return None
+
+
+def _parse_float_field(raw):
+    """Safely coerce a value to float, returning NaN on failure."""
+    if _safe_is_null(raw):
+        return np.nan
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return np.nan
+
 class DataFetcher:
     def __init__(self):
         self.session = requests.Session()
@@ -42,7 +140,7 @@ class DataFetcher:
         cache_file = CACHE_DIR / MARKETS_FILE
         min_created_at = None
         max_created_at = None
-        
+
         if cache_file.exists():
             try:
                 print(f"   📂 Loading existing markets cache to determine update range...")
@@ -52,7 +150,6 @@ class DataFetcher:
                     min_created_at = dates.min()
                     max_created_at = dates.max()
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
-
                 del date_df
                 gc.collect()
             except Exception as e:
@@ -61,92 +158,196 @@ class DataFetcher:
 
         # Helper to process a batch and flush it to disk to save RAM
         temp_files = []
+
         def process_and_save_chunk(raw_rows, chunk_idx):
-            if not raw_rows: return
+            if not raw_rows:
+                return
             df = pd.DataFrame(raw_rows)
-            
+
+            # ------------------------------------------------------------------
             # 1. Rename core columns
+            # ------------------------------------------------------------------
             rename_map = {
-                'id': 'market_id', 'question': 'question', 'conditionId': 'condition_id',
-                'slug': 'slug', 'endDate': 'resolution_timestamp', 'createdAt': 'created_at',
-                'updatedAt': 'updated_at', 'volume': 'volume'
+                'id':           'market_id',
+                'question':     'question',
+                'conditionId':  'condition_id',
+                'slug':         'slug',
+                'endDate':      'resolution_timestamp',
+                'startDate':    'start_date',
+                'createdAt':    'created_at',
+                'updatedAt':    'updated_at',
+                'closedTime':   'closed_time',
+                'volume':       'volume',
+                'description':  'description',
+                'resolutionSource': 'resolution_source',
+                'active':       'active',
+                'closed':       'closed',
+                'archived':     'archived',
+                'featured':     'featured',
+                'restricted':   'restricted',
+                'liquidity':    'liquidity',
+                'marketType':   'market_type',
+                'groupItemTitle': 'group_item_title',
+                'questionID':   'question_id',
+                'umaResolutionStatus': 'uma_resolution_status',
+                'enableOrderBook': 'enable_order_book',
+                'acceptingOrders': 'accepting_orders',
+                'competitive':  'competitive',
+                'spread':       'spread',
+                'lastTradePrice': 'last_trade_price',
+                'bestBid':      'best_bid',
+                'bestAsk':      'best_ask',
+                'oneDayPriceChange':   'price_change_1d',
+                'oneHourPriceChange':  'price_change_1h',
+                'oneWeekPriceChange':  'price_change_1w',
+                'oneMonthPriceChange': 'price_change_1m',
+                'volume24hr':   'volume_24h',
+                'volume1wk':    'volume_1w',
+                'volume1mo':    'volume_1m',
+                'volume1yr':    'volume_1y',
+                'liquidityNum': 'liquidity_num',
+                'volumeNum':    'volume_num',
+                'negRiskOther': 'neg_risk_other',
+                'sportsMarketType': 'sports_market_type',
+                'gameId':       'game_id',
+                'gameStartTime': 'game_start_time',
+                'line':         'line',
+                'automaticallyResolved': 'automatically_resolved',
+                'rewardsMinSize':   'rewards_min_size',
+                'rewardsMaxSpread': 'rewards_max_spread',
             }
-            df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
-            
-            # 2. Extract Categories and Tags
-            def extract_labels(item_list):
-                # If it's empty/NaN, skip it
-                if pd.isna(item_list) or item_list is None:
-                    return None
-                    
-                # If the API returned a string instead of a list, parse it
-                if isinstance(item_list, str):
-                    try:
-                        item_list = json.loads(item_list)
-                    except Exception:
-                        pass
-                
-                # Now extract the labels if we have a valid list
-                if isinstance(item_list, list):
-                    labels = [str(i.get('label', '')).strip() for i in item_list if isinstance(i, dict) and i.get('label')]
-                    if labels:
-                        return ", ".join(labels)
-                        
-                return None
+            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-            if 'categories' in df.columns: 
-                df['category_names'] = df['categories'].apply(extract_labels)
-            if 'tags' in df.columns: 
-                df['tag_names'] = df['tags'].apply(extract_labels)
+            # ------------------------------------------------------------------
+            # 2. Categories and Tags
+            #
+            #    Priority:  market-level field  >  top-level scalar 'category'
+            #    Fall back to event-level if market-level is absent.
+            # ------------------------------------------------------------------
 
-            # 3. Extract Contract IDs
+            # 2a. Market-level nested arrays
+            if 'categories' in df.columns:
+                df['category_names'] = df['categories'].apply(_extract_labels)
+            else:
+                df['category_names'] = None
+
+            if 'tags' in df.columns:
+                df['tag_names'] = df['tags'].apply(_extract_labels)
+            else:
+                df['tag_names'] = None
+
+            # 2b. Top-level flat 'category' string (often populated when the
+            #     nested array is empty / missing)
+            if 'category' in df.columns:
+                flat_cat = df['category'].where(
+                    df['category'].notna() & (df['category'].astype(str).str.strip() != ''),
+                    other=None
+                )
+                # Fill any gaps in category_names with the flat string
+                df['category_names'] = df['category_names'].combine_first(flat_cat)
+
+            # 2c. Fall back to event-level categories / tags / subcategory
+            if 'events' in df.columns:
+                event_cats = df['events'].apply(lambda e: _extract_event_labels(e, 'categories'))
+                event_tags = df['events'].apply(lambda e: _extract_event_labels(e, 'tags'))
+                event_subcat = df['events'].apply(lambda e: _extract_event_field(e, 'subcategory'))
+                event_title  = df['events'].apply(lambda e: _extract_event_field(e, 'title'))
+                event_slug   = df['events'].apply(lambda e: _extract_event_field(e, 'slug'))
+                event_neg_risk = df['events'].apply(lambda e: _extract_event_field(e, 'negRisk'))
+                event_open_interest = df['events'].apply(lambda e: _parse_float_field(_extract_event_field(e, 'openInterest')))
+
+                df['category_names'] = df['category_names'].combine_first(event_cats)
+                df['tag_names']       = df['tag_names'].combine_first(event_tags)
+                df['subcategory']     = event_subcat
+                df['event_title']     = event_title
+                df['event_slug']      = event_slug
+                df['neg_risk']        = event_neg_risk
+                df['open_interest']   = event_open_interest
+
+            # ------------------------------------------------------------------
+            # 3. Contract / Token IDs
+            # ------------------------------------------------------------------
             def extract_tokens(row):
                 raw = row.get('clobTokenIds') or row.get('tokens')
                 if isinstance(raw, str):
-                    try: raw = json.loads(raw)
-                    except: pass
+                    try:
+                        raw = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 if isinstance(raw, list):
                     clean_tokens = []
                     for t in raw:
                         if isinstance(t, dict):
                             tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                            if tid: clean_tokens.append(str(tid).strip())
+                            if tid:
+                                clean_tokens.append(str(tid).strip())
                         else:
                             clean_tokens.append(str(t).strip())
-                    if len(clean_tokens) >= 2: return ",".join(clean_tokens)
+                    if len(clean_tokens) >= 2:
+                        return ",".join(clean_tokens)
                 return None
-            
+
             df['contract_id'] = df.apply(extract_tokens, axis=1)
             df = df.dropna(subset=['contract_id'])
 
+            # ------------------------------------------------------------------
             # 4. Derive Outcomes
+            # ------------------------------------------------------------------
             def derive_outcome(row):
                 val = row.get('outcome')
-                if pd.notna(val):
-                    try: return float(str(val).replace('"', '').strip())
-                    except: pass
+                if not _safe_is_null(val):
+                    try:
+                        return float(str(val).replace('"', '').strip())
+                    except (TypeError, ValueError):
+                        pass
                 prices = row.get('outcomePrices')
                 if prices:
                     try:
-                        if isinstance(prices, str): prices = json.loads(prices)
+                        if isinstance(prices, str):
+                            prices = json.loads(prices)
                         if isinstance(prices, list):
                             p_floats = [float(p) for p in prices]
                             for i, p in enumerate(p_floats):
-                                if p >= 0.95: return float(i)
-                    except: pass
-                return np.nan 
+                                if p >= 0.95:
+                                    return float(i)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                return np.nan
+
             df['outcome'] = df.apply(derive_outcome, axis=1)
 
-            # 5. Dates and Drops
-            for col in ['resolution_timestamp', 'created_at', 'updated_at']:
+            # ------------------------------------------------------------------
+            # 5. Numeric coercions for key float fields
+            # ------------------------------------------------------------------
+            float_cols = [
+                'volume', 'liquidity', 'last_trade_price', 'best_bid', 'best_ask',
+                'spread', 'competitive', 'volume_24h', 'volume_1w', 'volume_1m',
+                'volume_1y', 'liquidity_num', 'volume_num', 'open_interest',
+                'price_change_1d', 'price_change_1h', 'price_change_1w',
+                'price_change_1m', 'rewards_min_size', 'rewards_max_spread',
+            ]
+            for col in float_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            # ------------------------------------------------------------------
+            # 6. Dates
+            # ------------------------------------------------------------------
+            date_cols = ['resolution_timestamp', 'created_at', 'updated_at',
+                         'start_date', 'closed_time', 'game_start_time']
+            for col in date_cols:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_localize(None)
+
             df = df.dropna(subset=['resolution_timestamp', 'outcome'])
-            if df.empty: return
-            
-            # 6. Explode and label tokens
+            if df.empty:
+                return
+
+            # ------------------------------------------------------------------
+            # 7. Explode tokens and label Yes/No
+            # ------------------------------------------------------------------
             df['contract_id_list'] = df['contract_id'].str.split(',')
-            df['market_row_id'] = df.index 
+            df['market_row_id'] = df.index
             df = df.explode('contract_id_list')
             df['token_index'] = df.groupby('market_row_id').cumcount()
             df['contract_id'] = df['contract_id_list'].str.strip()
@@ -155,117 +356,109 @@ class DataFetcher:
             def final_payout(row):
                 winning_idx = int(round(row['outcome']))
                 return 1.0 if row['token_index'] == winning_idx else 0.0
+
             df['outcome'] = df.apply(final_payout, axis=1)
-            
-            # 7. Serialize nested structures
+
+            # ------------------------------------------------------------------
+            # 8. Serialize any remaining nested structures
+            # ------------------------------------------------------------------
             for col in df.columns:
                 if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                    df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+                    df[col] = df[col].apply(
+                        lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
+                    )
 
-            # 8. Clean up and save chunk
-            drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
+            # ------------------------------------------------------------------
+            # 9. Clean up raw columns and save chunk
+            # ------------------------------------------------------------------
+            drops = [
+                'contract_id_list', 'token_index', 'clobTokenIds', 'tokens',
+                'outcomePrices', 'market_row_id',
+                # raw nested arrays already unpacked
+                'categories', 'tags', 'events',
+                # flat 'category' replaced by 'category_names'
+                'category',
+            ]
             df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
             df = df.drop_duplicates(subset=['contract_id'], keep='last')
-            
+
             temp_path = CACHE_DIR / f"temp_market_chunk_{chunk_idx}.parquet"
             df.to_parquet(temp_path)
             temp_files.append(temp_path)
-            
-            # Free RAM!
-            del df
-            gc.collect()
-        
-        # Modified fetch batch to use chunks
-        def fetch_batch(state, mode_label, time_filter_func=None, sort_order="desc", chunk_idx_start=0):
-            offset = 0; limit = 500
-            is_ascending = "true" if sort_order == "asc" else "false"
-            print(f"Fetching {mode_label} (closed={state})...", end=" ", flush=True)
-            
-            local_rows = []
-            chunk_idx = chunk_idx_start
-            total_fetched = 0
-            
-            while True:
-                params = {"limit": limit, "offset": offset, "closed": state, "order": "createdAt", "ascending": is_ascending}
-                try:
-                    resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
-                    if resp.status_code != 200: break
-                        
-                    rows = resp.json()
-                    if not rows: break
-                    
-                    if time_filter_func:
-                        valid_batch = []
-                        stop_signal = False
-                        for r in rows:
-                            c_date = r.get('createdAt')
-                            if c_date:
-                                try:
-                                    ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
-                                    if time_filter_func(ts):
-                                        stop_signal = True; continue
-                                except Exception: pass
-                            if not stop_signal: valid_batch.append(r)
-                        
-                        local_rows.extend(valid_batch)
-                        if stop_signal: break
-                    else:
-                        local_rows.extend(rows)
-                    
-                    offset += len(rows)
-                    total_fetched += len(rows)
-                    
-                    # -> THE MAGIC BULLET: Save every 10,000 rows to disk and clear RAM
-                    if len(local_rows) >= 10000:
-                        process_and_save_chunk(local_rows, chunk_idx)
-                        chunk_idx += 1
-                        local_rows.clear()
-                        gc.collect()
-                        
-                    if len(rows) < limit: break 
-                    print(".", end="", flush=True)
-                except Exception: break
-            
-            # Flush whatever is left
-            if local_rows:
-                process_and_save_chunk(local_rows, chunk_idx)
-                chunk_idx += 1
-                
-            print(f" Done ({total_fetched}).")
-            return chunk_idx
-            
-        # Run the fetches
-        next_idx = fetch_batch("false", "ACTIVE Markets", chunk_idx_start=0)
-        
-        if max_created_at:
-            stop_condition = lambda ts: ts <= max_created_at
-            next_idx = fetch_batch("true", "NEWLY CLOSED Markets", stop_condition, sort_order="desc", chunk_idx_start=next_idx)
+            print(f"   💾 Saved chunk {chunk_idx} ({len(df)} rows)")
+
+        # ── Pagination loop (unchanged logic, kept intact) ──────────────────
+        BATCH_SIZE = 100
+        chunk_idx = 0
+        current_raw_rows = []
+
+        params_base = {
+            'limit': BATCH_SIZE,
+            'active': 'false',
+            'closed': 'true',
+            '_c': 'createdAt:asc',
+        }
+
+        # Determine fetch window
+        if max_created_at is not None:
+            fetch_start = max_created_at.strftime('%Y-%m-%dT%H:%M:%SZ')
+            print(f"   🔄 Fetching markets updated after {fetch_start}")
         else:
-            next_idx = fetch_batch("true", "ALL CLOSED Markets", None, sort_order="desc", chunk_idx_start=next_idx)
+            fetch_start = FIXED_START_DATE.strftime('%Y-%m-%dT%H:%M:%SZ')
+            print(f"   📥 Full download from {fetch_start}")
 
-        if min_created_at:
-            stop_condition = lambda ts: ts >= min_created_at
-            fetch_batch("true", "ARCHIVE CLOSED Markets", stop_condition, sort_order="asc", chunk_idx_start=next_idx)
+        params_base['createdAt_gte'] = fetch_start
+        offset = 0
 
-        if not temp_files: 
-            print("✅ No new market updates found.")
+        while True:
+            params = {**params_base, 'offset': offset}
+            try:
+                resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
+                resp.raise_for_status()
+                batch = resp.json()
+            except Exception as e:
+                print(f"   ❌ API error at offset {offset}: {e}")
+                time.sleep(5)
+                continue
+
+            if not batch:
+                break
+
+            current_raw_rows.extend(batch)
+            offset += len(batch)
+
+            if len(current_raw_rows) >= 1000:
+                process_and_save_chunk(current_raw_rows, chunk_idx)
+                current_raw_rows = []
+                chunk_idx += 1
+
+            if len(batch) < BATCH_SIZE:
+                break
+
+        # Flush remaining rows
+        if current_raw_rows:
+            process_and_save_chunk(current_raw_rows, chunk_idx)
+
+        # ── Merge all temp chunks + existing cache ───────────────────────────
+        if not temp_files:
+            print("   ℹ️  No new market data to save.")
             return
 
-        print(f"Merging {len(temp_files)} chunks from disk...")
-        chunk_dfs = []
-        for f in temp_files:
-            try:
-                chunk_dfs.append(pd.read_parquet(f))
-                f.unlink() # Clean up temp file
-            except Exception as e:
-                log.warning(f"Failed to read temp chunk {f}: {e}")
-                
-        if not chunk_dfs: return
+        print(f"\n   🔀 Merging {len(temp_files)} chunk(s)...")
+        all_dfs = [pd.read_parquet(p) for p in temp_files]
+
+        if cache_file.exists() and max_created_at is not None:
+            existing_df = pd.read_parquet(cache_file)
+            all_dfs.insert(0, existing_df)
+
+        merged = pd.concat(all_dfs, ignore_index=True)
+        merged = merged.drop_duplicates(subset=['contract_id'], keep='last')
+        merged.to_parquet(cache_file)
+        print(f"   ✅ Markets saved: {len(merged)} total rows → {cache_file}")
+
+        for p in temp_files:
+            p.unlink(missing_ok=True)
             
-        new_df = pd.concat(chunk_dfs, ignore_index=True)
-        new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
-        del chunk_dfs
-        gc.collect()
 
         if cache_file.exists():
             print(f"   📂 Loading full history for merge...")
