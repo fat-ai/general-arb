@@ -151,7 +151,7 @@ class DataFetcher:
                     print(f"Existing Range: {min_created_at} <-> {max_created_at}")
                 del date_df
                 gc.collect()
-        except else:
+        else:
             print(f"   ⚠️ Could not read existing cache: {e}. Starting fresh.")
             date_df = pd.DataFrame()
 
