@@ -75,11 +75,29 @@ class DataFetcher:
             
             # 2. Extract Categories and Tags
             def extract_labels(item_list):
+                # If it's empty/NaN, skip it
+                if pd.isna(item_list) or item_list is None:
+                    return None
+                    
+                # If the API returned a string instead of a list, parse it
+                if isinstance(item_list, str):
+                    try:
+                        item_list = json.loads(item_list)
+                    except Exception:
+                        pass
+                
+                # Now extract the labels if we have a valid list
                 if isinstance(item_list, list):
-                    return ", ".join([str(i.get('label', '')) for i in item_list if isinstance(i, dict) and i.get('label')])
+                    labels = [str(i.get('label', '')).strip() for i in item_list if isinstance(i, dict) and i.get('label')]
+                    if labels:
+                        return ", ".join(labels)
+                        
                 return None
-            if 'categories' in df.columns: df['category_names'] = df['categories'].apply(extract_labels)
-            if 'tags' in df.columns: df['tag_names'] = df['tags'].apply(extract_labels)
+
+            if 'categories' in df.columns: 
+                df['category_names'] = df['categories'].apply(extract_labels)
+            if 'tags' in df.columns: 
+                df['tag_names'] = df['tags'].apply(extract_labels)
 
             # 3. Extract Contract IDs
             def extract_tokens(row):
