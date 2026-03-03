@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 # Constants
 FIXED_START_DATE = pd.Timestamp("2024-01-01")
+BEGINNING = pd.Timestamp("2020-01-01")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 today = pd.Timestamp.now().normalize()
 DAYS_BACK = (today - FIXED_START_DATE).days + 10
@@ -403,7 +404,7 @@ class DataFetcher:
             fetch_start = max_created_at.strftime('%Y-%m-%dT%H:%M:%SZ')
             print(f"   🔄 Fetching markets updated after {fetch_start}")
         else:
-            fetch_start = FIXED_START_DATE.strftime('%Y-%m-%dT%H:%M:%SZ')
+            fetch_start = BEGINNING.strftime('%Y-%m-%dT%H:%M:%SZ')
             print(f"   📥 Full download from {fetch_start}")
 
         params_base['createdAt_gte'] = fetch_start
