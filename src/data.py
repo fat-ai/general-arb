@@ -86,9 +86,10 @@ class MarketMetadata:
                 for outcome, token_id in zip(outcomes, token_ids):
                     tokens[str(outcome).lower()] = str(token_id)
 
-                mkt_obj = {
-                        "mid": mid,
-                        "conditon_id": cid,
+                if mid not in self.markets:
+                    market_obj = {
+                        "id": mid,
+                        "condition_id": cid,
                         "tokens": tokens,
                         "active": True, 
                         "question": mkt.get('question'),
@@ -96,11 +97,15 @@ class MarketMetadata:
                         "start_timestamp": start_ts,
                         "market_maker_address": mkt.get("marketMakerAddress"),
                      }
-                
-                if mid not in self.markets:
-                    self.markets[mid] = mkt_obj
-                    for t_id in tokens.values():
-                            self.token_to_market[t_id] = mkt_obj
+                    self.markets[mid] = market_obj
+                else:
+                    market_obj = self.markets[mid]
+                    market_obj["tokens"].update(tokens)
+                    
+                if not hasattr(self, 'token_to_market'):
+                    self.token_to_market = {}
+                for t_id in tokens.values():
+                    self.token_to_market[t_id] = market_obj
  
             except Exception as e:
                 logger.error(f"Gamma chunk error: {e}")
