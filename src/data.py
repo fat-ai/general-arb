@@ -213,7 +213,7 @@ class MarketMetadata:
                     tokens[token['outcome'].lower()] = token['token_id']
                     
                 mkt_obj =  {
-                        "mid": mid,
+                        "id": mid,
                         "condition_id": mkt.get('condition_id'),
                         "tokens": tokens,
                         "active": True, 
