@@ -592,6 +592,11 @@ class LiveTrader:
                 continue
 
             self.sub_manager.add_active(list(market['tokens'].values()))
+
+            if token_vol > 0:
+                price = usdc_vol / token_vol
+            else:
+                continue
                 
             mid = market['id']
             
