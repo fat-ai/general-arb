@@ -219,50 +219,6 @@ class DataFetcher:
             df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
             # ------------------------------------------------------------------
-            # 2. Categories and Tags
-            #
-            #    Priority:  market-level field  >  top-level scalar 'category'
-            #    Fall back to event-level if market-level is absent.
-            # ------------------------------------------------------------------
-
-            # 2a. Market-level nested arrays
-            if 'categories' in df.columns:
-                df['category_names'] = df['categories'].apply(_extract_labels)
-            else:
-                df['category_names'] = None
-
-            if 'tags' in df.columns:
-                df['tag_names'] = df['tags'].apply(_extract_labels)
-            else:
-                df['tag_names'] = None
-
-            # 2b. Top-level flat 'category' string (often populated when the
-            #     nested array is empty / missing)
-            if 'category' in df.columns:
-                flat_cat = df['category'].where(
-                    df['category'].notna() & (df['category'].astype(str).str.strip() != ''),
-                    other=None
-                )
-                # Fill any gaps in category_names with the flat string
-                df['category_names'] = df['category_names'].combine_first(flat_cat)
-
-            # 2c. Fall back to event-level categories / tags / subcategory
-            if 'events' in df.columns:
-                event_cats = df['events'].apply(lambda e: _extract_event_labels(e, 'categories'))
-                event_tags = df['events'].apply(lambda e: _extract_event_labels(e, 'tags'))
-                event_subcat = df['events'].apply(lambda e: _extract_event_field(e, 'subcategory'))
-                event_title  = df['events'].apply(lambda e: _extract_event_field(e, 'title'))
-                event_slug   = df['events'].apply(lambda e: _extract_event_field(e, 'slug'))
-                event_neg_risk = df['events'].apply(lambda e: _extract_event_field(e, 'negRisk'))
-                event_open_interest = df['events'].apply(lambda e: _parse_float_field(_extract_event_field(e, 'openInterest')))
-
-                df['category_names'] = df['category_names'].combine_first(event_cats)
-                df['tag_names']       = df['tag_names'].combine_first(event_tags)
-                df['subcategory']     = event_subcat
-                df['event_title']     = event_title
-                df['event_slug']      = event_slug
-                df['neg_risk']        = event_neg_risk
-                df['open_interest']   = event_open_interest
 
             # ------------------------------------------------------------------
             # 3. Contract / Token IDs
@@ -317,20 +273,6 @@ class DataFetcher:
             df['outcome'] = df.apply(derive_outcome, axis=1)
 
             # ------------------------------------------------------------------
-            # 5. Numeric coercions for key float fields
-            # ------------------------------------------------------------------
-            float_cols = [
-                'volume', 'liquidity', 'last_trade_price', 'best_bid', 'best_ask',
-                'spread', 'competitive', 'volume_24h', 'volume_1w', 'volume_1m',
-                'volume_1y', 'liquidity_num', 'volume_num', 'open_interest',
-                'price_change_1d', 'price_change_1h', 'price_change_1w',
-                'price_change_1m', 'rewards_min_size', 'rewards_max_spread',
-            ]
-            for col in float_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-
-            # ------------------------------------------------------------------
             # 6. Dates
             # ------------------------------------------------------------------
             date_cols_iso = ['resolution_timestamp', 'created_at', 'updated_at', 'start_date']
@@ -368,10 +310,7 @@ class DataFetcher:
             # 8. Serialize any remaining nested structures
             # ------------------------------------------------------------------
             for col in df.columns:
-                if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
-                    df[col] = df[col].apply(
-                        lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x
-                    )
+            df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
 
             # ------------------------------------------------------------------
             # 9. Clean up raw columns and save chunk
@@ -379,10 +318,6 @@ class DataFetcher:
             drops = [
                 'contract_id_list', 'token_index', 'clobTokenIds', 'tokens',
                 'outcomePrices', 'market_row_id',
-                # raw nested arrays already unpacked
-                'categories', 'tags', 'events',
-                # flat 'category' replaced by 'category_names'
-                'category',
             ]
             df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
             df = df.drop_duplicates(subset=['contract_id'], keep='last')
