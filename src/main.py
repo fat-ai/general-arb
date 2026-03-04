@@ -613,9 +613,6 @@ class LiveTrader:
 
             # 7. Process Signal with WalletScorer
             score_debug = self.scorer.get_score(wallet, usdc_vol, price)
-            
-            if score_debug == 0.0 and usdc_vol > 100:
-                log.debug(f"ℹ️ ZERO SCORE | Wallet: {wallet} | Vol: ${usdc_vol:.2f}")
 
             raw_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
