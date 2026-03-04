@@ -187,7 +187,6 @@ class MarketMetadata:
                         break
                         
                     page += 1
-                    # Tiny sleep to be polite
                     await asyncio.sleep(0.05)
                     
             except Exception as e:
@@ -197,7 +196,6 @@ class MarketMetadata:
     def _process_clob_chunk(self, markets):
         for mkt in markets:
             try:
-                # Primary Key: Condition ID
                 mid = mkt['question_id'].lower()
                 if mid in self.markets:
                     continue
