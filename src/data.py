@@ -123,7 +123,7 @@ class MarketMetadata:
         
         async with aiohttp.ClientSession() as session:
             # Gamma allows filtering by clobTokenIds
-            url = f"{GAMMA_API_URL}?clobTokenIds={token_id}"
+            url = f"{GAMMA_API_URL}?clob_token_ids={token_id}"
             try:
                 async with session.get(url) as response:
                     if response.status == 200:
