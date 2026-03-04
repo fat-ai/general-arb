@@ -600,7 +600,7 @@ class LiveTrader:
                 
             mid = market['id']
             
-            is_yes_token = (token_id == market['tokens'].get('yes'))
+            is_yes_token = (token_outcome == list(market['tokens'].keys())[0])
             
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
@@ -689,7 +689,8 @@ class LiveTrader:
             tokens = self.metadata.markets[mkt_id]
             if not tokens: continue
             
-            is_yes = (str(pos_token) == mkt['tokens'].get('yes'))
+            is_yes = (str(pos_token) == list(mkt['tokens'].keys())[0]))
+        
             pos_type = 'YES' if is_yes else 'NO'
             
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
