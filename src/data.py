@@ -82,6 +82,8 @@ class MarketMetadata:
 
                 outcomes = mkt.get('outcomes')
                 token_ids = mkt.get('clobTokenIds')
+                if isinstance(token_ids, str):
+                    token_ids = json.loads(token_ids)
                 tokens = {}
                 for outcome, token_id in zip(outcomes, token_ids):
                     tokens[str(outcome).lower()] = str(token_id)
