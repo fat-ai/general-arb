@@ -4,6 +4,7 @@ import time
 import logging
 from config import GAMMA_API_URL, CLOB_API_URL 
 from datetime import datetime
+import json
 
 logger = logging.getLogger("PaperGold")
 
