@@ -600,7 +600,7 @@ class LiveTrader:
                 
             mid = market['id']
             
-            is_yes_token = (token_outcome == list(market['tokens'].keys())[0])
+            is_yes_token = (token_id == list(market['tokens'].values())[0])
             
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
