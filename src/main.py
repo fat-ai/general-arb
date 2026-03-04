@@ -689,7 +689,7 @@ class LiveTrader:
             tokens = self.metadata.markets[mkt_id]
             if not tokens: continue
             
-            is_yes = (str(pos_token) == list(mkt['tokens'].keys())[0]))
+            is_yes_token = (token_outcome == list(market['tokens'].keys())[0])
         
             pos_type = 'YES' if is_yes else 'NO'
             
