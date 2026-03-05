@@ -15,7 +15,7 @@ class PolymarketWS:
         else:
             self.url = base
             
-        self.assets_ids = assets_ids
+        self.assets_ids = set(assets_ids) if assets_ids else set()
         self.on_message_callback = on_message_callback
         self.ws = None
         self.wst = None
@@ -34,17 +34,26 @@ class PolymarketWS:
 
     def on_open(self, ws):
         log.info("⚡ Websocket Connected.")
-        # FIX 1: Only send subscription if we actually have items
+        
         if self.assets_ids:
-            self.update_subscriptions(self.assets_ids)
+            payload = {"operation": "subscribe", "assets_ids": list(self.assets_ids)}
+            try:
+                ws.send(json.dumps(payload))
+                log.info(f"🔄 Auto-resubscribed to {len(self.assets_ids)} tracked assets")
+            except Exception as e:
+                log.error(f"Failed to resubscribe on open: {e}")
         else:
             log.info("💤 WS Idle (No assets to subscribe to yet)")
         
     def subscribe(self, assets_ids):
-        """Sends a strict subscribe payload."""
+        """Sends a strict subscribe payload and updates state."""
         if not assets_ids: return
+        
+        self.assets_ids.update(assets_ids)
+        
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            payload = {"operation": "subscribe", "assets_ids": assets_ids}
+
+            payload = {"operation": "subscribe", "assets_ids": list(assets_ids)}
             try:
                 self.ws.send(json.dumps(payload))
                 log.info(f"➕ WS Subscribed to {len(assets_ids)} new assets")
@@ -54,8 +63,11 @@ class PolymarketWS:
     def unsubscribe(self, assets_ids):
         """Sends a strict unsubscribe payload to free up bandwidth."""
         if not assets_ids: return
+        
+        self.assets_ids.difference_update(assets_ids)
+        
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            payload = {"operation": "unsubscribe", "assets_ids": assets_ids}
+            payload = {"operation": "unsubscribe", "assets_ids": list(assets_ids)}
             try:
                 self.ws.send(json.dumps(payload))
                 log.info(f"➖ WS Unsubscribed from {len(assets_ids)} old assets")
@@ -63,11 +75,9 @@ class PolymarketWS:
                 log.error(f"Failed to unsubscribe: {e}")
 
     def resubscribe_single(self, token_id):
+        self.assets_ids.add(token_id) # Add this line
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            payload = {
-                "operation": "subscribe",
-                "assets_ids": [token_id]
-            }
+            payload = {"operation": "subscribe", "assets_ids": [token_id]}
             try:
                 self.ws.send(json.dumps(payload))
                 log.info(f"🔄 Re-subscribed single token: {token_id}")
