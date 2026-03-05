@@ -581,6 +581,7 @@ class LiveTrader:
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = self.metadata.token_to_market.get(token_id)
+                logger.info(f"New market: {market}")
                 self.sub_manager.add_active(list(market['tokens'].values()))
 
             if market.get('start_timestamp', 0) < self.start_time:
