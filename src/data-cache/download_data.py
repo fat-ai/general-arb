@@ -327,55 +327,77 @@ class DataFetcher:
             temp_files.append(temp_path)
             print(f"   💾 Saved chunk {chunk_idx} ({len(df)} rows)")
 
-        # ── Pagination loop (unchanged logic, kept intact) ──────────────────
-        BATCH_SIZE = 100
+        # ── Corrected Pagination Loop ──────────────────────────────────────
+        BATCH_SIZE = 500 # Increased for faster fetching
         chunk_idx = 0
         current_raw_rows = []
 
-        params_base = {
-            'limit': BATCH_SIZE,
-            'active': 'false',
-            'closed': 'true',
-            '_c': 'createdAt:asc',
-        }
+        # Determine our cutoff date
+        cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE
+        print(f"   🔄 Fetching markets created after {cutoff_date}")
 
-        # Determine fetch window
-        if max_created_at is not None:
-            fetch_start = max_created_at.strftime('%Y-%m-%dT%H:%M:%SZ')
-            print(f"   🔄 Fetching markets updated after {fetch_start}")
-        else:
-            fetch_start = BEGINNING.strftime('%Y-%m-%dT%H:%M:%SZ')
-            print(f"   📥 Full download from {fetch_start}")
+        # Fetch both Active (false) and Closed (true) markets to ensure we miss nothing
+        for state in ['false', 'true']:
+            offset = 0
+            print(f"   Fetching (closed={state})...", end="", flush=True)
+            
+            while True:
+                # Use the parameters Gamma API actually recognizes
+                params = {
+                    'limit': BATCH_SIZE,
+                    'offset': offset,
+                    'closed': state,
+                    'order': 'createdAt',
+                    'ascending': 'false' # Descending: Newest first!
+                }
+                
+                try:
+                    resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
+                    resp.raise_for_status()
+                    batch = resp.json()
+                except Exception as e:
+                    print(f"\n   ❌ API error at offset {offset}: {e}")
+                    time.sleep(5)
+                    continue
 
-        params_base['createdAt_gte'] = fetch_start
-        offset = 0
+                if not batch:
+                    break
 
-        while True:
-            params = {**params_base, 'offset': offset}
-            try:
-                resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
-                resp.raise_for_status()
-                batch = resp.json()
-            except Exception as e:
-                print(f"   ❌ API error at offset {offset}: {e}")
-                time.sleep(5)
-                continue
+                stop_signal = False
+                valid_batch = []
+                
+                for r in batch:
+                    c_date = r.get('createdAt')
+                    if c_date:
+                        try:
+                            ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
+                            # THE MAGIC HALT: If we hit a market older than our cache, stop fetching!
+                            if ts <= cutoff_date:
+                                stop_signal = True
+                                continue 
+                        except (TypeError, ValueError):
+                            pass
+                            
+                    if not stop_signal:
+                        valid_batch.append(r)
 
-            if not batch:
-                break
+                current_raw_rows.extend(valid_batch)
+                offset += len(batch)
+                print(".", end="", flush=True)
 
-            current_raw_rows.extend(batch)
-            offset += len(batch)
+                # Save a chunk every 1000 rows to keep RAM usage near zero
+                if len(current_raw_rows) >= 1000:
+                    process_and_save_chunk(current_raw_rows, chunk_idx)
+                    current_raw_rows = []
+                    chunk_idx += 1
 
-            if len(current_raw_rows) >= 1000:
-                process_and_save_chunk(current_raw_rows, chunk_idx)
-                current_raw_rows = []
-                chunk_idx += 1
+                # If we received the stop signal (hit old data) or the API returned less than BATCH_SIZE (end of database)
+                if stop_signal or len(batch) < BATCH_SIZE:
+                    break
+                    
+            print(f" Done.")
 
-            if len(batch) < BATCH_SIZE:
-                break
-
-        # Flush remaining rows
+        # Flush any remaining rows that didn't hit the 1000 threshold
         if current_raw_rows:
             process_and_save_chunk(current_raw_rows, chunk_idx)
 
