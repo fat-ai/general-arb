@@ -105,8 +105,6 @@ class MarketMetadata:
                     market_obj = self.markets[mid]
                     market_obj["tokens"].update(tokens)
                     
-                if not hasattr(self, 'token_to_market'):
-                    self.token_to_market = {}
                 for t_id in tokens.values():
                     self.token_to_market[t_id] = market_obj
  
