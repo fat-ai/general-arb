@@ -705,11 +705,12 @@ class LiveTrader:
         ]
         
         for pos_token, pos_data in relevant_positions:
-            tokens = self.metadata.markets[mkt_id]
-            if not tokens: continue
+            # FIX: Rename to 'market_obj' for clarity
+            market_obj = self.metadata.markets.get(mkt_id)
+            if not market_obj: continue
             
-            is_yes_token = (token_outcome == list(market['tokens'].keys())[0])
-        
+            # FIX: Properly reference market_obj
+            is_yes = (str(pos_token) == market_obj['tokens'].get('yes'))
             pos_type = 'YES' if is_yes else 'NO'
             
             should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
