@@ -8,6 +8,7 @@ import requests
 import csv
 import queue
 from typing import Dict, List, Set
+import aiohttp
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
@@ -297,82 +298,83 @@ class LiveTrader:
     async def _poll_rpc_loop(self):
         """
         The 'Ground Truth' Loop.
-        Uses the specific mapping found by the Layout Diagnostic.
+        Upgraded to use aiohttp for persistent connections and prevent drift.
         """
+        import aiohttp
         from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
         log.info(f"🔗 CONNECTING TO RPC: {RPC_URL}")
         
-        # 1. Init Cursor
-        try:
-            resp = await asyncio.to_thread(requests.post, RPC_URL, json={
-                "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
-            })
-            # Start 10 blocks back to catch immediate data
-            current_block_num = int(resp.json()['result'], 16) - 10
-            log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
-        except Exception as e:
-            log.error(f"Failed to init RPC: {e}")
-            return
-
-        while self.running:
+        async with aiohttp.ClientSession() as session:
+            # 1. Init Cursor
             try:
-                # 2. Get Chain Tip
-                resp = await asyncio.to_thread(requests.post, RPC_URL, json={
-                    "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1
-                })
-                chain_tip = int(resp.json()['result'], 16)
-                
-                # 3. Scan Batch
-                if current_block_num < chain_tip:
-                    end_block = min(current_block_num + 5, chain_tip)
-                    if current_block_num > end_block:
-                        log.warning(f"⏳ RPC Node is lagging behind (Tip: {chain_tip}). Waiting to catch up...")
-                        await asyncio.sleep(2.0)
-                        continue
-                    # WILDCARD REQUEST (Safe Mode)
-                    payload = {
-                        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                        "params": [{
-                            "address": EXCHANGE_CONTRACT,
-                            "fromBlock": hex(current_block_num),
-                            "toBlock": hex(end_block)
-                        }]
-                    }
-                    
-                    logs_resp = await asyncio.to_thread(requests.post, RPC_URL, json=payload)
-                    data = logs_resp.json()
-                    
-                    if 'result' in data:
-                        logs = data['result']
-                        count = len(logs)
-                        
-                        if count > 0:
-                            trade_count = 0
-                            
-                            for log_item in logs:
-                                # We now filter by Topic inside Python
-                                # This is safer than relying on the RPC filter
-                                topics = log_item.get('topics', [])
-                                if not topics: continue
-                                
-                                if topics[0].lower() == ORDER_FILLED_TOPIC.lower():
-                                    res = await self._parse_log(log_item)
-                                    if res: trade_count += 1
-                            
-                            if trade_count > 0:
-                                log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
-                            else:
-                                log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
-                            
-                        current_block_num = end_block + 1
-                    
-                elif 'error' in data:
-                        log.error(f"🚨 RPC JSON Error on blocks {current_block_num}-{end_block}: {data['error']}")
-                        await asyncio.sleep(2.0) 
-                    
+                payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                async with session.post(RPC_URL, json=payload) as resp:
+                    data = await resp.json()
+                    # Start 10 blocks back to catch immediate data
+                    current_block_num = int(data['result'], 16) - 10
+                    log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
             except Exception as e:
-                log.error(f"RPC Error: {e}")
-                await asyncio.sleep(5)
+                log.error(f"Failed to init RPC: {e}")
+                return
+
+            while self.running:
+                try:
+                    # 2. Get Chain Tip
+                    payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                    async with session.post(RPC_URL, json=payload) as resp:
+                        tip_data = await resp.json()
+                        chain_tip = int(tip_data['result'], 16)
+                    
+                    # 3. Scan Batch
+                    if current_block_num <= chain_tip:
+                        end_block = min(current_block_num + 5, chain_tip)
+                        
+                        # WILDCARD REQUEST (Safe Mode)
+                        log_payload = {
+                            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+                            "params": [{
+                                "address": EXCHANGE_CONTRACT,
+                                "fromBlock": hex(current_block_num),
+                                "toBlock": hex(end_block)
+                            }]
+                        }
+                        
+                        async with session.post(RPC_URL, json=log_payload) as logs_resp:
+                            data = await logs_resp.json()
+                            
+                            if 'result' in data:
+                                logs = data['result']
+                                count = len(logs)
+                                
+                                if count > 0:
+                                    trade_count = 0
+                                    for log_item in logs:
+                                        topics = log_item.get('topics', [])
+                                        if not topics: continue
+                                        
+                                        if topics[0].lower() == ORDER_FILLED_TOPIC.lower():
+                                            res = await self._parse_log(log_item)
+                                            if res: trade_count += 1
+                                    
+                                    if trade_count > 0:
+                                        log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                                    else:
+                                        log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
+                                    
+                                current_block_num = end_block + 1
+                                
+                            elif 'error' in data:
+                                log.error(f"🚨 RPC JSON Error on blocks {current_block_num}-{end_block}: {data['error']}")
+                                await asyncio.sleep(2.0) 
+                    
+                    else:
+                        # FIX: We are caught up to the chain tip! 
+                        # Sleep to wait for the next block and avoid rate limits/drift.
+                        await asyncio.sleep(2.0)
+                        
+                except Exception as e:
+                    log.error(f"RPC Error: {e}")
+                    await asyncio.sleep(5)
     
     async def _parse_log(self, log_item):
         """
