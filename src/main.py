@@ -298,7 +298,7 @@ class LiveTrader:
     async def _poll_rpc_loop(self):
         """
         The 'Ground Truth' Loop.
-        Upgraded to use aiohttp for persistent connections and prevent drift.
+        Upgraded to use aiohttp for persistent connections, prevent drift, and dynamic backoff.
         """
         import aiohttp
         from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
@@ -317,6 +317,9 @@ class LiveTrader:
                 log.error(f"Failed to init RPC: {e}")
                 return
 
+            # FIX: Initialize batch_size OUTSIDE the while loop so it has a value from the very start
+            batch_size = 5 
+
             while self.running:
                 try:
                     # 2. Get Chain Tip
@@ -327,7 +330,7 @@ class LiveTrader:
                     
                     # 3. Scan Batch
                     if current_block_num <= chain_tip:
-                        # FIX: Calculate end block using our dynamic batch_size
+                        # Safely use batch_size here
                         end_block = min(current_block_num + batch_size - 1, chain_tip)
                         
                         log_payload = {
@@ -369,7 +372,7 @@ class LiveTrader:
                                 log.error(f"🚨 RPC Error on blocks {current_block_num}-{end_block}: {data['error']}")
                                 error_code = data['error'].get('code')
                                 
-                                # FIX: Dynamic Backoff for Timeouts (-32002) or Query Limits (-32005)
+                                # Dynamic Backoff for Timeouts (-32002) or Query Limits (-32005)
                                 if error_code in [-32002, -32005]:
                                     if batch_size > 1:
                                         batch_size = max(1, batch_size // 2)
