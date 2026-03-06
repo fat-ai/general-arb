@@ -327,9 +327,9 @@ class LiveTrader:
                     
                     # 3. Scan Batch
                     if current_block_num <= chain_tip:
-                        end_block = min(current_block_num + 5, chain_tip)
+                        # FIX: Calculate end block using our dynamic batch_size
+                        end_block = min(current_block_num + batch_size - 1, chain_tip)
                         
-                        # WILDCARD REQUEST (Safe Mode)
                         log_payload = {
                             "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
                             "params": [{
@@ -360,16 +360,29 @@ class LiveTrader:
                                         log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
                                     else:
                                         log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
-                                    
+                                
+                                # Move the cursor forward and reset batch size on success
                                 current_block_num = end_block + 1
+                                batch_size = 5 
                                 
                             elif 'error' in data:
-                                log.error(f"🚨 RPC JSON Error on blocks {current_block_num}-{end_block}: {data['error']}")
+                                log.error(f"🚨 RPC Error on blocks {current_block_num}-{end_block}: {data['error']}")
+                                error_code = data['error'].get('code')
+                                
+                                # FIX: Dynamic Backoff for Timeouts (-32002) or Query Limits (-32005)
+                                if error_code in [-32002, -32005]:
+                                    if batch_size > 1:
+                                        batch_size = max(1, batch_size // 2)
+                                        log.warning(f"📉 RPC struggling. Shrinking batch size to {batch_size}...")
+                                    else:
+                                        log.warning(f"⏳ Single block {current_block_num} timed out. Retrying in 5s...")
+                                        await asyncio.sleep(5.0)
+                                        continue
+                                        
                                 await asyncio.sleep(2.0) 
                     
                     else:
-                        # FIX: We are caught up to the chain tip! 
-                        # Sleep to wait for the next block and avoid rate limits/drift.
+                        # Caught up to chain tip
                         await asyncio.sleep(2.0)
                         
                 except Exception as e:
