@@ -734,6 +734,9 @@ class LiveTrader:
         if token_id in self.persistence.state["positions"]:
             return
 
+        elif self.persistence.state["positions"]["market_fpmm"] == mkt_id:
+            return
+
         # 1. Wait for Liquidity
         raw_book = self.order_books.get(token_id)
         if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
