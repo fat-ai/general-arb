@@ -559,6 +559,7 @@ class LiveTrader:
                     'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
                     'makerAmountFilled': float(raw_trade.get('makerAmountFilled') or 0),
                     'takerAmountFilled': float(raw_trade.get('takerAmountFilled') or 0),
+                    'retry_count': raw_trade.get('retry_count', 0),
                 }
                 
                 await self._process_batch([trade])
@@ -599,8 +600,19 @@ class LiveTrader:
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = self.metadata.token_to_market.get(token_id)
+                if not market:
+                    retry_count = t.get('retry_count', 0)
+                    if retry_count < 20: # Try for up to 60 seconds (6 attempts * 10s delay)
+                        log.warning(f"⏳ Gamma delay for {token_id}. Re-queueing trade (Attempt {retry_count + 1}/6)...")
+                        t['retry_count'] = retry_count + 1
+                        asyncio.create_task(self._requeue_trade(t, delay=10))
+                    else:
+                        # Only drop if Gamma is fundamentally broken for 60+ seconds
+                        log.error(f"💀 FATAL: Gamma failed to index {token_id} after 60s. Trade dropped.")
+                        skipped_counts["no_tokens"] += 1
+                    continue
+                    
                 log.info(f"New market: {market}")
-                self.sub_manager.add_active(list(market['tokens'].values()))
 
             if market.get('start_timestamp', 0) < self.start_time:
                 skipped_counts["old"] += 1
@@ -753,8 +765,10 @@ class LiveTrader:
         if token_id in self.persistence.state["positions"]:
             return
 
-        elif self.persistence.state["positions"]["market_fpmm"] == mkt_id:
-            return
+        for pos_data in self.persistence.state["positions"].values():
+            if pos_data.get("market_fpmm") == mkt_id:
+                log.info(f"🛡️ Market Guard: Already hold a position in market {mkt_id}... Skipping.")
+                return
 
         # 1. Wait for Liquidity
         raw_book = self.order_books.get(token_id)
@@ -820,7 +834,14 @@ class LiveTrader:
             token_id, "BUY", trade_size, mkt_id, current_book=clean_book
         )
         
-            
+    async def _requeue_trade(self, trade_obj, delay=10):
+        """
+        Holds a trade that is waiting for Gamma metadata to propagate,
+        then injects it back into the main processing queue.
+        """
+        await asyncio.sleep(delay)
+        await self.trade_queue.put(trade_obj)
+        
     async def _check_stop_loss(self, token_id, price):
         pos = self.persistence.state["positions"].get(token_id)
         if not pos: return
