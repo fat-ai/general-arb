@@ -764,6 +764,7 @@ class LiveTrader:
     async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, signal_price=None):
         token_id = str(token_id)
         
+        # 1. Position Guard
         if token_id in self.persistence.state["positions"]:
             return
 
@@ -772,70 +773,120 @@ class LiveTrader:
                 log.info(f"🛡️ Market Guard: Already hold a position in market {mkt_id}... Skipping.")
                 return
 
-        # 1. Wait for Liquidity
+        # 2. Wait for Initial Liquidity
         raw_book = self.order_books.get(token_id)
         if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
             if _retries >= 10:
                 log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
                 self.ws_client.resubscribe_single(token_id)
                 await asyncio.sleep(3.0)
-                asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=0))
+                asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=0, signal_price=signal_price))
                 return
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
             await asyncio.sleep(0.5)
-            asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=_retries+1))
+            asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=_retries+1, signal_price=signal_price))
             return
                 
-        # 2. DATA CONVERSION 
-        clean_book = self._prepare_clean_book(token_id)
-        if not clean_book:
-            log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
-            return
-            
-        sorted_bids = clean_book['bids']
-        sorted_asks = clean_book['asks']
-
-        # 3. Final Validation
-        best_bid = float(sorted_bids[0][0])
-        best_ask = float(sorted_asks[0][0])
-        
-        if best_ask > 0:
-            spread = (best_ask - best_bid) / best_ask
-
-        vwap_price, _ = self.broker.calculate_vwap_execution("BUY", CONFIG['fixed_size'], clean_book)
-        
-        if signal_price and vwap_price > 0:
-            slippage = (vwap_price - signal_price) / signal_price
-            slippage = slippage + spread
-            if slippage > CONFIG.get('max_slippage', 0.05):
-                log.warning(f"🛡️ SLIPPAGE GUARD: Skipped {token_id}. Slippage {slippage:.1%}")
-                self.pending_orders.discard(token_id)
-                return
-                
-        # 4. Prepare "Clean" Book for Broker
-        # The broker expects lists, not dictionaries.
-        clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
-
-        # 5. Execute
+        # 3. Determine Total Target Trade Size
         trade_size = CONFIG['fixed_size'] 
+        available_cash = self.persistence.state["cash"]
         
         if CONFIG.get('use_percentage_staking'):
             try:
                 total_equity = self.persistence.calculate_equity()
                 calculated_stake = total_equity * CONFIG['percentage_stake']
-                trade_size = max(2.0, calculated_stake)
-                available_cash = self.persistence.state["cash"]
-                if trade_size > available_cash:
-                    log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
-                    return 
+                trade_size = max(2.0, calculated_stake)    
             except Exception as e:
                 log.error(f"Sizing Failed: {e}")
                 trade_size = CONFIG['fixed_size']
-                
-        success = await self.broker.execute_market_order(
-            token_id, "BUY", trade_size, mkt_id, current_book=clean_book
-        )
+
+        if trade_size > available_cash:
+                    log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
+                    return
+            
+        # 4. Patient Execution Window Setup
+        max_duration = CONFIG.get('exec_timeout', 300) 
+        max_slippage = CONFIG.get('max_slippage', 0.05)
+        start_time = time.time()
+        accumulated_usdc = 0.0
         
+        log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
+
+        # 5. Dynamic Sweep Loop
+        while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
+            clean_book = self._prepare_clean_book(token_id)
+            if not clean_book or not clean_book['asks'] or not clean_book['bids']:
+                await asyncio.sleep(2.0)
+                continue
+
+            # Calculate Current Spread
+            best_bid = float(clean_book['bids'][0][0])
+            best_ask = float(clean_book['asks'][0][0])
+            spread = (best_ask - best_bid) / best_ask if best_ask > 0 else 0
+
+            remaining_usdc = trade_size - accumulated_usdc
+            
+            # --- DYNAMIC VWAP SWEEP ---
+            # Walk up the book to find the largest chunk we can take without breaking slippage limits
+            optimal_chunk_usdc = 0.0
+            accumulated_tokens_test = 0.0
+            
+            for ask_price_str, ask_size_tokens_str in clean_book['asks']:
+                ask_p = float(ask_price_str)
+                level_usdc = float(ask_size_tokens_str) * ask_p
+                
+                # Only take what we still need
+                take_usdc = min(level_usdc, remaining_usdc - optimal_chunk_usdc)
+                take_tokens = take_usdc / ask_p
+                
+                # Test the VWAP if we add this liquidity slice
+                test_tokens = accumulated_tokens_test + take_tokens
+                test_usdc = optimal_chunk_usdc + take_usdc
+                test_vwap = test_usdc / test_tokens if test_tokens > 0 else 0
+                
+                if signal_price and test_vwap > 0:
+                    test_slippage = (test_vwap - signal_price) / signal_price
+                    total_penalty = test_slippage + spread
+                    
+                    if total_penalty > max_slippage:
+                        # Adding this slice pushes our execution cost too high. Stop sweeping.
+                        break
+                
+                # Lock in this slice
+                optimal_chunk_usdc += take_usdc
+                accumulated_tokens_test += take_tokens
+                
+                if optimal_chunk_usdc >= remaining_usdc:
+                    break # We have enough to finish the order
+
+            # --- EXECUTE THE CHUNK ---
+            # Prevent microscopic "dust" executions unless it's the very last drop we need
+            if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
+                log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
+                
+                success = await self.broker.execute_market_order(
+                    token_id, "BUY", optimal_chunk_usdc, mkt_id, current_book=clean_book
+                )
+                
+                if success is not False:
+                    accumulated_usdc += optimal_chunk_usdc
+                    
+                    if accumulated_usdc >= trade_size:
+                        log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
+                        return
+            else:
+                # If optimal_chunk_usdc is 0 or dust, it means the top of the book is too expensive right now
+                pass 
+            
+            # Wait for market makers to react and replenish the order book
+            await asyncio.sleep(5.0)
+
+        # 6. Timeout handling (Accepting what we got)
+        if accumulated_usdc > 0:
+            log.warning(f"⏰ Execution timeout for {token_id}. Acceptable liquidity dried up. Total filled: ${accumulated_usdc:.2f} / ${trade_size:.2f}.")
+        else:
+            log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the VWAP+Spread requirements.")
+
     async def _requeue_trade(self, trade_obj, delay=10):
         """
         Holds a trade that is waiting for Gamma metadata to propagate,
