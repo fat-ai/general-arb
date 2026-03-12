@@ -317,8 +317,9 @@ class LiveTrader:
                 log.error(f"Failed to init RPC: {e}")
                 return
 
-            # FIX: Initialize batch_size OUTSIDE the while loop so it has a value from the very start
+            # FIX: Initialize dynamic batch scaling bounds
             batch_size = 5 
+            max_batch_size = 1000 # Max blocks to request at once when sprinting
 
             while self.running:
                 try:
@@ -357,23 +358,24 @@ class LiveTrader:
                                         
                                         if topics[0].lower() == ORDER_FILLED_TOPIC.lower():
                                             res = await self._parse_log(log_item)
-                                            if res: trade_count += 1
+                                            if res == "TRADE": trade_count += 1
                                     
                                     if trade_count > 0:
                                         log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
-                                    else:
-                                        log.info(f"⛓️ Blocks {current_block_num}-{end_block}: 💨 0 trades found.")
                                 
-                                # Move the cursor forward and reset batch size on success
+                                # Move the cursor forward
                                 current_block_num = end_block + 1
-                                batch_size = 5 
+                                
+                                # --- CRITICAL FIX: SPRINT TO CATCH UP ---
+                                # If successful, grow the batch size by 1.5x to allow fast catch-up
+                                batch_size = min(max_batch_size, int(batch_size * 1.5))
                                 
                             elif 'error' in data:
                                 log.error(f"🚨 RPC Error on blocks {current_block_num}-{end_block}: {data['error']}")
                                 error_code = data['error'].get('code')
                                 
-                                # Dynamic Backoff for Timeouts (-32002) or Query Limits (-32005)
-                                if error_code in [-32002, -32005]:
+                                # Dynamic Backoff for Timeouts (-32002), Query Limits (-32005), or Range Too Large (-32000)
+                                if error_code in [-32002, -32005, -32000]:
                                     if batch_size > 1:
                                         batch_size = max(1, batch_size // 2)
                                         log.warning(f"📉 RPC struggling. Shrinking batch size to {batch_size}...")
@@ -385,7 +387,9 @@ class LiveTrader:
                                 await asyncio.sleep(2.0) 
                     
                     else:
-                        # Caught up to chain tip
+                        # Caught up to chain tip completely. 
+                        # We don't reset batch size here. The `min(..., chain_tip)` logic handles 
+                        # small requests automatically when we are at the tip.
                         await asyncio.sleep(2.0)
                         
                 except Exception as e:
