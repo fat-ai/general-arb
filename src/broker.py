@@ -277,14 +277,23 @@ class PaperBroker:
             qty = pos['qty']
             proceeds = qty * payout_price
             
+            # 1. Update Cash
             state["cash"] += proceeds
             
-            # CAPTURE PnL
+            # 2. CAPTURE PnL
             cost_basis = qty * pos['avg_price']
             pnl = proceeds - cost_basis
             fpmm = pos.get('market_fpmm', 'unknown')
             
+            # 3. Remove Position
             del state["positions"][token_id]
+            
+            # 4. Calculate new equity and update high-water mark
+            current_equity = self.pm.calculate_equity()
+            if current_equity > state.get("highest_equity", 0):
+                state["highest_equity"] = current_equity
+
+            # 5. Save State AFTER all updates
             await self.pm.save_async()
             
             status = "🎉 WINNER" if payout_price > 0 else "💀 LOSER"
@@ -296,7 +305,7 @@ class PaperBroker:
                 "token": token_id,
                 "price": payout_price,
                 "qty": qty,
-                "equity": self.pm.calculate_equity(), 
+                "equity": current_equity, 
                 "fpmm": fpmm,
                 "pnl": pnl
             }
