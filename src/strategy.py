@@ -217,8 +217,7 @@ class TradeLogic:
         
         if abs_w > CONFIG['splash_threshold']:
             return 'BUY'
-        elif abs_w > (CONFIG['splash_threshold'] * CONFIG['preheat_threshold']):
-            return 'SPECULATE'
+
         return 'NONE'
 
     @staticmethod
