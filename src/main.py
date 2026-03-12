@@ -368,7 +368,7 @@ class LiveTrader:
                                 
                                 # --- CRITICAL FIX: SPRINT TO CATCH UP ---
                                 # If successful, grow the batch size by 1.5x to allow fast catch-up
-                                batch_size = min(max_batch_size, int(batch_size * 1.5))
+                                batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
                                 
                             elif 'error' in data:
                                 log.error(f"🚨 RPC Error on blocks {current_block_num}-{end_block}: {data['error']}")
