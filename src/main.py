@@ -298,40 +298,53 @@ class LiveTrader:
     async def _poll_rpc_loop(self):
         """
         The 'Ground Truth' Loop.
-        Upgraded to use aiohttp for persistent connections, prevent drift, and dynamic backoff.
+        Upgraded to use aiohttp for persistent connections, dynamic backoff, 
+        and Round-Robin RPC failover to prevent stalling.
         """
         import aiohttp
-        from config import RPC_URL, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
-        log.info(f"🔗 CONNECTING TO RPC: {RPC_URL}")
+        import asyncio
+        from config import RPC_URLS, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
+        
+        rpc_index = 0
+        
+        def get_rpc():
+            return RPC_URLS[rpc_index]
+
+        log.info(f"🔗 CONNECTING TO RPC: {get_rpc()}")
         
         async with aiohttp.ClientSession() as session:
-            # 1. Init Cursor
-            try:
-                payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
-                async with session.post(RPC_URL, json=payload) as resp:
-                    data = await resp.json()
-                    # Start 10 blocks back to catch immediate data
-                    current_block_num = int(data['result'], 16) - 10
-                    log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
-            except Exception as e:
-                log.error(f"Failed to init RPC: {e}")
-                return
+            # 2. Init Cursor (With Failover Support)
+            current_block_num = None
+            while current_block_num is None and self.running:
+                try:
+                    payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                    # Added a 5-second timeout so dead RPCs fail fast
+                    async with session.post(get_rpc(), json=payload, timeout=5) as resp:
+                        data = await resp.json()
+                        current_block_num = int(data['result'], 16) - 10
+                        log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
+                except Exception as e:
+                    log.warning(f"⚠️ Initial RPC {get_rpc()} failed: {e}. Rotating...")
+                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                    await asyncio.sleep(1)
 
-            # FIX: Initialize dynamic batch scaling bounds
             batch_size = 5 
-            max_batch_size = 1000 # Max blocks to request at once when sprinting
+            max_batch_size = 1000 
 
             while self.running:
                 try:
-                    # 2. Get Chain Tip
+                    current_rpc = get_rpc()
+                    
+                    # 3. Get Chain Tip
                     payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
-                    async with session.post(RPC_URL, json=payload) as resp:
+                    async with session.post(current_rpc, json=payload, timeout=5) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP Status {resp.status}")
                         tip_data = await resp.json()
                         chain_tip = int(tip_data['result'], 16)
                     
-                    # 3. Scan Batch
+                    # 4. Scan Batch
                     if current_block_num <= chain_tip:
-                        # Safely use batch_size here
                         end_block = min(current_block_num + batch_size - 1, chain_tip)
                         
                         log_payload = {
@@ -343,7 +356,8 @@ class LiveTrader:
                             }]
                         }
                         
-                        async with session.post(RPC_URL, json=log_payload) as logs_resp:
+                        # 10-second timeout for pulling heavy log batches
+                        async with session.post(current_rpc, json=log_payload, timeout=10) as logs_resp:
                             data = await logs_resp.json()
                             
                             if 'result' in data:
@@ -363,38 +377,40 @@ class LiveTrader:
                                     if trade_count > 0:
                                         log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
                                 
-                                # Move the cursor forward
+                                # Move cursor and sprint (Using the fixed math trap logic!)
                                 current_block_num = end_block + 1
-                                
-                                # --- CRITICAL FIX: SPRINT TO CATCH UP ---
-                                # If successful, grow the batch size by 1.5x to allow fast catch-up
                                 batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
                                 
                             elif 'error' in data:
-                                log.error(f"🚨 RPC Error on blocks {current_block_num}-{end_block}: {data['error']}")
+                                log.error(f"🚨 RPC Error from {current_rpc}: {data['error']}")
                                 error_code = data['error'].get('code')
                                 
-                                # Dynamic Backoff for Timeouts (-32002), Query Limits (-32005), or Range Too Large (-32000)
                                 if error_code in [-32002, -32005, -32000]:
                                     if batch_size > 1:
                                         batch_size = max(1, batch_size // 2)
-                                        log.warning(f"📉 RPC struggling. Shrinking batch size to {batch_size}...")
+                                        log.warning(f"📉 Shrinking batch size to {batch_size}...")
+                                        
+                                        # If it's a strict timeout (-32002), punish the RPC by rotating
+                                        if error_code == -32002:
+                                            rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                            log.warning(f"🔄 Rotating to new RPC: {get_rpc()}")
                                     else:
-                                        log.warning(f"⏳ Single block {current_block_num} timed out. Retrying in 5s...")
-                                        await asyncio.sleep(5.0)
+                                        log.warning(f"⏳ Single block {current_block_num} timed out. Rotating RPC and retrying...")
+                                        rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                        await asyncio.sleep(2.0)
                                         continue
                                         
-                                await asyncio.sleep(2.0) 
+                                await asyncio.sleep(1.0) 
                     
                     else:
-                        # Caught up to chain tip completely. 
-                        # We don't reset batch size here. The `min(..., chain_tip)` logic handles 
-                        # small requests automatically when we are at the tip.
                         await asyncio.sleep(2.0)
                         
                 except Exception as e:
-                    log.error(f"RPC Error: {e}")
-                    await asyncio.sleep(5)
+                    # Catch network drops, disconnected websockets, or Python timeout errors
+                    log.error(f"⚠️ Connection dropped/timeout on {get_rpc()}: {e}. Rotating RPC...")
+                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                    batch_size = max(1, batch_size // 2) # Cut batch size to be safe
+                    await asyncio.sleep(2.0)
     
     async def _parse_log(self, log_item):
         """
