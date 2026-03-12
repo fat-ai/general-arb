@@ -801,17 +801,17 @@ class LiveTrader:
         
         if best_ask > 0:
             spread = (best_ask - best_bid) / best_ask
-            if spread > 0.15: 
-                log.warning(f"🛡️ SPREAD GUARD: Skipped {token_id}. Spread {spread:.1%}")
-                return
 
         vwap_price, _ = self.broker.calculate_vwap_execution("BUY", CONFIG['fixed_size'], clean_book)
+        
         if signal_price and vwap_price > 0:
             slippage = (vwap_price - signal_price) / signal_price
-            if slippage > CONFIG.get('max_vwap_slippage', 0.05):
-                log.warning(f"🛡️ VWAP GUARD: Skipped {token_id}. Slippage {slippage:.1%}")
+            slippage = slippage + spread
+            if slippage > CONFIG.get('max_slippage', 0.05):
+                log.warning(f"🛡️ SLIPPAGE GUARD: Skipped {token_id}. Slippage {slippage:.1%}")
                 self.pending_orders.discard(token_id)
                 return
+                
         # 4. Prepare "Clean" Book for Broker
         # The broker expects lists, not dictionaries.
         clean_book = {'bids': sorted_bids, 'asks': sorted_asks}
