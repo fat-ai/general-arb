@@ -469,7 +469,7 @@ class LiveTrader:
         log.info("⚖️ Resolution Monitor Started (Batched Mode)")
         
         while self.running:
-            positions = self.persistence.state["positions"]
+            positions = self.persistence.state.get("positions", {})
             if not positions:
                 await asyncio.sleep(60)
                 continue
@@ -490,8 +490,8 @@ class LiveTrader:
             
             for i in range(0, len(unique_fpmms), chunk_size):
                 batch = unique_fpmms[i : i + chunk_size]
-                ids_str = ",".join(batch)
-                url = GAMMA_API_URL + "?" + "&".join([f"condition_ids={fpmm}" for fpmm in batch])
+                
+                url = GAMMA_API_URL + "?" + "&".join([f"id={fpmm}" for fpmm in batch])
                 
                 try:
                     resp = await asyncio.to_thread(requests.get, url)
@@ -500,21 +500,23 @@ class LiveTrader:
                         continue
                     
                     data = resp.json()
-                    markets_data = data if isinstance(data, list) else [data]
+                    
+                    markets_data = data.get('data', []) if isinstance(data, dict) else data
+                    
+                    if not isinstance(markets_data, list):
+                        markets_data = [markets_data]
                     
                     for mkt in markets_data:
-                        if mkt.get('closed'):
-                            fpmm_id = mkt.get('id') or mkt.get('fpmm') or mkt.get('conditionId')
-                            if not fpmm_id: continue
-                            
+             
+                        if mkt.get('closed') or mkt.get('active') is False:
+                            fpmm_id = mkt.get('id')
                             fpmm_id = fpmm_id.lower()
-                            if fpmm_id not in market_map: continue
-
                             outcome_tokens = mkt.get('tokens', [])
-                            winner_map = {
-                                str(t.get('tokenId')): t.get('winner', False) 
-                                for t in outcome_tokens
-                            }
+                            winner_map = {}
+                            for t in outcome_tokens:
+                                t_id = t.get('tokenId')
+                                if t_id:
+                                    winner_map[str(t_id)] = t.get('winner', False)
 
                             held_tokens_in_market = market_map[fpmm_id]
                             
@@ -522,7 +524,7 @@ class LiveTrader:
                                 is_winner = winner_map.get(str(my_token), False)
                                 payout = 1.0 if is_winner else 0.0
                                 
-                                log.info(f"⚖️ Market Resolved: {mkt.get('question')}")
+                                log.info(f"⚖️ Market Resolved: {mkt.get('question', 'Unknown')} | Win: {is_winner}")
                                 await self.broker.redeem_position(my_token, payout)
                                 redeemed_any = True
 
