@@ -37,7 +37,7 @@ CONFIG = {
     "preheat_threshold": 0.5,
     "max_ws_subs": 100000,
     "max_positions": 1000,
-    "max_vwap_slippage": 0.2,
+    "max_slippage": 0.25,
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
     "use_smart_exit": False, 
