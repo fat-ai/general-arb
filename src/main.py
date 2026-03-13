@@ -833,7 +833,9 @@ class LiveTrader:
         max_slippage = CONFIG.get('max_slippage', 0.05)
         start_time = time.time()
         accumulated_usdc = 0.0
-        
+
+        is_paper_trading = isinstance(self.broker, PaperBroker)
+        virtual_consumption = {}
         log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
 
         # 5. Dynamic Sweep Loop
@@ -855,15 +857,28 @@ class LiveTrader:
             optimal_chunk_usdc = 0.0
             accumulated_tokens_test = 0.0
             max_allowance = CONFIG['max_allowable_slippage']
+            planned_consumption = {}
+            
             for ask_price_str, ask_size_tokens_str in clean_book['asks']:
                 ask_p = float(ask_price_str)
-                level_usdc = float(ask_size_tokens_str) * ask_p
+                raw_level_usdc = float(ask_size_tokens_str) * ask_p
+                
+                # --- APPLY VIRTUAL CONSUMPTION ---
+                if is_paper_trading:
+                    previously_eaten = virtual_consumption.get(ask_price_str, 0.0)
+                    level_usdc = max(0.0, raw_level_usdc - previously_eaten)
+                else:
+                    level_usdc = raw_level_usdc
+                    
+                # If we've already pretend-bought all the liquidity at this price, skip it
+                if level_usdc <= 0:
+                    continue
                 
                 # Only take what we still need
                 take_usdc = min(level_usdc, remaining_usdc - optimal_chunk_usdc)
                 take_tokens = take_usdc / ask_p
                 
-                # Test the VWAP if we add this liquidity slice
+                # Test the VWAP
                 test_tokens = accumulated_tokens_test + take_tokens
                 test_usdc = optimal_chunk_usdc + take_usdc
                 test_vwap = test_usdc / test_tokens if test_tokens > 0 else 0
@@ -871,20 +886,20 @@ class LiveTrader:
                 if signal_price and test_vwap > 0:
                     test_slippage = (test_vwap - signal_price) / signal_price
                     total_penalty = test_slippage + spread
+                    absolute_cost_difference = test_vwap - signal_price
                     
-                    if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
-                        # Adding this slice pushes our execution cost too high. Stop sweeping.
+                    if total_penalty > max_slippage and absolute_cost_difference > max_absolute_allowance:
                         break
                 
                 # Lock in this slice
                 optimal_chunk_usdc += take_usdc
                 accumulated_tokens_test += take_tokens
+                planned_consumption[ask_price_str] = take_usdc # Record our intent
                 
                 if optimal_chunk_usdc >= remaining_usdc:
-                    break # We have enough to finish the order
+                    break 
 
             # --- EXECUTE THE CHUNK ---
-            # Prevent microscopic "dust" executions unless it's the very last drop we need
             if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
                 log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
                 
@@ -895,21 +910,26 @@ class LiveTrader:
                 if success is not False:
                     accumulated_usdc += optimal_chunk_usdc
                     
+                    if is_paper_trading:
+                        for p_str, amt in planned_consumption.items():
+                            virtual_consumption[p_str] = virtual_consumption.get(p_str, 0.0) + amt
+                    
                     if accumulated_usdc >= trade_size:
                         log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
                         return
+                else:
+                    log.error(f"❌ Broker rejected the ${optimal_chunk_usdc:.2f} order for {token_id}. Aborting.")
+                    break 
             else:
-                # If optimal_chunk_usdc is 0 or dust, it means the top of the book is too expensive right now
                 pass 
             
-            # Wait for market makers to react and replenish the order book
             await asyncio.sleep(5.0)
 
-        # 6. Timeout handling (Accepting what we got)
-        if accumulated_usdc > 0:
-            log.warning(f"⏰ Execution timeout for {token_id}. Acceptable liquidity dried up. Total filled: ${accumulated_usdc:.2f} / ${trade_size:.2f}.")
-        else:
-            log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the VWAP+Spread requirements.")
+        # 6. Timeout handling
+        if accumulated_usdc > 0 and accumulated_usdc < trade_size:
+            log.warning(f"⏰ Execution timeout for {token_id}. Total filled: ${accumulated_usdc:.2f} / ${trade_size:.2f}.")
+        elif accumulated_usdc == 0:
+            log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the requirements.")
 
     async def _requeue_trade(self, trade_obj, delay=10):
         """
