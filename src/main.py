@@ -35,6 +35,7 @@ class LiveTrader:
         self.ws_queue = asyncio.Queue()
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
+        self.pending_markets: Set[str] = set()
         self.running = True
         self.trade_queue = None
         self.stats = {
@@ -105,6 +106,7 @@ class LiveTrader:
                 await self.broker.execute_market_order(token_id, "SELL", 0, fpmm, current_book=book)
         finally:
             self.pending_orders.discard(token_id)
+            self.pending_markets.discard(fpmm)
 
     def _process_snapshot(self, item):
         """
@@ -718,9 +720,12 @@ class LiveTrader:
                 action = TradeLogic.check_entry_signal(normalized_weight)
                 
                 if action == 'BUY':
-                    if token_id not in self.pending_orders:
+                    if token_id not in self.pending_orders and mid not in self.pending_markets:
                         self.pending_orders.add(token_id)
+                        self.pending_markets.add(mid) 
                         asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
+                    else:
+                        log.info(f"🔒 Market {mid} or Token {token_id} is currently locked by an in-flight order. Skipping.")
 
         # End of Batch Summary
         if batch_scores:
@@ -804,8 +809,7 @@ class LiveTrader:
                 return
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
             await asyncio.sleep(0.5)
-            asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=_retries+1, signal_price=signal_price))
-            return
+            return await self._attempt_exec(token_id, mkt_id, _retries=_retries+1, signal_price=signal_price)
                 
         # 3. Determine Total Target Trade Size
         trade_size = CONFIG['fixed_size'] 
