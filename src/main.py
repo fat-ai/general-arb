@@ -460,10 +460,6 @@ class LiveTrader:
                     asset_b_str in ["0", target_usdc_dec]
                 )
 
-                # Heuristic: If one amount is ~1000x the other, use the larger one for Volume
-                # regardless of which slot it sits in.
-                final_vol_raw = max(amt_a_raw, amt_b_raw)
-
                 # --- FIX: Preserve the actual split to calculate Price ---
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
@@ -570,7 +566,6 @@ class LiveTrader:
          #   print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
             
             try:
-                self.stats['processed_count'] += 1
                 self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
 
                 # Normalize Data
@@ -805,8 +800,8 @@ class LiveTrader:
                 log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
                 self.ws_client.resubscribe_single(token_id)
                 await asyncio.sleep(3.0)
-                asyncio.create_task(self._attempt_exec(token_id, mkt_id, _retries=0, signal_price=signal_price))
-                return
+                return await self._attempt_exec(token_id, mkt_id, _retries=0, _resubscribe_attempts=_resubscribe_attempts + 1, signal_price=signal_price)
+                
             log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
             await asyncio.sleep(0.5)
             return await self._attempt_exec(token_id, mkt_id, _retries=_retries+1, signal_price=signal_price)
@@ -888,7 +883,7 @@ class LiveTrader:
                     total_penalty = test_slippage + spread
                     absolute_cost_difference = test_vwap - signal_price
                     
-                    if total_penalty > max_slippage and absolute_cost_difference > max_absolute_allowance:
+                    if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
                         break
                 
                 # Lock in this slice
