@@ -47,6 +47,7 @@ CONFIG = {
     "max_ws_subs": 100000,
     "max_positions": 1000,
     "max_slippage": 0.25,
+    "max_allowable_slippage": 0.03,
     "exec_timeout": 43200,
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
