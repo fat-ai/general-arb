@@ -854,7 +854,7 @@ class LiveTrader:
             # Walk up the book to find the largest chunk we can take without breaking slippage limits
             optimal_chunk_usdc = 0.0
             accumulated_tokens_test = 0.0
-            
+            max_allowance = CONFIG['max_allowable_slippage']
             for ask_price_str, ask_size_tokens_str in clean_book['asks']:
                 ask_p = float(ask_price_str)
                 level_usdc = float(ask_size_tokens_str) * ask_p
@@ -872,7 +872,7 @@ class LiveTrader:
                     test_slippage = (test_vwap - signal_price) / signal_price
                     total_penalty = test_slippage + spread
                     
-                    if total_penalty > max_slippage:
+                    if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
                         # Adding this slice pushes our execution cost too high. Stop sweeping.
                         break
                 
