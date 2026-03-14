@@ -29,7 +29,7 @@ def main():
     print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
     
     csv_file = CACHE_DIR / TRADES_FILE
-    output_file = Path("./") / WALLET_SCORES_FILE
+    output_file = CACHE_DIR / WALLET_SCORES_FILE
 
     if not os.path.exists(csv_file):
         print(f"❌ Error: File '{csv_file}' not found.", flush=True)
