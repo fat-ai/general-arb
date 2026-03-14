@@ -1,0 +1,12 @@
+services:
+  polymarket-pipeline:
+    build: .
+    container_name: polymarket_pipeline
+    restart: on-failure
+    volumes:
+      # Assuming this is your main data cache directory
+      - ~/data-cache/polymarket_cache:/app/data
+      - ~/config.py:/app/config.py
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
