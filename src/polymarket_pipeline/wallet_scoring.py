@@ -49,7 +49,7 @@ def main():
     print(f"🚀 Scanning trades and scoring via Sharded Polars Pipeline...", flush=True)
 
     # --- B. PASS 1: MAP (PHYSICAL SHARDING) ---
-    NUM_SHARDS = 100
+    NUM_SHARDS = 250
     SHARDS_DIR = CACHE_DIR / "shards"
     os.makedirs(SHARDS_DIR, exist_ok=True)
 
