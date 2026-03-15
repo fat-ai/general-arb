@@ -129,6 +129,9 @@ def main():
     print(f"📊 Pass 2: Processing shards and calculating scores...", flush=True)
     final_dict = {}
 
+    # Convert our outcomes dataframe into a lazy frame for the join
+    lazy_outcomes = df_outcomes.lazy()
+
     try:
         for shard_id in range(NUM_SHARDS):
             shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
@@ -137,73 +140,40 @@ def main():
                 
             print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
             
-            reader = pl.scan_csv(
-                shard_file, 
-                schema_overrides={"contract_id": pl.String, "user": pl.String}
-            )
-            
-            user_contract = None  
-            
-            for df_chunk in reader.collect_batches(chunk_size=50_000):
-                calculated = (
-                    df_chunk
-                    .join(df_outcomes, on="contract_id", how="inner")
-                    .with_columns([
-                        (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
-                        (pl.col("outcomeTokensAmount").abs()).alias("quantity")
-                    ])
-                    .with_columns([
-                        pl.when(pl.col("is_buy"))
-                        .then(pl.col("price") * pl.col("quantity"))
-                        .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
-                        .alias("invested_amount")
-                    ])
+            # 1. Define the ENTIRE pipeline as a single lazy query
+            lazy_query = (
+                pl.scan_csv(
+                    shard_file, 
+                    schema_overrides={"contract_id": pl.String, "user": pl.String}
                 )
-                
-                chunk_agg = (
-                    calculated
-                    .group_by(["user", "contract_id", "resolution_timestamp"])
-                    .agg([
-                        pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
-                        pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
-                        pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
-                        pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
-                        pl.len().alias("trade_count"),
-                        pl.col("outcome").first().alias("outcome")
-                    ])
-                    .with_columns([
-                        (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                        ((pl.col("qty_long") * pl.col("outcome")) + 
-                         (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
-                    ])
-                    .with_columns([
-                        (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
-                    ])
-                    .select(["user", "contract_id", "resolution_timestamp", "contract_pnl", "invested", "trade_count"])
-                )
-                
-                if user_contract is None:
-                    user_contract = chunk_agg
-                else:
-                    user_contract = (
-                        pl.concat([user_contract, chunk_agg])
-                        .group_by(["user", "contract_id", "resolution_timestamp"])
-                        .agg([
-                            pl.col("contract_pnl").sum().alias("contract_pnl"),
-                            pl.col("invested").sum().alias("invested"),
-                            pl.col("trade_count").sum().alias("trade_count")
-                        ])
-                        .rechunk() 
-                    )
-                
-                del df_chunk, calculated, chunk_agg
-            
-            if user_contract is None:
-                os.remove(shard_file)
-                continue
-
-            df_history = (
-                user_contract
+                .join(lazy_outcomes, on="contract_id", how="inner")
+                .with_columns([
+                    (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
+                    (pl.col("outcomeTokensAmount").abs()).alias("quantity")
+                ])
+                .with_columns([
+                    pl.when(pl.col("is_buy"))
+                    .then(pl.col("price") * pl.col("quantity"))
+                    .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
+                    .alias("invested_amount")
+                ])
+                .group_by(["user", "contract_id", "resolution_timestamp"])
+                .agg([
+                    pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
+                    pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
+                    pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
+                    pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
+                    pl.len().alias("trade_count"),
+                    pl.col("outcome").first().alias("outcome")
+                ])
+                .with_columns([
+                    (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
+                    ((pl.col("qty_long") * pl.col("outcome")) + 
+                     (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
+                ])
+                .with_columns([
+                    (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
+                ])
                 .sort(["user", "resolution_timestamp"])
                 .with_columns([
                     pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
@@ -214,34 +184,33 @@ def main():
                 .with_columns([
                     (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
                 ])
-            )
-
-            scored_shard = (
-                df_history
                 .group_by("user")
                 .agg([
                     pl.col("contract_pnl").sum().alias("total_pnl"),
                     pl.col("invested").sum().alias("total_invested"),
                     pl.col("trade_count").sum().alias("total_trades"),
-                    pl.col("current_drawdown").max().alias("max_drawdown") # This correctly gets historical max!
+                    pl.col("current_drawdown").max().alias("max_drawdown")
                 ])
                 .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
                 .with_columns([
                     (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
                     (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
                 ])
-                # Fixed the arbitrary score formula to weight ROI and Calmar more evenly without hard caps
                 .with_columns([
                     ((pl.col("roi") * 100.0) + pl.col("calmar_raw")).alias("score")
                 ])
             )
             
-            # Removed the noisy "|default_topic" string suffix
+            # 2. Execute the query using the streaming engine!
+            scored_shard = lazy_query.collect(streaming=True)
+            
+            # 3. Save to dict
             for row in scored_shard.iter_rows(named=True):
                 final_dict[row['user']] = row['score']
 
+            # Clean up disk and RAM
             os.remove(shard_file)
-            del user_contract, df_history, scored_shard
+            del scored_shard, lazy_query
             gc.collect()
             
         # --- D. SAVE RESULTS ---
