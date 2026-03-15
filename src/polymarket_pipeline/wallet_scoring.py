@@ -58,13 +58,22 @@ def main():
     print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
 
     try:
-        reader = pl.scan_csv(
+        # Ultra-safe eager batched reader (bypasses lazy engine read-ahead leaks)
+        reader = pl.read_csv_batched(
             csv_file,
-            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64}
-        ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
+            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
+            columns=["contract_id", "user", "price", "outcomeTokensAmount"],
+            batch_size=50_000
+        )
         
         batch_count = 0
-        for df_chunk in reader.collect_batches(chunk_size=50_000):
+        while True:
+            batches = reader.next_batches(1)
+            if not batches:
+                break # We reached the end of the 140GB file!
+                
+            df_chunk = batches[0]
+            
             df_chunk = (
                 df_chunk
                 .filter(pl.col("price").is_between(0.001, 0.999))
@@ -86,8 +95,10 @@ def main():
             batch_count += 1
             if batch_count % 50 == 0:
                 print(f"   Processed batch {batch_count}...", flush=True)
-                
+            
+            # Ruthlessly clear RAM before fetching the next batch
             del df_chunk
+            del batches
             gc.collect()
             
         print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
