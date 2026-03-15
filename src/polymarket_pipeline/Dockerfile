@@ -29,7 +29,7 @@ COPY run_pipeline.sh .
 RUN chmod +x run_pipeline.sh
 
 # Set up the single cron job to run at midnight every day
-RUN echo "0 0 * * * root /app/run_pipeline.sh >> /proc/1/fd/1 2>&1" > /etc/cron.d/pipeline-cron
+RUN echo "0 0 * * * /app/run_pipeline.sh >> /proc/1/fd/1 2>&1" > /etc/cron.d/pipeline-cron
 RUN chmod 0644 /etc/cron.d/pipeline-cron
 RUN crontab /etc/cron.d/pipeline-cron
 
