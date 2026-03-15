@@ -64,7 +64,7 @@ def main():
         ).select(["contract_id", "user", "price", "outcomeTokensAmount"])
         
         batch_count = 0
-        for df_chunk in reader.collect_batches(chunk_size=250_000):
+        for df_chunk in reader.collect_batches(chunk_size=50_000):
             df_chunk = (
                 df_chunk
                 .filter(pl.col("price").is_between(0.001, 0.999))
@@ -86,6 +86,9 @@ def main():
             batch_count += 1
             if batch_count % 50 == 0:
                 print(f"   Processed batch {batch_count}...", flush=True)
+                
+            del df_chunk
+            gc.collect()
             
         print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
 
@@ -112,7 +115,7 @@ def main():
             
             user_contract = None  
             
-            for df_chunk in reader.collect_batches(chunk_size=250_000):
+            for df_chunk in reader.collect_batches(chunk_size=50_000):
                 calculated = (
                     df_chunk
                     .join(df_outcomes, on="contract_id", how="inner")
