@@ -3,6 +3,10 @@ services:
     build: .
     container_name: polymarket_pipeline
     restart: on-failure
+    deploy:
+      resources:
+        limits:
+          memory: 8G
     volumes:
       # Assuming this is your main data cache directory
       - ~/data-cache/polymarket_cache:/app/data
