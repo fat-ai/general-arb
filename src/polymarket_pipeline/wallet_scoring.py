@@ -5,6 +5,8 @@ import os
 import sys
 import gc
 from pathlib import Path
+import csv
+import hashlib
 
 # Adjust imports based on your exact config
 from config import TRADES_FILE, WALLET_SCORES_FILE, MARKETS_FILE
@@ -58,53 +60,69 @@ def main():
     print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
 
     try:
-        # Ultra-safe eager batched reader (bypasses lazy engine read-ahead leaks)
-        reader = pl.read_csv_batched(
-            csv_file,
-            schema_overrides={"contract_id": pl.String, "user": pl.String, "price": pl.Float64, "outcomeTokensAmount": pl.Float64},
-            columns=["contract_id", "user", "price", "outcomeTokensAmount"],
-            batch_size=50_000
-        )
-        
-        batch_count = 0
-        while True:
-            batches = reader.next_batches(1)
-            if not batches:
-                break # We reached the end of the 140GB file!
+        # Open 100 file handles for writing (keeps RAM flat)
+        shard_files = {}
+        writers = {}
+        for i in range(NUM_SHARDS):
+            f = open(SHARDS_DIR / f"shard_{i}.csv", "w", newline="", encoding="utf-8")
+            shard_files[i] = f
+            writers[i] = csv.writer(f)
+            # Write the header exactly as Pass 2 expects
+            writers[i].writerow(["contract_id", "user", "price", "outcomeTokensAmount"])
+
+        processed_count = 0
+        written_count = 0
+
+        # Stream the 140GB file line-by-line
+        with open(csv_file, "r", encoding="utf-8") as fin:
+            reader = csv.DictReader(fin)
+            for row in reader:
+                processed_count += 1
                 
-            df_chunk = batches[0]
-            
-            df_chunk = (
-                df_chunk
-                .filter(pl.col("price").is_between(0.001, 0.999))
-                .with_columns([
-                    pl.col("contract_id").str.strip_chars().str.to_lowercase().str.strip_prefix("0x"),
-                    (pl.col("user").hash() % NUM_SHARDS).alias("shard_id")
+                # Safely parse price
+                try:
+                    price = float(row["price"])
+                except (ValueError, TypeError, KeyError):
+                    continue
+                
+                # Apply the filter: price must be between 0.001 and 0.999
+                if not (0.001 <= price <= 0.999):
+                    continue
+                
+                # Clean contract_id
+                contract_id = str(row["contract_id"]).strip().lower().replace("0x", "")
+                user = str(row.get("user", ""))
+                
+                # Deterministic hash to assign shard
+                # MD5 ensures all trades for a user ALWAYS go to the exact same shard
+                user_hash = int(hashlib.md5(user.encode('utf-8')).hexdigest(), 16)
+                shard_id = user_hash % NUM_SHARDS
+                
+                # Route row to specific shard
+                writers[shard_id].writerow([
+                    contract_id, 
+                    user, 
+                    price, 
+                    row.get("outcomeTokensAmount", 0.0)
                 ])
-            )
-            
-            for s_id_tuple, part_df in df_chunk.partition_by("shard_id", as_dict=True).items():
-                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
-                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
+                written_count += 1
                 
-                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
-                
-                with open(shard_file, "ab") as f:
-                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+                # Print progress every 1 million rows
+                if processed_count % 1_000_000 == 0:
+                    print(f"   Processed {processed_count:,} rows... (Kept {written_count:,})", flush=True)
+
+        # Close all file handles safely
+        for f in shard_files.values():
+            f.close()
             
-            batch_count += 1
-            if batch_count % 50 == 0:
-                print(f"   Processed batch {batch_count}...", flush=True)
-            
-            # Ruthlessly clear RAM before fetching the next batch
-            del df_chunk
-            del batches
-            gc.collect()
-            
-        print(f"\n✅ Pass 1 Complete! Data sharded into {SHARDS_DIR}", flush=True)
+        print(f"\n✅ Pass 1 Complete! Data safely sharded.", flush=True)
 
     except Exception as e:
         print(f"\n❌ Sharding Error: {e}", flush=True)
+        # Ensure files are closed even if an error occurs
+        for f in shard_files.values():
+            if not f.closed:
+                f.close()
         return
 
     # --- C. PASS 2: REDUCE (SCORE & AGGREGATE) ---
