@@ -135,13 +135,17 @@ def main():
         return
 
     # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
-    print("\n📊 Pass 2: Finding global first bets per wallet...", flush=True)
-    final_first_bets = []
+    print("\n📊 Pass 2: Finding global first bets per wallet (Zero-RAM Mode)...", flush=True)
+    
+    first_bets_file = CACHE_DIR / "all_first_bets.csv"
+    if os.path.exists(first_bets_file):
+        os.remove(first_bets_file)
 
     for shard_id in range(NUM_SHARDS):
-        print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
         shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
         if not os.path.exists(shard_file): continue
+        
+        print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
 
         df_shard = pl.read_csv(
             shard_file,
@@ -153,7 +157,6 @@ def main():
             }
         )
 
-        # Calculate final metrics just for this subset
         long_roi = (pl.col('outcome') - pl.col('safe_price')) / pl.col('safe_price')
         short_roi = (pl.col('safe_price') - pl.col('outcome')) / (1.0 - pl.col('safe_price'))
         final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi)
@@ -167,19 +170,23 @@ def main():
             won_bet.alias('won_bet')
         ]).select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
 
-        # Sort and deduplicate THIS shard. 
-        # Because all trades for a wallet live in this specific file, this is globally accurate!
+        # Sort and deduplicate THIS shard
         shard_firsts = df_shard.sort("ts_date").unique(subset=["wallet_id"], keep="first")
-        final_first_bets.append(shard_firsts)
         
-        os.remove(shard_file) # Clean up disk space
+        # WRITE IMMEDIATELY TO DISK INSTEAD OF HOLDING IN RAM
+        write_header = not os.path.exists(first_bets_file)
+        with open(first_bets_file, "ab") as f:
+            shard_firsts.write_csv(f, include_header=write_header)
+        
+        # Clean up disk and force RAM flush
+        os.remove(shard_file)
+        del df_shard, shard_firsts
+        gc.collect()
 
-    # Safely concat at the end because we only hold exactly ONE row per user across the whole dataset
-    global_first_bets = pl.concat(final_first_bets)
-    print(f"✅ Scan complete. Found {global_first_bets.height} unique first bets.")
+    print("\n📊 Loading combined first-bets for analysis...", flush=True)
+    df = pd.read_csv(first_bets_file)
+    print(f"✅ Scan complete. Found {len(df)} unique first bets.")
 
-    df = global_first_bets.to_pandas()
-    
     if len(df) < 100:
         print("❌ Not enough data for analysis.")
         return
