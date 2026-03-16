@@ -19,7 +19,7 @@ def main():
     trades_path = CACHE_DIR / TRADES_FILE
     outcomes_path = CACHE_DIR / MARKETS_FILE
     output_file = CACHE_DIR / FRESH_SCORE_FILE
-    BATCH_SIZE = 500_000 
+    BATCH_SIZE = 250_000 
 
     # 1. Load Outcomes (Simplified)
     print(f"Loading market outcomes from {outcomes_path}...")
