@@ -9,6 +9,8 @@ import warnings
 from datetime import datetime
 from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
 from pathlib import Path
+import csv
+import hashlib
 CACHE_DIR = Path("/app/data")
 warnings.filterwarnings("ignore")
 
@@ -50,9 +52,6 @@ def main():
         os.remove(os.path.join(SHARDS_DIR, f))
 
     print(f"🚀 Pass 1: Streaming trades, filtering, and sharding into {NUM_SHARDS} files (Zero-RAM Mode)...", flush=True)
-
-    import csv
-    import hashlib
 
     try:
         # Convert outcomes to a fast Python dictionary for O(1) lookups
