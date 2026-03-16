@@ -42,71 +42,97 @@ def main():
         return
 
     # --- PASS 1: MAP (PHYSICAL SHARDING & FILTERING) ---
-    NUM_SHARDS = 100
+    NUM_SHARDS = 250
     SHARDS_DIR = CACHE_DIR / "fresh_shards"
     os.makedirs(SHARDS_DIR, exist_ok=True)
 
     for f in os.listdir(SHARDS_DIR):
         os.remove(os.path.join(SHARDS_DIR, f))
 
-    print(f"🚀 Pass 1: Streaming trades, filtering, and sharding into {NUM_SHARDS} files...", flush=True)
-    
+    print(f"🚀 Pass 1: Streaming trades, filtering, and sharding into {NUM_SHARDS} files (Zero-RAM Mode)...", flush=True)
+
+    import csv
+    import hashlib
+
     try:
-        reader = pl.scan_csv(
-            trades_path,
-            schema_overrides={
-                "contract_id": pl.String, "user": pl.String, "tradeAmount": pl.Float64,
-                "outcomeTokensAmount": pl.Float64, "price": pl.Float64, "timestamp": pl.String
-            }
-        ).select(["contract_id", "user", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"])
+        # Convert outcomes to a fast Python dictionary for O(1) lookups
+        outcomes_dict = dict(zip(df_outcomes['contract_id'].to_list(), df_outcomes['outcome'].to_list()))
 
-        batch_idx = 0
-        for df_chunk in reader.collect_batches(chunk_size=100_000):
-            # Basic parsing
-            df_chunk = df_chunk.with_columns([
-                pl.col('contract_id').str.strip_chars(),
-                pl.col('outcomeTokensAmount').alias('tokens'),
-                pl.col('price').alias('bet_price'),
-                pl.col('user').alias('wallet_id'),
-                pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
-            ]).drop_nulls(subset=['ts_date'])
+        shard_files = {}
+        writers = {}
+        for i in range(NUM_SHARDS):
+            f = open(SHARDS_DIR / f"shard_{i}.csv", "w", newline="", encoding="utf-8")
+            shard_files[i] = f
+            writers[i] = csv.writer(f)
+            # Write the exact headers Pass 2 expects
+            writers[i].writerow(["contract_id", "wallet_id", "tradeAmount", "tokens", "bet_price", "ts_date", "outcome", "is_long", "safe_price", "risk_vol"])
 
-            # Join immediately to drop ~90% of irrelevant trades before writing to disk
-            joined = df_chunk.join(df_outcomes, on='contract_id', how='inner')
-            if joined.height == 0: continue
+        processed_count = 0
+        written_count = 0
 
-            joined = joined.with_columns([
-                pl.col('bet_price').clip(0.0, 1.0).alias('safe_price'),
-                (pl.col('tokens') > 0).alias('is_long')
-            ])
-
-            # Calculate Risk Volume and aggressively filter to save disk space
-            risk_vol_expr = pl.when(pl.col('is_long'))\
-                              .then(pl.col('tradeAmount'))\
-                              .otherwise(pl.col('tokens').abs() * (1.0 - pl.col('safe_price')))
-
-            joined = joined.with_columns(risk_vol_expr.alias('risk_vol')).filter(pl.col('risk_vol') > 1.0)
-            if joined.height == 0: continue
-            joined = joined.sort("ts_date").unique(subset=["wallet_id"], keep="first")
-
-            # Hash and partition
-            joined = joined.with_columns([(pl.col("wallet_id").hash() % NUM_SHARDS).alias("shard_id")])
-
-            for s_id_tuple, part_df in joined.partition_by("shard_id", as_dict=True).items():
-                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
-                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
-                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
+        with open(trades_path, "r", encoding="utf-8") as fin:
+            reader = csv.DictReader(fin)
+            for row in reader:
+                processed_count += 1
                 
-                with open(shard_file, "ab") as f:
-                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+                contract_id = str(row.get("contract_id", "")).strip().lower().replace("0x", "")
+                
+                # Immediate Join: Drop if not in our known outcomes
+                if contract_id not in outcomes_dict:
+                    continue
+                    
+                outcome_val = outcomes_dict[contract_id]
+                
+                # Parse numeric values safely
+                try:
+                    tradeAmount = float(row.get("tradeAmount", 0.0))
+                    tokens = float(row.get("outcomeTokensAmount", 0.0))
+                    bet_price = float(row.get("price", 0.0))
+                except (ValueError, TypeError):
+                    continue
 
-            batch_idx += 1
-            print(f"   Processed batch {batch_idx}...", end='\r', flush=True)
-            
+                ts_date = str(row.get("timestamp", ""))
+                wallet_id = str(row.get("user", ""))
+
+                safe_price = max(0.0, min(1.0, bet_price))
+                is_long = tokens > 0
+                
+                # Calculate risk volume
+                if is_long:
+                    risk_vol = tradeAmount
+                else:
+                    risk_vol = abs(tokens) * (1.0 - safe_price)
+
+                # Aggressive Filter to save disk space
+                if risk_vol <= 1.0:
+                    continue
+
+                # Deterministic hashing for shards
+                user_hash = int(hashlib.md5(wallet_id.encode('utf-8')).hexdigest(), 16)
+                shard_id = user_hash % NUM_SHARDS
+
+                # Write to shard
+                writers[shard_id].writerow([
+                    contract_id, wallet_id, tradeAmount, tokens, bet_price, ts_date, 
+                    outcome_val, "true" if is_long else "false", safe_price, risk_vol
+                ])
+                written_count += 1
+                
+                if processed_count % 1_000_000 == 0:
+                    print(f"   Processed {processed_count:,} rows... (Kept {written_count:,})", flush=True)
+
+        for f in shard_files.values():
+            f.close()
+
+        print(f"\n✅ Pass 1 Complete! Data safely sharded.", flush=True)
+
     except Exception as e:
         print(f"\n❌ Sharding Error: {e}")
         import traceback
         traceback.print_exc()
+        for f in shard_files.values():
+            if not f.closed:
+                f.close()
         return
 
     # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
@@ -120,7 +146,12 @@ def main():
 
         df_shard = pl.read_csv(
             shard_file,
-            schema_overrides={"contract_id": pl.String, "wallet_id": pl.String}
+            schema_overrides={
+                "contract_id": pl.String, 
+                "wallet_id": pl.String, 
+                "ts_date": pl.String, 
+                "is_long": pl.Boolean
+            }
         )
 
         # Calculate final metrics just for this subset
