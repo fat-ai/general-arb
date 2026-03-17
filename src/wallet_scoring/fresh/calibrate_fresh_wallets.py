@@ -1,235 +1,409 @@
+"""
+calibrate_fresh_wallets.py  —  single-pass, memory-controlled version
+
+Pass 1 design
+─────────────
+• Opens all NUM_SHARDS shard files simultaneously but with a tiny OS write
+  buffer (SHARD_WRITE_BUF bytes).  250 handles × 64 KB = 16 MB max — safe.
+• Reads the source CSV with csv.reader (not DictReader) for ~3–4× speed gain.
+• Flushes all handles every FLUSH_EVERY_ROWS rows to bound peak dirty-page RAM.
+• Uses struct-based MD5 slicing instead of int(hexdigest, 16) for faster hashing.
+
+Pass 2 design
+─────────────
+• Processes one shard at a time; deletes it immediately after.
+• All allocations are narrow typed arrays; no intermediate full-DataFrame copies.
+
+Analysis
+────────
+• Final CSV loaded once with explicit dtypes + parse_dates.
+• OLS built from three numpy arrays, not DataFrames; intermediates freed eagerly.
+"""
+
 import polars as pl
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 import json
-import os
 import gc
 import warnings
-from datetime import datetime
+import struct
 from config import TRADES_FILE, MARKETS_FILE, FRESH_SCORE_FILE
 from pathlib import Path
+import csv
+import hashlib
+
 CACHE_DIR = Path("/app/data")
 warnings.filterwarnings("ignore")
 
-def main():
+# ── tunables ──────────────────────────────────────────────────────────────────
+NUM_SHARDS          = 250
+# Per-handle OS write buffer.  250 × 64 KB = 16 MB total — well within budget.
+SHARD_WRITE_BUF     = 64 * 1024        # bytes
+# Flush all handles to disk every N accepted rows (bounds dirty-page RAM).
+FLUSH_EVERY_ROWS    = 100_000
+# Print progress every N raw rows read from source.
+PROGRESS_EVERY_ROWS = 1_000_000
+# ──────────────────────────────────────────────────────────────────────────────
+
+_UNPACK_I = struct.Struct(">I").unpack   # extract 4 bytes as big-endian uint
+
+
+def _fast_shard(wallet_id: str) -> int:
+    """Stable shard index in [0, NUM_SHARDS) — avoids full hex→int conversion."""
+    digest = hashlib.md5(wallet_id.encode("utf-8")).digest()
+    return _UNPACK_I(digest[:4])[0] % NUM_SHARDS
+
+
+def _clear_dir(d: Path) -> None:
+    if d.exists():
+        for f in d.iterdir():
+            f.unlink()
+    d.mkdir(parents=True, exist_ok=True)
+
+
+def main() -> None:
     print("--- Fresh Wallet Calibration ---")
-    trades_path = CACHE_DIR / TRADES_FILE
+    trades_path   = CACHE_DIR / TRADES_FILE
     outcomes_path = CACHE_DIR / MARKETS_FILE
-    output_file = FRESH_SCORE_FILE
-    BATCH_SIZE = 500_000 
+    output_file   = CACHE_DIR / FRESH_SCORE_FILE
+    shards_dir    = CACHE_DIR / "fresh_shards"
 
-    # 1. Load Outcomes (Simplified)
+    # ── 1. Load outcomes ──────────────────────────────────────────────────────
     print(f"Loading market outcomes from {outcomes_path}...")
-    try:
-        if not os.path.exists(outcomes_path):
-            print(f"❌ Error: File '{outcomes_path}' not found.")
-            return
+    if not outcomes_path.exists():
+        print(f"❌ File not found: {outcomes_path}")
+        return
 
+    try:
         df_outcomes = (
             pl.scan_parquet(outcomes_path)
             .select([
-                pl.col('contract_id').cast(pl.String).str.strip_chars(),
-                pl.col('outcome').cast(pl.Float64)
+                pl.col("contract_id").cast(pl.String).str.strip_chars(),
+                pl.col("outcome").cast(pl.Float64),
             ])
-            .unique(subset=['contract_id'], keep='last')
+            .unique(subset=["contract_id"], keep="last")
             .collect()
         )
-        print(f"✅ Loaded outcomes for {df_outcomes.height} markets.")
-        
+        print(f"✅ Loaded outcomes for {df_outcomes.height:,} markets.")
     except Exception as e:
         print(f"❌ Error loading outcomes: {e}")
         return
 
-    # --- PASS 1: MAP (PHYSICAL SHARDING & FILTERING) ---
-    NUM_SHARDS = 100
-    SHARDS_DIR = CACHE_DIR / "fresh_shards"
-    os.makedirs(SHARDS_DIR, exist_ok=True)
+    outcomes_dict: dict[str, float] = dict(
+        zip(df_outcomes["contract_id"].to_list(), df_outcomes["outcome"].to_list())
+    )
+    del df_outcomes
+    gc.collect()
 
-    for f in os.listdir(SHARDS_DIR):
-        os.remove(os.path.join(SHARDS_DIR, f))
+    # ── PASS 1: single-pass stream → 250 shards ───────────────────────────────
+    # All 250 handles are open simultaneously, but each has a hard 64 KB OS
+    # write buffer (set via the buffering= argument).  Total buffer RAM:
+    # 250 × 64 KB = 16 MB.  We also flush() every FLUSH_EVERY_ROWS accepted
+    # rows so dirty pages never accumulate beyond a known ceiling.
+    #
+    # Speed note: csv.reader (vs DictReader) skips per-row dict construction
+    # and is ~3–4× faster on large files.  Column indices are resolved once
+    # from the header row and then used as direct integer lookups.
+    _clear_dir(shards_dir)
 
-    print(f"🚀 Pass 1: Streaming trades, filtering, and sharding into {NUM_SHARDS} files...", flush=True)
-    
+    SHARD_COLS = [
+        "contract_id", "wallet_id", "tradeAmount", "tokens",
+        "bet_price", "ts_date", "outcome", "is_long", "safe_price", "risk_vol",
+    ]
+
+    print(
+        f"🚀 Pass 1: Single-pass stream → {NUM_SHARDS} shards "
+        f"({SHARD_WRITE_BUF // 1024} KB/handle = "
+        f"{NUM_SHARDS * SHARD_WRITE_BUF // (1024 * 1024)} MB total buffer)...",
+        flush=True,
+    )
+
+    shard_fhs: list = []
+    writers:   list = []
     try:
-        reader = pl.scan_csv(
-            trades_path,
-            schema_overrides={
-                "contract_id": pl.String, "user": pl.String, "tradeAmount": pl.Float64,
-                "outcomeTokensAmount": pl.Float64, "price": pl.Float64, "timestamp": pl.String
-            }
-        ).select(["contract_id", "user", "tradeAmount", "outcomeTokensAmount", "price", "timestamp"])
+        for i in range(NUM_SHARDS):
+            fh = open(
+                shards_dir / f"shard_{i}.csv",
+                "w",
+                newline="",
+                encoding="utf-8",
+                buffering=SHARD_WRITE_BUF,
+            )
+            shard_fhs.append(fh)
+            w = csv.writer(fh)
+            w.writerow(SHARD_COLS)
+            writers.append(w)
 
-        batch_idx = 0
-        for df_chunk in reader.collect_batches(chunk_size=100_000):
-            # Basic parsing
-            df_chunk = df_chunk.with_columns([
-                pl.col('contract_id').str.strip_chars(),
-                pl.col('outcomeTokensAmount').alias('tokens'),
-                pl.col('price').alias('bet_price'),
-                pl.col('user').alias('wallet_id'),
-                pl.col('timestamp').str.to_datetime(strict=False).alias('ts_date')
-            ]).drop_nulls(subset=['ts_date'])
+        processed = 0
+        accepted  = 0
+        flush_ctr = 0
 
-            # Join immediately to drop ~90% of irrelevant trades before writing to disk
-            joined = df_chunk.join(df_outcomes, on='contract_id', how='inner')
-            if joined.height == 0: continue
+        # 1 MB read buffer on the source file so the kernel can hand us large
+        # chunks instead of one tiny read() syscall per line.
+        with open(trades_path, "r", encoding="utf-8", buffering=1 << 20) as fin:
+            reader = csv.reader(fin)
+            header = next(reader)
+            col = {name: idx for idx, name in enumerate(header)}
 
-            joined = joined.with_columns([
-                pl.col('bet_price').clip(0.0, 1.0).alias('safe_price'),
-                (pl.col('tokens') > 0).alias('is_long')
-            ])
+            i_contract  = col["contract_id"]
+            i_trade     = col["tradeAmount"]
+            i_tokens    = col["outcomeTokensAmount"]
+            i_price     = col["price"]
+            i_timestamp = col["timestamp"]
+            i_user      = col["user"]
 
-            # Calculate Risk Volume and aggressively filter to save disk space
-            risk_vol_expr = pl.when(pl.col('is_long'))\
-                              .then(pl.col('tradeAmount'))\
-                              .otherwise(pl.col('tokens').abs() * (1.0 - pl.col('safe_price')))
+            for raw in reader:
+                processed += 1
 
-            joined = joined.with_columns(risk_vol_expr.alias('risk_vol')).filter(pl.col('risk_vol') > 1.0)
-            if joined.height == 0: continue
-            joined = joined.sort("ts_date").unique(subset=["wallet_id"], keep="first")
+                try:
+                    contract_id = raw[i_contract].strip().lower().replace("0x", "")
+                except IndexError:
+                    continue
 
-            # Hash and partition
-            joined = joined.with_columns([(pl.col("wallet_id").hash() % NUM_SHARDS).alias("shard_id")])
+                if contract_id not in outcomes_dict:
+                    continue
 
-            for s_id_tuple, part_df in joined.partition_by("shard_id", as_dict=True).items():
-                s_id = s_id_tuple[0] if isinstance(s_id_tuple, tuple) else s_id_tuple
-                shard_file = SHARDS_DIR / f"shard_{s_id}.csv"
-                write_header = not os.path.exists(shard_file) or os.path.getsize(shard_file) == 0
-                
-                with open(shard_file, "ab") as f:
-                    part_df.drop("shard_id").write_csv(f, include_header=write_header)
+                outcome_val = outcomes_dict[contract_id]
 
-            batch_idx += 1
-            print(f"   Processed batch {batch_idx}...", end='\r', flush=True)
-            
-    except Exception as e:
-        print(f"\n❌ Sharding Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+                try:
+                    tradeAmount = float(raw[i_trade])
+                    tokens      = float(raw[i_tokens])
+                    bet_price   = float(raw[i_price])
+                except (ValueError, TypeError, IndexError):
+                    continue
 
-    # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
-    print("\n📊 Pass 2: Finding global first bets per wallet...", flush=True)
-    final_first_bets = []
+                ts_date   = raw[i_timestamp]
+                wallet_id = raw[i_user]
 
-    for shard_id in range(NUM_SHARDS):
-        print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
-        shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
-        if not os.path.exists(shard_file): continue
+                safe_price = max(0.0, min(1.0, bet_price))
+                is_long    = tokens > 0
+                risk_vol   = tradeAmount if is_long else abs(tokens) * (1.0 - safe_price)
 
-        df_shard = pl.read_csv(
-            shard_file,
-            schema_overrides={"contract_id": pl.String, "wallet_id": pl.String}
+                if risk_vol <= 1.0:
+                    continue
+
+                shard_id = _fast_shard(wallet_id)
+                writers[shard_id].writerow([
+                    contract_id, wallet_id, tradeAmount, tokens, bet_price,
+                    ts_date, outcome_val,
+                    "true" if is_long else "false",
+                    safe_price, risk_vol,
+                ])
+                accepted  += 1
+                flush_ctr += 1
+
+                if flush_ctr >= FLUSH_EVERY_ROWS:
+                    for fh in shard_fhs:
+                        fh.flush()
+                    flush_ctr = 0
+
+                if processed % PROGRESS_EVERY_ROWS == 0:
+                    print(
+                        f"   Processed {processed:>12,}  kept {accepted:>10,}",
+                        flush=True,
+                    )
+
+        print(
+            f"\n✅ Pass 1 complete.  Processed {processed:,} rows, kept {accepted:,}.",
+            flush=True,
         )
 
-        # Calculate final metrics just for this subset
-        long_roi = (pl.col('outcome') - pl.col('safe_price')) / pl.col('safe_price')
-        short_roi = (pl.col('safe_price') - pl.col('outcome')) / (1.0 - pl.col('safe_price'))
-        final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi)
+    except Exception as e:
+        import traceback
+        print(f"\n❌ Pass 1 error: {e}")
+        traceback.print_exc()
+        return
+    finally:
+        for fh in shard_fhs:
+            try:
+                fh.flush()
+                fh.close()
+            except Exception:
+                pass
 
-        won_bet = (pl.col('is_long') & (pl.col('outcome') > 0.5)) | \
-                  ((~pl.col('is_long')) & (pl.col('outcome') < 0.5))
+    del outcomes_dict
+    gc.collect()
 
-        df_shard = df_shard.with_columns([
-            final_roi.alias('roi'),
-            pl.col('risk_vol').log1p().alias('log_vol'),
-            won_bet.alias('won_bet')
-        ]).select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
+    # ── PASS 2: per-shard reduce → first bet per wallet ───────────────────────
+    print("\n📊 Pass 2: Reducing shards to first bets...", flush=True)
 
-        # Sort and deduplicate THIS shard. 
-        # Because all trades for a wallet live in this specific file, this is globally accurate!
-        shard_firsts = df_shard.sort("ts_date").unique(subset=["wallet_id"], keep="first")
-        final_first_bets.append(shard_firsts)
-        
-        os.remove(shard_file) # Clean up disk space
+    first_bets_file = CACHE_DIR / "all_first_bets.csv"
+    if first_bets_file.exists():
+        first_bets_file.unlink()
 
-    # Safely concat at the end because we only hold exactly ONE row per user across the whole dataset
-    global_first_bets = pl.concat(final_first_bets)
-    print(f"✅ Scan complete. Found {global_first_bets.height} unique first bets.")
+    header_written = False
 
-    df = global_first_bets.to_pandas()
-    
+    read_dtypes = {
+        "wallet_id":  "string",
+        "ts_date":    "string",
+        "outcome":    "float32",
+        "safe_price": "float32",
+        "risk_vol":   "float32",
+        "bet_price":  "float32",
+        "is_long":    "string",
+    }
+    use_cols = list(read_dtypes.keys())
+
+    for shard_id in range(NUM_SHARDS):
+        shard_file = shards_dir / f"shard_{shard_id}.csv"
+        if not shard_file.exists():
+            continue
+
+        print(f"   Shard {shard_id + 1:>3}/{NUM_SHARDS}", end="\r", flush=True)
+
+        df_shard     = None
+        is_long_bool = None
+        try:
+            df_shard = pd.read_csv(shard_file, usecols=use_cols, dtype=read_dtypes)
+
+            if df_shard.empty:
+                continue
+
+            df_shard["ts_date"] = pd.to_datetime(df_shard["ts_date"], errors="coerce")
+            df_shard.dropna(subset=["ts_date"], inplace=True)
+            if df_shard.empty:
+                continue
+
+            df_shard["safe_price"] = df_shard["safe_price"].clip(1e-6, 1.0 - 1e-6)
+
+            is_long_bool = df_shard["is_long"].str.lower() == "true"
+
+            df_shard["roi"] = np.where(
+                is_long_bool,
+                (df_shard["outcome"] - df_shard["safe_price"]) / df_shard["safe_price"],
+                (df_shard["safe_price"] - df_shard["outcome"]) / (1.0 - df_shard["safe_price"]),
+            ).astype("float32")
+
+            df_shard["won_bet"] = (
+                (is_long_bool & (df_shard["outcome"] > 0.5))
+                | (~is_long_bool & (df_shard["outcome"] < 0.5))
+            )
+
+            df_shard["log_vol"] = np.log1p(df_shard["risk_vol"]).astype("float32")
+
+            df_shard.sort_values("ts_date", kind="mergesort", inplace=True)
+            df_shard.drop_duplicates(subset=["wallet_id"], keep="first", inplace=True)
+
+            keep = ["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"]
+            df_shard[keep].to_csv(
+                first_bets_file,
+                mode="a",
+                header=not header_written,
+                index=False,
+            )
+            header_written = True
+
+        except Exception as e:
+            print(f"\n  ⚠️  Shard {shard_id} error: {e}")
+        finally:
+            del df_shard, is_long_bool
+            shard_file.unlink(missing_ok=True)
+            gc.collect()
+
+    print(f"\n✅ Pass 2 complete.", flush=True)
+
+    # ── 3. Load first-bets for analysis ──────────────────────────────────────
+    if not first_bets_file.exists():
+        print("❌ No first-bets file produced.")
+        return
+
+    try:
+        df = pd.read_csv(
+            first_bets_file,
+            dtype={
+                "wallet_id": "string",
+                "roi":       "float32",
+                "risk_vol":  "float32",
+                "log_vol":   "float32",
+                "won_bet":   "bool",
+                "bet_price": "float32",
+            },
+            parse_dates=["ts_date"],
+        )
+    except Exception as e:
+        print(f"❌ Failed to load first-bets: {e}")
+        return
+
+    print(f"✅ Found {len(df):,} unique first bets.")
+
     if len(df) < 100:
         print("❌ Not enough data for analysis.")
         return
 
-    # 8. BINNING ANALYSIS
-    print("\n📊 VOLUME BUCKET ANALYSIS (Based on Outlay/Risk)")
-    bins = [0, 10, 50, 100, 500, 1000, 5000, 10000, 100000, float('inf')]
-    labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k", "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
-    
-    df['vol_bin'] = pd.cut(df['risk_vol'], bins=bins, labels=labels)
-    
-    stats = df.groupby('vol_bin', observed=True).agg(
-        Count=('roi', 'count'),
-        Win_Rate=('won_bet', 'mean'),
-        Mean_ROI=('roi', 'mean'),
-        Median_ROI=('roi', 'median'),
-        Mean_Price=('bet_price', 'mean')
+    # ── Binning analysis ──────────────────────────────────────────────────────
+    print("\n📊 VOLUME BUCKET ANALYSIS")
+    bins   = [0, 10, 50, 100, 500, 1_000, 5_000, 10_000, 100_000, float("inf")]
+    labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k",
+              "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
+
+    df["vol_bin"] = pd.cut(df["risk_vol"], bins=bins, labels=labels)
+    stats = df.groupby("vol_bin", observed=True).agg(
+        Count      =("roi",       "count"),
+        Win_Rate   =("won_bet",   "mean"),
+        Mean_ROI   =("roi",       "mean"),
+        Median_ROI =("roi",       "median"),
+        Mean_Price =("bet_price", "mean"),
     )
-    
-    print("="*95)
+
+    print("=" * 95)
     print(f"{'BUCKET':<10} | {'COUNT':<6} | {'WIN%':<6} | {'MEAN ROI':<9} | {'MEDIAN ROI':<10} | {'AVG PRICE':<9}")
     print("-" * 95)
     for bin_name, row in stats.iterrows():
-        print(f"{bin_name:<10} | {int(row['Count']):<6} | {row['Win_Rate']:.1%}  | {row['Mean_ROI']:>7.2%}   | {row['Median_ROI']:>8.2%}   | {row['Mean_Price']:>7.3f}")
-    print("="*95)
+        print(
+            f"{bin_name:<10} | {int(row['Count']):<6} | {row['Win_Rate']:.1%}  | "
+            f"{row['Mean_ROI']:>7.2%}   | {row['Median_ROI']:>8.2%}   | {row['Mean_Price']:>7.3f}"
+        )
+    print("=" * 95)
 
-    # 9. OLS REGRESSION (Aligned with simulate_strategy.py)
-    print("\n📉 RUNNING MULTIPLE OLS REGRESSION (365-DAY WINDOW)...")
-    
-    # Ensure ts_date is a datetime type in pandas for filtering
-    df['ts_date'] = pd.to_datetime(df['ts_date'])
-    
-    # 1. Apply the 365-day cutoff
-    # In live data, the 'current sim day' is just the most recent trade in the dataset
-    max_date = df['ts_date'].max()
+    # ── OLS regression ────────────────────────────────────────────────────────
+    print("\n📉 OLS REGRESSION (365-DAY WINDOW)...")
+
+    max_date    = df["ts_date"].max()
     cutoff_date = max_date - pd.Timedelta(days=365)
-    df_recent = df[df['ts_date'] >= cutoff_date]
-    
-    print(f"Filtered to recent trades: {len(df_recent)} rows (Cutoff: {cutoff_date.date()})")
+    mask        = df["ts_date"] >= cutoff_date
 
-    if len(df_recent) < 50:
-        print("❌ Not enough recent data for stable regression.")
+    log_vol_r   = df.loc[mask, "log_vol"].to_numpy(dtype="float64")
+    bet_price_r = df.loc[mask, "bet_price"].to_numpy(dtype="float64")
+    roi_r       = df.loc[mask, "roi"].to_numpy(dtype="float64")
+    del df
+    gc.collect()
+
+    n_recent = len(roi_r)
+    print(f"Recent rows: {n_recent:,}  (cutoff: {cutoff_date.date()})")
+
+    if n_recent < 50:
+        print("❌ Not enough recent data for regression.")
         return
 
-    # 2. Define multiple features: log_vol AND bet_price
-    X_features = df_recent[['log_vol', 'bet_price']]
-    y = df_recent['roi']
-    
-    # Add constant for the intercept
-    X_const = sm.add_constant(X_features)
-    model_ols = sm.OLS(y, X_const)
-    results_ols = model_ols.fit()
-    
-    # Extract all three parameters
-    intercept = results_ols.params['const']
-    slope_vol = results_ols.params['log_vol']
-    slope_price = results_ols.params['bet_price']
-    
+    X = np.column_stack([np.ones(n_recent, dtype="float64"), log_vol_r, bet_price_r])
+    del log_vol_r, bet_price_r
+    gc.collect()
+
+    results_ols = sm.OLS(roi_r, X).fit()
+    del roi_r, X
+    gc.collect()
+
+    intercept   = float(results_ols.params[0])
+    slope_vol   = float(results_ols.params[1])
+    slope_price = float(results_ols.params[2])
+
     print(f"OLS Intercept:   {intercept:.8f}")
     print(f"OLS Vol Slope:   {slope_vol:.8f}")
     print(f"OLS Price Slope: {slope_price:.8f}")
 
-    # 10. SAVE RESULTS
-    results = {
+    # ── Save ──────────────────────────────────────────────────────────────────
+    output = {
         "ols": {
-            "intercept": intercept, 
-            "slope_vol": slope_vol,
-            "slope_price": slope_price
+            "intercept":   intercept,
+            "slope_vol":   slope_vol,
+            "slope_price": slope_price,
         },
-        "buckets": stats.to_dict('index')
+        "buckets": {str(k): v for k, v in stats.to_dict("index").items()},
     }
-    
-    def clean_keys(obj):
-        if isinstance(obj, dict):
-            return {str(k): clean_keys(v) for k, v in obj.items()}
-        return obj
-
-    with open(output_file, 'w') as f:
-        json.dump(clean_keys(results), f, indent=4)
-    print(f"\n✅ Saved audit stats to {output_file}")
+    with open(output_file, "w") as fout:
+        json.dump(output, fout, indent=4)
+    print(f"\n✅ Saved to {output_file}")
 
 
 if __name__ == "__main__":
