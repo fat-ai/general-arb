@@ -135,11 +135,18 @@ def main():
         return
 
     # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
-    print("\n📊 Pass 2: Finding global first bets per wallet (Zero-RAM Mode)...", flush=True)
+    print("\n📊 Pass 2: Finding global first bets per wallet (Pandas Mode)...", flush=True)
     
     first_bets_file = CACHE_DIR / "all_first_bets.csv"
     if os.path.exists(first_bets_file):
         os.remove(first_bets_file)
+
+    # Free up the massive amount of RAM used by Pass 1 lookups before we begin Pass 2
+    if 'df_outcomes' in locals(): del df_outcomes
+    if 'outcomes_dict' in locals(): del outcomes_dict
+    gc.collect()
+
+    import pandas as pd
 
     for shard_id in range(NUM_SHARDS):
         shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
@@ -147,45 +154,59 @@ def main():
         
         print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
 
-        df_shard = pl.read_csv(
-            shard_file,
-            schema_overrides={
-                "contract_id": pl.String, 
-                "wallet_id": pl.String, 
-                "ts_date": pl.String, 
-                "is_long": pl.Boolean
-            }
-        )
+        try:
+            # Pandas guarantees strict memory release after each loop iteration
+            df_shard = pd.read_csv(shard_file)
+            
+            if len(df_shard) == 0:
+                os.remove(shard_file)
+                continue
 
-        long_roi = (pl.col('outcome') - pl.col('safe_price')) / pl.col('safe_price')
-        short_roi = (pl.col('safe_price') - pl.col('outcome')) / (1.0 - pl.col('safe_price'))
-        final_roi = pl.when(pl.col('is_long')).then(long_roi).otherwise(short_roi)
+            # Safely parse boolean
+            df_shard['is_long'] = df_shard['is_long'].astype(str).str.lower() == 'true'
 
-        won_bet = (pl.col('is_long') & (pl.col('outcome') > 0.5)) | \
-                  ((~pl.col('is_long')) & (pl.col('outcome') < 0.5))
+            # 1. ROI Math
+            long_roi = (df_shard['outcome'] - df_shard['safe_price']) / df_shard['safe_price']
+            short_roi = (df_shard['safe_price'] - df_shard['outcome']) / (1.0 - df_shard['safe_price'])
+            df_shard['roi'] = np.where(df_shard['is_long'], long_roi, short_roi)
 
-        df_shard = df_shard.with_columns([
-            final_roi.alias('roi'),
-            pl.col('risk_vol').log1p().alias('log_vol'),
-            won_bet.alias('won_bet')
-        ]).select(["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"])
+            # 2. Won Bet Math
+            df_shard['won_bet'] = (df_shard['is_long'] & (df_shard['outcome'] > 0.5)) | \
+                                  (~df_shard['is_long'] & (df_shard['outcome'] < 0.5))
 
-        # Sort and deduplicate THIS shard
-        shard_firsts = df_shard.sort("ts_date").unique(subset=["wallet_id"], keep="first")
-        
-        # WRITE IMMEDIATELY TO DISK INSTEAD OF HOLDING IN RAM
-        write_header = not os.path.exists(first_bets_file)
-        with open(first_bets_file, "ab") as f:
-            shard_firsts.write_csv(f, include_header=write_header)
-        
+            # 3. Log Vol Math
+            df_shard['log_vol'] = np.log1p(df_shard['risk_vol'])
+
+            # 4. Sort and deduplicate THIS shard
+            df_shard = df_shard.sort_values("ts_date").drop_duplicates(subset=["wallet_id"], keep="first")
+
+            # 5. Write to disk immediately
+            cols_to_keep = ["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"]
+            df_shard[cols_to_keep].to_csv(
+                first_bets_file, 
+                mode='a', 
+                header=not os.path.exists(first_bets_file), 
+                index=False
+            )
+
+            # 6. Ruthlessly clear Pandas memory
+            del df_shard
+            del long_roi
+            del short_roi
+            
+        except Exception as e:
+            print(f"Error on shard {shard_id}: {e}")
+
         # Clean up disk and force RAM flush
         os.remove(shard_file)
-        del df_shard, shard_firsts
         gc.collect()
 
     print("\n📊 Loading combined first-bets for analysis...", flush=True)
-    df = pd.read_csv(first_bets_file)
-    print(f"✅ Scan complete. Found {len(df)} unique first bets.")
+    try:
+        df = pd.read_csv(first_bets_file)
+        print(f"✅ Scan complete. Found {len(df)} unique first bets.")
+    except FileNotFoundError:
+        df = pd.DataFrame()
 
     if len(df) < 100:
         print("❌ Not enough data for analysis.")
