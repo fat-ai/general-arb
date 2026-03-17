@@ -135,18 +135,30 @@ def main():
         return
 
     # --- PASS 2: REDUCE (FIND TRUE FIRST BETS) ---
-    print("\n📊 Pass 2: Finding global first bets per wallet (Pandas Mode)...", flush=True)
+    print("\n📊 Pass 2: Finding global first bets per wallet (Bulletproof Pandas Mode)...", flush=True)
     
     first_bets_file = CACHE_DIR / "all_first_bets.csv"
     if os.path.exists(first_bets_file):
         os.remove(first_bets_file)
 
-    # Free up the massive amount of RAM used by Pass 1 lookups before we begin Pass 2
     if 'df_outcomes' in locals(): del df_outcomes
     if 'outcomes_dict' in locals(): del outcomes_dict
     gc.collect()
 
     import pandas as pd
+    import numpy as np
+
+    dtypes = {
+        "wallet_id": "string",
+        "ts_date": "string", 
+        "outcome": "float32",
+        "safe_price": "float32",
+        "risk_vol": "float32",
+        "bet_price": "float32",
+        "is_long": "string"
+    }
+    
+    use_cols = ["wallet_id", "ts_date", "outcome", "safe_price", "risk_vol", "bet_price", "is_long"]
 
     for shard_id in range(NUM_SHARDS):
         shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
@@ -155,32 +167,45 @@ def main():
         print(f"   Processing Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
 
         try:
-            # Pandas guarantees strict memory release after each loop iteration
-            df_shard = pd.read_csv(shard_file)
+            df_shard = pd.read_csv(
+                shard_file,
+                usecols=use_cols,
+                dtype=dtypes
+            )
             
             if len(df_shard) == 0:
                 os.remove(shard_file)
                 continue
 
-            # Safely parse boolean
-            df_shard['is_long'] = df_shard['is_long'].astype(str).str.lower() == 'true'
+            # Fix 1: Chronological Sorting Guarantee (drops bad data)
+            df_shard["ts_date"] = pd.to_datetime(df_shard["ts_date"], errors="coerce")
+            df_shard.dropna(subset=["ts_date"], inplace=True)
+            
+            # Fix 2: Prevent Division by Zero / NaN Propagation
+            df_shard["safe_price"] = df_shard["safe_price"].clip(1e-6, 1.0 - 1e-6)
+            
+            # Safely parse boolean inline
+            is_long_bool = df_shard['is_long'].str.lower() == 'true'
 
-            # 1. ROI Math
-            long_roi = (df_shard['outcome'] - df_shard['safe_price']) / df_shard['safe_price']
-            short_roi = (df_shard['safe_price'] - df_shard['outcome']) / (1.0 - df_shard['safe_price'])
-            df_shard['roi'] = np.where(df_shard['is_long'], long_roi, short_roi)
+            # 3. INLINE MATH: Avoids double array allocation memory spikes
+            df_shard['roi'] = np.where(
+                is_long_bool,
+                (df_shard['outcome'] - df_shard['safe_price']) / df_shard['safe_price'],
+                (df_shard['safe_price'] - df_shard['outcome']) / (1.0 - df_shard['safe_price'])
+            ).astype("float32")
 
-            # 2. Won Bet Math
-            df_shard['won_bet'] = (df_shard['is_long'] & (df_shard['outcome'] > 0.5)) | \
-                                  (~df_shard['is_long'] & (df_shard['outcome'] < 0.5))
+            df_shard['won_bet'] = (
+                (is_long_bool & (df_shard['outcome'] > 0.5)) | \
+                (~is_long_bool & (df_shard['outcome'] < 0.5))
+            )
 
-            # 3. Log Vol Math
-            df_shard['log_vol'] = np.log1p(df_shard['risk_vol'])
+            df_shard['log_vol'] = np.log1p(df_shard['risk_vol']).astype("float32")
 
-            # 4. Sort and deduplicate THIS shard
-            df_shard = df_shard.sort_values("ts_date").drop_duplicates(subset=["wallet_id"], keep="first")
+            # 4. IN-PLACE SORTING: Mergesort prevents the massive Quicksort RAM spike
+            df_shard.sort_values("ts_date", kind="mergesort", inplace=True)
+            df_shard.drop_duplicates(subset=["wallet_id"], keep="first", inplace=True)
 
-            # 5. Write to disk immediately
+            # 5. Write to disk
             cols_to_keep = ["wallet_id", "ts_date", "roi", "risk_vol", "log_vol", "won_bet", "bet_price"]
             df_shard[cols_to_keep].to_csv(
                 first_bets_file, 
@@ -189,10 +214,9 @@ def main():
                 index=False
             )
 
-            # 6. Ruthlessly clear Pandas memory
+            # 6. Ruthlessly clear memory
             del df_shard
-            del long_roi
-            del short_roi
+            del is_long_bool
             
         except Exception as e:
             print(f"Error on shard {shard_id}: {e}")
@@ -240,8 +264,6 @@ def main():
     # Ensure ts_date is a datetime type in pandas for filtering
     df['ts_date'] = pd.to_datetime(df['ts_date'])
     
-    # 1. Apply the 365-day cutoff
-    # In live data, the 'current sim day' is just the most recent trade in the dataset
     max_date = df['ts_date'].max()
     cutoff_date = max_date - pd.Timedelta(days=365)
     df_recent = df[df['ts_date'] >= cutoff_date]
