@@ -898,6 +898,15 @@ class LiveTrader:
             if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
                 log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
                 
+                market_obj = self.metadata.markets.get(mkt_id)
+                if market_obj:
+                    market_tokens = [str(t) for t in market_obj['tokens'].values()]
+                    for held_token in self.persistence.state["positions"].keys():
+                        # If we hold a token in this market, and it is NOT the one we are currently buying
+                        if str(held_token) in market_tokens and str(held_token) != str(token_id):
+                            log.critical(f"🛡️ Async Guard: Opposing side ({held_token}) already held! Aborting sweep for {token_id}.")
+                            return
+                            
                 success = await self.broker.execute_market_order(
                     token_id, "BUY", optimal_chunk_usdc, mkt_id, current_book=clean_book
                 )
