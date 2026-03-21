@@ -9,6 +9,7 @@ import csv
 import queue
 from typing import Dict, List, Set
 import aiohttp
+import copy
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
@@ -486,8 +487,6 @@ class LiveTrader:
         """Production-grade resolution monitor with batching, retries, and idempotency."""
         log.info("⚖️ Resolution Monitor Started (Production Mode)")
 
-        log = logging.getLogger(__name__)
-
         def _safe_json_load(x):
             if isinstance(x, str):
                 try:
@@ -499,7 +498,7 @@ class LiveTrader:
         
         def _chunked(lst, size):
             for i in range(0, len(lst), size):
-        yield lst[i:i + size]
+                yield lst[i:i + size]
         
         if not hasattr(self, "http_session") or self.http_session.closed:
             timeout = aiohttp.ClientTimeout(total=5)
@@ -533,10 +532,10 @@ class LiveTrader:
                 for batch in _chunked(list(market_map.keys()), 5):
 
                     url = GAMMA_API_URL + "?" + "&".join(f"id={fpmm}" for fpmm in batch)
-
+                    data = None
                     for attempt in range(10):
                         try:
-                            async with self.http_session.get(url) as resp:
+                            async with self.http_session.get(url, timeout=5)
                                 if resp.status != 200:
                                     raise RuntimeError(f"HTTP {resp.status}")
 
@@ -544,11 +543,11 @@ class LiveTrader:
                                 break  # success
 
                         except Exception as e:
-                            if attempt == 2:
+                            if attempt == 9:
                                 log.error(f"Resolution Batch Failed after retries: {e}")
                                 data = None
                             else:
-                                await asyncio.sleep(2 ** attempt)  # exponential backoff
+                                await asyncio.sleep(min(2 ** attempt, 10))  # exponential backoff
 
                     if not data:
                         continue
@@ -570,7 +569,8 @@ class LiveTrader:
 
                             outcome_tokens = _safe_json_load(mkt.get("tokens"))
                             outcome_prices = _safe_json_load(mkt.get("outcomePrices"))
-
+                            outcome_prices = [float(p) for p in outcome_prices]
+                            
                             if (
                                 not outcome_tokens
                                 or not outcome_prices
@@ -581,13 +581,10 @@ class LiveTrader:
                                 continue
 
                             # --- ROBUST WINNER DETECTION ---
-                            winner_idx = max(
-                                range(len(outcome_prices)),
-                                key=lambda i: outcome_prices[i] or 0.0,
-                            )
-
+                            winner_idx = max(range(len(outcome_prices)), key=lambda i: outcome_prices[i])
+                            
                             if outcome_prices[winner_idx] < 0.99:
-                                continue  # not confidently resolved
+                                continue
 
                             held_tokens = market_map.get(fpmm_id)
                             if not held_tokens:
@@ -604,9 +601,10 @@ class LiveTrader:
 
                                 is_winner = outcome_tokens[winner_idx] == token_id
                                 payout = 1.0 if is_winner else 0.0
-
+              
                                 pos["redeemed"] = True
-
+                                await self.persistence.save_async()
+                                
                                 log.info(
                                     f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
                                     f"Token: {token_id} | Win: {is_winner}"
