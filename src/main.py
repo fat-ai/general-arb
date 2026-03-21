@@ -13,7 +13,7 @@ import copy
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
-from reporting import generate_institutional_report
+from reporting import generate_institutional_report, generate_html_report
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
 from strategy import WalletScorer, SignalEngine, TradeLogic
@@ -21,7 +21,6 @@ from ws_handler import PolymarketWS
 
 # Setup Logging
 log, _ = setup_logging()
-TRADE_QUEUE = asyncio.Queue()
 
 class LiveTrader:
     def __init__(self):
@@ -226,7 +225,7 @@ class LiveTrader:
                     live_prices_map[tid] = float(bids[0][0])
 
             # Generate HTML
-            from reporting import generate_html_report
+      
             res = generate_html_report(self.persistence.state, live_prices_map, self.metadata)
             
             # Only print log every 60s to keep terminal clean, but update HTML every 5s
@@ -535,7 +534,7 @@ class LiveTrader:
                     data = None
                     for attempt in range(10):
                         try:
-                            async with self.http_session.get(url, timeout=5)
+                            async with self.http_session.get(url, timeout=5) as resp:
                                 if resp.status != 200:
                                     raise RuntimeError(f"HTTP {resp.status}")
 
@@ -568,7 +567,9 @@ class LiveTrader:
                                 continue
 
                             outcome_tokens = _safe_json_load(mkt.get("tokens"))
-                            outcome_prices = _safe_json_load(mkt.get("outcomePrices"))
+                            outcome_prices_raw = _safe_json_load(mkt.get("outcomePrices"))
+                            if not outcome_prices_raw:
+                               continue
                             outcome_prices = [float(p) for p in outcome_prices]
                             
                             if (
@@ -859,7 +860,7 @@ class LiveTrader:
         
         return {'bids': sorted_bids, 'asks': sorted_asks}
 
-    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, signal_price=None):
+    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
         token_id = str(token_id)
         
         # 1. Position Guard
@@ -948,7 +949,11 @@ class LiveTrader:
                     continue
                 
                 # Only take what we still need
-                take_usdc = min(level_usdc, remaining_usdc - optimal_chunk_usdc)
+                budget_left_in_chunk = remaining_usdc - optimal_chunk_usdc
+                take_usdc = min(level_usdc, budget_left_in_chunk)
+                if take_usdc <= 0:
+                    break
+                    
                 take_tokens = take_usdc / ask_p
                 
                 # Test the VWAP
@@ -1103,7 +1108,7 @@ class LiveTrader:
 
             drawdown = 0.0
             if high_water > 0:
-                drawdown = (equity - high_water) / high_water 
+                drawdown = (high_water - equity) / high_water
 
             try:
                 with open(EQUITY_FILE, "a", newline="") as f:
@@ -1122,14 +1127,18 @@ class LiveTrader:
             await asyncio.sleep(60)
             
 async def main():
+    trader = None
     try:
         trader = LiveTrader()
         await trader.start()
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
-        await trader.shutdown()
+        if trader:
+            await trader.shutdown()
     except Exception as e:
         log.critical(f"Fatal Error: {e}")
+        if trader:
+            await trader.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
