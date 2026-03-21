@@ -483,75 +483,155 @@ class LiveTrader:
             return "ERROR"
             
     async def _resolution_monitor_loop(self):
-        """Checks if any held positions have resolved using Batched API calls."""
-        log.info("⚖️ Resolution Monitor Started (Batched Mode)")
-        
-        while self.running:
-            positions = self.persistence.state.get("positions", {})
-            if not positions:
-                await asyncio.sleep(60)
-                continue
+        """Production-grade resolution monitor with batching, retries, and idempotency."""
+        log.info("⚖️ Resolution Monitor Started (Production Mode)")
 
-            market_map = {}
-            for token_id, pos in positions.items():
-                fpmm = pos.get('market_fpmm')
-                if fpmm:
-                    market_map.setdefault(fpmm.lower(), []).append(token_id)
+        log = logging.getLogger(__name__)
 
-            unique_fpmms = list(market_map.keys())
-            if not unique_fpmms:
-                await asyncio.sleep(60)
-                continue
-            
-            chunk_size = 5
-            redeemed_any = False
-            
-            for i in range(0, len(unique_fpmms), chunk_size):
-                batch = unique_fpmms[i : i + chunk_size]
-                
-                url = GAMMA_API_URL + "?" + "&".join([f"id={fpmm}" for fpmm in batch])
-                
+        def _safe_json_load(x):
+            if isinstance(x, str):
                 try:
-                    resp = await asyncio.to_thread(requests.get, url)
-                    if resp.status_code != 200: 
-                        log.warning(f"Resolution Batch Failed ({resp.status_code})")
+                    return json.loads(x)
+                except Exception:
+                    return None
+            return x
+        
+        
+        def _chunked(lst, size):
+            for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+        
+        if not hasattr(self, "http_session") or self.http_session.closed:
+            timeout = aiohttp.ClientTimeout(total=5)
+            self.http_session = aiohttp.ClientSession(timeout=timeout)
+
+        while self.running:
+            try:
+                raw_positions = self.persistence.state.get("positions", {})
+                if not raw_positions:
+                    await asyncio.sleep(60)
+                    continue
+
+                positions: Dict = copy.deepcopy(raw_positions)
+
+                market_map: Dict[str, List[str]] = {}
+                for token_id, pos in positions.items():
+                    if pos.get("redeemed"):
                         continue
-                    
-                    data = resp.json()
-                    
-                    markets_data = data.get('data', []) if isinstance(data, dict) else data
-                    
+
+                    fpmm = pos.get("market_fpmm")
+                    if fpmm:
+                        market_map.setdefault(fpmm.lower(), []).append(token_id)
+
+                if not market_map:
+                    await asyncio.sleep(60)
+                    continue
+
+                redeemed_any = False
+
+                # --- PROCESS IN BATCHES ---
+                for batch in _chunked(list(market_map.keys()), 5):
+
+                    url = GAMMA_API_URL + "?" + "&".join(f"id={fpmm}" for fpmm in batch)
+
+                    for attempt in range(10):
+                        try:
+                            async with self.http_session.get(url) as resp:
+                                if resp.status != 200:
+                                    raise RuntimeError(f"HTTP {resp.status}")
+
+                                data = await resp.json()
+                                break  # success
+
+                        except Exception as e:
+                            if attempt == 2:
+                                log.error(f"Resolution Batch Failed after retries: {e}")
+                                data = None
+                            else:
+                                await asyncio.sleep(2 ** attempt)  # exponential backoff
+
+                    if not data:
+                        continue
+
+                    # --- NORMALIZE RESPONSE ---
+                    markets_data = data.get("data") if isinstance(data, dict) else data
                     if not isinstance(markets_data, list):
                         markets_data = [markets_data]
-                    
+
+                    # --- PROCESS MARKETS ---
                     for mkt in markets_data:
-             
-                        if mkt.get('closed') or mkt.get('active') is False:
-                            fpmm_id = mkt.get('id')
-                            fpmm_id = fpmm_id.lower()
-                            outcome_tokens = mkt.get('tokens', [])
-                            winner_map = {}
-                            for t in outcome_tokens:
-                                t_id = t.get('tokenId')
-                                if t_id:
-                                    winner_map[str(t_id)] = t.get('winner', False)
+                        try:
+                            if not mkt or mkt.get("closed") is not True:
+                                continue
 
-                            held_tokens_in_market = market_map[fpmm_id]
-                            
-                            for my_token in held_tokens_in_market:
-                                is_winner = winner_map.get(str(my_token), False)
+                            fpmm_id = (mkt.get("id") or "").lower()
+                            if not fpmm_id:
+                                continue
+
+                            outcome_tokens = _safe_json_load(mkt.get("tokens"))
+                            outcome_prices = _safe_json_load(mkt.get("outcomePrices"))
+
+                            if (
+                                not outcome_tokens
+                                or not outcome_prices
+                                or not isinstance(outcome_tokens, list)
+                                or not isinstance(outcome_prices, list)
+                                or len(outcome_tokens) != len(outcome_prices)
+                            ):
+                                continue
+
+                            # --- ROBUST WINNER DETECTION ---
+                            winner_idx = max(
+                                range(len(outcome_prices)),
+                                key=lambda i: outcome_prices[i] or 0.0,
+                            )
+
+                            if outcome_prices[winner_idx] < 0.99:
+                                continue  # not confidently resolved
+
+                            held_tokens = market_map.get(fpmm_id)
+                            if not held_tokens:
+                                continue
+
+                            for token_id in held_tokens:
+                                pos = raw_positions.get(token_id)
+                                if not pos:
+                                    continue
+
+                                # --- IDEMPOTENCY CHECK ---
+                                if pos.get("redeemed"):
+                                    continue
+
+                                is_winner = outcome_tokens[winner_idx] == token_id
                                 payout = 1.0 if is_winner else 0.0
-                                
-                                log.info(f"⚖️ Market Resolved: {mkt.get('question', 'Unknown')} | Win: {is_winner}")
-                                await self.broker.redeem_position(my_token, payout)
-                                redeemed_any = True
 
-                except Exception as e:
-                    log.error(f"Resolution Batch Error: {e}")
-                
-                await asyncio.sleep(0.5)
+                                pos["redeemed"] = True
 
-            await asyncio.sleep(60)
+                                log.info(
+                                    f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
+                                    f"Token: {token_id} | Win: {is_winner}"
+                                )
+
+                                try:
+                                    await self.broker.redeem_position(token_id, payout)
+                                    redeemed_any = True
+                                except Exception as e:
+                                    pos["redeemed"] = False
+                                    log.error(f"Redeem failed for {token_id}: {e}")
+
+                        except Exception as e:
+                            log.error(f"Market processing error: {e}")
+
+                    await asyncio.sleep(0.5)
+
+                if redeemed_any:
+                    await asyncio.sleep(5)
+                else:
+                    await asyncio.sleep(60)
+
+            except Exception as loop_error:
+                log.error(f"Resolution loop critical error: {loop_error}")
+                await asyncio.sleep(10)
             
     # --- SIGNAL LOOPS ---
 
