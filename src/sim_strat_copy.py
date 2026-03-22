@@ -305,10 +305,10 @@ def main():
                 # --- TOP 10% ELITE WALLET FILTERING ---
                 # Re-calculate the top tier users daily based on updated histories
                 if user_history.height > 0:
-                    # Filter basic criteria: > 10 trades AND >= 1000 invested
+                    # Criteria: >= 10 different markets AND >= $100 average invested per market
                     eligible_users = user_history.filter(
-                        (pl.col("trade_count") > 10) & 
-                        (pl.col("total_invested") >= 1000.0)
+                        (pl.col("trade_count") >= 10) & 
+                        ((pl.col("total_invested") / pl.col("trade_count")) >= 100.0)
                     ).to_dicts()
 
                     calmar_scores = []
@@ -320,29 +320,35 @@ def main():
                             days_active = max(1, (current_sim_day - first_seen).days)
                             annualized_factor = 365.0 / days_active
                             
-                            ann_pnl = u["total_pnl"] * annualized_factor
-                            # Prevent divide by zero on zero drawdown
-                            max_dd = max(u["max_drawdown"], 1e-6) 
-                            
-                            calmar_ratio = ann_pnl / max_dd
-                            avg_trade_size = u["total_invested"] / u["trade_count"]
-                            
-                            calmar_scores.append({
-                                "user": uid,
-                                "calmar": calmar_ratio,
-                                "avg_size": avg_trade_size
-                            })
+                            roi = u["total_pnl"] / u["total_invested"]
+
+                            if roi >= 0.3:
+                                ann_pnl = u["total_pnl"] * annualized_factor
+                                
+                                baseline_dd = max(100.0, u["total_invested"] * 0.05)
+                                max_dd = max(u["max_drawdown"], baseline_dd) 
+                                
+                                calmar_ratio = ann_pnl / max_dd
+                                avg_trade_size = u["total_invested"] / u["trade_count"]
+                                
+                                calmar_scores.append({
+                                    "user": uid,
+                                    "calmar": calmar_ratio,
+                                    "avg_size": avg_trade_size
+                                })
                     
                     if calmar_scores:
                         calmar_df = pl.DataFrame(calmar_scores)
-                        # Find 90th percentile threshold
-                        percentile_90 = calmar_df["calmar"].quantile(0.9)
+                        # Find 95th percentile threshold
+                        percentile_95 = calmar_df["calmar"].quantile(0.95)
                         
-                        # Filter for the Top 10%
-                        top_10 = calmar_df.filter(pl.col("calmar") >= percentile_90)
+                        # Filter for the Top 5%
+                        top_5 = calmar_df.filter(pl.col("calmar") >= percentile_95)
+
+                        top_5 = top_5.sort("calmar", descending=True).head(5000)
                         
                         # Update our fast lookup dictionary
-                        top_tier_users = {row["user"]: row["avg_size"] for row in top_10.iter_rows(named=True)}
+                        top_tier_users = {row["user"]: row["avg_size"] for row in top_5.iter_rows(named=True)}
                         
                 log.info(f"   📅 {current_sim_day}: Identified {len(top_tier_users)} Elite Wallets. Simulating next day...")
 
