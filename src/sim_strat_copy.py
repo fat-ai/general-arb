@@ -479,7 +479,7 @@ def main():
                                     result_map[mid]['slippage'] = slippage
                                     result_map['resolutions'].append([m_end, profit, bet_size])
                                     result_map['performance']['cash'] -= bet_size
-                                    print(f"COPY TRADE TRIGGERED! User: {t['user'][:6]}... Market: {mid} - Size: {vol:.2f} (Avg: {avg_size:.2f})")
+                                    print(f"COPY TRADE TRIGGERED! User: {uid}... Market: {mid} - Pos Size: {total_position_size:.2f} (Avg: {avg_size:.2f})")
 
                     # Heartbeat / Result Checking Engine
                     now = t['timestamp']     
