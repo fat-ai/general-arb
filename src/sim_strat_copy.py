@@ -155,26 +155,6 @@ def main():
 
     chunk_gen = reverse_file_chunk_generator(TRADES_PATH, chunk_size=1024*1024*32)
 
-    def flush_updates():
-        nonlocal active_positions, updates_buffer
-        if not updates_buffer:
-            return
-
-        new_data = pl.concat(updates_buffer)
-        
-        if active_positions.height == 0:
-            active_positions = new_data
-        else:
-            active_positions = pl.concat([active_positions, new_data]) \
-                .group_by(["user", "contract_id"]).agg([
-                    pl.col("qty_long").sum(), pl.col("cost_long").sum(),
-                    pl.col("qty_short").sum(), pl.col("cost_short").sum(),
-                    pl.first("token_index")
-                ])
-        
-        updates_buffer = []
-        gc.collect()
-    
     for csv_bytes in chunk_gen:
 
         try:
@@ -225,11 +205,13 @@ def main():
 
                 resolved_ids = [
                     cid for cid, m in market_map.items() 
-                    if m['end'] is not None and m['end'].date() < current_sim_day
+                    if m['end'] is not None and m['end'].date() < current_sim_day and not m.get('is_resolved', False)
                 ]
 
                 if resolved_ids:
                     for cid in resolved_ids:
+                        # Mark as resolved so we never process it again
+                        market_map[cid]['is_resolved'] = True
                         # 1. INSTANT MEMORY CLEANUP: Pop the resolved market out of tracking
                         live_user_positions.pop(cid, None)
                         market_users = market_positions.pop(cid, None)
@@ -307,10 +289,6 @@ def main():
                 data_start_date = day
                 simulation_start_date = data_start_date + timedelta(days=WARMUP_DAYS)
                 log.info(f"🔥 Warm-up Period: {data_start_date} -> {simulation_start_date}")
-
-            original_count = len(market_map)
-            market_map = {k: v for k, v in market_map.items() 
-                          if v['start'] is not None and v['start'] >= pd.Timestamp(data_start_date)}
             
             if day < simulation_start_date:
                 if day.day == 1 or day.day == 15:
@@ -322,7 +300,7 @@ def main():
                 ]).to_dicts()
                 
                 results = []
-                heartbeat = datetime.now()
+                heartbeat = None # Initialize as None so we can anchor it to simulation time
                 
                 for t in sim_rows:
                     cid = t['contract_id']
@@ -420,9 +398,14 @@ def main():
                                     print(f"COPY TRADE TRIGGERED! User: {uid}... Market: {mid} - Pos Size: {total_position_size:.2f} (Avg: {avg_size:.2f})")
 
                     # Heartbeat / Result Checking Engine
-                    now = t['timestamp']     
-                    wait = heartbeat - now                  
-                    if wait.seconds > 60 and len(result_map['resolutions']) > 0:
+                    # Heartbeat / Result Checking Engine
+                    now = t['timestamp']  
+                    
+                    if heartbeat is None:
+                        heartbeat = now
+                        
+                    wait = now - heartbeat                  
+                    if wait.total_seconds() > 60 and len(result_map['resolutions']) > 0:
                             heartbeat = now
                             previous_equity = result_map['performance']['equity'] 
                             result_map['performance']['resolutions'] = len(result_map['resolutions'])
