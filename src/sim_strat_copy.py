@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import math
 from collections import Counter
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
+from collections import defaultdict
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -126,32 +127,24 @@ def main():
     
     log.info(f"Loaded {len(market_map)} resolved markets (Timezones normalized).")
     
-    # 2. INITIALIZE STATE
+    # 2. INITIALIZE STATE (ULTRA-FAST NATIVE DICTS)
     known_users = set()
-    user_first_seen = {} # Track first trade date to annualize Calmar
-    top_tier_users = {}  # Fast lookup for top 10% users -> avg_trade_size
-    entered_markets = set() # Track markets we have taken a position in
-    live_user_positions = {}
-    updates_buffer = []
+    top_tier_users = {}  
+    entered_markets = set() 
     
-    user_history = pl.DataFrame(schema={
-        "user": pl.Categorical,
-        "total_pnl": pl.Float32,
-        "total_invested": pl.Float32,
-        "trade_count": pl.UInt32,
-        "peak_pnl": pl.Float32,     
-        "max_drawdown": pl.Float32  
+    # { user_id: { "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": date } }
+    user_history = defaultdict(lambda: {
+        "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, 
+        "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": None
     })
     
-    active_positions = pl.DataFrame(schema={
-        "user": pl.Categorical,        
-        "contract_id": pl.Categorical, 
-        "qty_long": pl.Float32,        
-        "cost_long": pl.Float32,
-        "qty_short": pl.Float32,
-        "cost_short": pl.Float32,
-        "token_index": pl.UInt8
-    })
+    # { contract_id: { user_id: { "qty_long": 0.0, "cost_long": 0.0, "qty_short": 0.0, "cost_short": 0.0 } } }
+    market_positions = defaultdict(lambda: defaultdict(lambda: {
+        "qty_long": 0.0, "cost_long": 0.0, "qty_short": 0.0, "cost_short": 0.0
+    }))
+    
+    # { contract_id: { user_id: volume } }
+    live_user_positions = defaultdict(lambda: defaultdict(float))
 
     # 3. STREAMING LOOP
     log.info("Starting Reverse Simulation Stream (Oldest -> Newest)...")
@@ -220,8 +213,7 @@ def main():
             uid = trade["user"]
             if uid not in known_users:
                 known_users.add(uid)
-                # Store the exact date they made their first trade
-                user_first_seen[uid] = trade["timestamp"].date() if trade["timestamp"] else None
+                user_history[uid]["first_seen"] = trade["timestamp"].date() if trade["timestamp"] else None
 
         batch = batch.sort("timestamp")
         batch = batch.with_columns(pl.col("timestamp").dt.date().alias("day"))
@@ -237,126 +229,73 @@ def main():
                 ]
 
                 if resolved_ids:
-                    flush_updates()
-
-                live_user_positions = {
-                        k: v for k, v in live_user_positions.items() 
-                        if k[1] not in resolved_ids
-                    }
-                
-                if resolved_ids and active_positions.height > 0:
-                
-                    just_resolved = active_positions.filter(
-                        pl.col("contract_id").is_in(
-                            pl.Series(resolved_ids).cast(pl.Categorical).implode()
-                        )
-                    )
-                    
-                    if just_resolved.height > 0:
-                        unique_cids = just_resolved["contract_id"].unique().cast(pl.String).to_list()
-                        outcomes_df = pl.DataFrame([
-                            {"contract_id": cid, "outcome": market_map[cid]['outcome']} 
-                            for cid in unique_cids if cid in market_map
-                        ])
+                    for cid in resolved_ids:
+                        # 1. INSTANT MEMORY CLEANUP: Pop the resolved market out of tracking
+                        live_user_positions.pop(cid, None)
+                        market_users = market_positions.pop(cid, None)
                         
-                        if outcomes_df.height > 0:
-                            outcomes_df = outcomes_df.with_columns(pl.col("contract_id").cast(pl.Categorical))
-                            resolved_with_outcome = just_resolved.join(outcomes_df, on="contract_id", how="left")
-    
-                            pnl_calc = resolved_with_outcome.select([
-                                pl.col("user"),
-                                ((pl.col("qty_long") * pl.col("outcome")) + 
-                                 (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout"),
-                                (pl.col("cost_long") + pl.col("cost_short")).alias("invested")
-                            ]).group_by("user").agg([
-                                (pl.col("payout") - pl.col("invested")).sum().alias("delta_pnl"),
-                                pl.col("invested").sum().alias("delta_invested"),
-                                pl.len().alias("delta_count")
-                            ])
-    
-                            # Update History
-                            if user_history.height == 0:
-                                user_history = pnl_calc.select([
-                                    pl.col("user").cast(pl.Categorical),
-                                    pl.col("delta_pnl").cast(pl.Float32).alias("total_pnl"),
-                                    pl.col("delta_invested").cast(pl.Float32).alias("total_invested"),
-                                    pl.col("delta_count").cast(pl.UInt32).alias("trade_count"),
-                                ]).with_columns([
-                                    pl.max_horizontal(pl.col("total_pnl"), pl.lit(0.0)).alias("peak_pnl"),
-                                ]).with_columns([
-                                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("max_drawdown")
-                                ])
-                            else:
-                                joined = user_history.join(
-                                    pnl_calc.with_columns(pl.col("user").cast(pl.Categorical)), 
-                                    on="user", how="full", coalesce=True
-                                )
-                                
-                                user_history = joined.select([
-                                    pl.col("user"),
-                                    (pl.col("total_pnl").fill_null(0) + pl.col("delta_pnl").fill_null(0)).alias("total_pnl"),
-                                    (pl.col("total_invested").fill_null(0) + pl.col("delta_invested").fill_null(0)).alias("total_invested"),
-                                    (pl.col("trade_count").fill_null(0) + pl.col("delta_count").fill_null(0)).alias("trade_count"),
-                                    pl.col("peak_pnl").fill_null(0).alias("prev_peak"),
-                                    pl.col("max_drawdown").fill_null(0).alias("prev_max_dd")
-                                ]).with_columns([
-                                    pl.max_horizontal("prev_peak", "total_pnl", pl.lit(0.0)).alias("peak_pnl")
-                                ]).with_columns([
-                                    pl.max_horizontal("prev_max_dd", (pl.col("peak_pnl") - pl.col("total_pnl"))).alias("max_drawdown")
-                                ]).select([
-                                    "user", "total_pnl", "total_invested", "trade_count", "peak_pnl", "max_drawdown"
-                                ])
-    
-                # --- TOP 10% ELITE WALLET FILTERING ---
-                # Re-calculate the top tier users daily based on updated histories
-                if user_history.height > 0:
-                    # Criteria: >= 10 different markets AND >= $100 average invested per market
-                    eligible_users = user_history.filter(
-                        (pl.col("trade_count") >= 10) & 
-                        ((pl.col("total_invested") / pl.col("trade_count")) >= 100.0)
-                    ).to_dicts()
-
-                    calmar_scores = []
-                    for u in eligible_users:
-                        uid = u["user"]
-                        first_seen = user_first_seen.get(uid)
-                        
-                        if first_seen:
-                            days_active = max(1, (current_sim_day - first_seen).days)
-                            annualized_factor = 365.0 / days_active
+                        if not market_users:
+                            continue
                             
-                            roi = u["total_pnl"] / u["total_invested"]
+                        # 2. CALCULATE PAYOUTS & UPDATE HISTORY IN O(1)
+                        outcome = market_map[cid]['outcome']
+                        for uid, pos in market_users.items():
+                            payout = (pos["qty_long"] * outcome) + (pos["qty_short"] * (1.0 - outcome))
+                            invested = pos["cost_long"] + pos["cost_short"]
+                            delta_pnl = payout - invested
+                            
+                            # Update user history in place
+                            hist = user_history[uid]
+                            hist["total_pnl"] += delta_pnl
+                            hist["total_invested"] += invested
+                            hist["trade_count"] += 1
+                            
+                            # Update Peak and Drawdown
+                            if hist["total_pnl"] > hist["peak_pnl"]:
+                                hist["peak_pnl"] = hist["total_pnl"]
+                                
+                            current_dd = hist["peak_pnl"] - hist["total_pnl"]
+                            if current_dd > hist["max_drawdown"]:
+                                hist["max_drawdown"] = current_dd
 
-                            if roi >= 0.3:
-                                ann_pnl = u["total_pnl"] * annualized_factor
+                # --- TOP 5% ELITE WALLET FILTERING (NATIVE PYTHON) ---
+                if user_history:
+                    calmar_scores = []
+                    
+                    for uid, stats in user_history.items():
+                        # Criteria: >= 10 markets AND >= $100 avg size
+                        if stats["trade_count"] >= 10:
+                            avg_size = stats["total_invested"] / stats["trade_count"]
+                            if avg_size >= 100.0:
+                                roi = stats["total_pnl"] / stats["total_invested"] if stats["total_invested"] > 0 else 0
                                 
-                                baseline_dd = max(100.0, u["total_invested"] * 0.05)
-                                max_dd = max(u["max_drawdown"], baseline_dd) 
-                                
-                                calmar_ratio = ann_pnl / max_dd
-                                avg_trade_size = u["total_invested"] / u["trade_count"]
-                                
-                                calmar_scores.append({
-                                    "user": uid,
-                                    "calmar": calmar_ratio,
-                                    "avg_size": avg_trade_size
-                                })
+                                # 3% ROI Floor
+                                if roi >= 0.03 and stats["first_seen"]:
+                                    days_active = max(1, (current_sim_day - stats["first_seen"]).days)
+                                    ann_pnl = stats["total_pnl"] * (365.0 / days_active)
+                                    
+                                    # Regularized Drawdown (Min $100 or 5% of invested)
+                                    baseline_dd = max(100.0, stats["total_invested"] * 0.05)
+                                    true_max_dd = max(stats["max_drawdown"], baseline_dd)
+                                    
+                                    calmar = ann_pnl / true_max_dd
+                                    calmar_scores.append((uid, calmar, avg_size))
                     
                     if calmar_scores:
-                        calmar_df = pl.DataFrame(calmar_scores)
-                        # Find 95th percentile threshold
-                        percentile_95 = calmar_df["calmar"].quantile(0.95)
+                        # Sort by Calmar descending
+                        calmar_scores.sort(key=lambda x: x[1], reverse=True)
                         
-                        # Filter for the Top 5%
-                        top_5 = calmar_df.filter(pl.col("calmar") >= percentile_95)
-
-                        top_5 = top_5.sort("calmar", descending=True).head(5000)
+                        # Calculate the top 5% cutoff index natively
+                        top_5_count = max(1, int(len(calmar_scores) * 0.05))
                         
-                        # Update our fast lookup dictionary
-                        top_tier_users = {row["user"]: row["avg_size"] for row in top_5.iter_rows(named=True)}
+                        # Slice the top 5%, then cap at 5000 max
+                        elite_list = calmar_scores[:top_5_count][:5000]
+                        
+                        # Rebuild the fast lookup dict
+                        top_tier_users = {uid: avg_size for uid, calmar, avg_size in elite_list}
                         
                 log.info(f"   📅 {current_sim_day}: Identified {len(top_tier_users)} Elite Wallets. Simulating next day...")
-
+                
             # Move time forward
             current_sim_day = day
 
@@ -405,10 +344,9 @@ def main():
                     mid = m['id']
                     uid = t['user']
                     cid = t['contract_id']
-
-                    pos_key = (uid, cid)
-                    live_user_positions[pos_key] = live_user_positions.get(pos_key, 0.0) + vol
-                    total_position_size = live_user_positions[pos_key]
+                    
+                    live_user_positions[cid][uid] += vol
+                    total_position_size = live_user_positions[cid][uid]
                     
                     # We only copy opening BUYS (outcomeTokensAmount > 0) to keep signals clean
                     is_buying = (t['outcomeTokensAmount'] > 0)
@@ -541,24 +479,29 @@ def main():
                 if results:
                     pd.DataFrame(results).to_csv(OUTPUT_PATH, mode='a', header=not OUTPUT_PATH.exists(), index=False)
 
-            # D. ACCUMULATE POSITIONS
+            # D. ACCUMULATE POSITIONS (Fast Dict Update)
             processed_trades = daily_trades.with_columns([
                 (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
                 pl.col("outcomeTokensAmount").abs().alias("quantity")
             ])
             
+            # Group by user and market for the day
             daily_agg = processed_trades.group_by(["user", "contract_id"]).agg([
                 pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0).alias("qty_long"),
                 (pl.col("price") * pl.col("quantity")).filter(pl.col("is_buy")).sum().fill_null(0).alias("cost_long"),
                 pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0).alias("qty_short"),
                 ((1.0 - pl.col("price")) * pl.col("quantity")).filter(~pl.col("is_buy")).sum().fill_null(0).alias("cost_short")
-            ]).with_columns(pl.lit(0).cast(pl.UInt8).alias("token_index"))
+            ])
 
-            updates_buffer.append(daily_agg)
-            
-            if len(updates_buffer) > 50:
-                flush_updates()
+            # Dump into our fast O(1) nested dictionary
+            for row in daily_agg.iter_rows(named=True):
+                pos = market_positions[row["contract_id"]][row["user"]]
+                pos["qty_long"] += row["qty_long"]
+                pos["cost_long"] += row["cost_long"]
+                pos["qty_short"] += row["qty_short"]
+                pos["cost_short"] += row["cost_short"]
 
+        # Optional: Run garbage collection at the end of every batch file read, not every day
         gc.collect()
 
     log.info("✅ Simulation Complete.")
