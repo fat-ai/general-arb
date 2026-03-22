@@ -131,7 +131,7 @@ def main():
     user_first_seen = {} # Track first trade date to annualize Calmar
     top_tier_users = {}  # Fast lookup for top 10% users -> avg_trade_size
     entered_markets = set() # Track markets we have taken a position in
-    
+    live_user_positions = {}
     updates_buffer = []
     
     user_history = pl.DataFrame(schema={
@@ -238,6 +238,11 @@ def main():
 
                 if resolved_ids:
                     flush_updates()
+
+                live_user_positions = {
+                        k: v for k, v in live_user_positions.items() 
+                        if k[1] not in resolved_ids
+                    }
                 
                 if resolved_ids and active_positions.height > 0:
                 
@@ -398,6 +403,12 @@ def main():
 
                     # --- COPY TRADE EXECUTION LOGIC ---
                     mid = m['id']
+                    uid = t['user']
+                    cid = t['contract_id']
+
+                    pos_key = (uid, cid)
+                    live_user_positions[pos_key] = live_user_positions.get(pos_key, 0.0) + vol
+                    total_position_size = live_user_positions[pos_key]
                     
                     # We only copy opening BUYS (outcomeTokensAmount > 0) to keep signals clean
                     is_buying = (t['outcomeTokensAmount'] > 0)
@@ -406,7 +417,7 @@ def main():
                         avg_size = top_tier_users[t['user']]
                         
                         # Size must be >= their average
-                        if vol >= avg_size and t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
+                        if total_position_size >= avg_size and t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
                             entered_markets.add(mid) # Secure one position per market
                             
                             bet_on = m['outcome_label']
