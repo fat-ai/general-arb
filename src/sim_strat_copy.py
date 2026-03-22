@@ -318,22 +318,23 @@ def main():
                     m['volume'] += vol
                     cum_vol = m['volume']
 
-                    # --- COPY TRADE EXECUTION LOGIC ---
+                    ## --- COPY TRADE EXECUTION LOGIC ---
                     mid = m['id']
                     uid = t['user']
                     cid = t['contract_id']
                     
-                    live_user_positions[cid][uid] += vol
-                    total_position_size = live_user_positions[cid][uid]
+                    trade_cost = t['price'] * abs(t['outcomeTokensAmount'])
                     
-                    # We only copy opening BUYS (outcomeTokensAmount > 0) to keep signals clean
+                    live_user_positions[cid][uid] += trade_cost
+                    total_dollar_cost = live_user_positions[cid][uid]
+                    
                     is_buying = (t['outcomeTokensAmount'] > 0)
                     
-                    if is_buying and mid not in entered_markets and t['user'] in top_tier_users:
-                        avg_size = top_tier_users[t['user']]
+                    if is_buying and mid not in entered_markets and uid in top_tier_users:
+                        avg_size = top_tier_users[uid]
                         
-                        # Size must be >= their average
-                        if total_position_size >= avg_size and t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
+                        # Trigger based on accumulated DOLLAR COST being >= their historical average cost
+                        if total_dollar_cost >= avg_size and t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
                             entered_markets.add(mid) # Secure one position per market
                             
                             bet_on = m['outcome_label']
@@ -395,7 +396,7 @@ def main():
                                     result_map[mid]['slippage'] = slippage
                                     result_map['resolutions'].append([m_end, profit, bet_size])
                                     result_map['performance']['cash'] -= bet_size
-                                    print(f"COPY TRADE TRIGGERED! User: {uid}... Market: {mid} - Pos Size: {total_position_size:.2f} (Avg: {avg_size:.2f})")
+                                    print(f"COPY TRADE TRIGGERED! User: {uid[:8]}... Market: {mid} - Cost: ${total_dollar_cost:.2f} (Avg: ${avg_size:.2f})")
 
                     # Heartbeat / Result Checking Engine
                     # Heartbeat / Result Checking Engine
