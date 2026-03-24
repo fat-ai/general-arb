@@ -406,20 +406,50 @@ class DataFetcher:
             print("   ℹ️  No new market data to save.")
             return
 
-        print(f"\n   🔀 Merging {len(temp_files)} chunk(s)...")
-        all_dfs = [pd.read_parquet(p) for p in temp_files]
+        print(f"\n   🔀 Merging {len(temp_files)} chunk(s) (Memory-Optimized Pandas)...")
+        
+        # 1. Load the new chunks (these are tiny, easily fit in RAM)
+        new_df = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
+        # Deduplicate the new chunks themselves first
+        new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
         if cache_file.exists() and max_created_at is not None:
-            existing_df = pd.read_parquet(cache_file)
-            all_dfs.insert(0, existing_df)
+            # 2. Load ONLY the IDs from the master file (uses almost 0 RAM)
+            existing_ids = pd.read_parquet(cache_file, columns=['contract_id'])
+            
+            # 3. Flag the exact rows in the master file we want to KEEP
+            # We discard any old row that is being updated by the new fetch
+            new_ids_set = set(new_df['contract_id'])
+            keep_mask = ~existing_ids['contract_id'].isin(new_ids_set)
+            
+            # Free RAM immediately
+            del existing_ids
+            gc.collect()
 
-        merged = pd.concat(all_dfs, ignore_index=True)
-        merged = merged.drop_duplicates(subset=['contract_id'], keep='last')
+            # 4. Load the master file and apply the mask instantly
+            existing_df = pd.read_parquet(cache_file)[keep_mask]
+            
+            # Free mask
+            del keep_mask
+            gc.collect()
+
+            # 5. Append the fresh data to the filtered master data
+            merged = pd.concat([existing_df, new_df], ignore_index=True)
+            
+            del existing_df, new_df
+            gc.collect()
+        else:
+            merged = new_df
+
+        # Save and wipe RAM completely
         merged.to_parquet(cache_file)
         print(f"   ✅ Markets saved: {len(merged)} total rows → {cache_file}")
 
+        del merged
+        gc.collect()
+
         for p in temp_files:
-            p.unlink(missing_ok=True)
+            Path(p).unlink(missing_ok=True)
             
 
 
