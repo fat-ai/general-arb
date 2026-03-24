@@ -919,6 +919,26 @@ class LiveTrader:
                 await asyncio.sleep(2.0)
                 continue
 
+            # ==========================================
+            # 🛠️ THE FIX: Virtually Deplete the Book 
+            # ==========================================
+            if is_paper_trading:
+                adjusted_asks = []
+                for p_str, s_str in clean_book['asks']:
+                    p_float = float(p_str)
+                    raw_level_usdc = float(s_str) * p_float
+                    eaten = virtual_consumption.get(p_str, 0.0)
+                    
+                    left_usdc = max(0.0, raw_level_usdc - eaten)
+                    if left_usdc > 0.001:  # Keep level only if liquidity remains
+                        adjusted_asks.append([p_str, str(left_usdc / p_float)])
+                        
+                clean_book['asks'] = adjusted_asks # Broker will now see the depleted book!
+
+            if not clean_book['asks']:
+                await asyncio.sleep(2.0) # Wait for new sellers if book is virtually empty
+                continue
+
             # Calculate Current Spread
             best_bid = float(clean_book['bids'][0][0])
             best_ask = float(clean_book['asks'][0][0])
@@ -926,8 +946,6 @@ class LiveTrader:
 
             remaining_usdc = trade_size - accumulated_usdc
             
-            # --- DYNAMIC VWAP SWEEP ---
-            # Walk up the book to find the largest chunk we can take without breaking slippage limits
             optimal_chunk_usdc = 0.0
             accumulated_tokens_test = 0.0
             max_allowance = CONFIG['max_allowable_slippage']
@@ -935,18 +953,7 @@ class LiveTrader:
             
             for ask_price_str, ask_size_tokens_str in clean_book['asks']:
                 ask_p = float(ask_price_str)
-                raw_level_usdc = float(ask_size_tokens_str) * ask_p
-                
-                # --- APPLY VIRTUAL CONSUMPTION ---
-                if is_paper_trading:
-                    previously_eaten = virtual_consumption.get(ask_price_str, 0.0)
-                    level_usdc = max(0.0, raw_level_usdc - previously_eaten)
-                else:
-                    level_usdc = raw_level_usdc
-                    
-                # If we've already pretend-bought all the liquidity at this price, skip it
-                if level_usdc <= 0:
-                    continue
+                level_usdc = float(ask_size_tokens_str) * ask_p
                 
                 # Only take what we still need
                 budget_left_in_chunk = remaining_usdc - optimal_chunk_usdc
@@ -972,16 +979,20 @@ class LiveTrader:
                 # Lock in this slice
                 optimal_chunk_usdc += take_usdc
                 accumulated_tokens_test += take_tokens
-                planned_consumption[ask_price_str] = take_usdc # Record our intent
+                planned_consumption[ask_price_str] = take_usdc 
                 
                 if optimal_chunk_usdc >= remaining_usdc:
-                    break 
+                    break
 
             # --- EXECUTE THE CHUNK ---
             if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
                 log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
                 
                 market_obj = self.metadata.markets.get(mkt_id)
+                
+                # 1. Grab the expiration timestamp (default to 0 if not found)
+                expiration_ts = market_obj.get('end_timestamp', 0.0) if market_obj else 0.0
+                
                 if market_obj:
                     market_tokens = [str(t) for t in market_obj['tokens'].values()]
                     for held_token in self.persistence.state["positions"].keys():
@@ -990,8 +1001,10 @@ class LiveTrader:
                             log.critical(f"🛡️ Async Guard: Opposing side ({held_token}) already held! Aborting sweep for {token_id}.")
                             return
                             
+                # 2. Pass expiration_ts to the broker
                 success = await self.broker.execute_market_order(
-                    token_id, "BUY", optimal_chunk_usdc, mkt_id, current_book=clean_book
+                    token_id, "BUY", optimal_chunk_usdc, mkt_id, 
+                    current_book=clean_book, expiration_ts=expiration_ts
                 )
                 
                 if success is not False:
