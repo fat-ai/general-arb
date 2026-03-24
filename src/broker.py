@@ -22,7 +22,7 @@ class PersistenceManager:
     def __init__(self):
         self.state = {
             "cash": CONFIG['initial_capital'],
-            "positions": {},  # Format: {token_id: {qty, avg_price, market_fpmm}}
+            "positions": {},  # Format: {token_id: {qty, avg_price, market_fpmm, opened_at, market_end}}
             "start_time": time.time(),
             "highest_equity": CONFIG['initial_capital']
         }
@@ -163,8 +163,8 @@ class PaperBroker:
         return avg_price, total_qty
 
     async def execute_market_order(self, token_id: str, side: str, 
-                                   usdc_amount: float, fpmm_id: str, 
-                                   current_book: Dict) -> bool:
+                               usdc_amount: float, fpmm_id: str, 
+                               current_book: Dict, expiration_ts: float = 0.0) -> bool:
         """
         Executes a Buy or Sell order using Order Book depth.
         """
@@ -219,7 +219,13 @@ class PaperBroker:
                 
                 # 2. Update State
                 state["cash"] -= cost
-                pos = state["positions"].get(token_id, {"qty": 0.0, "avg_price": 0.0, "market_fpmm": fpmm_id})
+                pos = state["positions"].get(token_id, {
+                    "qty": 0.0, 
+                    "avg_price": 0.0, 
+                    "market_fpmm": fpmm_id,
+                    "opened_at": time.time(),       
+                    "market_end": expiration_ts 
+                })
                 
                 # Weighted Average Entry Price
                 prev_total_cost = pos["qty"] * pos["avg_price"]
