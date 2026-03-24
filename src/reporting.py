@@ -158,7 +158,7 @@ def generate_html_report(state, live_prices, metadata):
             
             # Metadata Extraction
             fpmm = pos.get('market_fpmm', 'Unknown')
-            tokens = metadata.markets.get(fpmm, {})['tokens']
+            tokens = metadata.markets.get(fpmm, {})
             # Identify if this token ID represents YES or NO
             side_label = "UNKNOWN"
             for label, token_id in tokens.items():
@@ -166,16 +166,11 @@ def generate_html_report(state, live_prices, metadata):
                     side_label = label.upper()
 
             # Format Times
-            start_ts_str = pos.get('startDate', '')
-            if start_ts_str:
-                start_ts = datetime.fromisoformat(start_date_str.replace('Z', '+00:00')).timestamp()
-            
-            end_ts_str = pos.get('endDate', '')
-            if end_ts_str:
-                end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
+            start_ts = pos.get('opened_at', 0)
+            end_ts = pos.get('market_end', 0)
             
             pos_data[tid] = {
-                "market": fpmm,
+                "market": fpmm[:15],
                 "side": side_label,
                 "qty": round(qty, 1),
                 "entry": round(entry, 3),
