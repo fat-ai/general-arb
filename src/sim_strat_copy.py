@@ -14,7 +14,7 @@ from collections import defaultdict
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-WARMUP_DAYS = 30
+WARMUP_DAYS = 500
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
 
@@ -251,8 +251,7 @@ def main():
                             if avg_size >= 100.0:
                                 roi = stats["total_pnl"] / stats["total_invested"] if stats["total_invested"] > 0 else 0
                                 
-                                # 3% ROI Floor
-                                if roi >= 0.03 and stats["first_seen"]:
+                                if roi >= 0.3 and stats["first_seen"]:
                                     days_active = max(1, (current_sim_day - stats["first_seen"]).days)
                                     ann_pnl = stats["total_pnl"] * (365.0 / days_active)
                                     
@@ -268,10 +267,10 @@ def main():
                         calmar_scores.sort(key=lambda x: x[1], reverse=True)
                         
                         # Calculate the top 5% cutoff index natively
-                        top_5_count = max(1, int(len(calmar_scores) * 0.05))
+                        top_1_count = max(1, int(len(calmar_scores) * 0.01))
                         
                         # Slice the top 5%, then cap at 5000 max
-                        elite_list = calmar_scores[:top_5_count][:5000]
+                        elite_list = calmar_scores[:top_1_count][:500]
                         
                         # Rebuild the fast lookup dict
                         top_tier_users = {uid: avg_size for uid, calmar, avg_size in elite_list}
@@ -334,7 +333,8 @@ def main():
                         avg_size = top_tier_users[uid]
                         
                         # Trigger based on accumulated DOLLAR COST being >= their historical average cost
-                        if total_dollar_cost >= avg_size and t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
+                    #    if total_dollar_cost >= avg_size and 
+                        if t['price'] > 0.05 and t['price'] < 0.95 and m_end < datetime.now():
                             entered_markets.add(mid) # Secure one position per market
                             
                             bet_on = m['outcome_label']
@@ -398,7 +398,6 @@ def main():
                                     result_map['performance']['cash'] -= bet_size
                                     print(f"COPY TRADE TRIGGERED! User: {uid[:8]}... Market: {mid} - Cost: ${total_dollar_cost:.2f} (Avg: ${avg_size:.2f})")
 
-                    # Heartbeat / Result Checking Engine
                     # Heartbeat / Result Checking Engine
                     now = t['timestamp']  
                     
