@@ -242,35 +242,36 @@ def main():
 
                 # --- TOP 5% ELITE WALLET FILTERING (NATIVE PYTHON) ---
                 if user_history:
-                    calmar_scores = []
                     
+                    calmar_scores = []
+        
                     for uid, stats in user_history.items():
                         # Criteria: >= 10 markets AND >= $100 avg size
                         if stats["trade_count"] >= 10:
                             avg_size = stats["total_invested"] / stats["trade_count"]
                             if avg_size >= 100.0:
-                                roi = stats["total_pnl"] / stats["total_invested"] if stats["total_invested"] > 0 else 0
+                                roi = stats["total_pnl"] / (stats["total_invested"] * stats["trade_count"])
                                 
-                                if roi >= 0.3 and stats["first_seen"]:
-                                    days_active = max(1, (current_sim_day - stats["first_seen"]).days)
-                                    ann_pnl = stats["total_pnl"] * (365.0 / days_active)
+                                if roi >= 0.2 and stats["first_seen"]:
+                                   days_active = max(1, (current_sim_day - stats["first_seen"]).days)
+                                   ann_pnl = stats["total_pnl"] * (365.0 / days_active)
                                     
-                                    # Regularized Drawdown (Min $100 or 5% of invested)
-                                    baseline_dd = max(100.0, stats["total_invested"] * 0.05)
-                                    true_max_dd = max(stats["max_drawdown"], baseline_dd)
+                                   # Regularized Drawdown (Min $100 or 5% of invested)
+                                   baseline_dd = max(100.0, stats["total_invested"] * 0.05)
+                                   true_max_dd = max(stats["max_drawdown"], baseline_dd)
                                     
-                                    calmar = ann_pnl / true_max_dd
-                                    calmar_scores.append((uid, calmar, avg_size))
+                                   calmar = ann_pnl / true_max_dd
+                                   calmar_scores.append((uid, calmar, avg_size))
                     
                     if calmar_scores:
                         # Sort by Calmar descending
                         calmar_scores.sort(key=lambda x: x[1], reverse=True)
                         
                         # Calculate the top 5% cutoff index natively
-                        top_1_count = max(1, int(len(calmar_scores) * 0.01))
+                        top_5_count = max(1, int(len(calmar_scores) * 0.05))
                         
                         # Slice the top 5%, then cap at 5000 max
-                        elite_list = calmar_scores[:top_1_count][:500]
+                        elite_list = calmar_scores[:top_5_count][:100]
                         
                         # Rebuild the fast lookup dict
                         top_tier_users = {uid: avg_size for uid, calmar, avg_size in elite_list}
@@ -330,7 +331,7 @@ def main():
                     is_buying = (t['outcomeTokensAmount'] > 0)
                     
                     if is_buying and mid not in entered_markets and uid in top_tier_users:
-                        avg_size = top_tier_users[uid]
+                       #  avg_size = top_tier_users[uid]
                         
                         # Trigger based on accumulated DOLLAR COST being >= their historical average cost
                     #    if total_dollar_cost >= avg_size and 
