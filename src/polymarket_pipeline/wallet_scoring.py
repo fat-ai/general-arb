@@ -1,26 +1,22 @@
+import os
+import json
+import sqlite3
+import warnings
 import polars as pl
 import pandas as pd
-import json
-import os
-import sys
-import gc
 from pathlib import Path
-import csv
-import hashlib
 
 # Adjust imports based on your exact config
 from config import TRADES_FILE, WALLET_SCORES_FILE, MARKETS_FILE
 
 CACHE_DIR = Path("/app/data")
-sys.stdout.reconfigure(line_buffering=True)
+warnings.filterwarnings("ignore")
 
 def fetch_markets():
     cache_file = CACHE_DIR / MARKETS_FILE
     if os.path.exists(cache_file):
         try:
-            df_cache = pl.read_parquet(cache_file)
-            print(f"✅ Found valid cached markets. Loading...", flush=True)
-            return df_cache
+            return pl.read_parquet(cache_file)
         except Exception as e:
             print(f"💀 Failed to load cached markets: {e}", flush=True)
             return None
@@ -28,206 +24,226 @@ def fetch_markets():
     return None
 
 def main():
-    print("**** 💸 POLYMARKET WALLET SCORING 💸 ****", flush=True)
+    print("**** 💸 POLYMARKET WALLET SCORING (OPTIMIZED SQLITE) 💸 ****", flush=True)
     
-    csv_file = CACHE_DIR / TRADES_FILE
+    trades_path = CACHE_DIR / TRADES_FILE
     output_file = CACHE_DIR / WALLET_SCORES_FILE
+    db_path = CACHE_DIR / "scoring_state.db"
 
-    if not os.path.exists(csv_file):
-        print(f"❌ Error: File '{csv_file}' not found.", flush=True)
+    if not os.path.exists(trades_path):
+        print(f"❌ Error: File '{trades_path}' not found.", flush=True)
         return
 
-    # --- A. FETCH MARKETS ---
-    # The reviewer noted the date filter was unused, so we rely entirely on the pre-filtered parquet.
+    # --- 1. SETUP SQLITE & LOAD MARKETS ---
+    print("Initializing SQLite database...", flush=True)
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA cache_size=-256000") # 256MB RAM cache
+    
+    # Create the user accumulation table
+    con.execute("""
+        CREATE TABLE user_markets (
+            user                 TEXT,
+            contract_id          TEXT,
+            qty_long             REAL,
+            cost_long            REAL,
+            qty_short            REAL,
+            cost_short           REAL,
+            trade_count          INTEGER,
+            PRIMARY KEY (user, contract_id)
+        )
+    """)
+
+    # Load outcomes from Parquet and insert them as a SQL table for native joining
+    print("Loading market outcomes into SQLite...", flush=True)
     outcomes = fetch_markets()
     if outcomes is None or outcomes.is_empty():
         print("⚠️ No valid markets found. Exiting.", flush=True)
         return
 
-    df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"])
+    df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"]).to_pandas()
+    df_outcomes['contract_id'] = df_outcomes['contract_id'].str.strip().str.lower().str.replace("0x", "")
+    df_outcomes.to_sql("markets", con, if_exists="replace", index=False)
+    
+    # Create an index to make the final join lightning fast
+    con.execute("CREATE INDEX idx_markets_contract ON markets(contract_id)")
 
-    print(f"🚀 Scanning trades and scoring via Sharded Polars Pipeline...", flush=True)
+    # Build a fast Python set to filter trades in real-time before they hit SQL
+    valid_contracts = set(df_outcomes['contract_id'].to_list())
+    del df_outcomes
+    del outcomes
 
-    # --- B. PASS 1: MAP (PHYSICAL SHARDING) ---
-    NUM_SHARDS = 250
-    SHARDS_DIR = CACHE_DIR / "shards"
-    os.makedirs(SHARDS_DIR, exist_ok=True)
+    # --- 2. STREAM & ACCUMULATE TRADES ---
+    print("Mapping CSV headers...", flush=True)
+    with open(trades_path, 'r', encoding='utf-8') as f:
+        headers = f.readline().strip().split(',')
+        col_idx = {name: i for i, name in enumerate(headers)}
 
-    # Clean up any leftover shards from previous failed runs
-    for f in os.listdir(SHARDS_DIR):
-        os.remove(os.path.join(SHARDS_DIR, f))
+    INSERT_SQL = """
+        INSERT INTO user_markets 
+            (user, contract_id, qty_long, cost_long, qty_short, cost_short, trade_count)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(user, contract_id) DO UPDATE SET
+            qty_long = qty_long + excluded.qty_long,
+            cost_long = cost_long + excluded.cost_long,
+            qty_short = qty_short + excluded.qty_short,
+            cost_short = cost_short + excluded.cost_short,
+            trade_count = trade_count + 1
+    """
 
-    print(f"🚀 Pass 1: Splitting 140GB trades into {NUM_SHARDS} physical shards...", flush=True)
+    print("🚀 Streaming 140GB trades Top-to-Bottom and accumulating positions...", flush=True)
+    BATCH_SIZE = 100_000
+    batch = []
+    processed_count = 0
+    skipped_count = 0
 
-    try:
-        # Open 100 file handles for writing (keeps RAM flat)
-        shard_files = {}
-        writers = {}
-        for i in range(NUM_SHARDS):
-            f = open(SHARDS_DIR / f"shard_{i}.csv", "w", newline="", encoding="utf-8")
-            shard_files[i] = f
-            writers[i] = csv.writer(f)
-            # Write the header exactly as Pass 2 expects
-            writers[i].writerow(["contract_id", "user", "price", "outcomeTokensAmount"])
-
-        processed_count = 0
-        written_count = 0
-
-        # Stream the 140GB file line-by-line
-        with open(csv_file, "r", encoding="utf-8") as fin:
-            reader = csv.DictReader(fin)
-            for row in reader:
-                processed_count += 1
-                
-                # Safely parse price
-                try:
-                    price = float(row["price"])
-                except (ValueError, TypeError, KeyError):
-                    continue
-                
-                # Apply the filter: price must be between 0.001 and 0.999
-                if not (0.001 <= price <= 0.999):
-                    continue
-                
-                # Clean contract_id
-                contract_id = str(row["contract_id"]).strip().lower().replace("0x", "")
-                user = str(row.get("user", ""))
-                
-                # Deterministic hash to assign shard
-                # MD5 ensures all trades for a user ALWAYS go to the exact same shard
-                user_hash = int(hashlib.md5(user.encode('utf-8')).hexdigest(), 16)
-                shard_id = user_hash % NUM_SHARDS
-                
-                # Route row to specific shard
-                writers[shard_id].writerow([
-                    contract_id, 
-                    user, 
-                    price, 
-                    row.get("outcomeTokensAmount", 0.0)
-                ])
-                written_count += 1
-                
-                # Print progress every 1 million rows
-                if processed_count % 1_000_000 == 0:
-                    print(f"   Processed {processed_count:,} rows... (Kept {written_count:,})", flush=True)
-
-        # Close all file handles safely
-        for f in shard_files.values():
-            f.close()
+    with open(trades_path, 'r', encoding='utf-8') as f:
+        next(f)  # Skip the header row we already read
+        for line in f:
+            row = line.split(',')
+            processed_count += 1
             
-        print(f"\n✅ Pass 1 Complete! Data safely sharded.", flush=True)
+            if processed_count % 5_000_000 == 0:
+                print(f"   Processed {processed_count:,} rows...", flush=True)
 
-    except Exception as e:
-        print(f"\n❌ Sharding Error: {e}", flush=True)
-        # Ensure files are closed even if an error occurs
-        for f in shard_files.values():
-            if not f.closed:
-                f.close()
+            try:
+                contract_id = row[col_idx['contract_id']].strip().lower().replace("0x", "")
+                if contract_id not in valid_contracts:
+                    continue
+                
+                price = float(row[col_idx['price']])
+                # Accept prices between 0.0 and 1.0 (inclusive) to catch valid redemptions
+                if not (0.0 <= price <= 1.0):
+                    continue
+                    
+                user = row[col_idx['user']]
+                tokens = float(row[col_idx['outcomeTokensAmount']])
+            except (ValueError, KeyError, IndexError):
+                skipped_count += 1
+                continue
+
+            # Route the math correctly based on Buy (Long) or Sell (Short)
+            is_buy = tokens > 0
+            quantity = abs(tokens)
+            
+            if is_buy:
+                qty_long, cost_long = quantity, price * quantity
+                qty_short, cost_short = 0.0, 0.0
+            else:
+                qty_long, cost_long = 0.0, 0.0
+                qty_short, cost_short = quantity, (1.0 - price) * quantity
+
+            batch.append((user, contract_id, qty_long, cost_long, qty_short, cost_short))
+
+            if len(batch) >= BATCH_SIZE:
+                con.executemany(INSERT_SQL, batch)
+                con.commit()
+                batch.clear()
+
+        if batch:
+            con.executemany(INSERT_SQL, batch)
+            con.commit()
+
+    if skipped_count > 0:
+        print(f"\n⚠️ Warning: {skipped_count:,} rows skipped due to parse errors.", flush=True)
+
+    # --- 3. THE GOD QUERY (BANKROLL DRAWDOWN MATH) ---
+    print("\n📊 Calculating PnL and chronological Bankroll Drawdowns natively in SQLite...", flush=True)
+    
+    query = """
+    WITH MarketPnL AS (
+        SELECT 
+            u.user, 
+            m.resolution_timestamp,
+            (u.cost_long + u.cost_short) AS invested,
+            u.trade_count,
+            ((u.qty_long * m.outcome) + (u.qty_short * (1.0 - m.outcome))) - (u.cost_long + u.cost_short) AS contract_pnl
+        FROM user_markets u
+        JOIN markets m ON u.contract_id = m.contract_id
+    ),
+    RunningTotals AS (
+        SELECT 
+            user, 
+            resolution_timestamp, 
+            invested, 
+            trade_count, 
+            contract_pnl,
+            SUM(invested) OVER w AS cumulative_invested,
+            SUM(contract_pnl) OVER w AS cumulative_pnl
+        FROM MarketPnL
+        WINDOW w AS (PARTITION BY user ORDER BY resolution_timestamp ROWS UNBOUNDED PRECEDING)
+    ),
+    BankrollTracking AS (
+        SELECT 
+            user, 
+            resolution_timestamp, 
+            invested, 
+            trade_count, 
+            contract_pnl,
+            (cumulative_invested + cumulative_pnl) AS running_bankroll
+        FROM RunningTotals
+    ),
+    PeakTracking AS (
+        SELECT 
+            user, 
+            invested, 
+            trade_count, 
+            contract_pnl, 
+            running_bankroll,
+            MAX(running_bankroll) OVER (PARTITION BY user ORDER BY resolution_timestamp ROWS UNBOUNDED PRECEDING) AS peak_bankroll
+        FROM BankrollTracking
+    )
+    SELECT 
+        user,
+        SUM(contract_pnl) AS total_pnl,
+        SUM(invested) AS total_invested,
+        SUM(trade_count) AS total_trades,
+        MAX(peak_bankroll - running_bankroll) AS max_drawdown
+    FROM PeakTracking
+    GROUP BY user
+    HAVING SUM(trade_count) >= 2 AND SUM(invested) > 10.0;
+    """
+
+    # Fetch the final filtered dataset directly into Pandas
+    df_scores = pd.read_sql_query(query, con)
+
+    # Clean up the DB
+    con.close()
+    if os.path.exists(db_path):
+        os.remove(db_path)
+        print("🧹 Cleaned up temporary SQLite database.", flush=True)
+
+    if len(df_scores) == 0:
+        print("❌ No eligible users found after filtering.", flush=True)
         return
 
-    # --- C. PASS 2: REDUCE (SCORE & AGGREGATE) ---
-    print(f"📊 Pass 2: Processing shards and calculating scores...", flush=True)
-    final_dict = {}
+    # --- 4. CALCULATE FINAL SCORES ---
+    print("📈 Calculating final Calmar and ROI scores...", flush=True)
+    
+    # Clip max_drawdown at $1.00 to prevent math explosions (Thor's fix)
+    df_scores['max_drawdown'] = df_scores['max_drawdown'].clip(lower=1.0)
+    
+    df_scores['calmar_raw'] = df_scores['total_pnl'] / df_scores['max_drawdown']
+    df_scores['roi'] = df_scores['total_pnl'] / df_scores['total_invested']
+    
+    # Your requested final scoring formula
+    df_scores['score'] = (df_scores['roi'] * 100.0) + min(5, df_scores['calmar_raw'])
 
-    # Convert our outcomes dataframe into a lazy frame for the join
-    lazy_outcomes = df_outcomes.lazy()
+    print(f"✅ Scoring complete! Total unique eligible users: {len(df_scores):,}", flush=True)
 
-    try:
-        for shard_id in range(NUM_SHARDS):
-            shard_file = SHARDS_DIR / f"shard_{shard_id}.csv"
-            if not os.path.exists(shard_file):
-                continue
-                
-            print(f"   Scoring Shard {shard_id + 1}/{NUM_SHARDS}...", flush=True)
-            
-            # 1. Define the ENTIRE pipeline as a single lazy query
-            lazy_query = (
-                pl.scan_csv(
-                    shard_file, 
-                    schema_overrides={"contract_id": pl.String, "user": pl.String}
-                )
-                .join(lazy_outcomes, on="contract_id", how="inner")
-                .with_columns([
-                    (pl.col("outcomeTokensAmount") > 0).alias("is_buy"),
-                    (pl.col("outcomeTokensAmount").abs()).alias("quantity")
-                ])
-                .with_columns([
-                    pl.when(pl.col("is_buy"))
-                    .then(pl.col("price") * pl.col("quantity"))
-                    .otherwise((1.0 - pl.col("price")) * pl.col("quantity"))
-                    .alias("invested_amount")
-                ])
-                .group_by(["user", "contract_id", "resolution_timestamp"])
-                .agg([
-                    pl.col("quantity").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("qty_long"),
-                    pl.col("invested_amount").filter(pl.col("is_buy")).sum().fill_null(0.0).alias("cost_long"),
-                    pl.col("quantity").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("qty_short"),
-                    pl.col("invested_amount").filter(~pl.col("is_buy")).sum().fill_null(0.0).alias("cost_short"),
-                    pl.len().alias("trade_count"),
-                    pl.col("outcome").first().alias("outcome")
-                ])
-                .with_columns([
-                    (pl.col("cost_long") + pl.col("cost_short")).alias("invested"),
-                    ((pl.col("qty_long") * pl.col("outcome")) + 
-                     (pl.col("qty_short") * (1.0 - pl.col("outcome")))).alias("payout")
-                ])
-                .with_columns([
-                    (pl.col("payout") - pl.col("invested")).alias("contract_pnl")
-                ])
-                .sort(["user", "resolution_timestamp"])
-                .with_columns([
-                    pl.col("contract_pnl").cum_sum().over("user").alias("total_pnl")
-                ])
-                .with_columns([
-                    pl.max_horizontal(pl.col("total_pnl").cum_max().over("user"), pl.lit(0.0)).alias("peak_pnl")
-                ])
-                .with_columns([
-                    (pl.col("peak_pnl") - pl.col("total_pnl")).alias("current_drawdown")
-                ])
-                .group_by("user")
-                .agg([
-                    pl.col("contract_pnl").sum().alias("total_pnl"),
-                    pl.col("invested").sum().alias("total_invested"),
-                    pl.col("trade_count").sum().alias("total_trades"),
-                    pl.col("current_drawdown").max().alias("max_drawdown")
-                ])
-                .filter((pl.col("total_trades") >= 2) & (pl.col("total_invested") > 10.0))
-                .with_columns([
-                    (pl.col("total_pnl") / (pl.col("max_drawdown") + 1e-6)).alias("calmar_raw"),
-                    (pl.col("total_pnl") / pl.col("total_invested")).alias("roi") 
-                ])
-                .with_columns([
-                    ((pl.col("roi") * 100.0) + pl.col("calmar_raw")).alias("score")
-                ])
-            )
-            
-            # 2. Execute the query using the streaming engine!
-            scored_shard = lazy_query.collect(streaming=True)
-            
-            # 3. Save to dict
-            for row in scored_shard.iter_rows(named=True):
-                final_dict[row['user']] = row['score']
+    # Convert to dictionary and sort descending
+    df_scores.sort_values(by='score', ascending=False, inplace=True)
+    final_dict = dict(zip(df_scores['user'], df_scores['score']))
 
-            # Clean up disk and RAM
-            os.remove(shard_file)
-            del scored_shard, lazy_query
-            gc.collect()
-            
-        # --- D. SAVE RESULTS ---
-        print(f"\n✅ All shards scored! Total unique eligible users: {len(final_dict)}", flush=True)
+    # --- 5. SAVE RESULTS ---
+    with open(output_file, "w") as f:
+        json.dump(final_dict, f, indent=2)
         
-        final_dict = dict(sorted(final_dict.items(), key=lambda item: item[1], reverse=True))
-
-        with open(output_file, "w") as f:
-            json.dump(final_dict, f, indent=2)
-        
-        print(f"✅ Success! Saved scores to {output_file}", flush=True)
-        
-        if os.path.exists(SHARDS_DIR) and not os.listdir(SHARDS_DIR):
-            os.rmdir(SHARDS_DIR)
-
-    except Exception as e:
-        print(f"\n❌ Pipeline Error: {e}", flush=True)
+    print(f"✅ Success! Saved leaderboard to {output_file}", flush=True)
 
 if __name__ == "__main__":
     main()
