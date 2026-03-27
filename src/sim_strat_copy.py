@@ -135,7 +135,7 @@ def main():
     # { user_id: { "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": date } }
     user_history = defaultdict(lambda: {
         "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, 
-        "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": None
+        "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": None, "weighted_ann_roi_sum": 0.0
     })
     
     # { contract_id: { user_id: { "qty_long": 0.0, "cost_long": 0.0, "qty_short": 0.0, "cost_short": 0.0 } } }
