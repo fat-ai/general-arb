@@ -222,15 +222,22 @@ def main():
                         # 2. CALCULATE PAYOUTS & UPDATE HISTORY IN O(1)
                         outcome = market_map[cid]['outcome']
                         for uid, pos in market_users.items():
-                            payout = (pos["qty_long"] * outcome) + (pos["qty_short"] * (1.0 - outcome))
                             invested = pos["cost_long"] + pos["cost_short"]
-                            delta_pnl = payout - invested
+                            if invested <= 0: continue
                             
-                            # Update user history in place
+                            payout = (pos["qty_long"] * outcome) + (pos["qty_short"] * (1.0 - outcome))
+                            raw_roi = (payout / invested) - 1.0
+                            
+                            # Calculate duration for this specific market
+                            days_held = max(1, (current_sim_day - pos["first_entry"]).days)
+                            ann_roi = raw_roi * (365.0 / days_held)
+                            
                             hist = user_history[uid]
-                            hist["total_pnl"] += delta_pnl
+                            hist["total_pnl"] += (payout - invested)
+                            # We weight the ROI by the dollar amount invested
+                            hist["weighted_ann_roi_sum"] += (ann_roi * invested)
                             hist["total_invested"] += invested
-                            hist["trade_count"] += 1
+                            hist["market_count"] += 1
                             
                             # Update Peak and Drawdown
                             if hist["total_pnl"] > hist["peak_pnl"]:
@@ -245,23 +252,25 @@ def main():
                     
                     calmar_scores = []
         
+                    if user_history:
+                    calmar_scores = []
                     for uid, stats in user_history.items():
-                        # Criteria: >= 10 markets AND >= $100 avg size
-                        if stats["trade_count"] >= 10:
-                            avg_size = stats["total_invested"] / stats["trade_count"]
-                            if avg_size >= 100.0:
-                                roi = stats["total_pnl"] / (stats["total_invested"] * stats["trade_count"])
+                        if stats["market_count"] >= 10 and stats["total_invested"] > 0:
+                            avg_size = stats["total_invested"] / stats["market_count"]
+                            
+                            # Calculate the weighted average annualized ROI
+                            user_weighted_ann_roi = stats["weighted_ann_roi_sum"] / stats["total_invested"]
+                            
+                            if avg_size >= 100.0 and user_weighted_ann_roi >= 0.50: # Example: 50% Ann. ROI
+                                # Calculate Calmar using annualized PnL vs Max Drawdown
+                                days_active = max(1, (current_sim_day - stats["first_seen"]).days)
+                                ann_pnl = stats["total_pnl"] * (365.0 / days_active)
                                 
-                                if roi >= 0.2 and stats["first_seen"]:
-                                   days_active = max(1, (current_sim_day - stats["first_seen"]).days)
-                                   ann_pnl = stats["total_pnl"] * (365.0 / days_active)
-                                    
-                                   # Regularized Drawdown (Min $100 or 5% of invested)
-                                   baseline_dd = max(100.0, stats["total_invested"] * 0.05)
-                                   true_max_dd = max(stats["max_drawdown"], baseline_dd)
-                                    
-                                   calmar = ann_pnl / true_max_dd
-                                   calmar_scores.append((uid, calmar, avg_size))
+                                baseline_dd = max(100.0, stats["total_invested"] * 0.05)
+                                true_max_dd = max(stats["max_drawdown"], baseline_dd)
+                                
+                                calmar = ann_pnl / true_max_dd
+                                calmar_scores.append((uid, calmar, avg_size))
                     
                     if calmar_scores:
                         # Sort by Calmar descending
@@ -479,7 +488,13 @@ def main():
 
             # Dump into our fast O(1) nested dictionary
             for row in daily_agg.iter_rows(named=True):
-                pos = market_positions[row["contract_id"]][row["user"]]
+                cid = row["contract_id"]
+                uid = row["user"]
+                pos = market_positions[cid][uid]
+                
+                if "first_entry" not in pos:
+                    pos["first_entry"] = day 
+                
                 pos["qty_long"] += row["qty_long"]
                 pos["cost_long"] += row["cost_long"]
                 pos["qty_short"] += row["qty_short"]
