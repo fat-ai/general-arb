@@ -268,10 +268,10 @@ def main():
                         calmar_scores.sort(key=lambda x: x[1], reverse=True)
                         
                         # Calculate the top 5% cutoff index natively
-                        top_5_count = max(1, int(len(calmar_scores) * 0.05))
+                        #top_5_count = max(1, int(len(calmar_scores) * 0.05))
                         
                         # Slice the top 5%, then cap at 5000 max
-                        elite_list = calmar_scores[:top_5_count][:100]
+                        elite_list = calmar_scores[:100]
                         
                         # Rebuild the fast lookup dict
                         top_tier_users = {uid: avg_size for uid, calmar, avg_size in elite_list}
