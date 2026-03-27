@@ -253,24 +253,24 @@ def main():
                     calmar_scores = []
         
                     if user_history:
-                    calmar_scores = []
-                    for uid, stats in user_history.items():
-                        if stats["market_count"] >= 10 and stats["total_invested"] > 0:
-                            avg_size = stats["total_invested"] / stats["market_count"]
-                            
-                            # Calculate the weighted average annualized ROI
-                            user_weighted_ann_roi = stats["weighted_ann_roi_sum"] / stats["total_invested"]
-                            
-                            if avg_size >= 100.0 and user_weighted_ann_roi >= 0.50: # Example: 50% Ann. ROI
-                                # Calculate Calmar using annualized PnL vs Max Drawdown
-                                days_active = max(1, (current_sim_day - stats["first_seen"]).days)
-                                ann_pnl = stats["total_pnl"] * (365.0 / days_active)
+                        calmar_scores = []
+                        for uid, stats in user_history.items():
+                            if stats["market_count"] >= 10 and stats["total_invested"] > 0:
+                                avg_size = stats["total_invested"] / stats["market_count"]
                                 
-                                baseline_dd = max(100.0, stats["total_invested"] * 0.05)
-                                true_max_dd = max(stats["max_drawdown"], baseline_dd)
+                                # Calculate the weighted average annualized ROI
+                                user_weighted_ann_roi = stats["weighted_ann_roi_sum"] / stats["total_invested"]
                                 
-                                calmar = ann_pnl / true_max_dd
-                                calmar_scores.append((uid, calmar, avg_size))
+                                if avg_size >= 100.0 and user_weighted_ann_roi >= 0.50: # Example: 50% Ann. ROI
+                                    # Calculate Calmar using annualized PnL vs Max Drawdown
+                                    days_active = max(1, (current_sim_day - stats["first_seen"]).days)
+                                    ann_pnl = stats["total_pnl"] * (365.0 / days_active)
+                                    
+                                    baseline_dd = max(100.0, stats["total_invested"] * 0.05)
+                                    true_max_dd = max(stats["max_drawdown"], baseline_dd)
+                                    
+                                    calmar = ann_pnl / true_max_dd
+                                    calmar_scores.append((uid, calmar, avg_size))
                     
                     if calmar_scores:
                         # Sort by Calmar descending
