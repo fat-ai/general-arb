@@ -134,7 +134,7 @@ def main():
     
     # { user_id: { "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": date } }
     user_history = defaultdict(lambda: {
-        "total_pnl": 0.0, "total_invested": 0.0, "trade_count": 0, 
+        "total_pnl": 0.0, "total_invested": 0.0, "market_count": 0, 
         "peak_pnl": 0.0, "max_drawdown": 0.0, "first_seen": None, "weighted_ann_roi_sum": 0.0
     })
     
