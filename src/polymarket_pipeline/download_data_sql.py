@@ -21,14 +21,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-FIXED_START_DATE = pd.Timestamp("2024-01-01")
+FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_localize(None)
 BEGINNING = pd.Timestamp("2020-01-01")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
-today = pd.Timestamp.now().normalize()
-DAYS_BACK = (today - FIXED_START_DATE).days + 10
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE_SQL, GRAPH_URL
 
 def normalize_contract_id(id_str):
     """Single source of truth for ID normalization"""
@@ -372,15 +370,13 @@ class DataFetcher:
                     if c_date:
                         try:
                             ts = pd.to_datetime(c_date, utc=True).tz_localize(None)
-                            # THE MAGIC HALT: If we hit a market older than our cache, stop fetching!
                             if ts <= cutoff_date:
                                 stop_signal = True
-                                continue 
+                                break  # <-- CHANGED from continue to break!
                         except (TypeError, ValueError):
                             pass
                             
-                    if not stop_signal:
-                        valid_batch.append(r)
+                    valid_batch.append(r)
 
                 current_raw_rows.extend(valid_batch)
                 offset += len(batch)
@@ -453,10 +449,9 @@ class DataFetcher:
             Path(p).unlink(missing_ok=True)
             
 
-    def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
-        # We will hardcode the .db extension here to ensure it uses the new database
-        # even if TRADES_FILE in your config still says .csv
-        db_file = CACHE_DIR / "gamma_trades.db"
+    def fetch_gamma_trades(self, target_token_ids, days_back=365):
+
+        db_file = CACHE_DIR / TRADES_FILE_SQL
         
         valid_token_ints = set()
         for t in target_token_ids:
@@ -476,12 +471,14 @@ class DataFetcher:
         
         def parse_iso_to_ts(iso_str):
             try:
-                ts_obj = pd.to_datetime(iso_str, utc=False)
-                if ts_obj.tz is None:
-                    ts_obj = ts_obj.tz_localize('UTC')
+                # Let pandas infer the UTC offset safely
+                ts_obj = pd.to_datetime(iso_str)
+                if ts_obj.tz is not None:
+                    # If it has a timezone, convert to naive UTC
+                    ts_obj = ts_obj.tz_convert(None)
                 return ts_obj.timestamp()
-            except: 
-                log.warning(f"Failed to parse timestamp from {iso_str}")
+            except Exception as e: 
+                log.warning(f"Failed to parse timestamp from {iso_str}: {e}")
                 return 0.0
 
         # --- SQLite Setup & Bounds Checking ---
@@ -491,7 +488,7 @@ class DataFetcher:
         # Ensure the table exists
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trades (
-                id TEXT,
+                id TEXT PRIMARY KEY,
                 timestamp TEXT,
                 tradeAmount REAL,
                 outcomeTokensAmount REAL,
@@ -615,9 +612,10 @@ class DataFetcher:
                                 ))
 
                     if out_rows:
-                        # Direct, highly-efficient SQLite bulk insert
+                        # --- 2. Update the Insert Command ---
+                        # INSERT OR IGNORE safely skips rows where the 'id' already exists
                         db_conn.executemany("""
-                            INSERT INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
+                            INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, out_rows)
                         db_conn.commit()
@@ -662,6 +660,20 @@ class DataFetcher:
         return pd.DataFrame()
 
     def run(self):
+
+        today = pd.Timestamp.now(tz='UTC').tz_localize(None)
+        fixed_end_date = today 
+        days_back = (today - FIXED_START_DATE).days + 10
+
+        print(f"Starting data collection up to {fixed_end_date}...")
+        
+        # --- 3. Clean up orphaned temp files from previous crashes ---
+        print("Cleaning up any stale temporary files...")
+        for p in CACHE_DIR.glob("temp_market_chunk_*.parquet"):
+            p.unlink(missing_ok=True)
+            
+        print("\n--- Phase 1: Fetching Markets ---")
+        self.fetch_gamma_markets()
         print("Starting data collection...")
         print("\n--- Phase 1: Fetching Markets ---")
         self.fetch_gamma_markets()
@@ -670,19 +682,27 @@ class DataFetcher:
         market_file = CACHE_DIR / MARKETS_FILE
         
         if market_file.exists():
-            print("Loading contract IDs...")
-            market_ids_df = pd.read_parquet(market_file, columns=['contract_id'])
-            market_ids_df['contract_id'] = market_ids_df['contract_id'].astype(str).str.strip().str.lower().apply(normalize_contract_id)
-            valid_market_ids = set(market_ids_df['contract_id'].unique())
-            del market_ids_df
+            print("Loading contract IDs efficiently...")
+            
+            # Read directly, process, and drop NaNs in one clean pipeline
+            market_ids_series = pd.read_parquet(market_file, columns=['contract_id'])['contract_id']
+            
+            # Convert to a set of integers immediately to save memory
+            valid_market_ints = set()
+            for val in market_ids_series.dropna():
+                try:
+                    # Handle both standard strings and hex strings
+                    clean_str = str(val).strip().lower().replace('0x', '')
+                    valid_market_ints.add(int(clean_str, 16))
+                except ValueError:
+                    continue
+                    
+            del market_ids_series
             gc.collect()
-            print(f"Found {len(valid_market_ids)} unique contract IDs.")
+            print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
 
             print("\n--- Phase 2: Fetching Trades ---")
-            self.fetch_gamma_trades_parallel(valid_market_ids, days_back=DAYS_BACK)
-            
-        else:
-            print("No markets file found. Skipping trade fetch.")
+            self.fetch_gamma_trades(valid_market_ints)
             
 if __name__ == "__main__":
     fetcher = DataFetcher()
