@@ -109,21 +109,25 @@ def main():
                 THEN weighted_price_sum + excluded.weighted_price_sum ELSE weighted_price_sum END
     """
 
-    # 5. Stream and Batch Insert
-    print("🚀 Streaming trades Oldest to Newest and writing to disk...")
+    # --- 5. STREAM AND BATCH INSERT (WITH RAM-LIGHT SHIELD) ---
+    print("🚀 Streaming trades Oldest to Newest...", flush=True)
     BATCH_SIZE = 100_000
     batch = []
     processed_count = 0
     skipped_count = 0
+    
+    # THE SHIELD: {wallet_id: (contract_id, is_long)}
+    first_markets = {}
 
-    for line in reverse_csv_reader(trades_path):
+    # Increased chunk size for faster reverse reading
+    for line in reverse_csv_reader(trades_path, chunk_size=256000):
         if line.startswith(headers[0]): continue
             
         row = line.split(',') 
         processed_count += 1
         
         if processed_count % 5_000_000 == 0:
-            print(f"   Processed {processed_count:,} rows...", flush=True)
+            print(f"   Processed {processed_count:,} rows... (Shield tracking {len(first_markets):,} wallets)", flush=True)
 
         try:
             wallet = row[col_idx['user']]
@@ -144,10 +148,27 @@ def main():
         abs_tokens = abs(tokens)
         risk_vol = tradeAmount if is_long else (abs_tokens * (1.0 - safe_price))
 
-        batch.append((
-            wallet, contract, int(is_long), risk_vol, 
-            abs_tokens, safe_price * abs_tokens, ts_date
-        ))
+        # --- THE RAM-LIGHT SHIELD LOGIC ---
+        if wallet not in first_markets:
+            # First time seeing this wallet! Lock in their first market in RAM.
+            first_markets[wallet] = (contract, is_long)
+            
+            # Send to SQLite for insertion
+            batch.append((
+                wallet, contract, int(is_long), risk_vol, 
+                abs_tokens, safe_price * abs_tokens, ts_date
+            ))
+        else:
+            # We already know this wallet. Did they add to their first position?
+            first_contract, first_direction = first_markets[wallet]
+            
+            if contract == first_contract and is_long == first_direction:
+                # Yes! Send to SQLite to trigger the ON CONFLICT accumulation
+                batch.append((
+                    wallet, contract, int(is_long), risk_vol, 
+                    abs_tokens, safe_price * abs_tokens, ts_date
+                ))
+            # If it doesn't match, Python silently drops the row. It never touches SQLite.
 
         if len(batch) >= BATCH_SIZE:
             con.executemany(INSERT_SQL, batch)
@@ -159,7 +180,10 @@ def main():
         con.commit()
 
     if skipped_count > 0:
-        print(f"\n⚠️ Warning: {skipped_count:,} rows skipped due to parse errors.")
+        print(f"\n⚠️ Warning: {skipped_count:,} rows skipped due to parse errors.", flush=True)
+
+    # Free up the RAM shield now that we are done streaming
+    del first_markets
 
     print("\n✅ Stream complete! Fetching aggregated results directly into Pandas...")
 
