@@ -7,8 +7,8 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 def migrate_csv_to_sqlite():
     # --- Configuration ---
-    csv_filepath = '/app/gamma_trades_stream.csv' 
-    db_filepath = '/app/gamma_trades.db'
+    csv_filepath = '/app/data/gamma_trades_stream.csv' 
+    db_filepath = '/app/data/gamma_trades.db'
     table_name = 'trades'
     chunk_size = 1000000 
     
