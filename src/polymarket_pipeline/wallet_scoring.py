@@ -77,80 +77,79 @@ def main():
     del df_outcomes
     del outcomes
 
-    # --- 2. STREAM & ACCUMULATE TRADES ---
-    print("Mapping CSV headers...", flush=True)
-    with open(trades_path, 'r', encoding='utf-8') as f:
-        headers = f.readline().strip().split(',')
-        col_idx = {name: i for i, name in enumerate(headers)}
-
+   # --- 2. STREAM & ACCUMULATE TRADES (OPTIMIZED CHUNKING) ---
+    print("🚀 Streaming trades via Pandas Chunks to prevent DB thrashing...", flush=True)
+    
     INSERT_SQL = """
         INSERT INTO user_markets 
             (user, contract_id, qty_long, cost_long, qty_short, cost_short, trade_count)
-        VALUES (?, ?, ?, ?, ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user, contract_id) DO UPDATE SET
             qty_long = qty_long + excluded.qty_long,
             cost_long = cost_long + excluded.cost_long,
             qty_short = qty_short + excluded.qty_short,
             cost_short = cost_short + excluded.cost_short,
-            trade_count = trade_count + 1
+            trade_count = trade_count + excluded.trade_count
     """
 
-    print("🚀 Streaming 140GB trades Top-to-Bottom and accumulating positions...", flush=True)
-    BATCH_SIZE = 100_000
-    batch = []
+    chunksize = 5_000_000
     processed_count = 0
-    skipped_count = 0
+    
+    # Use Pandas C-engine to read chunks. We only read the columns we actually need to save RAM.
+    chunk_iterator = pd.read_csv(
+        trades_path,
+        chunksize=chunksize,
+        usecols=['contract_id', 'user', 'price', 'outcomeTokensAmount'],
+        dtype={
+            'contract_id': 'string', 
+            'user': 'string', 
+            'price': 'float32', 
+            'outcomeTokensAmount': 'float32'
+        },
+        engine='c'
+    )
 
-    with open(trades_path, 'r', encoding='utf-8') as f:
-        next(f)  # Skip the header row we already read
-        for line in f:
-            row = line.split(',')
-            processed_count += 1
-            
-            if processed_count % 5_000_000 == 0:
-                print(f"   Processed {processed_count:,} rows...", flush=True)
+    for chunk in chunk_iterator:
+        processed_count += len(chunk)
+        print(f"   Reading chunk... Total processed: {processed_count:,} rows", flush=True)
 
-            try:
-                contract_id = row[col_idx['contract_id']].strip().lower().replace("0x", "")
-                if contract_id not in valid_contracts:
-                    continue
-                
-                price = float(row[col_idx['price']])
-                # Accept prices between 0.0 and 1.0 (inclusive) to catch valid redemptions
-                if not (0.0 <= price <= 1.0):
-                    continue
-                    
-                user = row[col_idx['user']]
-                tokens = float(row[col_idx['outcomeTokensAmount']])
-            except (ValueError, KeyError, IndexError):
-                skipped_count += 1
-                continue
+        # 1. Clean and Filter
+        chunk['contract_id'] = chunk['contract_id'].str.strip().str.lower().str.replace("0x", "")
+        
+        # Filter valid contracts and prices
+        chunk = chunk[chunk['contract_id'].isin(valid_contracts)]
+        chunk = chunk[(chunk['price'] >= 0.0) & (chunk['price'] <= 1.0)]
 
-            # Route the math correctly based on Buy (Long) or Sell (Short)
-            is_buy = tokens > 0
-            quantity = abs(tokens)
-            
-            if is_buy:
-                qty_long, cost_long = quantity, price * quantity
-                qty_short, cost_short = 0.0, 0.0
-            else:
-                qty_long, cost_long = 0.0, 0.0
-                qty_short, cost_short = quantity, (1.0 - price) * quantity
+        if chunk.empty:
+            continue
 
-            batch.append((user, contract_id, qty_long, cost_long, qty_short, cost_short))
+        # 2. Vectorized Math (No for-loops)
+        is_buy = chunk['outcomeTokensAmount'] > 0
+        qty = chunk['outcomeTokensAmount'].abs()
+        price = chunk['price']
 
-            if len(batch) >= BATCH_SIZE:
-                con.executemany(INSERT_SQL, batch)
-                con.commit()
-                batch.clear()
+        chunk['qty_long'] = np.where(is_buy, qty, 0.0)
+        chunk['cost_long'] = np.where(is_buy, price * qty, 0.0)
+        chunk['qty_short'] = np.where(~is_buy, qty, 0.0)
+        chunk['cost_short'] = np.where(~is_buy, (1.0 - price) * qty, 0.0)
+        chunk['trade_count'] = 1
 
-        if batch:
-            con.executemany(INSERT_SQL, batch)
-            con.commit()
+        # 3. Aggregate in RAM (Squash millions of rows down to thousands)
+        agg_chunk = chunk.groupby(['user', 'contract_id'], as_index=False).agg({
+            'qty_long': 'sum',
+            'cost_long': 'sum',
+            'qty_short': 'sum',
+            'cost_short': 'sum',
+            'trade_count': 'sum'
+        })
 
-    if skipped_count > 0:
-        print(f"\n⚠️ Warning: {skipped_count:,} rows skipped due to parse errors.", flush=True)
-
+        # 4. Batch Upsert to SQLite
+        # Convert aggregated dataframe directly to a list of tuples for executemany
+        batch = agg_chunk[['user', 'contract_id', 'qty_long', 'cost_long', 'qty_short', 'cost_short', 'trade_count']].to_records(index=False).tolist()
+        
+        con.executemany(INSERT_SQL, batch)
+        con.commit()
+        
     # --- 3. THE GOD QUERY (BANKROLL DRAWDOWN MATH) ---
     print("\n📊 Calculating PnL and chronological Bankroll Drawdowns natively in SQLite...", flush=True)
     
@@ -231,7 +230,7 @@ def main():
     df_scores['roi'] = df_scores['total_pnl'] / df_scores['total_invested']
     
     # Your requested final scoring formula
-    df_scores['score'] = (df_scores['roi'] * 100.0) + min(5, df_scores['calmar_raw'])
+    df_scores['score'] = (df_scores['roi'] * 100.0) + df_scores['calmar_raw'].clip(upper=5.0)
 
     print(f"✅ Scoring complete! Total unique eligible users: {len(df_scores):,}", flush=True)
 
