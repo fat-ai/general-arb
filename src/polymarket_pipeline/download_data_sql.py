@@ -1,4 +1,3 @@
-import os
 import json
 import requests
 import pandas as pd
@@ -21,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_convert(None)
+FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC')
 BEGINNING = pd.Timestamp("2020-01-01")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 CACHE_DIR = Path("/app/data")
@@ -153,7 +152,6 @@ class DataFetcher:
                 gc.collect()
         else:
             print(f"   ⚠️ Could not read existing cache: Starting fresh.")
-            date_df = pd.DataFrame()
 
         # Helper to process a batch and flush it to disk to save RAM
         temp_files = []
@@ -514,7 +512,7 @@ class DataFetcher:
         else:
             print("⚠️ Database is empty or new. Starting full fetch.")
 
-        global_start_cursor = int(FIXED_START_DATE.timestamp())
+        global_start_cursor = int(pd.Timestamp("2024-01-01", tz='UTC').timestamp())
         global_stop_ts = int(end_date.timestamp())
                 
         def fetch_segment(start_ts, end_ts, db_conn, segment_name):
