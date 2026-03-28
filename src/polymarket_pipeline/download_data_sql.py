@@ -14,6 +14,7 @@ from collections import defaultdict
 import logging
 import gc
 import shutil
+import sqlite3
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -452,10 +453,11 @@ class DataFetcher:
             Path(p).unlink(missing_ok=True)
             
 
-
     def fetch_gamma_trades_parallel(self, target_token_ids, days_back=365):
-        cache_file = CACHE_DIR / TRADES_FILE
-        temp_file = cache_file.with_suffix(".tmp.csv")
+        # We will hardcode the .db extension here to ensure it uses the new database
+        # even if TRADES_FILE in your config still says .csv
+        db_file = CACHE_DIR / "gamma_trades.db"
+        
         valid_token_ints = set()
         for t in target_token_ids:
             try:
@@ -479,86 +481,46 @@ class DataFetcher:
                     ts_obj = ts_obj.tz_localize('UTC')
                 return ts_obj.timestamp()
             except: 
-                log.warning("Failed to parse timestamp from {iso_str}")
+                log.warning(f"Failed to parse timestamp from {iso_str}")
                 return 0.0
 
-        def get_csv_bounds(filepath):
-            """Memory-safe read of first and last timestamps."""
-            high_ts = None
-            low_ts = None
-            
-            if not os.path.exists(filepath) or os.path.getsize(filepath) < 50:
-                return None, None
-
-            # 1. Get Head (First Row) - Low Memory
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    header = f.readline() # Skip header
-                    first_line = f.readline()
-                    if first_line:
-                        # Parse first data row
-                        row = list(csv.reader([first_line]))[0]
-                        if len(row) > 1:
-                            high_ts = parse_iso_to_ts(row[1])
-            except Exception: pass
-
-            if high_ts is None: return None, None
-
-            # 2. Get Tail (Last Row) - Low Memory via Seek
-            try:
-                with open(filepath, 'rb') as f:
-                    f.seek(0, os.SEEK_END)
-                    file_size = f.tell()
-                    
-                    # Read only the last 4096 bytes
-                    offset = max(0, file_size - 4096)
-                    f.seek(offset)
-                    
-                    # Decode binary chunk, ignore partial chars at start
-                    lines = f.read().decode('utf-8', errors='ignore').splitlines()
-                    
-                    # Iterate backwards to find last valid row
-                    for line in reversed(lines):
-                        if not line.strip(): continue
-                        try:
-                            row = list(csv.reader([line]))[0]
-                            if len(row) > 1:
-                                t = parse_iso_to_ts(row[1])
-                                if t > 0:
-                                    low_ts = t
-                                    break
-                        except:
-                            log.warning(f"Failed to parse {line}")
-            except Exception: pass
-            
-            return high_ts, low_ts
-
+        # --- SQLite Setup & Bounds Checking ---
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        
+        # Ensure the table exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id TEXT,
+                timestamp TEXT,
+                tradeAmount REAL,
+                outcomeTokensAmount REAL,
+                user TEXT,
+                contract_id TEXT,
+                price REAL,
+                size REAL,
+                side_mult INTEGER
+            )
+        ''')
+        
         existing_high_ts = None
         existing_low_ts = None
         
-        if cache_file.exists():
-            print(f"📂 Found existing trades cache. Checking bounds...")
-            existing_high_ts, existing_low_ts = get_csv_bounds(cache_file)
-            
-            if existing_high_ts is None or existing_low_ts is None:
-                print("❌ CRITICAL ERROR: Existing CSV is empty, corrupt, or unreadable.")
-                print("➡️  Action: Delete 'gamma_trades_stream.csv' manually and retry.")
-                return pd.DataFrame()
-
+        print(f"📂 Checking existing SQLite database bounds...")
+        cursor.execute("SELECT MAX(timestamp), MIN(timestamp) FROM trades")
+        max_ts_str, min_ts_str = cursor.fetchone()
+        
+        if max_ts_str and min_ts_str:
+            existing_high_ts = parse_iso_to_ts(max_ts_str)
+            existing_low_ts = parse_iso_to_ts(min_ts_str)
             print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
-            
-            if existing_low_ts > existing_high_ts:
-                print("❌ CRITICAL ERROR: Existing CSV is NOT sorted descending (Newest -> Oldest).")
-                print("➡️  Action: The incremental fetcher requires strict ordering. Delete the file and retry.")
-                return pd.DataFrame()
-  
-        global_start_cursor = int(pd.Timestamp(FIXED_START_DATE).timestamp())
-        print(f"   📅 Config Start Date: {globals()['FIXED_START_DATE']}")
+        else:
+            print("⚠️ Database is empty or new. Starting full fetch.")
 
+        global_start_cursor = int(pd.Timestamp(FIXED_START_DATE).timestamp())
         global_stop_ts = int(pd.Timestamp(FIXED_END_DATE).timestamp())
-        print(f"   📅 Config End Date: {globals()['FIXED_END_DATE']}")
                 
-        def fetch_segment(start_ts, end_ts, writer_obj, segment_name):
+        def fetch_segment(start_ts, end_ts, db_conn, segment_name):
             cursor = int(start_ts)
             stop_limit = int(end_ts)
             
@@ -609,10 +571,8 @@ class DataFetcher:
                     out_rows = []
                     
                     for ts in sorted_ts:
-                        
                         if ts <= stop_limit: 
                             continue
-                            
                         if is_full_batch and ts == oldest_ts: continue
                         
                         for r in by_ts[ts]:
@@ -642,24 +602,28 @@ class DataFetcher:
                                 if price > 1.00 or price < 0.000001:
                                     seg_dropped += 1; continue
                                     
-                                out_rows.append({
-                                    'id': r['id'], 
-                                    'timestamp': datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
-                                    'tradeAmount': val_usdc, 
-                                    'outcomeTokensAmount': val_size * mult,
-                                    'user': r['taker'], 
-                                    'contract_id': str(tid),
-                                    'price': price, 
-                                    'size': val_size, 
-                                    'side_mult': mult
-                                })
+                                out_rows.append((
+                                    r['id'], 
+                                    datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                    val_usdc, 
+                                    val_size * mult,
+                                    r['taker'], 
+                                    str(tid),
+                                    price, 
+                                    val_size, 
+                                    mult
+                                ))
 
                     if out_rows:
-                        writer_obj.writerows(out_rows)
+                        # Direct, highly-efficient SQLite bulk insert
+                        db_conn.executemany("""
+                            INSERT INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, out_rows)
+                        db_conn.commit()
                         seg_captured += len(out_rows)
 
                     cursor = oldest_ts
-
                     print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
 
                 except Exception as e:
@@ -675,39 +639,25 @@ class DataFetcher:
         if existing_high_ts:
             if global_stop_ts > existing_high_ts:
                 print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                with open(temp_file, 'w', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-                    writer.writeheader()
-                    count = fetch_segment(global_stop_ts, existing_high_ts, writer, "NEW_HEAD")
-                    total_captured += count
-                old_cache = cache_file.with_suffix(".old.csv")
-                os.rename(cache_file, old_cache)
-                os.rename(temp_file, cache_file)
-                with open(cache_file, 'a', newline='') as f_new, open(old_cache, 'r') as f_old:
-                    f_old.readline()
-                    shutil.copyfileobj(f_old, f_new)
-                os.remove(old_cache)
+                count = fetch_segment(global_stop_ts, existing_high_ts, conn, "NEW_HEAD")
+                total_captured += count
             else:
                 print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
 
-        # PHASE 3: OLDER DATA (append directly)
+        # PHASE 3: OLDER DATA
         if existing_low_ts:
             if existing_low_ts > global_start_cursor:
                 print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                with open(cache_file, 'a', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-                    count = fetch_segment(existing_low_ts, global_start_cursor, writer, "OLD_TAIL")
-                    total_captured += count
+                count = fetch_segment(existing_low_ts, global_start_cursor, conn, "OLD_TAIL")
+                total_captured += count
             else:
                 print(f"\n📜 PHASE 3: Skipped (Existing Tail covers request)")
         elif not existing_high_ts:
             print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-            with open(cache_file, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult'])
-                writer.writeheader()
-                count = fetch_segment(global_stop_ts, global_start_cursor, writer, "FULL_HISTORY")
-                total_captured += count
+            count = fetch_segment(global_stop_ts, global_start_cursor, conn, "FULL_HISTORY")
+            total_captured += count
 
+        conn.close()
         print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
         return pd.DataFrame()
 
