@@ -473,12 +473,12 @@ class DataFetcher:
                                         seg_dropped += 1; continue
                                         
                                     out_rows.append((
-                                        r['id'], 
+                                        str(r['id']),  # <-- Added str() here for safety
                                         datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
                                         val_usdc, 
                                         val_size * mult,
-                                        r['taker'], 
-                                        str(tid),
+                                        str(r['taker']), # <-- Added str() here for safety
+                                        str(tid),        # (This one was already safe!)
                                         price, 
                                         val_size, 
                                         mult
