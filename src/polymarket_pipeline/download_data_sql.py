@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 log = logging.getLogger(__name__)
 
 # Constants
-FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_localize(None)
+FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_convert(None)
 BEGINNING = pd.Timestamp("2020-01-01")
 FIXED_END_DATE = pd.Timestamp.now(tz='UTC').normalize()
 CACHE_DIR = Path("/app/data")
@@ -514,8 +514,8 @@ class DataFetcher:
         else:
             print("⚠️ Database is empty or new. Starting full fetch.")
 
-        global_start_cursor = int(pd.Timestamp(FIXED_START_DATE).timestamp())
-        global_stop_ts = int(pd.Timestamp(FIXED_END_DATE).timestamp())
+        global_start_cursor = int(FIXED_START_DATE.timestamp())
+        global_stop_ts = int(end_date.timestamp())
                 
         def fetch_segment(start_ts, end_ts, db_conn, segment_name):
             cursor = int(start_ts)
@@ -636,22 +636,21 @@ class DataFetcher:
         # PHASE 1: NEWER DATA
         if existing_high_ts:
             if global_stop_ts > existing_high_ts:
-                print(f"\n🌊 PHASE 1: Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
+                print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
                 count = fetch_segment(global_stop_ts, existing_high_ts, conn, "NEW_HEAD")
                 total_captured += count
             else:
-                print(f"\n🌊 PHASE 1: Skipped (Configured End Date <= Existing Head)")
+                print(f"\n🌊 Fetching Newer Data Skipped (Configured End Date <= Existing Head)")
 
-        # PHASE 3: OLDER DATA
         if existing_low_ts:
             if existing_low_ts > global_start_cursor:
-                print(f"\n📜 PHASE 3: Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
+                print(f"\n📜 Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
                 count = fetch_segment(existing_low_ts, global_start_cursor, conn, "OLD_TAIL")
                 total_captured += count
             else:
-                print(f"\n📜 PHASE 3: Skipped (Existing Tail covers request)")
+                print(f"\n📜 Fetching Older Data Skipped (Existing Tail covers request)")
         elif not existing_high_ts:
-            print(f"\n📥 PHASE 0: Full Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
+            print(f"\n📥 Full Historical Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
             count = fetch_segment(global_stop_ts, global_start_cursor, conn, "FULL_HISTORY")
             total_captured += count
 
@@ -660,21 +659,14 @@ class DataFetcher:
         return pd.DataFrame()
 
     def run(self):
-
-        today = pd.Timestamp.now(tz='UTC').tz_localize(None)
-        fixed_end_date = today 
-        days_back = (today - FIXED_START_DATE).days + 10
-
-        print(f"Starting data collection up to {fixed_end_date}...")
+        # 1. Calculate dynamic time fresh on every run
+        current_utc_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
+        print(f"Starting data collection up to {current_utc_naive}...")
         
-        # --- 3. Clean up orphaned temp files from previous crashes ---
         print("Cleaning up any stale temporary files...")
         for p in CACHE_DIR.glob("temp_market_chunk_*.parquet"):
             p.unlink(missing_ok=True)
             
-        print("\n--- Phase 1: Fetching Markets ---")
-        self.fetch_gamma_markets()
-        print("Starting data collection...")
         print("\n--- Phase 1: Fetching Markets ---")
         self.fetch_gamma_markets()
         
@@ -683,18 +675,20 @@ class DataFetcher:
         
         if market_file.exists():
             print("Loading contract IDs efficiently...")
-            
-            # Read directly, process, and drop NaNs in one clean pipeline
             market_ids_series = pd.read_parquet(market_file, columns=['contract_id'])['contract_id']
             
-            # Convert to a set of integers immediately to save memory
             valid_market_ints = set()
             for val in market_ids_series.dropna():
                 try:
-                    # Handle both standard strings and hex strings
-                    clean_str = str(val).strip().lower().replace('0x', '')
-                    valid_market_ints.add(int(clean_str, 16))
-                except ValueError:
+                    # 2. Safely parse IDs exactly like your original robust logic
+                    s = str(val).strip().lower()
+                    if s.startswith("0x"): 
+                        valid_market_ints.add(int(s, 16))
+                    elif "e+" in s: 
+                        valid_market_ints.add(int(float(s)))
+                    else: 
+                        valid_market_ints.add(int(Decimal(s)))
+                except Exception:
                     continue
                     
             del market_ids_series
@@ -702,7 +696,11 @@ class DataFetcher:
             print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
 
             print("\n--- Phase 2: Fetching Trades ---")
-            self.fetch_gamma_trades(valid_market_ints)
+            # 3. Pass the dynamic end_date explicitly
+            self.fetch_gamma_trades(valid_market_ints, end_date=current_utc_naive) 
+            
+        else:
+            print("No markets file found. Skipping trade fetch.")
             
 if __name__ == "__main__":
     fetcher = DataFetcher()
