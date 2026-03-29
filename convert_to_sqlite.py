@@ -1,20 +1,20 @@
-import pandas as pd
 import sqlite3
 import time
+import csv
 
 def migrate_csv_to_sqlite():
     csv_filepath = '/app/data/gamma_trades_stream.csv' 
     db_filepath = '/app/data/gamma_trades.db'
-    chunk_size = 1000000 
+    
+    # Lower chunk size to 500k to be absolutely paranoid about RAM
+    chunk_size = 500000 
     
     print(f"🚀 Starting/Resuming migration from {csv_filepath} to {db_filepath}...")
     
     conn = sqlite3.connect(db_filepath)
-    
-    # TURBO BOOST PRAGMAS
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-512000") 
+    conn.execute("PRAGMA cache_size=-256000") 
     
     cursor = conn.cursor()
     
@@ -35,57 +35,69 @@ def migrate_csv_to_sqlite():
     cursor.execute("SELECT COUNT(*) FROM trades")
     existing_rows = cursor.fetchone()[0]
     
-    csv_dtypes = {
-        'id': str, 'timestamp': str, 'tradeAmount': float, 'outcomeTokensAmount': float,
-        'user': str, 'contract_id': str, 'price': float, 'size': float, 'side_mult': int
-    }
-    
+    skip_lines = 0
     if existing_rows > 0:
-        # Back up by 1 chunk to handle overlap safely
         skip_lines = max(0, existing_rows - chunk_size)
-        print(f"🔄 Found {existing_rows:,} rows already in DB. Fast-forwarding CSV by {skip_lines:,} rows...")
-        
-        # Pass a single integer (skip_lines + 1 for the header) 
-        # Explicitly declare 'names' so Pandas knows the columns since the header is skipped
-        chunk_iterator = pd.read_csv(
-            csv_filepath, 
-            chunksize=chunk_size, 
-            dtype=csv_dtypes, 
-            skiprows=skip_lines + 1, 
-            names=list(csv_dtypes.keys()),
-            header=None
-        )
-    else:
-        chunk_iterator = pd.read_csv(csv_filepath, chunksize=chunk_size, dtype=csv_dtypes)
-    
-    total_rows = existing_rows if existing_rows > 0 else 0
-    start_time = time.time()
-    
+        print(f"🔄 Found {existing_rows:,} rows already in DB.")
+        print(f"⏳ Fast-forwarding {skip_lines:,} lines. (This will take 1-3 minutes. It is NOT frozen, just counting lines using zero RAM)...")
+
     insert_sql = """
         INSERT OR IGNORE INTO trades 
         (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     
+    start_time = time.time()
+    total_rows = skip_lines
+    
     try:
-        for i, chunk in enumerate(chunk_iterator):
+        with open(csv_filepath, 'r', encoding='utf-8') as f:
+            # 1. PURE PYTHON FAST-FORWARD (Zero Memory)
+            # We skip the calculated lines + 1 for the header
+            for _ in range(skip_lines + 1):
+                next(f, None)
+                
+            print("✅ Fast-forward complete! Resuming inserts...")
             
-            for col in ['id', 'user', 'contract_id', 'timestamp']:
-                if col in chunk.columns:
-                    chunk[col] = chunk[col].astype(str).str.strip()
+            # 2. BARE-BONES CSV READER
+            reader = csv.reader(f)
+            batch = []
+            
+            for row in reader:
+                if len(row) < 9:
+                    continue
                     
-            chunk = chunk.drop_duplicates(subset=['id'], keep='last')
+                # Clean and safely cast the data exactly how SQLite needs it
+                try:
+                    r_id = str(row[0]).strip()
+                    r_ts = str(row[1]).strip()
+                    r_ta = float(row[2]) if row[2] else 0.0
+                    r_ot = float(row[3]) if row[3] else 0.0
+                    r_user = str(row[4]).strip()
+                    r_cid = str(row[5]).strip()
+                    r_price = float(row[6]) if row[6] else 0.0
+                    r_size = float(row[7]) if row[7] else 0.0
+                    r_side = int(row[8]) if row[8] else 0
+                except (ValueError, TypeError):
+                    continue # Skip corrupted lines safely
+                
+                batch.append((r_id, r_ts, r_ta, r_ot, r_user, r_cid, r_price, r_size, r_side))
+                
+                if len(batch) >= chunk_size:
+                    cursor.executemany(insert_sql, batch)
+                    conn.commit()
+                    total_rows += len(batch)
+                    batch.clear() # Dump RAM instantly
+                    
+                    elapsed_time = round(time.time() - start_time, 2)
+                    print(f"✅ Processed chunk | Total CSV rows passed: {total_rows:,} | Time: {elapsed_time}s")
             
-            records = chunk[['id', 'timestamp', 'tradeAmount', 'outcomeTokensAmount', 'user', 'contract_id', 'price', 'size', 'side_mult']].to_records(index=False).tolist()
-            
-            cursor.executemany(insert_sql, records)
-            conn.commit()
-            
-            total_rows += len(records)
-            elapsed_time = round(time.time() - start_time, 2)
-            
-            print(f"✅ Processed chunk {i + 1} | Total CSV rows passed: {total_rows:,} | Time: {elapsed_time}s")
-            
+            # Flush whatever is left
+            if batch:
+                cursor.executemany(insert_sql, batch)
+                conn.commit()
+                total_rows += len(batch)
+                
     except Exception as e:
         print(f"\n❌ An error occurred during migration: {e}")
     finally:
