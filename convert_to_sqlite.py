@@ -11,12 +11,10 @@ def migrate_csv_to_sqlite():
     
     conn = sqlite3.connect(db_filepath)
     
-    # --- TURBO BOOST PRAGMAS ---
-    # These prevent the progressive slowdown by keeping the massive index in RAM 
-    # and optimizing how SQLite flushes data to your hard drive.
+    # TURBO BOOST PRAGMAS
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-512000") # 512MB of RAM allocated just for the index
+    conn.execute("PRAGMA cache_size=-512000") 
     
     cursor = conn.cursor()
     
@@ -34,28 +32,33 @@ def migrate_csv_to_sqlite():
         )
     ''')
     
-    # --- RESUME LOGIC ---
     cursor.execute("SELECT COUNT(*) FROM trades")
     existing_rows = cursor.fetchone()[0]
-    
-    skip_lines = 0
-    skip_args = {}
-    if existing_rows > 0:
-        skip_lines = max(0, existing_rows - chunk_size)
-        print(f"🔄 Found {existing_rows:,} rows already in DB. Fast-forwarding CSV by {skip_lines:,} rows...")
-        # Using a range object allows Pandas to skip rows using its lightning-fast C-engine
-        # while safely preserving the header (row 0).
-        skip_args['skiprows'] = range(1, skip_lines + 1)
     
     csv_dtypes = {
         'id': str, 'timestamp': str, 'tradeAmount': float, 'outcomeTokensAmount': float,
         'user': str, 'contract_id': str, 'price': float, 'size': float, 'side_mult': int
     }
     
-    # Pass the skip_args directly into the reader
-    chunk_iterator = pd.read_csv(csv_filepath, chunksize=chunk_size, dtype=csv_dtypes, **skip_args)
+    if existing_rows > 0:
+        # Back up by 1 chunk to handle overlap safely
+        skip_lines = max(0, existing_rows - chunk_size)
+        print(f"🔄 Found {existing_rows:,} rows already in DB. Fast-forwarding CSV by {skip_lines:,} rows...")
+        
+        # Pass a single integer (skip_lines + 1 for the header) 
+        # Explicitly declare 'names' so Pandas knows the columns since the header is skipped
+        chunk_iterator = pd.read_csv(
+            csv_filepath, 
+            chunksize=chunk_size, 
+            dtype=csv_dtypes, 
+            skiprows=skip_lines + 1, 
+            names=list(csv_dtypes.keys()),
+            header=None
+        )
+    else:
+        chunk_iterator = pd.read_csv(csv_filepath, chunksize=chunk_size, dtype=csv_dtypes)
     
-    total_rows = skip_lines
+    total_rows = existing_rows if existing_rows > 0 else 0
     start_time = time.time()
     
     insert_sql = """
