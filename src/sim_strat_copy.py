@@ -17,6 +17,9 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 WARMUP_DAYS = 500
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
+MAX_TRADER_EXPOSURE = 0.01
+BET_PERCENT = 0.01
+ELITE_WALLETS = 500
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -145,6 +148,8 @@ def main():
     
     # { contract_id: { user_id: volume } }
     live_user_positions = defaultdict(lambda: defaultdict(float))
+
+    active_wallet_exposure = defaultdict(float)
 
     # 3. STREAMING LOOP
     log.info("Starting Reverse Simulation Stream (Oldest -> Newest)...")
@@ -280,7 +285,7 @@ def main():
                         #top_5_count = max(1, int(len(calmar_scores) * 0.05))
                         
                         # Slice the top 5%, then cap at 5000 max
-                        elite_list = calmar_scores[:100]
+                        elite_list = calmar_scores[:ELITE_WALLETS]
                         
                         # Rebuild the fast lookup dict
                         top_tier_users = {uid: avg_size for uid, calmar, avg_size in elite_list}
@@ -354,7 +359,8 @@ def main():
                             if result_map[mid]['outcome'] > 0 and bet_on == "yes": verdict = "RIGHT!"
                             elif result_map[mid]['outcome'] == 0 and bet_on == "no": verdict = "RIGHT!"
 
-                            bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
+                            bet_size = min(MAX_BET, BET_PERCENT * result_map['performance']['equity'])
+                            max_exposure = MAX_TRADER_EXPOSURE * result_map['performance']['equity']
                             min_irr = 5.0
                             slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
                             
@@ -406,7 +412,7 @@ def main():
                                     result_map[mid]['slippage'] = slippage
                                     result_map['resolutions'].append([m_end, profit, bet_size])
                                     result_map['performance']['cash'] -= bet_size
-                                    print(f"COPY TRADE TRIGGERED! User: {uid[:8]}... Market: {mid} - Cost: ${total_dollar_cost:.2f} (Avg: ${avg_size:.2f})")
+                                    print(f"COPY TRADE TRIGGERED! User: {uid[:8]}... Market: {mid} - Cost: ${total_dollar_cost:.2f}")
 
                     # Heartbeat / Result Checking Engine
                     now = t['timestamp']  
