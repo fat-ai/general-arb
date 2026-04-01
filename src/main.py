@@ -920,7 +920,7 @@ class LiveTrader:
                 continue
 
             # ==========================================
-            # 🛠️ THE FIX: Virtually Deplete the Book 
+            # Virtually Deplete the Book 
             # ==========================================
             if is_paper_trading:
                 adjusted_asks = []
