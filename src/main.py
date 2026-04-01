@@ -712,6 +712,8 @@ class LiveTrader:
                     
                 log.info(f"New market: {market}")
 
+            mid = market['id']
+
             if market.get('start_timestamp', 0) < self.start_time:
                 skipped_counts["old"] += 1
                 continue
@@ -727,8 +729,6 @@ class LiveTrader:
             else:
                 continue
                 
-            mid = market['id']
-            
             is_yes_token = (token_id == list(market['tokens'].values())[0])
             
             if is_yes_token:
@@ -762,6 +762,13 @@ class LiveTrader:
             # 9. Smart Exits
             if CONFIG.get('use_smart_exit'):
                 await self._check_smart_exits_for_market(mid, normalized_weight)
+
+            for pos_data in self.persistence.state["positions"].values():
+              if pos_data.get("market_fpmm") == mid:
+                continue
+
+            if token_id in self.pending_orders or mid in self.pending_markets:
+                continue
     
             # 10. Entry Actions (With price bounds)
             if 0.05 < price < 0.95:
@@ -788,7 +795,6 @@ class LiveTrader:
                         passes_roi_filter = True
                 
                 if not passes_roi_filter and days_to_expiry > 0:
-                  #  print(f"Trade failed ROI filter, days: {days_to_expiry}, end: {end_ts}, price: {price}, roi: {annualized_roi}")
                     continue 
                     
                 action = TradeLogic.check_entry_signal(normalized_weight)
