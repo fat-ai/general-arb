@@ -158,7 +158,8 @@ def generate_html_report(state, live_prices, metadata):
             
             # Metadata Extraction
             fpmm = pos.get('market_fpmm', 'Unknown')
-            tokens = metadata.markets.get(fpmm, {})
+            market_obj = metadata.markets.get(fpmm, {})
+            tokens = market_obj.get('tokens', {})
             # Identify if this token ID represents YES or NO
             side_label = "UNKNOWN"
             for label, token_id in tokens.items():
