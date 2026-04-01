@@ -483,12 +483,12 @@ class LiveTrader:
             return "ERROR"
             
     def _safe_json_load(x):
-    if isinstance(x, str):
-        try:
-            return json.loads(x)
-        except Exception:
-            return None
-    return x
+        if isinstance(x, str):
+            try:
+                return json.loads(x)
+            except Exception:
+                return None
+        return x
 
 
     def _chunked(lst, size):
