@@ -482,23 +482,25 @@ class LiveTrader:
             log.error(f"Parse Fail: {e}")
             return "ERROR"
             
-    def _safe_json_load(x):
-        if isinstance(x, str):
-            try:
-                return json.loads(x)
-            except Exception:
-                return None
-        return x
-
-
-    def _chunked(lst, size):
-        for i in range(0, len(lst), size):
-            yield lst[i:i + size]
+    
     
     
     async def _resolution_monitor_loop(self):
         """Production-grade resolution monitor with batching, retries, and idempotency."""
         log.info("⚖️ Resolution Monitor Started (Production Mode)")
+        
+        def _safe_json_load(x):
+            if isinstance(x, str):
+                try:
+                    return json.loads(x)
+                except Exception:
+                    return None
+            return x
+    
+    
+        def _chunked(lst, size):
+            for i in range(0, len(lst), size):
+                yield lst[i:i + size]
     
         async def _ensure_session():
             if not hasattr(self, "http_session") or self.http_session.closed:
