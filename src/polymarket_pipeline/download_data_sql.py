@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_convert(None)
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE_SQL, GRAPH_URL
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
 
 # ---------------------------------------------------------------------------
 # Schema helpers
@@ -66,7 +66,6 @@ class DataFetcher:
                 gc.collect()
         else:
             print(f"   ⚠️ Could not read existing cache: Starting fresh.")
-            date_df = pd.DataFrame()
 
         temp_files = []
 
@@ -325,9 +324,8 @@ class DataFetcher:
         for p in temp_files:
             Path(p).unlink(missing_ok=True)
             
-    # FIXED: The method signature now accepts end_date
     def fetch_gamma_trades(self, target_token_ids, end_date):
-        db_file = CACHE_DIR / TRADES_FILE_SQL
+        db_file = CACHE_DIR / "gamma_trades.db"
         
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
@@ -342,7 +340,6 @@ class DataFetcher:
                 log.warning(f"Failed to parse timestamp from {iso_str}: {e}")
                 return None  # Safer failure mode than returning 0.0
 
-        # FIXED: Wrap in contextlib to ensure safe closing
         with contextlib.closing(sqlite3.connect(db_file)) as conn:
             db_cursor = conn.cursor()
             
@@ -360,10 +357,6 @@ class DataFetcher:
                 )
             ''')
             
-            # --- NEW: Create the index immediately so downstream scripts are blazing fast ---
-            print("📂 Ensuring chronologic index exists for downstream scripts...")
-            db_cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)')
-            
             existing_high_ts = None
             existing_low_ts = None
             
@@ -375,6 +368,7 @@ class DataFetcher:
                 parsed_high = parse_iso_to_ts(max_ts_str)
                 parsed_low = parse_iso_to_ts(min_ts_str)
                 
+                # Halt to prevent massive re-download if DB contains unparseable bounds
                 if parsed_high is None or parsed_low is None:
                     log.error("CRITICAL: Failed to parse timestamp bounds from the database. Aborting trades fetch.")
                     return
@@ -389,7 +383,6 @@ class DataFetcher:
             global_stop_ts = int(end_date.timestamp())
                     
             def fetch_segment(start_ts, end_ts, db_conn, segment_name):
-                # FIXED: renaming variable to not shadow the outer cursor
                 current_ts = int(start_ts)
                 stop_limit = int(end_ts)
                 
@@ -457,7 +450,6 @@ class DataFetcher:
                                 else: t_int = int(Decimal(t_raw))
                                 
                                 tid = None; mult = 0
-                                # FIXED: target_token_ids instead of valid_token_ints
                                 if m_int in target_token_ids:
                                     tid = m_int; mult = 1
                                     val_usdc = float(r['takerAmountFilled']) / 1e6
@@ -473,12 +465,12 @@ class DataFetcher:
                                         seg_dropped += 1; continue
                                         
                                     out_rows.append((
-                                        str(r['id']),  # <-- Added str() here for safety
+                                        r['id'], 
                                         datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
                                         val_usdc, 
                                         val_size * mult,
-                                        str(r['taker']), # <-- Added str() here for safety
-                                        str(tid),        # (This one was already safe!)
+                                        r['taker'], 
+                                        str(tid),
                                         price, 
                                         val_size, 
                                         mult
@@ -525,7 +517,6 @@ class DataFetcher:
                 total_captured += count
 
             print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
-            # FIXED: returning None instead of empty DataFrame
 
     def run(self):
         current_utc_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
@@ -552,4 +543,21 @@ class DataFetcher:
                     if s.startswith("0x"): 
                         valid_market_ints.add(int(s, 16))
                     elif "e+" in s: 
-                        valid_market_ints.add(int(
+                        valid_market_ints.add(int(float(s)))
+                    else: 
+                        valid_market_ints.add(int(Decimal(s)))
+                except Exception:
+                    continue
+                    
+            del market_ids_series
+            gc.collect()
+            print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
+
+            print("\n--- Phase 2: Fetching Trades ---")
+            self.fetch_gamma_trades(valid_market_ints, end_date=current_utc_naive) 
+            
+        else:
+            print("No markets file found. Skipping trade fetch.")
+            
+if __name__ == "__main__":
+    fetcher = DataFetcher()
