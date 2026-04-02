@@ -564,3 +564,4 @@ class DataFetcher:
             
 if __name__ == "__main__":
     fetcher = DataFetcher()
+    fetcher.run()
