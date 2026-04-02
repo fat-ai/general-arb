@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 # Constants
 # Construct an aware UTC timestamp, then safely convert to naive
-FIXED_START_DATE = pd.Timestamp("2024-01-01", tz='UTC').tz_convert(None)
+FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC').tz_convert(None)
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
