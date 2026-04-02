@@ -381,7 +381,7 @@ class DataFetcher:
             else:
                 print("⚠️ Database is empty or new. Starting full fetch.")
 
-            global_start_cursor = int(FIXED_START_DATE.timestamp())
+            global_start_cursor = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
             global_stop_ts = int(end_date.timestamp())
                     
             def fetch_segment(start_ts, end_ts, db_conn, segment_name):
