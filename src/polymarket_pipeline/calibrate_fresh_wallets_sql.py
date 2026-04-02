@@ -62,12 +62,16 @@ def main():
             )
         """)
 
-        # 3. The Upsert Query (Simplified!)
-        # Since the Python shield guarantees mismatched contracts never reach here,
-        # we safely remove the dead CASE WHEN logic and just accumulate.
+        # --- 3. Push Outcomes to SQLite for C-Level Filtering ---
+        print("Pushing outcome dictionary to SQLite for native filtering...")
+        # Convert Polars DataFrame to Pandas to use the fast to_sql method
+        df_outcomes_pd = df_outcomes.to_pandas() if hasattr(df_outcomes, 'to_pandas') else df_outcomes
+        df_outcomes_pd.to_sql('resolved_markets', con, index=False, if_exists='replace')
+        con.execute("CREATE UNIQUE INDEX idx_resolved ON resolved_markets(contract_id)")
+
+        # The Upsert Query
         INSERT_SQL = """
-            INSERT INTO wallet_state 
-                (wallet_id, contract_id, is_long, total_risk_vol, total_tokens, weighted_price_sum, ts_date)
+            INSERT INTO wallet_state (wallet_id, contract_id, is_long, total_risk_vol, total_tokens, weighted_price_sum, ts_date)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(wallet_id) DO UPDATE SET
                 total_risk_vol = total_risk_vol + excluded.total_risk_vol,
@@ -75,78 +79,51 @@ def main():
                 weighted_price_sum = weighted_price_sum + excluded.weighted_price_sum
         """
 
-        # --- 4. STREAM FROM MASTER DB ---
-        print("🚀 Checking Master DB index and streaming trades...", flush=True)
-        BATCH_SIZE = 100_000
+        # --- 4. ATTACH MASTER DB & RUN C-OPTIMIZED STREAM ---
+        print("🚀 Attaching Master DB and executing C-optimized stream...", flush=True)
+        con.execute(f"ATTACH DATABASE '{source_db_path}' AS source")
+
+        BATCH_SIZE = 150_000  # Increased batch size since rows are cleaner
         batch = []
         processed_count = 0
-        parse_errors = 0
-        unresolved_skips = 0
-        
         first_markets = {}
 
-        source_con = sqlite3.connect(source_db_path)
-        source_cursor = source_con.cursor()
-        
-        # Defensive Programming: Ensure the index exists before sorting!
-        print("   (Ensuring chronological index exists on source data...)")
-        
+        # 🧠 The Push-Down Query: 
+        # All string cleaning, math, and filtering happens in SQLite's C-engine
         query = """
-            SELECT user, contract_id, tradeAmount, outcomeTokensAmount, price, timestamp 
-            FROM trades 
-            ORDER BY timestamp ASC
+            SELECT 
+                t.user, 
+                r.contract_id, 
+                t.tradeAmount, 
+                ABS(t.outcomeTokensAmount) AS abs_tokens, 
+                t.outcomeTokensAmount > 0 AS is_long,
+                MAX(1e-6, MIN(1.0 - 1e-6, t.price)) AS safe_price,
+                t.timestamp
+            FROM source.trades t
+            INNER JOIN resolved_markets r 
+                ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = r.contract_id
+            ORDER BY t.timestamp ASC
         """
-        
-        source_cursor.execute(query)
 
-        for row in source_cursor:
+        cursor = con.execute(query)
+
+        # Python now receives a perfectly clean, pre-filtered, mathematical dataset
+        for wallet, contract, trade_amount, abs_tokens, is_long, safe_price, ts_date in cursor:
             processed_count += 1
             
             if processed_count % 5_000_000 == 0:
-                print(f"   Processed {processed_count:,} rows... (Shield tracking {len(first_markets):,} wallets)", flush=True)
+                print(f"   Passed {processed_count:,} valid trades... (Tracking {len(first_markets):,} wallets)", flush=True)
 
+            risk_vol = trade_amount if is_long else (abs_tokens * (1.0 - safe_price))
+
+            # try/except is significantly faster than "if wallet not in dict"
             try:
-                wallet = row[0]
-                contract_raw = row[1]
-                
-                if not wallet or not contract_raw:
-                    parse_errors += 1
-                    continue
-                    
-                contract = str(contract_raw).strip().lower().replace("0x", "")
-                
-                # Split the skip counting logic
-                if contract not in outcomes_dict: 
-                    unresolved_skips += 1
-                    continue
-                    
-                tradeAmount = float(row[2])
-                tokens = float(row[3])
-                price = float(row[4])
-                ts_date = row[5]
-                
-            except (ValueError, TypeError, IndexError):
-                parse_errors += 1
-                continue
-
-            safe_price = max(1e-6, min(1.0 - 1e-6, price))
-            is_long = tokens > 0
-            abs_tokens = abs(tokens)
-            risk_vol = tradeAmount if is_long else (abs_tokens * (1.0 - safe_price))
-
-            if wallet not in first_markets:
-                first_markets[wallet] = (contract, is_long)
-                batch.append((
-                    wallet, contract, int(is_long), risk_vol, 
-                    abs_tokens, safe_price * abs_tokens, ts_date
-                ))
-            else:
                 first_contract, first_direction = first_markets[wallet]
                 if contract == first_contract and is_long == first_direction:
-                    batch.append((
-                        wallet, contract, int(is_long), risk_vol, 
-                        abs_tokens, safe_price * abs_tokens, ts_date
-                    ))
+                    batch.append((wallet, contract, int(is_long), risk_vol, abs_tokens, safe_price * abs_tokens, ts_date))
+            except KeyError:
+                first_markets[wallet] = (contract, is_long)
+                batch.append((wallet, contract, int(is_long), risk_vol, abs_tokens, safe_price * abs_tokens, ts_date))
 
             if len(batch) >= BATCH_SIZE:
                 con.executemany(INSERT_SQL, batch)
@@ -157,16 +134,12 @@ def main():
             con.executemany(INSERT_SQL, batch)
             con.commit()
 
-        # Sanity Check the DB
+        # Sanity Check
         con.execute("SELECT COUNT(*) FROM wallet_state")
-        total_wallets = con.fetchone()[0]
-        print(f"\n✅ Stream complete! Aggregated data for {total_wallets:,} unique wallets.")
-        print(f"   ℹ️ Skipped {unresolved_skips:,} trades (market not yet resolved).")
-        if parse_errors > 0:
-            print(f"   ⚠️ Warning: {parse_errors:,} trades skipped due to corrupted data.")
-
+        print(f"\n✅ Stream complete! Aggregated data for {con.fetchone()[0]:,} unique wallets.")
+        
+        # Cleanup memory
         del first_markets
-        source_con.close()
 
         # 5. Fetch Results directly to DataFrame
         print("Fetching aggregated results into Pandas...")
