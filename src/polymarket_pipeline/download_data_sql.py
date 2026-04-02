@@ -341,6 +341,8 @@ class DataFetcher:
                 return None  # Safer failure mode than returning 0.0
 
         with contextlib.closing(sqlite3.connect(db_file)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
             db_cursor = conn.cursor()
             
             db_cursor.execute('''
