@@ -333,12 +333,13 @@ class DataFetcher:
         def parse_iso_to_ts(iso_str):
             try:
                 ts_obj = pd.to_datetime(iso_str)
-                if ts_obj.tz is not None:
-                    ts_obj = ts_obj.tz_convert(None)
+                # Force the naive database timestamp to be recognized as UTC
+                if ts_obj.tz is None:
+                    ts_obj = ts_obj.tz_localize('UTC')
                 return ts_obj.timestamp()
             except Exception as e: 
                 log.warning(f"Failed to parse timestamp from {iso_str}: {e}")
-                return None  # Safer failure mode than returning 0.0
+                return None
 
         with contextlib.closing(sqlite3.connect(db_file)) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -382,7 +383,7 @@ class DataFetcher:
                 print("⚠️ Database is empty or new. Starting full fetch.")
 
             global_start_cursor = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
-            global_stop_ts = int(end_date.timestamp())
+            global_stop_ts = int(end_date.tz_localize('UTC').timestamp())
                     
             def fetch_segment(start_ts, end_ts, db_conn, segment_name):
                 current_ts = int(start_ts)
