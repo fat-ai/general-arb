@@ -83,7 +83,7 @@ def main():
         print("🚀 Attaching Master DB and calculating accumulations natively in SQL...", flush=True)
         
         # Attach the 200GB trades database to our temporary scoring database
-        con.execute(f"ATTACH DATABASE '{source_db_path}' AS source_db")
+        con.execute("ATTACH DATABASE ? AS source_db", (str(source_db_path),))
 
         # This single query replaces the entire Pandas chunking loop!
         # It joins against markets to filter valid contracts automatically.
@@ -98,7 +98,7 @@ def main():
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN (1.0 - t.price) * ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS cost_short,
                 COUNT(t.id) AS trade_count
             FROM source_db.trades t
-            INNER JOIN markets m ON t.contract_id = m.contract_id
+            INNER JOIN markets m ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = m.contract_id
             WHERE t.price >= 0.0 AND t.price <= 1.0
             GROUP BY t.user, t.contract_id
         """
