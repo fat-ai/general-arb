@@ -90,7 +90,6 @@ def main():
         
         # Defensive Programming: Ensure the index exists before sorting!
         print("   (Ensuring chronological index exists on source data...)")
-        source_cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
         
         query = """
             SELECT user, contract_id, tradeAmount, outcomeTokensAmount, price, timestamp 
