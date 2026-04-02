@@ -81,7 +81,7 @@ def main():
 
         # --- 4. ATTACH MASTER DB & RUN C-OPTIMIZED STREAM ---
         print("🚀 Attaching Master DB and executing C-optimized stream...", flush=True)
-        con.execute(f"ATTACH DATABASE '{source_db_path}' AS source")
+        con.execute("ATTACH DATABASE ? AS source", (str(source_db_path),))
 
         BATCH_SIZE = 150_000  # Increased batch size since rows are cleaner
         batch = []
@@ -135,7 +135,7 @@ def main():
             con.commit()
 
         # Sanity Check
-        con.execute("SELECT COUNT(*) FROM wallet_state")
+        total_wallets = con.execute("SELECT COUNT(*) FROM wallet_state").fetchone()[0]
         print(f"\n✅ Stream complete! Aggregated data for {con.fetchone()[0]:,} unique wallets.")
         
         # Cleanup memory
