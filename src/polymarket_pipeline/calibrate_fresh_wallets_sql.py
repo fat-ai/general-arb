@@ -42,6 +42,7 @@ def main():
         con.execute("PRAGMA memory_limit='4GB';")
         con.execute("PRAGMA threads=2;") 
         con.execute(f"PRAGMA temp_directory='{tmp_dir}';")
+        con.execute("PRAGMA preserve_insertion_order=false;")
         
         con.execute("INSTALL sqlite;")
         con.execute("LOAD sqlite;")
@@ -67,7 +68,6 @@ def main():
             WHERE t.price >= 0.0 AND t.price <= 1.0
         ),
         MarketJoined AS (
-            -- 🛠️ Read Parquet directly from disk, avoiding Pandas entirely
             SELECT 
                 c.*,
                 m.outcome
@@ -77,35 +77,30 @@ def main():
                 FROM read_parquet('{outcomes_path}')
             ) m ON c.contract_id = m.contract_id
         ),
-        RankedTrades AS (
-            -- 🛠️ Replaces the Python dictionary: Numbers trades 1, 2, 3... chronologically per user
-            SELECT 
-                *,
-                ROW_NUMBER() OVER (PARTITION BY wallet_id ORDER BY timestamp ASC) as rn
-            FROM MarketJoined
-        ),
         FirstTrades AS (
-            -- 🛠️ Isolates exactly what the first trade was
-            SELECT wallet_id, contract_id, is_long
-            FROM RankedTrades
-            WHERE rn = 1
+            -- 🛠️ THE FIX: arg_min finds the first trade instantly WITHOUT sorting data in RAM
+            SELECT 
+                wallet_id,
+                arg_min(contract_id, timestamp) AS target_contract,
+                arg_min(is_long, timestamp) AS target_is_long
+            FROM MarketJoined
+            GROUP BY wallet_id
         ),
         TargetTrades AS (
-            -- 🛠️ Joins back to get ALL trades for that user that match their FIRST contract and direction
             SELECT 
-                r.wallet_id,
-                r.contract_id,
-                r.is_long,
-                r.abs_tokens,
-                r.outcome,
-                r.timestamp,
-                (CASE WHEN r.is_long THEN r.tradeAmount ELSE r.abs_tokens * (1.0 - r.safe_price) END) AS risk_vol,
-                (r.safe_price * r.abs_tokens) AS weighted_price
-            FROM RankedTrades r
+                m.wallet_id,
+                m.contract_id,
+                m.is_long,
+                m.abs_tokens,
+                m.outcome,
+                m.timestamp,
+                (CASE WHEN m.is_long THEN m.tradeAmount ELSE m.abs_tokens * (1.0 - m.safe_price) END) AS risk_vol,
+                (m.safe_price * m.abs_tokens) AS weighted_price
+            FROM MarketJoined m
             INNER JOIN FirstTrades f 
-                ON r.wallet_id = f.wallet_id 
-                AND r.contract_id = f.contract_id 
-                AND r.is_long = f.is_long
+                ON m.wallet_id = f.wallet_id 
+                AND m.contract_id = f.target_contract 
+                AND m.is_long = f.target_is_long
         )
         SELECT 
             wallet_id, 
@@ -120,7 +115,7 @@ def main():
         GROUP BY wallet_id, contract_id, is_long
         HAVING SUM(abs_tokens) > 0;
         """
-
+        
         # We can safely use .df() here because the output is just one row per user!
         df = con.execute(query).df()
 
