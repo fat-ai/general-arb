@@ -17,7 +17,8 @@ RUN pip install --no-cache-dir \
     numpy \
     scipy \
     statsmodels \
-    pyarrow
+    pyarrow \
+    duckdb
 
 # Copy your scripts into the container
 COPY download_data.py .
