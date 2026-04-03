@@ -97,8 +97,9 @@ def main():
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS qty_short,
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN (1.0 - t.price) * ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS cost_short,
                 COUNT(t.id) AS trade_count
-            FROM source_db.trades t
-            INNER JOIN markets m ON t.contract_id = m.contract_id
+            -- 🛠️ THE FIX: Flip the order and use CROSS JOIN to force index usage
+            FROM markets m
+            CROSS JOIN source_db.trades t ON t.contract_id = m.contract_id
             WHERE t.price >= 0.0 AND t.price <= 1.0
             GROUP BY t.user, t.contract_id
         """
