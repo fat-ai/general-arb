@@ -41,7 +41,7 @@ def main():
         con = duckdb.connect(database=':memory:')
         
         # 🛠️ OPTIMIZATION 4: Prevent network calls on every run
-        con.execute("INSTALL sqlite IF NOT EXISTS;")
+        con.execute("INSTALL sqlite;")
         con.execute("LOAD sqlite;")
 
         # --- 2. LOAD MARKETS DATA ---
