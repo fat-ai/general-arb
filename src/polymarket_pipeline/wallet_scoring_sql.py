@@ -38,14 +38,11 @@ def main():
 
     try:
         # --- 1. SETUP SQLITE & LOAD MARKETS ---
-        print("Initializing temporary SQLite database...", flush=True)
-        if os.path.exists(db_path):
-            os.remove(db_path)
-            
-        con = sqlite3.connect(db_path)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA synchronous=NORMAL")
-        con.execute("PRAGMA cache_size=-256000") # 256MB RAM cache
+        print("Initializing IN-MEMORY SQLite database...", flush=True)
+        
+        # 🛠️ THE FIX: Use pure RAM instead of the hard drive
+        con = sqlite3.connect(":memory:")
+        con.execute("PRAGMA temp_store=MEMORY")
         
         # Create the user accumulation table
         con.execute("""
@@ -86,6 +83,9 @@ def main():
         
         # Attach the 200GB trades database to our temporary scoring database
         con.execute("ATTACH DATABASE ? AS source_db", (str(source_db_path),))
+
+        # 🛠️ THE FIX: Allow SQLite to map up to 10GB of the file into RAM at a time
+        con.execute("PRAGMA source_db.mmap_size=10000000000")
 
         # This single query replaces the entire Pandas chunking loop!
         # It joins against markets to filter valid contracts automatically.
