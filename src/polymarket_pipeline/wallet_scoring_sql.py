@@ -1,8 +1,5 @@
 import os
 import json
-import warnings
-import polars as pl
-import pandas as pd
 import duckdb
 from pathlib import Path
 
@@ -10,66 +7,50 @@ from pathlib import Path
 from config import WALLET_SCORES_FILE, MARKETS_FILE
 
 CACHE_DIR = Path("/app/data")
-warnings.filterwarnings("ignore")
-
-def fetch_markets():
-    cache_file = CACHE_DIR / MARKETS_FILE
-    if os.path.exists(cache_file):
-        try:
-            return pl.read_parquet(cache_file)
-        except Exception as e:
-            print(f"💀 Failed to load cached markets: {e}", flush=True)
-            return None
-    print(f"💀 No cached markets found. Run download_data.py.", flush=True)
-    return None
 
 def main():
-    print("**** 🦆 POLYMARKET WALLET SCORING (DUCKDB ENTERPRISE) 🦆 ****", flush=True)
+    print("**** 🦆 POLYMARKET WALLET SCORING (MAX MEMORY SAFETY) 🦆 ****", flush=True)
     
     source_db_path = CACHE_DIR / "gamma_trades.db"
     output_file = CACHE_DIR / WALLET_SCORES_FILE
+    markets_parquet_path = CACHE_DIR / MARKETS_FILE
 
     if not os.path.exists(source_db_path):
         print(f"❌ Error: Source database '{source_db_path}' not found.", flush=True)
+        return
+        
+    if not os.path.exists(markets_parquet_path):
+        print(f"❌ Error: Markets file '{markets_parquet_path}' not found.", flush=True)
         return
 
     con = None
 
     try:
-        # --- 1. SETUP DUCKDB & EXTENSIONS ---
+        # --- 1. SETUP DUCKDB FOR EXTREME MEMORY SAFETY ---
         print("Spinning up DuckDB engine...", flush=True)
         con = duckdb.connect(database=':memory:')
         
         tmp_dir = CACHE_DIR / "duckdb_tmp"
         os.makedirs(tmp_dir, exist_ok=True)
-        con.execute("PRAGMA memory_limit='6GB';")
+        
+        # 🛠️ THE OOM SHIELD: 4GB limit, 2 threads, and disk spillover
+        con.execute("PRAGMA memory_limit='4GB';")
+        con.execute("PRAGMA threads=2;") 
         con.execute(f"PRAGMA temp_directory='{tmp_dir}';")
         
-        # Install/Load the SQLite extension
         con.execute("INSTALL sqlite;")
         con.execute("LOAD sqlite;")
 
-        # --- 2. LOAD MARKETS DATA ---
-        print("Loading market outcomes into memory...", flush=True)
-        outcomes = fetch_markets()
-        if outcomes is None or outcomes.is_empty():
-            print("⚠️ No valid markets found. Exiting.", flush=True)
-            return
-
-        # Prepare DataFrame (DuckDB will query this directly)
-        df_markets = outcomes.select(["contract_id", "outcome", "resolution_timestamp"]).to_pandas()
-        df_markets['contract_id'] = df_markets['contract_id'].astype(str).str.strip()
-
-        # --- 3. ATTACH THE 200GB SQLITE FILE ---
+        # --- 2. ATTACH THE 200GB SQLITE FILE ---
         print("🚀 Attaching Master SQLite DB...", flush=True)
         con.execute(f"ATTACH '{source_db_path}' AS source_db (TYPE SQLITE);")
 
-        # --- 4. THE GOD QUERY (FULLY VECTORIZED & FLATTENED) ---
-        print("\n📊 Executing parallel aggregation, PnL math, and scoring...", flush=True)
+        # --- 3. THE GOD QUERY (NO PANDAS INVOLVED) ---
+        print("\n📊 Executing low-memory aggregation and scoring...", flush=True)
         
-        query = """
+        # Notice the INNER JOIN: DuckDB reads and formats the Parquet file natively!
+        query = f"""
         WITH UserMarkets AS (
-            -- 🛠️ OPTIMIZATION 1: Carry outcome and timestamp through to avoid a second join later
             SELECT 
                 t.user, 
                 t.contract_id,
@@ -81,7 +62,13 @@ def main():
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN (1.0 - t.price) * ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS cost_short,
                 COUNT(t.id) AS trade_count
             FROM source_db.trades t
-            INNER JOIN df_markets m ON t.contract_id = m.contract_id
+            INNER JOIN (
+                SELECT 
+                    TRIM(CAST(contract_id AS VARCHAR)) AS contract_id, 
+                    outcome, 
+                    resolution_timestamp 
+                FROM read_parquet('{markets_parquet_path}')
+            ) m ON t.contract_id = m.contract_id
             WHERE t.price >= 0.0 AND t.price <= 1.0
             GROUP BY t.user, t.contract_id, m.outcome, m.resolution_timestamp
         ),
@@ -107,7 +94,6 @@ def main():
             WINDOW w AS (PARTITION BY user ORDER BY resolution_timestamp ROWS UNBOUNDED PRECEDING)
         ),
         PeakTracking AS (
-            -- 🛠️ OPTIMIZATION 2: Collapsed BankrollTracking directly into this CTE to save memory
             SELECT 
                 user, 
                 invested, 
@@ -117,7 +103,6 @@ def main():
                 MAX(cumulative_invested + cumulative_pnl) OVER (PARTITION BY user ORDER BY resolution_timestamp ROWS UNBOUNDED PRECEDING) AS peak_bankroll
             FROM RunningTotals
         )
-        -- 🛠️ OPTIMIZATION 3: All scoring math natively in DuckDB
         SELECT 
             user,
             (SUM(contract_pnl) / SUM(invested) * 100.0) 
@@ -128,7 +113,6 @@ def main():
         ORDER BY score DESC;
         """
 
-        # 🛠️ OPTIMIZATION 5: fetchall() streams native Python tuples instead of a massive Pandas DataFrame
         results = con.execute(query).fetchall()
 
         if not results:
@@ -137,10 +121,8 @@ def main():
 
         print(f"✅ Scoring complete! Total unique eligible users: {len(results):,}", flush=True)
 
-        # Convert the list of tuples [('user1', score), ('user2', score)] straight into a dictionary
         final_dict = dict(results)
 
-        # --- 5. SAVE RESULTS ---
         with open(output_file, "w") as f:
             json.dump(final_dict, f, indent=2)
             
