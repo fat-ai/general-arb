@@ -69,7 +69,7 @@ def main():
             return
 
         df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"]).to_pandas()
-        df_outcomes['contract_id'] = df_outcomes['contract_id'].str.strip().str.lower()
+        df_outcomes['contract_id'] = df_outcomes['contract_id'].astype(str).str.strip()
         df_outcomes.to_sql("markets", con, if_exists="replace", index=False)
         
         # Create an index to make the final join lightning fast
