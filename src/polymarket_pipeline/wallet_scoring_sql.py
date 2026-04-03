@@ -69,7 +69,7 @@ def main():
             return
 
         df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"]).to_pandas()
-        df_outcomes['contract_id'] = df_outcomes['contract_id'].str.strip().str.lower().str.replace("0x", "")
+        df_outcomes['contract_id'] = df_outcomes['contract_id'].str.strip().str.lower()
         df_outcomes.to_sql("markets", con, if_exists="replace", index=False)
         
         # Create an index to make the final join lightning fast
@@ -98,7 +98,7 @@ def main():
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN (1.0 - t.price) * ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS cost_short,
                 COUNT(t.id) AS trade_count
             FROM source_db.trades t
-            INNER JOIN markets m ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = m.contract_id
+            INNER JOIN markets m ON t.contract_id = m.contract_id
             WHERE t.price >= 0.0 AND t.price <= 1.0
             GROUP BY t.user, t.contract_id
         """
