@@ -1,182 +1,149 @@
 import os
 import json
-import sqlite3
+import duckdb
 import warnings
-import polars as pl
 import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from pathlib import Path
+
+# Adjust imports based on your exact config
 from config import MARKETS_FILE, FRESH_SCORE_FILE
-# Removed TRADES_FILE from import as requested by Morpheus
 
 CACHE_DIR = Path("/app/data")
 warnings.filterwarnings("ignore")
 
 def main():
-    print("--- Fresh Wallet Calibration (SQLite Optimized) ---")
+    print("**** 🦆 FRESH WALLET CALIBRATION (DUCKDB MAX SAFETY) 🦆 ****", flush=True)
+    
     source_db_path = CACHE_DIR / "gamma_trades.db"
     outcomes_path = CACHE_DIR / MARKETS_FILE
     output_file = CACHE_DIR / FRESH_SCORE_FILE
-    temp_db_path = CACHE_DIR / "wallet_state.db"
+    tmp_dir = CACHE_DIR / "duckdb_tmp"
 
-    # --- Use try/finally to guarantee temp DB cleanup on crash ---
+    if not os.path.exists(source_db_path):
+        print(f"❌ Error: Source database '{source_db_path}' not found.", flush=True)
+        return
+        
+    if not os.path.exists(outcomes_path):
+        print(f"❌ Error: Markets file '{outcomes_path}' not found.", flush=True)
+        return
+
+    con = None
+
     try:
-        # 1. Load Market Outcomes into memory
-        print("Loading market outcomes...")
-        try:
-            df_outcomes = (
-                pl.scan_parquet(outcomes_path)
-                .select([
-                    pl.col('contract_id').cast(pl.String).str.strip_chars().str.to_lowercase(),
-                    pl.col('outcome').cast(pl.Float64)
-                ])
-                .unique(subset=['contract_id'], keep='last')
-                .collect()
-            )
-            outcomes_dict = dict(zip(df_outcomes['contract_id'].to_list(), df_outcomes['outcome'].to_list()))
-            print(f"✅ Loaded {len(outcomes_dict):,} resolved markets.")
-        except Exception as e:
-            print(f"❌ Error loading outcomes: {e}")
-            return
-
-        # 2. Initialize Temporary SQLite Database for Aggregation
-        print("Initializing temporary aggregation database...")
-        if os.path.exists(temp_db_path):
-            os.remove(temp_db_path)
-            
-        con = sqlite3.connect(temp_db_path)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA synchronous=NORMAL")
-        con.execute("PRAGMA cache_size=-256000") 
+        # --- 1. SETUP DUCKDB FOR EXTREME MEMORY SAFETY ---
+        print("Spinning up DuckDB engine...", flush=True)
+        con = duckdb.connect(database=':memory:')
         
-        con.execute("""
-            CREATE TABLE wallet_state (
-                wallet_id            TEXT PRIMARY KEY,
-                contract_id          TEXT,
-                is_long              INTEGER,
-                total_risk_vol       REAL,
-                total_tokens         REAL,
-                weighted_price_sum   REAL,
-                ts_date              TEXT
-            )
-        """)
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        # 🛠️ THE OOM SHIELD: 4GB limit, 2 threads, and disk spillover
+        con.execute("PRAGMA memory_limit='4GB';")
+        con.execute("PRAGMA threads=2;") 
+        con.execute(f"PRAGMA temp_directory='{tmp_dir}';")
+        
+        con.execute("INSTALL sqlite;")
+        con.execute("LOAD sqlite;")
 
-        # --- 3. Push Outcomes to SQLite for C-Level Filtering ---
-        print("Pushing outcome dictionary to SQLite for native filtering...")
-        # Convert Polars DataFrame to Pandas to use the fast to_sql method
-        df_outcomes_pd = df_outcomes.to_pandas() if hasattr(df_outcomes, 'to_pandas') else df_outcomes
-        df_outcomes_pd.to_sql('resolved_markets', con, index=False, if_exists='replace')
-        con.execute("CREATE UNIQUE INDEX idx_resolved ON resolved_markets(contract_id)")
+        # --- 2. ATTACH THE 200GB SQLITE FILE ---
+        print("🚀 Attaching Master SQLite DB...", flush=True)
+        con.execute(f"ATTACH '{source_db_path}' AS source_db (TYPE SQLITE);")
 
-        # The Upsert Query
-        INSERT_SQL = """
-            INSERT INTO wallet_state (wallet_id, contract_id, is_long, total_risk_vol, total_tokens, weighted_price_sum, ts_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(wallet_id) DO UPDATE SET
-                total_risk_vol = total_risk_vol + excluded.total_risk_vol,
-                total_tokens = total_tokens + excluded.total_tokens,
-                weighted_price_sum = weighted_price_sum + excluded.weighted_price_sum
-        """
-
-        # --- 4. ATTACH MASTER DB & RUN C-OPTIMIZED STREAM ---
-        print("🚀 Attaching Master DB and executing C-optimized stream...", flush=True)
-        con.execute("ATTACH DATABASE ? AS source", (str(source_db_path),))
-
-        BATCH_SIZE = 150_000  # Increased batch size since rows are cleaner
-        batch = []
-        processed_count = 0
-        first_markets = {}
-
-        # 🧠 The Push-Down Query: 
-        # All string cleaning, math, and filtering happens in SQLite's C-engine
-        query = """
+        # --- 3. THE GOD QUERY (WINDOW FUNCTIONS REPLACING PYTHON) ---
+        print("\n📊 Executing parallel aggregation and first-trade isolation...", flush=True)
+        
+        query = f"""
+        WITH CleanTrades AS (
             SELECT 
-                t.user, 
-                r.contract_id, 
-                t.tradeAmount, 
-                ABS(t.outcomeTokensAmount) AS abs_tokens, 
-                t.outcomeTokensAmount > 0 AS is_long,
-                MAX(1e-6, MIN(1.0 - 1e-6, t.price)) AS safe_price,
+                t.user AS wallet_id,
+                LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) AS contract_id,
+                ABS(t.outcomeTokensAmount) AS abs_tokens,
+                (t.outcomeTokensAmount > 0) AS is_long,
+                GREATEST(1e-6, LEAST(1.0 - 1e-6, t.price)) AS safe_price,
+                t.tradeAmount,
                 t.timestamp
-            FROM source.trades t
-            INNER JOIN resolved_markets r 
-                ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = r.contract_id
-            ORDER BY t.timestamp ASC
+            FROM source_db.trades t
+            WHERE t.price >= 0.0 AND t.price <= 1.0
+        ),
+        MarketJoined AS (
+            -- 🛠️ Read Parquet directly from disk, avoiding Pandas entirely
+            SELECT 
+                c.*,
+                m.outcome
+            FROM CleanTrades c
+            INNER JOIN (
+                SELECT LOWER(TRIM(CAST(contract_id AS VARCHAR))) AS contract_id, outcome
+                FROM read_parquet('{outcomes_path}')
+            ) m ON c.contract_id = m.contract_id
+        ),
+        RankedTrades AS (
+            -- 🛠️ Replaces the Python dictionary: Numbers trades 1, 2, 3... chronologically per user
+            SELECT 
+                *,
+                ROW_NUMBER() OVER (PARTITION BY wallet_id ORDER BY timestamp ASC) as rn
+            FROM MarketJoined
+        ),
+        FirstTrades AS (
+            -- 🛠️ Isolates exactly what the first trade was
+            SELECT wallet_id, contract_id, is_long
+            FROM RankedTrades
+            WHERE rn = 1
+        ),
+        TargetTrades AS (
+            -- 🛠️ Joins back to get ALL trades for that user that match their FIRST contract and direction
+            SELECT 
+                r.wallet_id,
+                r.contract_id,
+                r.is_long,
+                r.abs_tokens,
+                r.outcome,
+                r.timestamp,
+                (CASE WHEN r.is_long THEN r.tradeAmount ELSE r.abs_tokens * (1.0 - r.safe_price) END) AS risk_vol,
+                (r.safe_price * r.abs_tokens) AS weighted_price
+            FROM RankedTrades r
+            INNER JOIN FirstTrades f 
+                ON r.wallet_id = f.wallet_id 
+                AND r.contract_id = f.contract_id 
+                AND r.is_long = f.is_long
+        )
+        SELECT 
+            wallet_id, 
+            contract_id, 
+            CAST(is_long AS INTEGER) AS is_long,
+            SUM(risk_vol) AS risk_vol, 
+            SUM(abs_tokens) AS total_tokens, 
+            SUM(weighted_price) AS weighted_price_sum, 
+            MIN(timestamp) AS ts_date,
+            MAX(outcome) AS outcome
+        FROM TargetTrades
+        GROUP BY wallet_id, contract_id, is_long
+        HAVING SUM(abs_tokens) > 0;
         """
 
-        cursor = con.execute(query)
-
-        # Python now receives a perfectly clean, pre-filtered, mathematical dataset
-        for wallet, contract, trade_amount, abs_tokens, is_long, safe_price, ts_date in cursor:
-            processed_count += 1
-            
-            if processed_count % 5_000_000 == 0:
-                print(f"   Passed {processed_count:,} valid trades... (Tracking {len(first_markets):,} wallets)", flush=True)
-
-            risk_vol = trade_amount if is_long else (abs_tokens * (1.0 - safe_price))
-
-            # try/except is significantly faster than "if wallet not in dict"
-            try:
-                first_contract, first_direction = first_markets[wallet]
-                if contract == first_contract and is_long == first_direction:
-                    batch.append((wallet, contract, int(is_long), risk_vol, abs_tokens, safe_price * abs_tokens, ts_date))
-            except KeyError:
-                first_markets[wallet] = (contract, is_long)
-                batch.append((wallet, contract, int(is_long), risk_vol, abs_tokens, safe_price * abs_tokens, ts_date))
-
-            if len(batch) >= BATCH_SIZE:
-                con.executemany(INSERT_SQL, batch)
-                con.commit()
-                batch.clear()
-
-        if batch:
-            con.executemany(INSERT_SQL, batch)
-            con.commit()
-
-        # Sanity Check
-        total_wallets = con.execute("SELECT COUNT(*) FROM wallet_state").fetchone()[0]
-        print(f"\n✅ Stream complete! Aggregated data for {con.fetchone()[0]:,} unique wallets.")
-        
-        # Cleanup memory
-        del first_markets
-
-        # 5. Fetch Results directly to DataFrame
-        print("Fetching aggregated results into Pandas...")
-        df = pd.read_sql_query("""
-            SELECT 
-                wallet_id, 
-                contract_id,
-                is_long, 
-                total_risk_vol AS risk_vol, 
-                total_tokens, 
-                weighted_price_sum, 
-                ts_date
-            FROM wallet_state 
-            WHERE total_tokens > 0
-        """, con)
-
-        con.close()
+        # We can safely use .df() here because the output is just one row per user!
+        df = con.execute(query).df()
 
         if len(df) < 100:
             print("❌ Not enough data for analysis.")
             return
 
-        df['outcome'] = df['contract_id'].map(outcomes_dict)
-        df.dropna(subset=['outcome'], inplace=True) 
+        print(f"✅ Stream complete! Aggregated data for {len(df):,} unique wallets.")
+
+        # --- 4. DATA PROCESSING IN PANDAS ---
+        print("📈 Running vector math and filtering...", flush=True)
 
         df['vwap'] = df['weighted_price_sum'] / df['total_tokens']
-        # Removed redundant astype(bool) as int works fine for vectorized math
         df['log_vol'] = np.log1p(df['risk_vol'])
 
         df['roi'] = np.where(
-            df['is_long'],
+            df['is_long'] == 1,
             (df['outcome'] - df['vwap']) / df['vwap'],
             (df['vwap'] - df['outcome']) / (1.0 - df['vwap'])
         )
 
         df['won_bet'] = np.where(
-            df['is_long'],
+            df['is_long'] == 1,
             df['outcome'] > 0.5,
             df['outcome'] < 0.5
         )
@@ -192,7 +159,7 @@ def main():
             print("❌ Not enough valid data left for analysis after filtering.")
             return
 
-        # 7. Analytics
+        # --- 5. ANALYTICS & REGRESSION ---
         print("\n📊 ACCUMULATED VOLUME BUCKET ANALYSIS")
         bins = [0, 10, 50, 100, 500, 1000, 5000, 10000, 100000, float('inf')]
         labels = ["$0-10", "$10-50", "$50-100", "$100-500", "$500-1k", "$1k-5k", "$5k-10k", "$10k-100k", "$100k+"]
@@ -214,7 +181,6 @@ def main():
         print("="*95)
 
         print("\n📉 RUNNING MULTIPLE OLS REGRESSION (365-DAY WINDOW)...")
-        # Fix: Calculate cutoff from current time, not max dataset time
         cutoff_date = pd.Timestamp.now(tz='UTC').tz_convert(None) - pd.Timedelta(days=365)
         df_recent = df[df['ts_date'] >= cutoff_date]
         
@@ -241,16 +207,13 @@ def main():
         else:
             print("❌ Not enough recent data for regression.")
 
+    except Exception as e:
+        print(f"💥 Fatal Error: {e}", flush=True)
+
     finally:
-        # Guarantee cleanup even if user hits Ctrl+C or script crashes
-        try:
-            if 'con' in locals():
-                con.close()
-        except: pass
-        
-        if os.path.exists(temp_db_path):
-            os.remove(temp_db_path)
-            print("\n🧹 Cleaned up temporary SQLite database.")
+        if con:
+            con.close()
+            print("🧹 Cleaned up DuckDB engine.", flush=True)
 
 if __name__ == "__main__":
     main()
