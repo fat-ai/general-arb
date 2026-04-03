@@ -40,7 +40,13 @@ def main():
         print("Spinning up DuckDB engine...", flush=True)
         con = duckdb.connect(database=':memory:')
         
-        # 🛠️ OPTIMIZATION 4: Prevent network calls on every run
+        # 🛠️ THE OOM FIX: Set a strict RAM ceiling and a disk spillover location
+        tmp_dir = CACHE_DIR / "duckdb_tmp"
+        os.makedirs(tmp_dir, exist_ok=True)
+        con.execute("PRAGMA memory_limit='8GB';")
+        con.execute(f"PRAGMA temp_directory='{tmp_dir}';")
+        
+        # Install/Load the SQLite extension
         con.execute("INSTALL sqlite;")
         con.execute("LOAD sqlite;")
 
