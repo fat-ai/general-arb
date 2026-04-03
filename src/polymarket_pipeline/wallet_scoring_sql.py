@@ -70,7 +70,9 @@ def main():
 
         df_outcomes = outcomes.select(["contract_id", "outcome", "resolution_timestamp"]).to_pandas()
         df_outcomes['contract_id'] = df_outcomes['contract_id'].astype(str).str.strip()
-        df_outcomes.to_sql("markets", con, if_exists="replace", index=False)
+        con.execute("DROP TABLE IF EXISTS markets")
+        con.execute("CREATE TABLE markets (contract_id TEXT, outcome REAL, resolution_timestamp INTEGER)")
+        df_outcomes.to_sql("markets", con, if_exists="append", index=False)
         
         # Create an index to make the final join lightning fast
         con.execute("CREATE INDEX idx_markets_contract ON markets(contract_id)")
@@ -97,10 +99,10 @@ def main():
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS qty_short,
                 SUM(CASE WHEN t.outcomeTokensAmount <= 0 THEN (1.0 - t.price) * ABS(t.outcomeTokensAmount) ELSE 0.0 END) AS cost_short,
                 COUNT(t.id) AS trade_count
-            -- 🛠️ THE FIX: Flip the order and use CROSS JOIN to force index usage
-            FROM markets m
-            CROSS JOIN source_db.trades t ON t.contract_id = m.contract_id
+            FROM source_db.trades t
             WHERE t.price >= 0.0 AND t.price <= 1.0
+              -- 🛠️ THE FIX: Force a Sequential Scan. The || '' stops SQLite from doing slow Random I/O
+              AND t.contract_id || '' IN (SELECT contract_id FROM markets)
             GROUP BY t.user, t.contract_id
         """
         
