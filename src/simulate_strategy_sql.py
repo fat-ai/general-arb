@@ -36,7 +36,6 @@ def setup_duckdb(db_path: Path, tmp_dir: Path, markets_path: Path):
     log.info("Spinning up DuckDB engine...")
     con = duckdb.connect(database=':memory:')
     
-    # [FIX 6] Use SET instead of PRAGMA for DuckDB native config
     con.execute("SET memory_limit='4GB';")
     con.execute("SET threads=2;") 
     con.execute(f"SET temp_directory='{tmp_dir}';")
@@ -47,11 +46,18 @@ def setup_duckdb(db_path: Path, tmp_dir: Path, markets_path: Path):
     log.info("🚀 Attaching Master SQLite DB...")
     con.execute(f"ATTACH '{db_path}' AS source_db (TYPE SQLITE);")
     
-    # [FIX 7] Load markets into an in-memory table ONCE to avoid daily disk I/O
+    # [OPTIMIZATION] Load all necessary market columns into DuckDB ONCE
     log.info("Loading Markets Parquet into DuckDB...")
     con.execute(f"""
         CREATE TABLE static_markets AS 
-        SELECT TRIM(CAST(contract_id AS VARCHAR)) AS contract_id, outcome, CAST(resolution_timestamp AS TIMESTAMP) AS resolution_timestamp
+        SELECT 
+            TRIM(CAST(contract_id AS VARCHAR)) AS contract_id, 
+            id, 
+            question, 
+            startDate,
+            CAST(resolution_timestamp AS TIMESTAMP) AS resolution_timestamp,
+            outcome, 
+            token_outcome_label
         FROM read_parquet('{markets_path}')
     """)
     
@@ -179,27 +185,25 @@ def main():
     print(f"Output file created successfully at {OUTPUT_PATH}")
     
     # 1. SETUP DUCKDB FIRST
-    # We move this up so we can use DuckDB to read the Parquet file memory-safely
     duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
     duck_tmp.mkdir(parents=True, exist_ok=True)
     con = setup_duckdb(TRADES_PATH, duck_tmp, MARKETS_PATH)
     precompute_first_trades(con)
     
-    # 2. LOAD MARKETS (Streaming Data Native via DuckDB)
-    log.info("Loading Market Metadata natively via DuckDB...")
+    # 2. LOAD MARKETS (From the purely in-memory DuckDB table)
+    log.info("Loading Market Metadata from in-memory cache...")
     
     market_map = {}
     result_map = {}
     
-    # Query the Parquet file directly from disk
-    query = f"""
+    # Query the already-loaded static_markets table, NOT the parquet file
+    query = """
         SELECT 
             contract_id, id, question, startDate, resolution_timestamp, outcome, token_outcome_label
-        FROM read_parquet('{MARKETS_PATH}')
+        FROM static_markets
     """
     cursor = con.execute(query)
     
-    # Stream the data in chunks to prevent memory spikes
     while True:
         rows = cursor.fetchmany(10000)
         if not rows:
@@ -228,7 +232,7 @@ def main():
     # Initialize Strategy Objects
     scorer = WalletScorer()
     engine = SignalEngine()
-
+    
     log.info("Fetching unique trading days for simulation...")
     trading_days = [row[0] for row in con.execute("SELECT DISTINCT CAST(timestamp AS DATE) as sim_day FROM source_db.trades WHERE price >= 0.0 AND price <= 1.0 ORDER BY sim_day ASC").fetchall() if row[0] is not None]
     
