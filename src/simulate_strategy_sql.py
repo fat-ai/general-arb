@@ -11,7 +11,7 @@ import gc
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter, defaultdict, deque
-
+import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
 
@@ -146,7 +146,7 @@ def main():
     current_sim_day = None
     simulation_start_date = None
     data_start_date = None
-    heartbeat = datetime.now()
+    heartbeat = None
     results_buffer = []
 
     log.info("🔥 Streaming chronologically...")
@@ -350,41 +350,53 @@ def main():
                         result_map['performance']['cash'] -= bet_size
                         log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
 
-            # Performance Heatbeat Logging
-            now_time = datetime.now()
-            if abs((heartbeat - now_time).total_seconds()) > 60 and len(result_map['resolutions']) > 0:
-                heartbeat = now_time
-                
-                result_map['performance']['resolutions'] = len(result_map['resolutions'])
-                for res in result_map['resolutions']:
-                    if res[0] <= ts:
-                        result_map['performance']['pnl'] += res[1]
-                        result_map['performance']['equity'] += res[1]
-                        result_map['performance']['cash'] += res[1] + res[2]
+            # ---------------------------------------------------------
+            # D. PERFORMANCE HEARTBEAT & SETTLEMENT (Deterministic Sim Time)
+            # ---------------------------------------------------------
+            if heartbeat is None:
+                heartbeat = ts
 
-                result_map['resolutions'] = [res for res in result_map['resolutions'] if res[0] > ts]
+            # Fire deterministically every 1 simulated hour (3600 seconds)
+            if abs((ts - heartbeat).total_seconds()) >= 3600:
+                heartbeat = ts
                 
-                if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
-                    result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                if len(result_map['resolutions']) > 0:
+                    result_map['performance']['resolutions'] = len(result_map['resolutions'])
                     
-                drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
-                if drawdown > result_map['performance']['max_drawdown'][0]:
-                    result_map['performance']['max_drawdown'][0] = drawdown
-                    
-                percent_drawdown = drawdown / result_map['performance']['peak_equity']
-                if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
-                    result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
-                    
-                calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001), 100000)
-                result_map['performance']['Calmar'] = round(calmar, 1)
+                    for res in result_map['resolutions']:
+                        # Settle payouts for simulated bets where the market end date has passed
+                        if res[0] <= ts:
+                            result_map['performance']['pnl'] += res[1]
+                            result_map['performance']['equity'] += res[1]
+                            result_map['performance']['cash'] += res[1] + res[2]
 
-                verdicts = (mr['verdict'] for mr in result_map.values() if "verdict" in mr)
-                counts = Counter(verdicts)
-                total_bets = counts['RIGHT!'] + counts['WRONG!']
-                
-                if total_bets > 0:
-                    hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
-                    log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
+                    # Keep only unresolved bets
+                    result_map['resolutions'] = [res for res in result_map['resolutions'] if res[0] > ts]
+                    
+                    # Calculate High-Water Mark and Drawdowns
+                    if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
+                        result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                        
+                    drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
+                    if drawdown > result_map['performance']['max_drawdown'][0]:
+                        result_map['performance']['max_drawdown'][0] = drawdown
+                        
+                    percent_drawdown = drawdown / result_map['performance']['peak_equity']
+                    if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
+                        result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
+                        
+                    calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001), 100000)
+                    result_map['performance']['Calmar'] = round(calmar, 1)
+
+                    # Tally Hit Rate
+                    verdicts = (mr['verdict'] for mr in result_map.values() if "verdict" in mr)
+                    counts = Counter(verdicts)
+                    total_bets = counts['RIGHT!'] + counts['WRONG!']
+                    
+                    if total_bets > 0:
+                        hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
+                        # Optional: You can comment out this log.info if logging every simulated hour is too noisy
+                        log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
 
             results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
             
