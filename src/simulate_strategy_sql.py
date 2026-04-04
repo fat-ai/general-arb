@@ -286,10 +286,20 @@ def main():
                     min_irr = 5.0
                     slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
                     
-                    execution_price = t['price'] * (1 + slippage) if (result_map[mid]['outcome'] > 0 and bet_on == "yes") or (result_map[mid]['outcome'] <= 0 and bet_on == "no") else t['price'] * (1 - slippage)
-                    profit = (1 - execution_price) if (result_map[mid]['outcome'] > 0 and bet_on == "yes") or (result_map[mid]['outcome'] <= 0 and bet_on == "no") else execution_price
-                    contracts = bet_size / execution_price if (result_map[mid]['outcome'] > 0 and bet_on == "yes") or (result_map[mid]['outcome'] <= 0 and bet_on == "no") else bet_size / (1 - execution_price)
+                    is_winning_side = (
+                        (result_map[mid]['outcome'] > 0 and bet_on == "yes") or 
+                        (result_map[mid]['outcome'] <= 0 and bet_on == "no")
+                    )
 
+                    if is_winning_side:
+                        execution_price = t['price'] * (1 + slippage)
+                        profit = 1 - execution_price
+                        contracts = bet_size / execution_price
+                    else:
+                        execution_price = t['price'] * (1 - slippage)
+                        profit = execution_price
+                        contracts = bet_size / (1 - execution_price)
+                        
                     profit = profit * contracts
                     roi = profit / bet_size
                     duration = m_end - ts
