@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import math
 from collections import Counter
+import polars as pl
 
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
@@ -29,7 +30,7 @@ TRADES_PATH = CACHE_DIR / "gamma_trades.db"
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 OUTPUT_PATH = SIGNAL_FILE
 
-def setup_duckdb(db_path: Path, tmp_dir: Path, markets_path: Path):
+def setup_duckdb(db_path: Path, tmp_dir: Path, markets_pl):
     """
     Initializes a memory-safe DuckDB connection.
     """
@@ -46,20 +47,21 @@ def setup_duckdb(db_path: Path, tmp_dir: Path, markets_path: Path):
     log.info("🚀 Attaching Master SQLite DB...")
     con.execute(f"ATTACH '{db_path}' AS source_db (TYPE SQLITE);")
     
-    # [OPTIMIZATION] Load all necessary market columns into DuckDB ONCE
-    log.info("Loading Markets Parquet into DuckDB...")
-    con.execute(f"""
+    # Register the highly-optimized Polars DataFrame directly to DuckDB via PyArrow
+    log.info("Registering optimized Markets data into DuckDB...")
+    con.register("markets_arrow", markets_pl.to_arrow())
+    
+    con.execute("""
         CREATE TABLE static_markets AS 
         SELECT 
-            TRIM(CAST(contract_id AS VARCHAR)) AS contract_id, 
-            id, 
-            question, 
-            startDate,
-            CAST(resolution_timestamp AS TIMESTAMP) AS resolution_timestamp,
+            contract_id, 
             outcome, 
-            token_outcome_label
-        FROM read_parquet('{markets_path}')
+            CAST(resolution_timestamp AS TIMESTAMP) AS resolution_timestamp
+        FROM markets_arrow
     """)
+    
+    con.unregister("markets_arrow")
+    log.info("✅ Static markets table materialized and Arrow view unregistered.")
     
     return con
 
@@ -184,50 +186,61 @@ def main():
         writer.writerow(headers)
     print(f"Output file created successfully at {OUTPUT_PATH}")
     
-    # 1. SETUP DUCKDB FIRST
-    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
-    duck_tmp.mkdir(parents=True, exist_ok=True)
-    con = setup_duckdb(TRADES_PATH, duck_tmp, MARKETS_PATH)
-    precompute_first_trades(con)
-    
-    # 2. LOAD MARKETS (From the purely in-memory DuckDB table)
-    log.info("Loading Market Metadata from in-memory cache...")
+    # 1. LOAD MARKETS USING ORIGINAL POLARS LOGIC (Extremely Memory Efficient)
+    log.info("Loading Market Metadata via Polars...")
+    markets_pl = pl.read_parquet(MARKETS_PATH).select([
+        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+        pl.col('id'),
+        pl.col('question'),
+        pl.col("startDate").cast(pl.String).alias("start_date"),
+        pl.col("resolution_timestamp"),
+        pl.col('outcome').cast(pl.Float32),
+        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
+    ])
     
     market_map = {}
     result_map = {}
     
-    # Query the already-loaded static_markets table, NOT the parquet file
-    query = """
-        SELECT 
-            contract_id, id, question, startDate, resolution_timestamp, outcome, token_outcome_label
-        FROM static_markets
-    """
-    cursor = con.execute(query)
-    
-    while True:
-        rows = cursor.fetchmany(10000)
-        if not rows:
-            break
-            
-        for row in rows:
-            c_id_raw, m_id, question, s_date_raw, e_date_raw, outcome, token_label = row
-            
-            cid = str(c_id_raw).strip().lower().replace("0x", "") if c_id_raw else ""
-            s_date = pd.to_datetime(s_date_raw, utc=True).tz_localize(None) if s_date_raw is not None else None
-            e_date = pd.to_datetime(e_date_raw, utc=True).tz_localize(None) if e_date_raw is not None else None
+    for market in markets_pl.iter_rows(named=True):
+        cid = market['contract_id']
+        s_date = market['start_date']
+        
+        if isinstance(s_date, str):
+            try: s_date = pd.to_datetime(s_date, utc=True)
+            except: s_date = None
                 
-            market_map[cid] = {
-                'id': m_id, 'question': question, 'start': s_date, 'end': e_date,
-                'outcome': outcome, 'outcome_label': str(token_label).strip().lower() if token_label else "", 'volume': 0,
-            }
-            if m_id not in result_map:
-                result_map[m_id] = {'question': question, 'start': s_date, 'end': e_date, 'outcome': outcome}
+        if s_date is not None and s_date.tzinfo is not None:
+            s_date = s_date.replace(tzinfo=None)
+            
+        e_date = market['resolution_timestamp']
+        if e_date is not None and e_date.tzinfo is not None:
+            e_date = e_date.replace(tzinfo=None)
+            
+        market_map[cid] = {
+            'id': market['id'], 'question': market['question'], 'start': s_date, 'end': e_date,
+            'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 'volume': 0,
+        }
+
+        if market['id'] not in result_map:
+            result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
 
     result_map['performance'] = { 
         'equity': CONFIG["initial_capital"], 'cash': CONFIG["initial_capital"], 
         'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0
     }
     result_map['resolutions'] = []
+
+    # 2. SETUP DUCKDB FIRST
+    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
+    duck_tmp.mkdir(parents=True, exist_ok=True)
+    
+    # Pass the Polars DataFrame to DuckDB setup
+    con = setup_duckdb(TRADES_PATH, duck_tmp, markets_pl)
+    precompute_first_trades(con)
+
+    del markets_pl
+    gc.collect()
+    log.info("🧹 Memory cleaned up. Starting strategy initialization...")
 
     # Initialize Strategy Objects
     scorer = WalletScorer()
