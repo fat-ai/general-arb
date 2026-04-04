@@ -51,72 +51,50 @@ def main():
         print("🚀 Attaching Master SQLite DB...", flush=True)
         con.execute(f"ATTACH '{source_db_path}' AS source_db (TYPE SQLITE);")
 
-        # --- 3. THE GOD QUERY (WINDOW FUNCTIONS REPLACING PYTHON) ---
-        print("\n📊 Executing parallel aggregation and first-trade isolation...", flush=True)
+        # --- 3. THE TWO-PASS STRATEGY (NO DISK SPILL) ---
+        # PASS 1: Find the first trade for every user and save it as a tiny temp table
+        print("\n🛠️ PASS 1: Scanning for first trades...", flush=True)
+        con.execute("""
+            CREATE TEMP TABLE first_trades AS
+            SELECT 
+                user AS wallet_id,
+                arg_min(LOWER(TRIM(REPLACE(contract_id, '0x', ''))), timestamp) AS target_contract,
+                arg_min((outcomeTokensAmount > 0), timestamp) AS target_is_long
+            FROM source_db.trades
+            WHERE price >= 0.0 AND price <= 1.0
+            GROUP BY user;
+        """)
         
+        # PASS 2: Stream the DB again, joining only against the tiny first_trades table
+        print("📊 PASS 2: Aggregating target trades...", flush=True)
         query = f"""
-        WITH CleanTrades AS (
             SELECT 
-                t.user AS wallet_id,
-                LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) AS contract_id,
-                ABS(t.outcomeTokensAmount) AS abs_tokens,
-                (t.outcomeTokensAmount > 0) AS is_long,
-                GREATEST(1e-6, LEAST(1.0 - 1e-6, t.price)) AS safe_price,
-                t.tradeAmount,
-                t.timestamp
+                t.user AS wallet_id, 
+                f.target_contract AS contract_id, 
+                CAST(f.target_is_long AS INTEGER) AS is_long,
+                SUM(
+                    CASE WHEN f.target_is_long THEN t.tradeAmount 
+                    ELSE ABS(t.outcomeTokensAmount) * (1.0 - GREATEST(1e-6, LEAST(1.0 - 1e-6, t.price))) END
+                ) AS risk_vol, 
+                SUM(ABS(t.outcomeTokensAmount)) AS total_tokens, 
+                SUM(GREATEST(1e-6, LEAST(1.0 - 1e-6, t.price)) * ABS(t.outcomeTokensAmount)) AS weighted_price_sum, 
+                MIN(t.timestamp) AS ts_date,
+                MAX(m.outcome) AS outcome
             FROM source_db.trades t
-            WHERE t.price >= 0.0 AND t.price <= 1.0
-        ),
-        MarketJoined AS (
-            SELECT 
-                c.*,
-                m.outcome
-            FROM CleanTrades c
+            INNER JOIN first_trades f 
+                ON t.user = f.wallet_id 
+                AND LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = f.target_contract 
+                AND (t.outcomeTokensAmount > 0) = f.target_is_long
             INNER JOIN (
                 SELECT LOWER(TRIM(CAST(contract_id AS VARCHAR))) AS contract_id, outcome
                 FROM read_parquet('{outcomes_path}')
-            ) m ON c.contract_id = m.contract_id
-        ),
-        FirstTrades AS (
-            -- 🛠️ THE FIX: arg_min finds the first trade instantly WITHOUT sorting data in RAM
-            SELECT 
-                wallet_id,
-                arg_min(contract_id, timestamp) AS target_contract,
-                arg_min(is_long, timestamp) AS target_is_long
-            FROM MarketJoined
-            GROUP BY wallet_id
-        ),
-        TargetTrades AS (
-            SELECT 
-                m.wallet_id,
-                m.contract_id,
-                m.is_long,
-                m.abs_tokens,
-                m.outcome,
-                m.timestamp,
-                (CASE WHEN m.is_long THEN m.tradeAmount ELSE m.abs_tokens * (1.0 - m.safe_price) END) AS risk_vol,
-                (m.safe_price * m.abs_tokens) AS weighted_price
-            FROM MarketJoined m
-            INNER JOIN FirstTrades f 
-                ON m.wallet_id = f.wallet_id 
-                AND m.contract_id = f.target_contract 
-                AND m.is_long = f.target_is_long
-        )
-        SELECT 
-            wallet_id, 
-            contract_id, 
-            CAST(is_long AS INTEGER) AS is_long,
-            SUM(risk_vol) AS risk_vol, 
-            SUM(abs_tokens) AS total_tokens, 
-            SUM(weighted_price) AS weighted_price_sum, 
-            MIN(timestamp) AS ts_date,
-            MAX(outcome) AS outcome
-        FROM TargetTrades
-        GROUP BY wallet_id, contract_id, is_long
-        HAVING SUM(abs_tokens) > 0;
+            ) m ON f.target_contract = m.contract_id
+            WHERE t.price >= 0.0 AND t.price <= 1.0
+            GROUP BY t.user, f.target_contract, f.target_is_long
+            HAVING SUM(ABS(t.outcomeTokensAmount)) > 0;
         """
-        
-        # We can safely use .df() here because the output is just one row per user!
+
+        # Execute Pass 2 and pull the final results directly into Pandas
         df = con.execute(query).df()
 
         if len(df) < 100:
