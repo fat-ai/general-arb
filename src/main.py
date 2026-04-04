@@ -22,6 +22,22 @@ from ws_handler import PolymarketWS
 # Setup Logging
 log, _ = setup_logging()
 
+def _chunked(lst, size):
+    """Split a list into chunks of a given size."""
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def _safe_json_load(x):
+    """Safely parse a JSON string; returns the original value if already parsed."""
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return x
+
+
 class LiveTrader:
     def __init__(self):
         self.persistence = PersistenceManager()
@@ -485,29 +501,17 @@ class LiveTrader:
     
     
     
+    async def _ensure_session(self):
+        """Creates a shared aiohttp session if one doesn't exist or has been closed."""
+        if not hasattr(self, "http_session") or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+
     async def _resolution_monitor_loop(self):
         """Production-grade resolution monitor with batching, retries, and idempotency."""
         log.info("⚖️ Resolution Monitor Started (Production Mode)")
         
-        def _safe_json_load(x):
-            if isinstance(x, str):
-                try:
-                    return json.loads(x)
-                except Exception:
-                    return None
-            return x
-    
-    
-        def _chunked(lst, size):
-            for i in range(0, len(lst), size):
-                yield lst[i:i + size]
-    
-        async def _ensure_session():
-            if not hasattr(self, "http_session") or self.http_session.closed:
-                self.http_session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=5)
-                )
-    
         while self.running:
             try:
                 positions = self.persistence.state.get("positions", {})
@@ -525,7 +529,7 @@ class LiveTrader:
                     await asyncio.sleep(60)
                     continue
     
-                await _ensure_session()
+                await self._ensure_session()
                 redeemed_any = False
     
                 for batch in _chunked(list(market_map.keys()), 5):
@@ -1113,6 +1117,11 @@ class LiveTrader:
             drawdown = 0.0
             if high_water > 0:
                 drawdown = (high_water - equity) / high_water
+
+            # Persist max drawdown to state so it survives restarts and appears in reports
+            prev_max_dd = self.persistence.state.get("max_drawdown", 0.0)
+            if drawdown > prev_max_dd:
+                self.persistence.state["max_drawdown"] = drawdown
 
             try:
                 with open(EQUITY_FILE, "a", newline="") as f:
