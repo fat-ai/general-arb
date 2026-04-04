@@ -59,8 +59,8 @@ def main():
         #   Python/pandas heap     : ~1-2 GB (chunked fetch)
         #   OS + Docker overhead   : ~1 GB
         #   Safety headroom        : ~3 GB
-        con.execute("SET memory_limit='2GB';")
-        con.execute("SET threads=1;")
+        con.execute("SET memory_limit='4GB';")
+        con.execute("SET threads=2;")
         con.execute(f"SET temp_directory='{tmp_dir}';")
         con.execute("SET preserve_insertion_order=false;")
 
