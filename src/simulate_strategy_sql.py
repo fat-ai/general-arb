@@ -123,9 +123,10 @@ def main():
     log.info("🚀 Attaching Master SQLite DB...")
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
 
-    log.info("Executing Single-Pass Chronological Sort (This may take a few minutes as DuckDB sorts the file once)...")
+    log.info("Executing Instant Single-Pass Stream (Relying on physical SQLite insertion order)...")
     
-    # Native DuckDB datetime casting makes Python loop faster
+    # By removing the ORDER BY, we bypass DuckDB's sorting engine entirely. 
+    # The rows will begin streaming into Python instantly.
     query = """
         SELECT 
             LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
@@ -136,8 +137,8 @@ def main():
             CAST(timestamp AS TIMESTAMP) AS ts
         FROM source_db.trades 
         WHERE price >= 0.0 AND price <= 1.0
-        ORDER BY timestamp ASC
     """
+    
     cursor = con.execute(query)
 
     # ==========================================
