@@ -108,25 +108,16 @@ def main():
     engine = SignalEngine()
 
     # ==========================================
-    # 3. DUCKDB SINGLE-PASS STREAM SETUP
+    # 3. SQLITE NATIVE SINGLE-PASS STREAM SETUP
     # ==========================================
-    log.info("Spinning up DuckDB engine...")
-    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
-    duck_tmp.mkdir(parents=True, exist_ok=True)
-    
-    con = duckdb.connect(database=':memory:')
-    con.execute("SET memory_limit='4GB';")
-    con.execute("SET threads=2;") 
-    con.execute(f"SET temp_directory='{duck_tmp}';")
-    
-    con.execute("INSTALL sqlite; LOAD sqlite;")
-    log.info("🚀 Attaching Master SQLite DB...")
-    con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
+    log.info("Connecting natively to SQLite to leverage the idx_timestamp B-Tree...")
+    con = sqlite3.connect(TRADES_PATH)
+    cursor = con.cursor()
 
-    log.info("Executing Instant Single-Pass Stream (Relying on physical SQLite insertion order)...")
+    log.info("Executing Native Indexed Stream (This will start instantly)...")
     
-    # By removing the ORDER BY, we bypass DuckDB's sorting engine entirely. 
-    # The rows will begin streaming into Python instantly.
+    # Using native SQLite. It will automatically use 'idx_timestamp' 
+    # to stream the rows sequentially without a memory sort.
     query = """
         SELECT 
             LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
@@ -134,12 +125,12 @@ def main():
             tradeAmount, 
             outcomeTokensAmount, 
             price, 
-            CAST(timestamp AS TIMESTAMP) AS ts
-        FROM source_db.trades 
+            timestamp
+        FROM trades 
         WHERE price >= 0.0 AND price <= 1.0
+        ORDER BY timestamp ASC
     """
-    
-    cursor = con.execute(query)
+    cursor.execute(query)
 
     # ==========================================
     # 4. CHRONOLOGICAL SIMULATION LOOP
@@ -158,9 +149,10 @@ def main():
             break
             
         for row in rows:
-            cid, user, amount, tokens, price, ts = row
+            cid, user, amount, tokens, price, ts_raw = row
             
-            if ts is None: continue
+            if ts_raw is None: continue
+            ts = pd.to_datetime(ts_raw)
             trade_date = ts.date()
             
             # Initialization of Warmup Anchor
