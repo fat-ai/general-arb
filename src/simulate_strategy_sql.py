@@ -178,35 +178,54 @@ def main():
         writer.writerow(headers)
     print(f"Output file created successfully at {OUTPUT_PATH}")
     
-    log.info("Loading Market Metadata...")
-    markets_df = pd.read_parquet(MARKETS_PATH)
+    # 1. SETUP DUCKDB FIRST
+    # We move this up so we can use DuckDB to read the Parquet file memory-safely
+    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
+    duck_tmp.mkdir(parents=True, exist_ok=True)
+    con = setup_duckdb(TRADES_PATH, duck_tmp, MARKETS_PATH)
+    precompute_first_trades(con)
+    
+    # 2. LOAD MARKETS (Streaming Data Native via DuckDB)
+    log.info("Loading Market Metadata natively via DuckDB...")
     
     market_map = {}
     result_map = {}
     
-    for _, market in markets_df.iterrows():
-        cid = str(market['contract_id']).strip().lower().replace("0x", "")
-        s_date = pd.to_datetime(market['startDate'], utc=True).tz_localize(None) if pd.notnull(market['startDate']) else None
-        e_date = pd.to_datetime(market['resolution_timestamp'], utc=True).tz_localize(None) if pd.notnull(market['resolution_timestamp']) else None
+    # Query the Parquet file directly from disk
+    query = f"""
+        SELECT 
+            contract_id, id, question, startDate, resolution_timestamp, outcome, token_outcome_label
+        FROM read_parquet('{MARKETS_PATH}')
+    """
+    cursor = con.execute(query)
+    
+    # Stream the data in chunks to prevent memory spikes
+    while True:
+        rows = cursor.fetchmany(10000)
+        if not rows:
+            break
             
-        market_map[cid] = {
-            'id': market['id'], 'question': market['question'], 'start': s_date, 'end': e_date,
-            'outcome': market['outcome'], 'outcome_label': str(market['token_outcome_label']).strip().lower(), 'volume': 0,
-        }
-        if market['id'] not in result_map:
-            result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
+        for row in rows:
+            c_id_raw, m_id, question, s_date_raw, e_date_raw, outcome, token_label = row
+            
+            cid = str(c_id_raw).strip().lower().replace("0x", "") if c_id_raw else ""
+            s_date = pd.to_datetime(s_date_raw, utc=True).tz_localize(None) if s_date_raw is not None else None
+            e_date = pd.to_datetime(e_date_raw, utc=True).tz_localize(None) if e_date_raw is not None else None
+                
+            market_map[cid] = {
+                'id': m_id, 'question': question, 'start': s_date, 'end': e_date,
+                'outcome': outcome, 'outcome_label': str(token_label).strip().lower() if token_label else "", 'volume': 0,
+            }
+            if m_id not in result_map:
+                result_map[m_id] = {'question': question, 'start': s_date, 'end': e_date, 'outcome': outcome}
 
     result_map['performance'] = { 
         'equity': CONFIG["initial_capital"], 'cash': CONFIG["initial_capital"], 
         'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0
     }
     result_map['resolutions'] = []
-    
-    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
-    duck_tmp.mkdir(parents=True, exist_ok=True)
-    con = setup_duckdb(TRADES_PATH, duck_tmp, MARKETS_PATH)
-    precompute_first_trades(con)
 
+    # Initialize Strategy Objects
     scorer = WalletScorer()
     engine = SignalEngine()
 
