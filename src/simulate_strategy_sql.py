@@ -190,9 +190,9 @@ def main():
     log.info("Loading Market Metadata via Polars...")
     markets_pl = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-        pl.col('id'),
+        pl.col('market_id').alias('id'),
         pl.col('question'),
-        pl.col("startDate").cast(pl.String).alias("start_date"),
+        pl.col('start_date').cast(pl.String),
         pl.col("resolution_timestamp"),
         pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
