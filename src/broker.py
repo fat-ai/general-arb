@@ -24,7 +24,8 @@ class PersistenceManager:
             "cash": CONFIG['initial_capital'],
             "positions": {},  # Format: {token_id: {qty, avg_price, market_fpmm, opened_at, market_end}}
             "start_time": time.time(),
-            "highest_equity": CONFIG['initial_capital']
+            "highest_equity": CONFIG['initial_capital'],
+            "max_drawdown": 0.0
         }
         self._executor = ThreadPoolExecutor(max_workers=1)
         self.load()
@@ -247,6 +248,7 @@ class PaperBroker:
                 state["cash"] += proceeds
                 pos = state["positions"][token_id]
                 pnl = proceeds - (filled_qty * pos["avg_price"])
+                realized_pnl = pnl  # Capture for audit record
                 del state["positions"][token_id]
                 
                 log.info(f"🔴 SELL {filled_qty:.2f} {token_id} @ {vwap_price:.3f} | PnL: ${pnl:.2f}")
