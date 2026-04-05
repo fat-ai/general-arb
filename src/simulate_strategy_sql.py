@@ -111,7 +111,7 @@ def main():
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
     # ==========================================
-    log.info("Spinning up DuckDB to perform an optimized bulk-sort (Bypassing SQLite's Random I/O bottleneck)...")
+    log.info("Spinning up DuckDB")
     duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
     duck_tmp.mkdir(parents=True, exist_ok=True)
     
