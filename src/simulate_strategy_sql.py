@@ -137,6 +137,7 @@ def main():
             CAST(timestamp AS TIMESTAMP) AS ts
         FROM source_db.trades 
         WHERE price >= 0.0 AND price <= 1.0
+        ORDER BY timestamp ASC
     """
     cursor = con.execute(query)
 
