@@ -47,6 +47,7 @@ HTML_TEMPLATE = """
         <thead>
             <tr>
                 <th>Market</th>
+                <th>Question</th>
                 <th>Side</th>
                 <th>Qty</th>
                 <th>Entry</th>
@@ -82,6 +83,7 @@ HTML_TEMPLATE = """
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td><b>${pos.market}</b></td>
+                <td style="font-size:0.75em;color:#aaa">${pos.question}</td>
                 <td>${pos.side}</td>
                 <td>${pos.qty}</td>
                 <td>$${pos.entry}</td>
@@ -173,7 +175,8 @@ def generate_html_report(state, live_prices, metadata):
             end_ts = pos.get('market_end', 0)
             
             pos_data[tid] = {
-                "market": fpmm[:15],
+                "market": fpmm,
+                "question": market_obj.get('question', '')
                 "side": side_label,
                 "qty": round(qty, 1),
                 "entry": round(entry, 3),
