@@ -162,7 +162,6 @@ def main():
             
             if ts is None: continue
             
-            # ts is ALREADY a native datetime object! No parsing needed!
             trade_date = ts.date()
             
             # Initialization of Warmup Anchor
