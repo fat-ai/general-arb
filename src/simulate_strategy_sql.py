@@ -168,10 +168,13 @@ def main():
             # Initialization of Warmup Anchor
             if data_start_date is None:
                 data_start_date = trade_date
-
+                simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
+                log.info(f"🔥 Warm-up Anchor Set: {data_start_date} -> Start Trading: {simulation_start_date.date()}")
+            
             # ---------------------------------------------------------
             # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
             # ---------------------------------------------------------
+
             if current_sim_day is None:
                 current_sim_day = trade_date
                 
