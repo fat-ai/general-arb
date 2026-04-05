@@ -123,7 +123,7 @@ def main():
     con.execute("INSTALL sqlite; LOAD sqlite;")
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
 
-    log.info("⏳ DuckDB is now bulk-sorting 300GB of data. This WILL take 30-45 minutes upfront, but it prevents 15+ hours of thrashing!")
+    log.info("⏳ DuckDB is now bulk-sorting ... Please wait")
     
     # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
     # saving Python from doing it a billion times!
