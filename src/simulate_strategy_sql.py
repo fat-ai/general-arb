@@ -123,7 +123,7 @@ def main():
     con.execute("INSTALL sqlite; LOAD sqlite;")
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
 
-    log.info("⏳ DuckDB is now bulk-sorting ... Please wait")
+    log.info("⏳ DuckDB is now working ... Please wait")
     
     # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
     # saving Python from doing it a billion times!
@@ -137,7 +137,6 @@ def main():
             CAST(timestamp AS TIMESTAMP) AS ts
         FROM source_db.trades 
         WHERE price >= 0.0 AND price <= 1.0
-        ORDER BY timestamp ASC
     """
     cursor = con.execute(query)
 
