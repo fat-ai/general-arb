@@ -254,7 +254,9 @@ def generate_institutional_report():
         downside_std = neg_ret.std()
         sortino = (returns.mean() / downside_std) * np.sqrt(8760) if downside_std > 0 else 0.0
         
-        max_dd = df_eq['drawdown'].min() 
+        rolling_max = df_eq['equity'].cummax()
+        drawdown_series = (df_eq['equity'] - rolling_max) / rolling_max
+        max_dd = drawdown_series.min()
 
         # --- 4. CALCULATE EXECUTION METRICS (Event Series) ---
         win_rate, profit_factor, expectancy = 0.0, 0.0, 0.0
