@@ -109,16 +109,24 @@ def main():
     engine = SignalEngine()
 
     # ==========================================
-    # 3. SQLITE NATIVE SINGLE-PASS STREAM SETUP
+    # 3. DUCKDB BULK-SORT STREAM SETUP
     # ==========================================
-    log.info("Connecting natively to SQLite to leverage the idx_timestamp B-Tree...")
-    con = sqlite3.connect(TRADES_PATH)
-    cursor = con.cursor()
-
-    log.info("Executing Native Indexed Stream (This will start instantly)...")
+    log.info("Spinning up DuckDB to perform an optimized bulk-sort (Bypassing SQLite's Random I/O bottleneck)...")
+    duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
+    duck_tmp.mkdir(parents=True, exist_ok=True)
     
-    # Using native SQLite. It will automatically use 'idx_timestamp' 
-    # to stream the rows sequentially without a memory sort.
+    con = duckdb.connect(database=':memory:')
+    con.execute("SET memory_limit='4GB';")
+    con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
+    con.execute(f"SET temp_directory='{duck_tmp}';")
+    
+    con.execute("INSTALL sqlite; LOAD sqlite;")
+    con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
+
+    log.info("⏳ DuckDB is now bulk-sorting 300GB of data. This WILL take 30-45 minutes upfront, but it prevents 15+ hours of thrashing!")
+    
+    # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
+    # saving Python from doing it a billion times!
     query = """
         SELECT 
             LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
@@ -126,12 +134,12 @@ def main():
             tradeAmount, 
             outcomeTokensAmount, 
             price, 
-            timestamp
-        FROM trades 
+            CAST(timestamp AS TIMESTAMP) AS ts
+        FROM source_db.trades 
         WHERE price >= 0.0 AND price <= 1.0
         ORDER BY timestamp ASC
     """
-    cursor.execute(query)
+    cursor = con.execute(query)
 
     # ==========================================
     # 4. CHRONOLOGICAL SIMULATION LOOP
@@ -142,7 +150,7 @@ def main():
     heartbeat = None
     results_buffer = []
 
-    log.info("🔥 Streaming chronologically...")
+    log.info("🔥 Streaming perfectly sorted native objects...")
 
     while True:
         rows = cursor.fetchmany(50000)
@@ -150,17 +158,16 @@ def main():
             break
             
         for row in rows:
-            cid, user, amount, tokens, price, ts_raw = row
+            cid, user, amount, tokens, price, ts = row
             
-            if ts_raw is None: continue
-            ts = pd.to_datetime(ts_raw)
+            if ts is None: continue
+            
+            # ts is ALREADY a native datetime object! No parsing needed!
             trade_date = ts.date()
             
             # Initialization of Warmup Anchor
             if data_start_date is None:
                 data_start_date = trade_date
-                simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
-                log.info(f"🔥 Warm-up Anchor Set: {data_start_date} -> Start Trading: {simulation_start_date.date()}")
 
             # ---------------------------------------------------------
             # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
