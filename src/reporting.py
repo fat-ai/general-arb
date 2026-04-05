@@ -176,7 +176,7 @@ def generate_html_report(state, live_prices, metadata):
             
             pos_data[tid] = {
                 "market": fpmm,
-                "question": market_obj.get('question', '')
+                "question": market_obj.get('question', ''),
                 "side": side_label,
                 "qty": round(qty, 1),
                 "entry": round(entry, 3),
