@@ -118,7 +118,9 @@ def main():
     # Fresh wallet tracking
     known_users = set()
     first_bets_pending = defaultdict(dict) # Dict[cid] -> Dict[user] -> {log_vol, vwap, is_long}
-    calibration_buffer = deque() # Stores {date, log_vol, vwap, roi}
+    calib_dates = deque()
+    calib_X = deque() 
+    calib_y = deque()
     
     scorer = WalletScorer()
     engine = SignalEngine()
@@ -244,21 +246,29 @@ def main():
                             for u, bet in first_bets.items():
                                 vwap = bet['vwap']
                                 roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
-                                calibration_buffer.append({'date': end_date, 'vol': bet['log_vol'], 'vwap': vwap, 'roi': roi})
+                                
+                                # Append to parallel deques to avoid dictionary memory bloat
+                                calib_dates.append(end_date)
+                                calib_X.append([bet['log_vol'], vwap])
+                                calib_y.append(roi)
     
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
                     
-                    # Prune old records from deque
-                    while calibration_buffer and calibration_buffer[0]['date'] < cutoff_date:
-                        calibration_buffer.popleft()
+                    # Prune old records from all parallel deques simultaneously
+                    while calib_dates and calib_dates[0] < cutoff_date:
+                        calib_dates.popleft()
+                        calib_X.popleft()
+                        calib_y.popleft()
                         
-                    if len(calibration_buffer) >= 50:
-                        y_recent = [d['roi'] for d in calibration_buffer]
-                        X_features = [[d['vol'], d['vwap']] for d in calibration_buffer]
+                    if len(calib_dates) >= 50:
+                        # Convert flat deques directly to arrays for fast processing
+                        y_recent = np.array(calib_y)
+                        X_features = np.array(calib_X)
                         X_recent = sm.add_constant(X_features)
                         
                         try:
+                            # Run the full regression on 100% of the active data
                             model = sm.OLS(y_recent, X_recent).fit()
                             scorer.intercept = model.params[0]
                             scorer.slope_vol = model.params[1]
