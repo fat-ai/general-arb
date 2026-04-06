@@ -366,7 +366,7 @@ def main():
                 sig = sig / cum_vol
     
                 if abs(sig) > 1 and 0.05 < price < 0.95:
-                    if 'verdict' not in result_map[m['id']] and m['end'] is not None and m['end'] < datetime.now():
+                    if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
                         score = scorer.get_score(user, amount, price)
                         mid = m['id']
                         
@@ -400,7 +400,7 @@ def main():
                         
                         if result_map['performance']['cash'] < bet_size:  
                             result_map['performance']['ins_cash'] += 1
-                            
+   
                         if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:
                             if verdict == "WRONG!":
                                 roi = -1.00
@@ -411,7 +411,8 @@ def main():
 
                             result_map['resolutions'].append([m['end'], profit, bet_size])
                             result_map['performance']['cash'] -= bet_size
-
+                            result_map[mid]['traded'] = True
+                            
                             executions_buffer.append([
                                 ts, mid, verdict, bet_on, direction, price, slippage, 
                                 bet_size, profit, roi, duration.days, score, 
