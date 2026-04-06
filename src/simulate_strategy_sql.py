@@ -126,7 +126,7 @@ def main():
     log.info("⏳ DuckDB is now working ... Please wait")
     
     # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
-    # saving Python from doing it a billion times!
+
     query = """
         SELECT 
             LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
@@ -135,8 +135,7 @@ def main():
             outcomeTokensAmount, 
             price, 
             CAST(timestamp AS TIMESTAMP) AS ts
-        FROM source_db.trades 
-        WHERE price >= 0.0 AND price <= 1.0
+        FROM source_db.trades
         ORDER BY timestamp ASC
     """
     cursor = con.execute(query)
