@@ -16,6 +16,7 @@ from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
 import sqlite3
 import shutil
+from dataclasses import dataclass
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,6 +31,21 @@ log = logging.getLogger("Sim")
 TRADES_PATH = CACHE_DIR / "gamma_trades.db" 
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 OUTPUT_PATH = SIGNAL_FILE
+
+@dataclass(slots=True)
+class PositionMetrics:
+    qty_long: float = 0.0
+    cost_long: float = 0.0
+    qty_short: float = 0.0
+    cost_short: float = 0.0
+
+@dataclass(slots=True)
+class UserMetrics:
+    invested: float = 0.0
+    pnl: float = 0.0
+    peak: float = 0.0
+    max_dd: float = 0.0
+    trades: int = 0
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -96,10 +112,8 @@ def main():
     # 2. STATE MACHINE INITIALIZATION
     # ==========================================
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
-    contract_positions = defaultdict(lambda: defaultdict(lambda: {'qty_long': 0.0, 'cost_long': 0.0, 'qty_short': 0.0, 'cost_short': 0.0}))
-    
-    # user_history: Dict[user] -> cumulative metrics
-    user_history = defaultdict(lambda: {'invested': 0.0, 'pnl': 0.0, 'peak': 0.0, 'max_dd': 0.0, 'trades': 0})
+    contract_positions = defaultdict(lambda: defaultdict(PositionMetrics))
+    user_history = defaultdict(UserMetrics)
     
     # Fresh wallet tracking
     known_users = set()
@@ -206,22 +220,23 @@ def main():
                             users_in_market = contract_positions.pop(r_cid)
                             
                             for u, pos in users_in_market.items():
-                                payout = (pos['qty_long'] * outcome) + (pos['qty_short'] * (1.0 - outcome))
-                                invested = pos['cost_long'] + pos['cost_short']
+                                payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
+                                invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
                                 
                                 hist = user_history[u]
-                                hist['invested'] += invested
-                                hist['pnl'] += pnl
-                                hist['trades'] += 1
-                                hist['peak'] = max(hist['peak'], hist['pnl'])
-                                hist['max_dd'] = max(hist['max_dd'], hist['peak'] - hist['pnl'])
+                                hist.invested += invested
+                                hist.pnl += pnl
+                                hist.trades += 1
+                                hist.peak = max(hist.peak, hist.pnl)
+                                hist.max_dd = max(hist.max_dd, hist.peak - hist.pnl)
                                 
                                 # Calmar / ROI Update
-                                if hist['trades'] >= 2 and hist['invested'] > 10.0:
-                                    calmar = hist['pnl'] / max(hist['max_dd'], 1e-6)
-                                    roi = hist['pnl'] / hist['invested']
+                                if hist.trades >= 2 and hist.invested > 10.0:
+                                    calmar = hist.pnl / max(hist.max_dd, 1e-6)
+                                    roi = hist.pnl / hist.invested
                                     scorer.wallet_scores[u] = roi + min(calmar, 5.0)
+                                        scorer.wallet_scores[u] = roi + min(calmar, 5.0)
                         
                         # Update Fresh Wallet Calibration Buffer
                         if r_cid in first_bets_pending:
@@ -271,11 +286,11 @@ def main():
                 # Accumulate internal tracking state
                 pos = contract_positions[cid][user]
                 if is_buying:
-                    pos['qty_long'] += qty
-                    pos['cost_long'] += price * qty
+                    pos.qty_long += qty           
+                    pos.cost_long += price * qty
                 else:
-                    pos['qty_short'] += qty
-                    pos['cost_short'] += (1.0 - price) * qty
+                    pos.qty_short += qty
+                    pos.cost_short += (1.0 - price) * qty
                     
                 # Fresh Wallet Check
                 if user not in known_users:
