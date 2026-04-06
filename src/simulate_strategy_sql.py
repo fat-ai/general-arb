@@ -459,15 +459,15 @@ def main():
                         result_map['performance']['Calmar'] = round(calmar, 1)
     
                         # Tally Hit Rate
-                        verdicts = (mr['verdict'] for mr in result_map.values() if "verdict" in mr)
-                        counts = Counter(verdicts)
-                        total_bets = counts['RIGHT!'] + counts['WRONG!']
+                        wins = result_map['performance']['wins']
+                        losses = result_map['performance']['losses']
+                        total_bets = wins + losses
                         
                         if total_bets > 0:
-                            hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
+                            hit_rate = round(100 * (wins / total_bets), 1)
                             log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
     
-                results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
+       
 
                 if len(executions_buffer) >= 1000:
                     with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
