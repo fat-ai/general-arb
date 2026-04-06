@@ -127,18 +127,26 @@ def main():
     
         log.info("⏳ DuckDB is now working ... Please wait")
         
-        # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
-    
+        # OPTIMIZATION: Create a tiny DataFrame of only the contracts we care about
+        valid_cids_df = pd.DataFrame({'cid': list(market_map.keys())})
+        
+        # Register it virtually inside DuckDB (takes almost zero memory)
+        con.register('valid_markets', valid_cids_df)
+        
+        # OPTIMIZATION: Use an INNER JOIN to filter the SQLite data BEFORE sorting.
+        # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
         query = """
             SELECT 
-                LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
-                user, 
-                tradeAmount, 
-                outcomeTokensAmount, 
-                price, 
-                CAST(timestamp AS TIMESTAMP) AS ts
-            FROM source_db.trades
-            ORDER BY timestamp ASC
+                LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) AS contract_id, 
+                t.user, 
+                t.tradeAmount, 
+                t.outcomeTokensAmount, 
+                t.price, 
+                CAST(t.timestamp AS TIMESTAMP) AS ts
+            FROM source_db.trades t
+            JOIN valid_markets v ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = v.cid
+            WHERE t.timestamp IS NOT NULL
+            ORDER BY t.timestamp ASC
         """
         cursor = con.execute(query)
     
@@ -154,7 +162,7 @@ def main():
         log.info("🔥 Streaming perfectly sorted native objects...")
     
         while True:
-            rows = cursor.fetchmany(50000)
+            rows = cursor.fetchmany(10000)
             if not rows:
                 break
                 
@@ -242,6 +250,8 @@ def main():
                             pass
                     
                     current_sim_day = trade_date
+
+                    gc.collect()
     
                 # ---------------------------------------------------------
                 # B. PROCESS TRADE INTO STATE TRACKERS
