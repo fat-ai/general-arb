@@ -15,6 +15,7 @@ import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
 import sqlite3
+import shutil
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -114,305 +115,322 @@ def main():
     log.info("Spinning up DuckDB")
     duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
     duck_tmp.mkdir(parents=True, exist_ok=True)
-    
-    con = duckdb.connect(database=':memory:')
-    con.execute("SET memory_limit='4GB';")
-    con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
-    con.execute(f"SET temp_directory='{duck_tmp}';")
-    
-    con.execute("INSTALL sqlite; LOAD sqlite;")
-    con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
 
-    log.info("⏳ DuckDB is now working ... Please wait")
-    
-    # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
-
-    query = """
-        SELECT 
-            LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
-            user, 
-            tradeAmount, 
-            outcomeTokensAmount, 
-            price, 
-            CAST(timestamp AS TIMESTAMP) AS ts
-        FROM source_db.trades
-        ORDER BY timestamp ASC
-    """
-    cursor = con.execute(query)
-
-    # ==========================================
-    # 4. CHRONOLOGICAL SIMULATION LOOP
-    # ==========================================
-    current_sim_day = None
-    simulation_start_date = None
-    data_start_date = None
-    heartbeat = None
-    results_buffer = []
-
-    log.info("🔥 Streaming perfectly sorted native objects...")
-
-    while True:
-        rows = cursor.fetchmany(50000)
-        if not rows:
-            break
-            
-        for row in rows:
-            cid, user, amount, tokens, price, ts = row
-            
-            if ts is None: continue
-            
-            trade_date = ts.date()
-            
-            # Initialization of Warmup Anchor
-            if data_start_date is None:
-                data_start_date = trade_date
-                simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
-                log.info(f"🔥 Warm-up Anchor Set: {data_start_date} -> Start Trading: {simulation_start_date.date()}")
-            
-            # ---------------------------------------------------------
-            # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
-            # ---------------------------------------------------------
-
-            if current_sim_day is None:
-                current_sim_day = trade_date
-                
-            elif trade_date > current_sim_day:
-                
-                # 1. Resolve Markets that ended yesterday
-                resolved_cids = [
-                    c for c, m in market_map.items() 
-                    if m['end'] is not None and m['end'].date() < current_sim_day and not m['resolved']
-                ]
-                
-                for r_cid in resolved_cids:
-                    outcome = market_map[r_cid]['outcome']
-                    end_date = market_map[r_cid]['end']
-                    market_map[r_cid]['resolved'] = True
-                    
-                    # Update Standard User History
-                    if r_cid in contract_positions:
-                        users_in_market = contract_positions.pop(r_cid)
-                        
-                        for u, pos in users_in_market.items():
-                            payout = (pos['qty_long'] * outcome) + (pos['qty_short'] * (1.0 - outcome))
-                            invested = pos['cost_long'] + pos['cost_short']
-                            pnl = payout - invested
-                            
-                            hist = user_history[u]
-                            hist['invested'] += invested
-                            hist['pnl'] += pnl
-                            hist['trades'] += 1
-                            hist['peak'] = max(hist['peak'], hist['pnl'])
-                            hist['max_dd'] = max(hist['max_dd'], hist['peak'] - hist['pnl'])
-                            
-                            # Calmar / ROI Update
-                            if hist['trades'] >= 2 and hist['invested'] > 10.0:
-                                calmar = hist['pnl'] / max(hist['max_dd'], 1e-6)
-                                roi = hist['pnl'] / hist['invested']
-                                scorer.wallet_scores[u] = roi + min(calmar, 5.0)
-                    
-                    # Update Fresh Wallet Calibration Buffer
-                    if r_cid in first_bets_pending:
-                        first_bets = first_bets_pending.pop(r_cid)
-                        for u, bet in first_bets.items():
-                            vwap = bet['vwap']
-                            roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
-                            calibration_buffer.append({'date': end_date, 'vol': bet['log_vol'], 'vwap': vwap, 'roi': roi})
-
-                # 2. Daily OLS Calibration (Rolling 365 Days)
-                cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
-                
-                # Prune old records from deque
-                while calibration_buffer and calibration_buffer[0]['date'] < cutoff_date:
-                    calibration_buffer.popleft()
-                    
-                if len(calibration_buffer) >= 50:
-                    y_recent = [d['roi'] for d in calibration_buffer]
-                    X_features = [[d['vol'], d['vwap']] for d in calibration_buffer]
-                    X_recent = sm.add_constant(X_features)
-                    
-                    try:
-                        model = sm.OLS(y_recent, X_recent).fit()
-                        scorer.intercept = model.params[0]
-                        scorer.slope_vol = model.params[1]
-                        scorer.slope_price = model.params[2]
-                    except Exception:
-                        pass
-                
-                current_sim_day = trade_date
-
-            # ---------------------------------------------------------
-            # B. PROCESS TRADE INTO STATE TRACKERS
-            # ---------------------------------------------------------
-            if cid not in market_map: continue
-            m = market_map[cid]
-            
-            # Start/End filtering
-            if m['start'] is not None and ts < m['start']: continue
-            if m['end'] is not None and ts > m['end']: continue
-            
-            qty = abs(tokens)
-            is_buying = (tokens > 0)
-            
-            # Accumulate internal tracking state
-            pos = contract_positions[cid][user]
-            if is_buying:
-                pos['qty_long'] += qty
-                pos['cost_long'] += price * qty
-            else:
-                pos['qty_short'] += qty
-                pos['cost_short'] += (1.0 - price) * qty
-                
-            # Fresh Wallet Check
-            if user not in known_users:
-                risk_vol = amount if is_buying else qty * (1.0 - price)
-                if risk_vol >= 1.0: # Ignore noise
-                    known_users.add(user)
-                    first_bets_pending[cid][user] = {
-                        'log_vol': math.log1p(risk_vol),
-                        'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                        'is_long': is_buying
-                    }
-
-            # ---------------------------------------------------------
-            # C. SIMULATE SIGNALS (Post Warm-Up)
-            # ---------------------------------------------------------
-            if m['start'] is None or m['start'] < simulation_start_date: continue
-            if ts < simulation_start_date: continue
-
-            m['volume'] += amount
-            cum_vol = m['volume']
-            bet_on = m['outcome_label']
-
-            direction = 1.0 if is_buying else -1.0
-            if bet_on != "yes": direction *= -1.0
-            
-            sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
-            sig = sig / cum_vol
-
-            if abs(sig) > 1 and 0.05 < price < 0.95:
-                if 'verdict' not in result_map[m['id']] and m['end'] is not None and m['end'] < datetime.now():
-                    score = scorer.get_score(user, amount, price)
-                    mid = m['id']
-                    
-                    verdict = "WRONG!"
-                    if result_map[mid]['outcome'] > 0 and sig > 0: verdict = "RIGHT!"
-                    elif result_map[mid]['outcome'] <= 0 and sig < 0: verdict = "RIGHT!"
-
-                    bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
-                    min_irr = 5.0
-                    slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
-                    
-                    # Clean Boolean check logic (DRY Principle)
-                    is_winning_side = (
-                        (result_map[mid]['outcome'] > 0 and bet_on == "yes") or 
-                        (result_map[mid]['outcome'] <= 0 and bet_on == "no")
-                    )
-
-                    if is_winning_side:
-                        execution_price = price * (1 + slippage)
-                        profit = 1 - execution_price
-                        contracts = bet_size / execution_price
-                    else:
-                        execution_price = price * (1 - slippage)
-                        profit = execution_price
-                        contracts = bet_size / (1 - execution_price)
-                        
-                    profit = profit * contracts
-                    roi = profit / bet_size
-                    duration = m['end'] - ts
-                    time_factor = max(duration.days,1) / 365
-                    
-                    if result_map['performance']['cash'] < bet_size:  
-                        result_map['performance']['ins_cash'] += 1
-                        
-                    if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:
-                        if verdict == "WRONG!":
-                            roi = -1.00
-                            profit = -bet_size
-                        
-                        result_map[mid]['id'] = mid
-                        result_map[mid]['timestamp'] = ts
-                        result_map[mid]['days'] = duration.days
-                        result_map[mid]['signal'] = sig
-                        result_map[mid]['verdict'] = verdict
-                        result_map[mid]['price'] = price
-                        result_map[mid]['bet_on'] = bet_on
-                        result_map[mid]['direction'] = direction
-                        result_map[mid]['end'] = m['end']
-                        result_map[mid]['user_score'] = score
-                        result_map[mid]['total_vol'] = cum_vol
-                        result_map[mid]['user_vol'] = amount
-                        result_map[mid]['impact'] = round(direction * score * (amount/cum_vol), 1)
-                        result_map[mid]['pnl'] = profit
-                        result_map[mid]['roi'] = roi
-                        result_map[mid]['slippage'] = slippage
-                        
-                        result_map['resolutions'].append([m['end'], profit, bet_size])
-                        result_map['performance']['cash'] -= bet_size
-                        log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
-
-            # ---------------------------------------------------------
-            # D. PERFORMANCE HEARTBEAT & SETTLEMENT (Deterministic Sim Time)
-            # ---------------------------------------------------------
-            if heartbeat is None:
-                heartbeat = ts
-
-            # Fire deterministically every 1 simulated hour (3600 seconds)
-            if abs((ts - heartbeat).total_seconds()) >= 3600:
-                heartbeat = ts
-                
-                if len(result_map['resolutions']) > 0:
-                    result_map['performance']['resolutions'] = len(result_map['resolutions'])
-                    
-                    for res in result_map['resolutions']:
-                        # Settle payouts for simulated bets where the market end date has passed
-                        if res[0] <= ts:
-                            result_map['performance']['pnl'] += res[1]
-                            result_map['performance']['equity'] += res[1]
-                            result_map['performance']['cash'] += res[1] + res[2]
-
-                    # Keep only unresolved bets
-                    result_map['resolutions'] = [res for res in result_map['resolutions'] if res[0] > ts]
-                    
-                    # Calculate High-Water Mark and Drawdowns
-                    if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
-                        result_map['performance']['peak_equity'] = result_map['performance']['equity']
-                        
-                    drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
-                    if drawdown > result_map['performance']['max_drawdown'][0]:
-                        result_map['performance']['max_drawdown'][0] = drawdown
-                        
-                    percent_drawdown = drawdown / result_map['performance']['peak_equity']
-                    if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
-                        result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
-                        
-                    calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001), 100000)
-                    result_map['performance']['Calmar'] = round(calmar, 1)
-
-                    # Tally Hit Rate
-                    verdicts = (mr['verdict'] for mr in result_map.values() if "verdict" in mr)
-                    counts = Counter(verdicts)
-                    total_bets = counts['RIGHT!'] + counts['WRONG!']
-                    
-                    if total_bets > 0:
-                        hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
-                        # Optional: You can comment out this log.info if logging every simulated hour is too noisy
-                        log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
-
-            results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
-            
-            if len(results_buffer) >= 10000:
-                with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
-                    csv.writer(f).writerows(results_buffer)
-                results_buffer.clear()
+    try:
+        con = duckdb.connect(database=':memory:')
+        con.execute("SET memory_limit='4GB';")
+        con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
+        con.execute(f"SET temp_directory='{duck_tmp}';")
         
-    # Flush remaining
-    if results_buffer:
-        with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerows(results_buffer)
+        con.execute("INSTALL sqlite; LOAD sqlite;")
+        con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
+    
+        log.info("⏳ DuckDB is now working ... Please wait")
+        
+        # We CAST to TIMESTAMP so DuckDB does the heavy datetime parsing in highly-optimized C++, 
+    
+        query = """
+            SELECT 
+                LOWER(TRIM(REPLACE(contract_id, '0x', ''))) AS contract_id, 
+                user, 
+                tradeAmount, 
+                outcomeTokensAmount, 
+                price, 
+                CAST(timestamp AS TIMESTAMP) AS ts
+            FROM source_db.trades
+            ORDER BY timestamp ASC
+        """
+        cursor = con.execute(query)
+    
+        # ==========================================
+        # 4. CHRONOLOGICAL SIMULATION LOOP
+        # ==========================================
+        current_sim_day = None
+        simulation_start_date = None
+        data_start_date = None
+        heartbeat = None
+        results_buffer = []
+    
+        log.info("🔥 Streaming perfectly sorted native objects...")
+    
+        while True:
+            rows = cursor.fetchmany(50000)
+            if not rows:
+                break
+                
+            for row in rows:
+                cid, user, amount, tokens, price, ts = row
+                
+                if ts is None: continue
+                
+                trade_date = ts.date()
+                
+                # Initialization of Warmup Anchor
+                if data_start_date is None:
+                    data_start_date = trade_date
+                    simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
+                    log.info(f"🔥 Warm-up Anchor Set: {data_start_date} -> Start Trading: {simulation_start_date.date()}")
+                
+                # ---------------------------------------------------------
+                # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
+                # ---------------------------------------------------------
+    
+                if current_sim_day is None:
+                    current_sim_day = trade_date
+                    
+                elif trade_date > current_sim_day:
+                    
+                    # 1. Resolve Markets that ended yesterday
+                    resolved_cids = [
+                        c for c, m in market_map.items() 
+                        if m['end'] is not None and m['end'].date() < current_sim_day and not m['resolved']
+                    ]
+                    
+                    for r_cid in resolved_cids:
+                        outcome = market_map[r_cid]['outcome']
+                        end_date = market_map[r_cid]['end']
+                        market_map[r_cid]['resolved'] = True
+                        
+                        # Update Standard User History
+                        if r_cid in contract_positions:
+                            users_in_market = contract_positions.pop(r_cid)
+                            
+                            for u, pos in users_in_market.items():
+                                payout = (pos['qty_long'] * outcome) + (pos['qty_short'] * (1.0 - outcome))
+                                invested = pos['cost_long'] + pos['cost_short']
+                                pnl = payout - invested
+                                
+                                hist = user_history[u]
+                                hist['invested'] += invested
+                                hist['pnl'] += pnl
+                                hist['trades'] += 1
+                                hist['peak'] = max(hist['peak'], hist['pnl'])
+                                hist['max_dd'] = max(hist['max_dd'], hist['peak'] - hist['pnl'])
+                                
+                                # Calmar / ROI Update
+                                if hist['trades'] >= 2 and hist['invested'] > 10.0:
+                                    calmar = hist['pnl'] / max(hist['max_dd'], 1e-6)
+                                    roi = hist['pnl'] / hist['invested']
+                                    scorer.wallet_scores[u] = roi + min(calmar, 5.0)
+                        
+                        # Update Fresh Wallet Calibration Buffer
+                        if r_cid in first_bets_pending:
+                            first_bets = first_bets_pending.pop(r_cid)
+                            for u, bet in first_bets.items():
+                                vwap = bet['vwap']
+                                roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
+                                calibration_buffer.append({'date': end_date, 'vol': bet['log_vol'], 'vwap': vwap, 'roi': roi})
+    
+                    # 2. Daily OLS Calibration (Rolling 365 Days)
+                    cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
+                    
+                    # Prune old records from deque
+                    while calibration_buffer and calibration_buffer[0]['date'] < cutoff_date:
+                        calibration_buffer.popleft()
+                        
+                    if len(calibration_buffer) >= 50:
+                        y_recent = [d['roi'] for d in calibration_buffer]
+                        X_features = [[d['vol'], d['vwap']] for d in calibration_buffer]
+                        X_recent = sm.add_constant(X_features)
+                        
+                        try:
+                            model = sm.OLS(y_recent, X_recent).fit()
+                            scorer.intercept = model.params[0]
+                            scorer.slope_vol = model.params[1]
+                            scorer.slope_price = model.params[2]
+                        except Exception:
+                            pass
+                    
+                    current_sim_day = trade_date
+    
+                # ---------------------------------------------------------
+                # B. PROCESS TRADE INTO STATE TRACKERS
+                # ---------------------------------------------------------
+                if cid not in market_map: continue
+                m = market_map[cid]
+                
+                # Start/End filtering
+                if m['start'] is not None and ts < m['start']: continue
+                if m['end'] is not None and ts > m['end']: continue
+                
+                qty = abs(tokens)
+                is_buying = (tokens > 0)
+                
+                # Accumulate internal tracking state
+                pos = contract_positions[cid][user]
+                if is_buying:
+                    pos['qty_long'] += qty
+                    pos['cost_long'] += price * qty
+                else:
+                    pos['qty_short'] += qty
+                    pos['cost_short'] += (1.0 - price) * qty
+                    
+                # Fresh Wallet Check
+                if user not in known_users:
+                    risk_vol = amount if is_buying else qty * (1.0 - price)
+                    if risk_vol >= 1.0: # Ignore noise
+                        known_users.add(user)
+                        first_bets_pending[cid][user] = {
+                            'log_vol': math.log1p(risk_vol),
+                            'vwap': max(1e-6, min(1.0 - 1e-6, price)),
+                            'is_long': is_buying
+                        }
+    
+                # ---------------------------------------------------------
+                # C. SIMULATE SIGNALS (Post Warm-Up)
+                # ---------------------------------------------------------
+                if m['start'] is None or m['start'] < simulation_start_date: continue
+                if ts < simulation_start_date: continue
+    
+                m['volume'] += amount
+                cum_vol = m['volume']
+                bet_on = m['outcome_label']
+    
+                direction = 1.0 if is_buying else -1.0
+                if bet_on != "yes": direction *= -1.0
+                
+                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
+                sig = sig / cum_vol
+    
+                if abs(sig) > 1 and 0.05 < price < 0.95:
+                    if 'verdict' not in result_map[m['id']] and m['end'] is not None and m['end'] < datetime.now():
+                        score = scorer.get_score(user, amount, price)
+                        mid = m['id']
+                        
+                        verdict = "WRONG!"
+                        if result_map[mid]['outcome'] > 0 and sig > 0: verdict = "RIGHT!"
+                        elif result_map[mid]['outcome'] <= 0 and sig < 0: verdict = "RIGHT!"
+    
+                        bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
+                        min_irr = 5.0
+                        slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
+                        
+                        # Clean Boolean check logic (DRY Principle)
+                        is_winning_side = (
+                            (result_map[mid]['outcome'] > 0 and bet_on == "yes") or 
+                            (result_map[mid]['outcome'] <= 0 and bet_on == "no")
+                        )
+    
+                        if is_winning_side:
+                            execution_price = price * (1 + slippage)
+                            profit = 1 - execution_price
+                            contracts = bet_size / execution_price
+                        else:
+                            execution_price = price * (1 - slippage)
+                            profit = execution_price
+                            contracts = bet_size / (1 - execution_price)
+                            
+                        profit = profit * contracts
+                        roi = profit / bet_size
+                        duration = m['end'] - ts
+                        time_factor = max(duration.days,1) / 365
+                        
+                        if result_map['performance']['cash'] < bet_size:  
+                            result_map['performance']['ins_cash'] += 1
+                            
+                        if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:
+                            if verdict == "WRONG!":
+                                roi = -1.00
+                                profit = -bet_size
+                            
+                            result_map[mid]['id'] = mid
+                            result_map[mid]['timestamp'] = ts
+                            result_map[mid]['days'] = duration.days
+                            result_map[mid]['signal'] = sig
+                            result_map[mid]['verdict'] = verdict
+                            result_map[mid]['price'] = price
+                            result_map[mid]['bet_on'] = bet_on
+                            result_map[mid]['direction'] = direction
+                            result_map[mid]['end'] = m['end']
+                            result_map[mid]['user_score'] = score
+                            result_map[mid]['total_vol'] = cum_vol
+                            result_map[mid]['user_vol'] = amount
+                            result_map[mid]['impact'] = round(direction * score * (amount/cum_vol), 1)
+                            result_map[mid]['pnl'] = profit
+                            result_map[mid]['roi'] = roi
+                            result_map[mid]['slippage'] = slippage
+                            
+                            result_map['resolutions'].append([m['end'], profit, bet_size])
+                            result_map['performance']['cash'] -= bet_size
+                            log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
+    
+                # ---------------------------------------------------------
+                # D. PERFORMANCE HEARTBEAT & SETTLEMENT (Deterministic Sim Time)
+                # ---------------------------------------------------------
+                if heartbeat is None:
+                    heartbeat = ts
+    
+                # Fire deterministically every 1 simulated hour (3600 seconds)
+                if abs((ts - heartbeat).total_seconds()) >= 3600:
+                    heartbeat = ts
+                    
+                    if len(result_map['resolutions']) > 0:
+                        result_map['performance']['resolutions'] = len(result_map['resolutions'])
+                        
+                        for res in result_map['resolutions']:
+                            # Settle payouts for simulated bets where the market end date has passed
+                            if res[0] <= ts:
+                                result_map['performance']['pnl'] += res[1]
+                                result_map['performance']['equity'] += res[1]
+                                result_map['performance']['cash'] += res[1] + res[2]
+    
+                        # Keep only unresolved bets
+                        result_map['resolutions'] = [res for res in result_map['resolutions'] if res[0] > ts]
+                        
+                        # Calculate High-Water Mark and Drawdowns
+                        if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
+                            result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                            
+                        drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
+                        if drawdown > result_map['performance']['max_drawdown'][0]:
+                            result_map['performance']['max_drawdown'][0] = drawdown
+                            
+                        percent_drawdown = drawdown / result_map['performance']['peak_equity']
+                        if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
+                            result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
+                            
+                        calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001), 100000)
+                        result_map['performance']['Calmar'] = round(calmar, 1)
+    
+                        # Tally Hit Rate
+                        verdicts = (mr['verdict'] for mr in result_map.values() if "verdict" in mr)
+                        counts = Counter(verdicts)
+                        total_bets = counts['RIGHT!'] + counts['WRONG!']
+                        
+                        if total_bets > 0:
+                            hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
+                            # Optional: You can comment out this log.info if logging every simulated hour is too noisy
+                            log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
+    
+                results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
+                
+                if len(results_buffer) >= 10000:
+                    with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                        csv.writer(f).writerows(results_buffer)
+                    results_buffer.clear()
+            
+        # Flush remaining
+        if results_buffer:
+            with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(results_buffer)
+    
+        log.info("✅ Simulation Complete.")
 
-    log.info("✅ Simulation Complete.")
+    finally:
+        # ==========================================
+        # 5. GUARANTEED CLEANUP
+        # ==========================================
+        log.info("🧹 Cleaning up DuckDB and temporary files...")
+        
+        try:
+            con.close()
+        except Exception as e:
+            log.warning(f"Could not close DuckDB connection: {e}")
+            
+        # 2. Force delete the temporary directory and all its contents
+        if duck_tmp.exists():
+            shutil.rmtree(duck_tmp, ignore_errors=True)
+            log.info(f"🗑️ Temporary directory {duck_tmp} successfully wiped from disk.")
 
 if __name__ == "__main__":
     main()
