@@ -365,7 +365,7 @@ def main():
                 sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
                 sig = sig / cum_vol
     
-                if abs(sig) > 1 and 0.05 < price < 0.95:
+                if abs(sig) > 5 and 0.05 < price < 0.95:
                     if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
                         score = scorer.get_score(user, amount, price)
                         mid = m['id']
