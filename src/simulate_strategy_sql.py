@@ -188,6 +188,8 @@ def main():
                     
                 elif trade_date > current_sim_day:
                     
+                    log.info(f"📅 --- STARTING NEW SIMULATION DAY: {trade_date} ---")
+                    
                     # 1. Resolve Markets that ended yesterday
                     resolved_cids = [
                         c for c, m in market_map.items() 
