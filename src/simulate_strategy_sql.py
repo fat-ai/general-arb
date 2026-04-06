@@ -158,6 +158,7 @@ def main():
     try:
         con = duckdb.connect(database=str(sim_db_path))
         con.execute("SET memory_limit='4GB';")
+        con.execute("SET max_temp_directory_size = '100GB';")
         con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
         con.execute(f"SET temp_directory='{duck_tmp}';")
         
