@@ -32,6 +32,22 @@ TRADES_PATH = CACHE_DIR / "gamma_trades.db"
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 OUTPUT_PATH = SIGNAL_FILE
 
+if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
+    
+headers = ["timestamp", "id", "cid", "question", "bet_on", "outcome", "trade_price", "trade_volume", "signal_strength"]
+with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
+    csv.writer(f).writerow(headers)
+        
+
+EXECUTIONS_PATH = CACHE_DIR / "strategy_executions.csv"
+if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
+    
+exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
+with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
+    csv.writer(f).writerow(exec_headers)
+        
+executions_buffer = []
+
 @dataclass(slots=True)
 class PositionMetrics:
     qty_long: float = 0.0
@@ -101,7 +117,8 @@ def main():
 
     result_map['performance'] = { 
         'equity': CONFIG["initial_capital"], 'cash': CONFIG["initial_capital"], 
-        'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0
+        'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0,
+        'wins': 0, 'losses': 0 
     }
     result_map['resolutions'] = []
 
@@ -118,6 +135,7 @@ def main():
     # Fresh wallet tracking
     known_users = set()
     first_bets_pending = defaultdict(dict) # Dict[cid] -> Dict[user] -> {log_vol, vwap, is_long}
+    last_recorded_signal = {}
     calib_dates = deque()
     calib_X = deque() 
     calib_y = deque()
@@ -130,10 +148,15 @@ def main():
     # ==========================================
     log.info("Spinning up DuckDB")
     duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
+    sim_db_path = CACHE_DIR / "sim_working.duckdb"
     duck_tmp.mkdir(parents=True, exist_ok=True)
 
+    for leftover in [sim_db_path, Path(str(sim_db_path) + ".wal")]:
+        if leftover.exists():
+            leftover.unlink()
+
     try:
-        con = duckdb.connect(database=':memory:')
+        con = duckdb.connect(database=str(sim_db_path))
         con.execute("SET memory_limit='4GB';")
         con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
         con.execute(f"SET temp_directory='{duck_tmp}';")
@@ -216,7 +239,7 @@ def main():
                         outcome = market_map[r_cid]['outcome']
                         end_date = market_map[r_cid]['end']
                         market_map[r_cid]['resolved'] = True
-                        
+                        last_recorded_signal.pop(r_cid, None)
                         # Update Standard User History
                         if r_cid in contract_positions:
                             users_in_market = contract_positions.pop(r_cid)
@@ -251,7 +274,20 @@ def main():
                                 calib_dates.append(end_date)
                                 calib_X.append([bet['log_vol'], vwap])
                                 calib_y.append(roi)
-    
+                                
+                    orphan_cutoff = current_sim_day - timedelta(days=30)
+                    orphan_cids = [
+                        c for c, m in market_map.items()
+                        if m['end'] is not None and m['end'].date() < orphan_cutoff and not m['resolved']
+                    ]
+                    
+                    # Silently clear their tracked data to free RAM
+                    for o_cid in orphan_cids:
+                        market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
+                        contract_positions.pop(o_cid, None)
+                        first_bets_pending.pop(o_cid, None)
+                        last_recorded_signal.pop(o_cid, None)
+                        
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
                     
@@ -369,26 +405,19 @@ def main():
                             if verdict == "WRONG!":
                                 roi = -1.00
                                 profit = -bet_size
-                            
-                            result_map[mid]['id'] = mid
-                            result_map[mid]['timestamp'] = ts
-                            result_map[mid]['days'] = duration.days
-                            result_map[mid]['signal'] = sig
-                            result_map[mid]['verdict'] = verdict
-                            result_map[mid]['price'] = price
-                            result_map[mid]['bet_on'] = bet_on
-                            result_map[mid]['direction'] = direction
-                            result_map[mid]['end'] = m['end']
-                            result_map[mid]['user_score'] = score
-                            result_map[mid]['total_vol'] = cum_vol
-                            result_map[mid]['user_vol'] = amount
-                            result_map[mid]['impact'] = round(direction * score * (amount/cum_vol), 1)
-                            result_map[mid]['pnl'] = profit
-                            result_map[mid]['roi'] = roi
-                            result_map[mid]['slippage'] = slippage
-                            
+                                result_map['performance']['losses'] += 1
+                            else:
+                                result_map['performance']['wins'] += 1
+
                             result_map['resolutions'].append([m['end'], profit, bet_size])
                             result_map['performance']['cash'] -= bet_size
+
+                            executions_buffer.append([
+                                ts, mid, verdict, bet_on, direction, price, slippage, 
+                                bet_size, profit, roi, duration.days, score, 
+                                round(direction * score * (amount/cum_vol), 1)
+                            ])
+                            
                             log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
     
                 # ---------------------------------------------------------
@@ -436,21 +465,34 @@ def main():
                         
                         if total_bets > 0:
                             hit_rate = round(100 * (counts['RIGHT!'] / total_bets), 1)
-                            # Optional: You can comment out this log.info if logging every simulated hour is too noisy
                             log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
     
                 results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
+
+                if len(executions_buffer) >= 1000:
+                    with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
+                        csv.writer(f).writerows(executions_buffer)
+                    executions_buffer.clear()
                 
-                if len(results_buffer) >= 10000:
-                    with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
-                        csv.writer(f).writerows(results_buffer)
-                    results_buffer.clear()
+                last_sig = last_recorded_signal.get(cid)
+                
+                if last_sig is None or abs(sig - last_sig) >= 0.1:
+                    last_recorded_signal[cid] = sig
+                    results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
+                    
+                    if len(results_buffer) >= 10000:
+                        with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                            csv.writer(f).writerows(results_buffer)
+                        results_buffer.clear()
             
-        # Flush remaining
         if results_buffer:
             with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerows(results_buffer)
-    
+                
+        if executions_buffer:
+            with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(executions_buffer)
+                
         log.info("✅ Simulation Complete.")
 
     finally:
@@ -464,10 +506,14 @@ def main():
         except Exception as e:
             log.warning(f"Could not close DuckDB connection: {e}")
             
-        # 2. Force delete the temporary directory and all its contents
         if duck_tmp.exists():
             shutil.rmtree(duck_tmp, ignore_errors=True)
             log.info(f"🗑️ Temporary directory {duck_tmp} successfully wiped from disk.")
+            
+        for scratch in [sim_db_path, Path(str(sim_db_path) + ".wal")]:
+            if scratch.exists():
+                scratch.unlink()
+        log.info("🗑️ Scratch DuckDB files successfully wiped from disk.")
 
 if __name__ == "__main__":
     main()
