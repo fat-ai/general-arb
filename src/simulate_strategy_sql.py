@@ -159,7 +159,7 @@ def main():
         con = duckdb.connect(database=str(sim_db_path))
         con.execute("SET memory_limit='4GB';")
         con.execute("SET max_temp_directory_size = '100GB';")
-        con.execute("SET threads=4;") # Increased threads to speed up the upfront sort
+        con.execute("SET threads=4;")
         con.execute(f"SET temp_directory='{duck_tmp}';")
         
         con.execute("INSTALL sqlite; LOAD sqlite;")
@@ -168,7 +168,10 @@ def main():
         log.info("⏳ DuckDB is now working ... Please wait")
         
         # OPTIMIZATION: Create a tiny DataFrame of only the contracts we care about
-        valid_cids_df = pd.DataFrame({'cid': list(market_map.keys())})
+        valid_cids_df = pd.DataFrame({
+            'clean_cid': list(market_map.keys()),
+            'sqlite_cid': ['0x' + cid for cid in market_map.keys()]
+        })
         
         # Register it virtually inside DuckDB (takes almost zero memory)
         con.register('valid_markets', valid_cids_df)
@@ -177,16 +180,16 @@ def main():
         # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
         query = """
             SELECT 
-                LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) AS contract_id, 
+                v.clean_cid AS contract_id, 
                 t.user, 
                 t.tradeAmount, 
                 t.outcomeTokensAmount, 
                 t.price, 
                 CAST(t.timestamp AS TIMESTAMP) AS ts
             FROM source_db.trades t
-            JOIN valid_markets v ON LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) = v.cid
+            JOIN valid_markets v ON LOWER(t.contract_id) = v.sqlite_cid
             WHERE t.timestamp IS NOT NULL
-            ORDER BY t.timestamp ASC
+            ORDER BY t.timestamp ASC, t.rowid ASC
         """
         cursor = con.execute(query)
     
