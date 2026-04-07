@@ -154,7 +154,9 @@ def main():
     for leftover in [sim_db_path, Path(str(sim_db_path) + ".wal")]:
         if leftover.exists():
             leftover.unlink()
-
+            
+    con = None
+    
     try:
         con = duckdb.connect(database=str(sim_db_path))
         con.execute("SET memory_limit='3GB';")
