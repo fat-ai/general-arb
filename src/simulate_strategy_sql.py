@@ -266,7 +266,7 @@ def main():
                                     calmar = hist.pnl / max(hist.max_dd, 1e-6)
                                     roi = hist.pnl / hist.invested
                                     scorer.wallet_scores[u] = roi + min(calmar, 5.0)
-                                    scorer.wallet_scores[u] = roi + min(calmar, 5.0)
+                                  
                         
                         # Update Fresh Wallet Calibration Buffer
                         if r_cid in first_bets_pending:
@@ -315,6 +315,7 @@ def main():
                             scorer.slope_vol = model.params[1]
                             scorer.slope_price = model.params[2]
                         except Exception:
+                            log.warning(f"OLS calibration failed: {e}")
                             pass
                     
                     current_sim_day = trade_date
