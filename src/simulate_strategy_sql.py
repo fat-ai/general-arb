@@ -159,7 +159,7 @@ def main():
     
     try:
         con = duckdb.connect(database=str(sim_db_path))
-        con.execute("SET memory_limit='3GB';")
+        con.execute("SET memory_limit='4GB';")
         con.execute("SET max_temp_directory_size = '100GB';")
         con.execute("SET threads=4;")
         con.execute("SET preserve_insertion_order=false;")
