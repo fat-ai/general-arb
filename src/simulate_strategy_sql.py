@@ -169,8 +169,7 @@ def main():
         
         # OPTIMIZATION: Create a tiny DataFrame of only the contracts we care about
         valid_cids_df = pd.DataFrame({
-            'clean_cid': list(market_map.keys()),
-            'sqlite_cid': ['0x' + cid for cid in market_map.keys()]
+            'clean_cid': list(market_map.keys())
         })
         
         # Register it virtually inside DuckDB (takes almost zero memory)
@@ -180,15 +179,16 @@ def main():
         # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
         query = """
             SELECT 
-                v.clean_cid AS contract_id, 
+                TRIM(CAST(t.contract_id AS VARCHAR)) AS contract_id, 
                 t.user, 
                 t.tradeAmount, 
                 t.outcomeTokensAmount, 
                 t.price, 
                 CAST(t.timestamp AS TIMESTAMP) AS ts
             FROM source_db.trades t
-            JOIN valid_markets v ON LOWER(t.contract_id) = v.sqlite_cid
+            JOIN valid_markets v ON TRIM(CAST(t.contract_id AS VARCHAR)) = CAST(v.clean_cid AS VARCHAR)
             WHERE t.timestamp IS NOT NULL
+              AND t.price >= 0.0 AND t.price <= 1.0
             ORDER BY t.timestamp ASC, t.rowid ASC
         """
         cursor = con.execute(query)
