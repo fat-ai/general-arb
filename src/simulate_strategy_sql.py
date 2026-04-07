@@ -157,9 +157,10 @@ def main():
 
     try:
         con = duckdb.connect(database=str(sim_db_path))
-        con.execute("SET memory_limit='4GB';")
+        con.execute("SET memory_limit='3GB';")
         con.execute("SET max_temp_directory_size = '100GB';")
         con.execute("SET threads=4;")
+        con.execute("SET preserve_insertion_order=false;")
         con.execute(f"SET temp_directory='{duck_tmp}';")
         
         con.execute("INSTALL sqlite; LOAD sqlite;")
@@ -179,17 +180,17 @@ def main():
         # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
         query = """
             SELECT 
-                TRIM(CAST(t.contract_id AS VARCHAR)) AS contract_id, 
+                t.contract_id, 
                 t.user, 
                 t.tradeAmount, 
                 t.outcomeTokensAmount, 
                 t.price, 
                 CAST(t.timestamp AS TIMESTAMP) AS ts
             FROM source_db.trades t
-            JOIN valid_markets v ON TRIM(CAST(t.contract_id AS VARCHAR)) = CAST(v.clean_cid AS VARCHAR)
+            JOIN valid_markets v ON t.contract_id = v.clean_cid
             WHERE t.timestamp IS NOT NULL
               AND t.price >= 0.0 AND t.price <= 1.0
-            ORDER BY t.timestamp ASC, t.rowid ASC
+            ORDER BY t.timestamp ASC
         """
         cursor = con.execute(query)
     
