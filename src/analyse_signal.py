@@ -15,7 +15,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     parquet_columns = ['market_id', 'resolution_timestamp']
     markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
     
-    markets_df['resolution_timestamp'] = pd.to_datetime(markets_df['resolution_timestamp')
+    markets_df['resolution_timestamp'] = pd.to_datetime(markets_df['resolution_timestamp'])
 
     results = {}
     
