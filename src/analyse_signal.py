@@ -50,7 +50,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         merged_df['irr'] = np.where(
             merged_df['payout'] == 0.0,
             -1.0, 
-            (merged_df['payout'] / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
+            ((merged_df['payout'] -  merged_df['trade_price']) / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
         )
         
         # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
