@@ -32,12 +32,14 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         # 4. Targeted Merge & Math
         merged_df = first_trades.merge(markets_df, left_on='id', right_on='market_id', how='inner')
 
-        # Calculate duration in years
-        merged_df['duration_days'] = (merged_df['resolution_timestamp'] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
+        # Calculate duration in days
+        merged_df['duration_days'] = (merged_df[resolution_col] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
         
-        # Drop rows with 0 or negative duration to prevent errors
-        merged_df = merged_df[merged_df['duration_days'] > 0].copy() 
-        merged_df['duration_years'] = merged_df['duration_days'] / 365.25
+        # Drop rows with negative duration, or where the trade price is 0.0 (which causes division by zero)
+        merged_df = merged_df[(merged_df['duration_days'] > 0) & (merged_df['trade_price'] > 0)].copy() 
+
+        # SAFEY CAP: If duration is less than 1 day, treat it as 1 day to prevent infinite annualization exponents
+        merged_df['duration_years'] = np.maximum(merged_df['duration_days'] / 365.25, 1 / 365.25)
 
         # Determine payout
         merged_df['payout'] = np.where(merged_df['outcome'] == 1.0, 1.0, 0.0)
@@ -49,6 +51,10 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             (merged_df['payout'] / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
         )
         
+        # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
+        merged_df['irr'] = merged_df['irr'].replace([np.inf, -np.inf], np.nan)
+        merged_df = merged_df.dropna(subset=['irr'])
+
         # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
         trade_count = len(merged_df)
