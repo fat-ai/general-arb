@@ -12,8 +12,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     
     # 2. Load ONLY the necessary columns from the Parquet file
-    resolution_col = 'resolution_time' 
-    parquet_columns = ['id', resolution_col]
+    parquet_columns = ['market_id', 'resolution_timestamp']
     markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
     
     markets_df[resolution_col] = pd.to_datetime(markets_df[resolution_col])
