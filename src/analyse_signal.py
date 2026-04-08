@@ -6,7 +6,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     
     # 1. Load ONLY the necessary columns from the CSV to save memory
     csv_columns = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength']
-    trades_df = pd.read_csv(csv_path, usecols=csv_columns)
+    trades_df = pd.read_csv(csv_path, usecols=csv_columns, dtype={'id': str})
 
     # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
