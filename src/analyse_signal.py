@@ -9,13 +9,18 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
 
     # Convert timestamps to datetime objects right away for sorting
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%y-%m-%d %H:%M:%S')
-    columns_to_keep = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength']
-    trades_df = pd.read_csv(csv_path, usecols=columns_to_keep)
-    # ASSUMPTION: The resolution date column is called 'resolution_time'.
-    resolution_col = 'resolution_time' 
-    markets_df[resolution_col] = pd.to_datetime(markets_df[resolution_col])
+    csv_columns = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength']
+    trades_df = pd.read_csv(csv_path, usecols=csv_columns)
+
+    # Convert timestamps to datetime objects right away for sorting
+    trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%y-%m-%d %H:%M:%S')
     
-    # We only need the ID and resolution time from the parquet file
+    # 2. Load ONLY the necessary columns from the Parquet file
+    parquet_columns = ['market_id', 'resolution_timestamp']
+    markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
+    
+    markets_df[resolution_col] = pd.to_datetime(markets_df[resolution_col])
+
     markets_subset = markets_df[['id', resolution_col]]
 
     results = {}
