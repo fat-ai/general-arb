@@ -113,7 +113,7 @@ if __name__ == "__main__":
     # Define your file paths and thresholds
     TRADES_CSV_PATH = 'simulation_results.csv' # REMEMBER: Replace with your actual CSV file name!
     PARQUET_PATH = './data-cache/polymarket_cache/gamma_markets_all_tokens.parquet'
-    MY_THRESHOLDS = [5, 6, 7, 8, 9, 10, 15, 20]
+    MY_THRESHOLDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
     # Run the optimized analysis
     final_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS)
