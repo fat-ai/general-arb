@@ -2,42 +2,36 @@ import pandas as pd
 import numpy as np
 
 def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
-    print("Loading data...")
-    # 1. Load the data
-    trades_df = pd.read_csv(csv_path)
-    markets_df = pd.read_parquet(parquet_path)
-
-    # Convert timestamps to datetime objects right away for sorting
-    trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%y-%m-%d %H:%M:%S')
+    print("Loading data efficiently...")
+    
+    # 1. Load ONLY the necessary columns from the CSV to save memory
     csv_columns = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength']
     trades_df = pd.read_csv(csv_path, usecols=csv_columns)
 
-    # Convert timestamps to datetime objects right away for sorting
-    trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%y-%m-%d %H:%M:%S')
+    # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
+    trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     
     # 2. Load ONLY the necessary columns from the Parquet file
-    parquet_columns = ['market_id', 'resolution_timestamp']
+    resolution_col = 'resolution_time' 
+    parquet_columns = ['id', resolution_col]
     markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
     
     markets_df[resolution_col] = pd.to_datetime(markets_df[resolution_col])
 
-    markets_subset = markets_df[['id', resolution_col]]
-
     results = {}
     
-    # 2. Loop through thresholds FIRST to optimize processing
+    # 3. Loop through thresholds
     for threshold in thresholds:
         print(f"Processing threshold: {threshold}...")
         
-        # 3. Filter by Signal and Deduplicate BEFORE merging
+        # Filter by Signal and Deduplicate BEFORE merging
         sig_filtered = trades_df[trades_df['signal_strength'] >= threshold]
         
         # Sort oldest to newest, drop duplicates based on market 'id'
         first_trades = sig_filtered.sort_values('timestamp').drop_duplicates(subset=['id'], keep='first')
         
         # 4. Targeted Merge & Math
-        # Merge ONLY the filtered, deduplicated trades with the market resolution times
-        merged_df = first_trades.merge(markets_subset, on='id', how='inner')
+        merged_df = first_trades.merge(markets_df, on='id', how='inner')
 
         # Calculate duration in years
         merged_df['duration_days'] = (merged_df[resolution_col] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
@@ -56,25 +50,47 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             (merged_df['payout'] / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
         )
         
-        # 5. Average the results for this threshold
+        # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
         trade_count = len(merged_df)
         
+        # Count wins and losses
+        wins = (merged_df['outcome'] == 1.0).sum()
+        losses = (merged_df['outcome'] == 0.0).sum()
+        
+        # Calculate win rate and handle potential division by zero
+        win_rate = (wins / trade_count) * 100 if trade_count > 0 else 0.0
+        
+        # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
+        win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
+        
+        # Store everything in our results dictionary
         results[threshold] = {
             'Average IRR': avg_irr,
-            'Number of Trades': trade_count
+            'Number of Trades': trade_count,
+            'Wins': wins,
+            'Losses': losses,
+            'Win Rate (%)': win_rate,
+            'Win/Loss Ratio': win_loss_ratio
         }
 
     # Format into a clean DataFrame
     results_df = pd.DataFrame.from_dict(results, orient='index')
     results_df.index.name = 'Signal Threshold'
     
+    # Round the numbers to make the terminal output easier to read
+    results_df = results_df.round({
+        'Average IRR': 4, 
+        'Win Rate (%)': 2, 
+        'Win/Loss Ratio': 2
+    })
+    
     return results_df
 
 # === Implementation ===
 if __name__ == "__main__":
     # Define your file paths and thresholds
-    TRADES_CSV_PATH = 'simulation_results.csv' # Replace with your actual CSV file name/path
+    TRADES_CSV_PATH = 'simulation_results.csv' # REMEMBER: Replace with your actual CSV file name!
     PARQUET_PATH = './data-cache/polymarket_cache/gamma_markets_all_tokens.parquet'
     MY_THRESHOLDS = [5, 6, 7, 8, 9, 10, 15, 20]
 
