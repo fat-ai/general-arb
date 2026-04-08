@@ -249,6 +249,9 @@ def main():
                         end_date = market_map[r_cid]['end']
                         market_map[r_cid]['resolved'] = True
                         last_recorded_signal.pop(r_cid, None)
+                        resolved_event_id = market_map[r_cid].get('event_id')
+                        if resolved_event_id:
+                            traded_events.discard(resolved_event_id)
                         # Update Standard User History
                         if r_cid in contract_positions:
                             users_in_market = contract_positions.pop(r_cid)
@@ -293,6 +296,9 @@ def main():
                     # Silently clear their tracked data to free RAM
                     for o_cid in orphan_cids:
                         market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
+                        orphan_event_id = market_map[o_cid].get('event_id')
+                        if orphan_event_id:
+                            traded_events.discard(orphan_event_id)
                         contract_positions.pop(o_cid, None)
                         first_bets_pending.pop(o_cid, None)
                         last_recorded_signal.pop(o_cid, None)
