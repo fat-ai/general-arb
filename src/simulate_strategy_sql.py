@@ -30,7 +30,7 @@ log = logging.getLogger("Sim")
 
 TRADES_PATH = CACHE_DIR / "gamma_trades.db" 
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
-OUTPUT_PATH = SIGNAL_FILE
+OUTPUT_PATH = CACHE_DIR / SIGNAL_FILE
 
 if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
     
