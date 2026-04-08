@@ -30,7 +30,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         first_trades = sig_filtered.sort_values('timestamp').drop_duplicates(subset=['id'], keep='first')
         
         # 4. Targeted Merge & Math
-        merged_df = first_trades.merge(markets_df, on='id', how='inner')
+        merged_df = first_trades.merge(markets_df, on='market_id', how='inner')
 
         # Calculate duration in years
         merged_df['duration_days'] = (merged_df['resolution_timestamp'] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
