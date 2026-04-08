@@ -60,6 +60,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         merged_df = merged_df[(merged_df['trade_volume'] > 0.0)]
         # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
+        avg_price = merged_df['trade_price'].mean()
         trade_count = len(merged_df)
         
         # Count wins and losses
@@ -74,6 +75,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         
         # Store everything in our results dictionary
         results[threshold] = {
+            'Average Price': avg_price,
             'Average IRR': avg_irr,
             'Number of Trades': trade_count,
             'Wins': wins,
