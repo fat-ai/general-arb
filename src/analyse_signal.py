@@ -10,6 +10,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
 
     # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+
+    trades_df = trades_df[(trades_df['trade_price'] >= 0.05) & (trades_df['trade_price'] <= 0.95)]
     
     # 2. Load ONLY the necessary columns from the Parquet file
     parquet_columns = ['market_id', 'resolution_timestamp']
