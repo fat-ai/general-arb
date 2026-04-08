@@ -72,6 +72,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         
         # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
         win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
+
+        total_return = (avg_irr * trade_count) / 100
         
         # Store everything in our results dictionary
         results[threshold] = {
@@ -81,7 +83,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             'Wins': wins,
             'Losses': losses,
             'Win Rate (%)': win_rate,
-            'Win/Loss Ratio': win_loss_ratio
+            'Win/Loss Ratio': win_loss_ratio,
+            'Total Return': total_return
         }
 
     # Format into a clean DataFrame
