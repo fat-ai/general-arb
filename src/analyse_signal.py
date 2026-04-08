@@ -56,7 +56,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
         merged_df['irr'] = merged_df['irr'].replace([np.inf, -np.inf], np.nan)
         merged_df = merged_df.dropna(subset=['irr'])
-
+        merged_df = merged_df[merged_df['irr'] > 5.0]
         # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
         trade_count = len(merged_df)
