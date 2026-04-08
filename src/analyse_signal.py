@@ -15,7 +15,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     parquet_columns = ['market_id', 'resolution_timestamp']
     markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
     
-    markets_df[resolution_col] = pd.to_datetime(markets_df[resolution_col])
+    markets_df['resolution_timestamp'] = pd.to_datetime(markets_df['resolution_timestamp')
 
     results = {}
     
@@ -33,7 +33,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         merged_df = first_trades.merge(markets_df, on='id', how='inner')
 
         # Calculate duration in years
-        merged_df['duration_days'] = (merged_df[resolution_col] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
+        merged_df['duration_days'] = (merged_df['resolution_timestamp'] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
         
         # Drop rows with 0 or negative duration to prevent errors
         merged_df = merged_df[merged_df['duration_days'] > 0].copy() 
