@@ -57,6 +57,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         merged_df['irr'] = merged_df['irr'].clip(upper=100.0)
         merged_df = merged_df.dropna(subset=['irr'])
         merged_df = merged_df[(merged_df['irr'] > 5.0) | (merged_df['outcome'] == 0.0)]
+        merged_df = merged_df[(merged_df['trade_volume'] > 0.0)]
         # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
         trade_count = len(merged_df)
