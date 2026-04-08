@@ -5,7 +5,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     print("Loading data efficiently...")
     
     # 1. Load ONLY the necessary columns from the CSV to save memory
-    csv_columns = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength']
+    csv_columns = ['timestamp', 'id', 'outcome', 'trade_price', 'signal_strength', 'trade_volume']
     trades_df = pd.read_csv(csv_path, usecols=csv_columns, dtype={'id': str})
 
     # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
@@ -54,7 +54,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         )
         
         # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
-        merged_df['irr'] = merged_df['irr'].replace([np.inf, -np.inf], np.nan)
+        merged_df['irr'] = merged_df['irr'].clip(upper=100.0)
         merged_df = merged_df.dropna(subset=['irr'])
         merged_df = merged_df[(merged_df['irr'] > 5.0) | (merged_df['outcome'] == 0.0)]
         # 5. Calculate Average IRR & Win/Loss Metrics
