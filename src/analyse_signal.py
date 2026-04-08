@@ -35,7 +35,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         merged_df = first_trades.merge(markets_df, left_on='id', right_on='market_id', how='inner')
 
         # Calculate duration in days
-        merged_df['duration_days'] = (merged_df[resolution_col] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
+        merged_df['duration_days'] = (merged_df['resolution_timestamp'] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
         
         # Drop rows with negative duration, or where the trade price is 0.0 (which causes division by zero)
         merged_df = merged_df[(merged_df['duration_days'] > 0) & (merged_df['trade_price'] > 0)].copy() 
