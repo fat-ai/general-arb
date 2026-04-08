@@ -132,6 +132,7 @@ def main():
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
     contract_positions = defaultdict(lambda: defaultdict(PositionMetrics))
     user_history = defaultdict(UserMetrics)
+    traded_events = set()
     
     # Fresh wallet tracking
     known_users = set()
@@ -373,9 +374,11 @@ def main():
                 
                 sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
                 sig = sig / cum_vol
-    
+
+                current_event_id = m.get('event_id')
+                
                 if abs(sig) > 5 and 0.05 < price < 0.95:
-                    if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
+                    if not result_map[m['id']].get('traded') and current_event_id not in traded_events and m['end'] is not None and m['end'] < datetime.now():
                         score = scorer.get_score(user, amount, price)
                         mid = m['id']
                         
@@ -421,6 +424,7 @@ def main():
                             result_map['resolutions'].append([m['end'], profit, bet_size])
                             result_map['performance']['cash'] -= bet_size
                             result_map[mid]['traded'] = True
+                            traded_events.add(current_event_id)
                             
                             executions_buffer.append([
                                 ts, mid, verdict, bet_on, direction, price, slippage, 
