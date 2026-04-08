@@ -81,6 +81,7 @@ def main():
     markets_pl = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('market_id').alias('id'),
+        pl.col('events').str.json_path_match(r"$[0].id").alias('event_id'),
         pl.col('question'),
         pl.col('start_date').cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
@@ -107,7 +108,7 @@ def main():
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
-            'id': market['id'], 'question': market['question'], 'start': s_date, 'end': e_date,
+            'id': market['id'], 'event_id': market['event_id'], 'question': market['question'], 'start': s_date, 'end': e_date,
             'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 'volume': 0,
             'resolved': False
         }
