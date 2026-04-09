@@ -91,10 +91,10 @@ class WalletScorer:
         # 2. FRESH WALLET HEURISTIC
         # NOTE: If you are testing with < $10 trades, this returns 0.0!
        
-        score = self.intercept + (self.slope_vol * math.log1p(volume)) + (self.slope_price * price)
-        if volume > 1000:
-            log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
-        return score
+  #      score = self.intercept + (self.slope_vol * math.log1p(volume)) + (self.slope_price * price)
+  #      if volume > 1000:
+  #          log.info(f"🐋 FRESH WHALE: {w_id[:6]}... dropped ${volume:.0f} (Score: {score:.2f})")
+        return 0.0
         
     def get_percentile_score(self, wallet_id: str, volume: float) -> float:
         """
