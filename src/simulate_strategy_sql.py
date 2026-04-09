@@ -62,6 +62,7 @@ class UserMetrics:
     peak: float = 0.0
     max_dd: float = 0.0
     trades: int = 0
+    downside_sq_sum: float = 0.0
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -260,6 +261,8 @@ def main():
                                 payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
+
+                                position_roi = pnl / invested if invested > 0 else 0.0
                                 
                                 hist = user_history[u]
                                 hist.invested += invested
@@ -267,25 +270,30 @@ def main():
                                 hist.trades += 1
                                 hist.peak = max(hist.peak, hist.pnl)
                                 hist.max_dd = max(hist.max_dd, hist.peak - hist.pnl)
+
+                                if position_roi < 0.0:
+                                    hist.downside_sq_sum += (position_roi ** 2)
                                 
                                 # Calmar / ROI Update
-                                if hist.trades >= 2 and hist.invested > 10.0:
+                                if hist.trades >= 5 and hist.invested > 1000.0:
                                     calmar = hist.pnl / max(hist.max_dd, 1e-6)
                                     roi = hist.pnl / hist.invested
-                                    scorer.wallet_scores[u] = roi + min(calmar, 5.0)
+                                    downside_dev = math.sqrt(hist.downside_sq_sum / hist.trades)
+                                    sortino = roi / max(downside_dev, 1e-6)
+                                    scorer.wallet_scores[u] = min(calmar, 5.0) * sortino
                                   
                         
                         # Update Fresh Wallet Calibration Buffer
-                        if r_cid in first_bets_pending:
-                            first_bets = first_bets_pending.pop(r_cid)
-                            for u, bet in first_bets.items():
-                                vwap = bet['vwap']
-                                roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
+               #         if r_cid in first_bets_pending:
+               #             first_bets = first_bets_pending.pop(r_cid)
+               #             for u, bet in first_bets.items():
+               #                 vwap = bet['vwap']
+               #                 roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
                                 
                                 # Append to parallel deques to avoid dictionary memory bloat
-                                calib_dates.append(end_date)
-                                calib_X.append([bet['log_vol'], vwap])
-                                calib_y.append(roi)
+               #                 calib_dates.append(end_date)
+               #                 calib_X.append([bet['log_vol'], vwap])
+               #                 calib_y.append(roi)
                                 
                     orphan_cutoff = current_sim_day - timedelta(days=30)
                     orphan_cids = [
@@ -307,26 +315,26 @@ def main():
                     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
                     
                     # Prune old records from all parallel deques simultaneously
-                    while calib_dates and calib_dates[0] < cutoff_date:
-                        calib_dates.popleft()
-                        calib_X.popleft()
-                        calib_y.popleft()
+            #        while calib_dates and calib_dates[0] < cutoff_date:
+            #            calib_dates.popleft()
+            #            calib_X.popleft()
+            #            calib_y.popleft()
                         
-                    if len(calib_dates) >= 50:
+            #        if len(calib_dates) >= 50:
                         # Convert flat deques directly to arrays for fast processing
-                        y_recent = np.array(calib_y)
-                        X_features = np.array(calib_X)
-                        X_recent = sm.add_constant(X_features)
+            #            y_recent = np.array(calib_y)
+            #            X_features = np.array(calib_X)
+            #            X_recent = sm.add_constant(X_features)
                         
-                        try:
+            #            try:
                             # Run the full regression on 100% of the active data
-                            model = sm.OLS(y_recent, X_recent).fit()
-                            scorer.intercept = model.params[0]
-                            scorer.slope_vol = model.params[1]
-                            scorer.slope_price = model.params[2]
-                        except Exception:
-                            log.warning(f"OLS calibration failed: {e}")
-                            pass
+            #                model = sm.OLS(y_recent, X_recent).fit()
+            #                scorer.intercept = model.params[0]
+            #                scorer.slope_vol = model.params[1]
+            #                scorer.slope_price = model.params[2]
+            #            except Exception:
+            #                log.warning(f"OLS calibration failed: {e}")
+            #                pass
                     
                     current_sim_day = trade_date
 
@@ -355,37 +363,38 @@ def main():
                     pos.cost_short += (1.0 - price) * qty
                     
                 # Fresh Wallet Check
-                if user not in known_users:
-                    risk_vol = amount if is_buying else qty * (1.0 - price)
-                    if risk_vol >= 1.0: # Ignore noise
-                        known_users.add(user)
-                        first_bets_pending[cid][user] = {
-                            'log_vol': math.log1p(risk_vol),
-                            'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                            'is_long': is_buying
-                        }
+          #      if user not in known_users:
+          #          risk_vol = amount if is_buying else qty * (1.0 - price)
+          #          if risk_vol >= 1.0: # Ignore noise
+          #              known_users.add(user)
+          #              first_bets_pending[cid][user] = {
+          #                  'log_vol': math.log1p(risk_vol),
+          #                  'vwap': max(1e-6, min(1.0 - 1e-6, price)),
+          #                  'is_long': is_buying
+          #              }
     
                 # ---------------------------------------------------------
                 # C. SIMULATE SIGNALS (Post Warm-Up)
                 # ---------------------------------------------------------
                 if m['start'] is None or m['start'] < simulation_start_date: continue
                 if ts < simulation_start_date: continue
-    
-                m['volume'] += amount
+
+                usdc_vol = amount * price
+                m['volume'] += usdc_vol
                 cum_vol = m['volume']
                 bet_on = m['outcome_label']
     
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
+                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=usdc_vol, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
                 sig = sig / cum_vol
 
                 current_event_id = m.get('event_id')
                 
-                if abs(sig) > 5 and 0.05 < price < 0.95:
+                if abs(sig) > 10 and 0.05 < price < 0.95:
                     if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
-                        score = scorer.get_score(user, amount, price)
+                        score = scorer.get_score(user, usdc_vol, price)
                         mid = m['id']
                         
                         verdict = "WRONG!"
@@ -393,7 +402,7 @@ def main():
                         elif result_map[mid]['outcome'] <= 0 and sig < 0: verdict = "RIGHT!"
     
                         bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
-                        min_irr = 5.0
+                       # min_irr = 5.0
                         slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
                         
                         # Clean Boolean check logic (DRY Principle)
@@ -419,7 +428,7 @@ def main():
                         if result_map['performance']['cash'] < bet_size:  
                             result_map['performance']['ins_cash'] += 1
    
-                        if roi / time_factor > min_irr and result_map['performance']['cash'] > bet_size:
+                        if result_map['performance']['cash'] > bet_size:
                             if verdict == "WRONG!":
                                 roi = -1.00
                                 profit = -bet_size
@@ -435,7 +444,7 @@ def main():
                             executions_buffer.append([
                                 ts, mid, verdict, bet_on, direction, price, slippage, 
                                 bet_size, profit, roi, duration.days, score, 
-                                round(direction * score * (amount/cum_vol), 1)
+                                round(direction * score * (usdc_vol/cum_vol), 1)
                             ])
                             
                             log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
