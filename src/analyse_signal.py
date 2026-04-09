@@ -78,7 +78,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         losses = (merged_df['outcome'] == 0.0).sum()
         
         # Calculate win rate and handle potential division by zero
-        win_rate = (wins / trade_count) * 100 if trade_count > 0 else 0.0
+        win_rate = (wins / trade_count) if trade_count > 0 else 0.0
         
         # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
         win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
@@ -137,7 +137,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         neg_trade_count = len(neg_merged)
         neg_wins = (neg_merged['outcome'] == 1.0).sum()
         neg_losses = (neg_merged['outcome'] == 0.0).sum()
-        neg_win_rate = (neg_wins / neg_trade_count) * 100 if neg_trade_count > 0 else 0.0
+        neg_win_rate = (neg_wins / neg_trade_count) if neg_trade_count > 0 else 0.0
         neg_win_loss_ratio = (neg_wins / neg_losses) if neg_losses > 0 else float('inf')
         neg_margin = neg_win_rate - neg_avg_price
         neg_percent_margin = (neg_margin / neg_avg_price) - 1
