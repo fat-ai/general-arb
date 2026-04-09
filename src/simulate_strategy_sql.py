@@ -384,7 +384,7 @@ def main():
                 current_event_id = m.get('event_id')
                 
                 if abs(sig) > 5 and 0.05 < price < 0.95:
-                    if not result_map[m['id']].get('traded') and current_event_id not in traded_events and m['end'] is not None and m['end'] < datetime.now():
+                    if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
                         score = scorer.get_score(user, amount, price)
                         mid = m['id']
                         
