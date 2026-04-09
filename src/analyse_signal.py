@@ -10,6 +10,27 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
 
     # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+
+    # ==========================================
+    # === CHECK BASELINE MARKET RESOLUTIONS ===
+    # ==========================================
+    # Get one row per unique market 'id'
+    baseline_df = trades_df.drop_duplicates(subset=['id']).copy()
+    
+    # Figure out the true market resolution (If the bet was 'no', flip the outcome to see if the market actually resolved 'yes')
+    is_no_baseline = baseline_df['bet_on'].astype(str).str.lower() == 'no'
+    baseline_df['market_resolved_yes'] = baseline_df['outcome']
+    baseline_df.loc[is_no_baseline, 'market_resolved_yes'] = 1.0 - baseline_df.loc[is_no_baseline, 'outcome']
+    
+    total_markets = len(baseline_df)
+    total_yes = baseline_df['market_resolved_yes'].sum()
+    total_no = total_markets - total_yes
+    
+    print("\n--- BASELINE DATASET RESOLUTIONS ---")
+    print(f"Total Unique Markets: {total_markets}")
+    print(f"Markets Resolving YES: {int(total_yes)} ({(total_yes/total_markets)*100:.2f}%)")
+    print(f"Markets Resolving NO:  {int(total_no)} ({(total_no/total_markets)*100:.2f}%)\n")
+    # ==========================================
     
     is_no_trade = trades_df['bet_on'].astype(str).str.lower() == 'no'
     
