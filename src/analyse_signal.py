@@ -63,7 +63,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         )
         
         # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
-        merged_df['irr'] = merged_df['irr'].clip(upper=100.0)
+        merged_df['irr'] = merged_df['irr'].clip(upper=6570.0)
         merged_df = merged_df.dropna(subset=['irr'])
         merged_df = merged_df[(merged_df['irr'] > 5.0) | (merged_df['outcome'] == 0.0)]
         merged_df = merged_df[(merged_df['trade_volume'] > 0.0)]
@@ -82,8 +82,9 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         
         # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
         win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
-
-        total_return = (avg_irr * trade_count) / 100
+        margin = win_rate - avg_price
+        percent_margin = (margin / avg_price) - 1       
+        total_return = (margin * trade_count) / 100
         
         # Store everything in our results dictionary
         results[threshold] = {
@@ -94,6 +95,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             'Losses': losses,
             'Win Rate (%)': win_rate,
             'Win/Loss Ratio': win_loss_ratio,
+            'Average Profit Margin': margin,
+            'Profit Margin (%)': percent_margin,
             'Total Return': total_return
         }
 
@@ -123,7 +126,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         )
         
         # Clean IRR
-        neg_merged['irr'] = neg_merged['irr'].clip(upper=100.0)
+        neg_merged['irr'] = neg_merged['irr'].clip(upper=6570.0)
         neg_merged = neg_merged.dropna(subset=['irr'])
         neg_merged = neg_merged[(neg_merged['irr'] > 5.0) | (neg_merged['outcome'] == 0.0)]
         neg_merged = neg_merged[(neg_merged['trade_volume'] > 0.0)]
@@ -136,10 +139,12 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         neg_losses = (neg_merged['outcome'] == 0.0).sum()
         neg_win_rate = (neg_wins / neg_trade_count) * 100 if neg_trade_count > 0 else 0.0
         neg_win_loss_ratio = (neg_wins / neg_losses) if neg_losses > 0 else float('inf')
-        neg_total_return = (neg_avg_irr * neg_trade_count) / 100
+        neg_margin = neg_win_rate - neg_avg_price
+        neg_percent_margin = (neg_margin / neg_avg_price) - 1
+        neg_total_return = (neg_margin * neg_trade_count) / 100
         
-        # Store in negative results dictionary
-        neg_results[-threshold] = {
+        # Store everything in our results dictionary
+        results[threshold] = {
             'Average Price': neg_avg_price,
             'Average IRR': neg_avg_irr,
             'Number of Trades': neg_trade_count,
@@ -147,6 +152,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             'Losses': neg_losses,
             'Win Rate (%)': neg_win_rate,
             'Win/Loss Ratio': neg_win_loss_ratio,
+            'Average Profit Margin': neg_margin,
+            'Profit Margin (%)': neg_percent_margin,
             'Total Return': neg_total_return
         }
 
