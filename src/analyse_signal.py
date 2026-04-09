@@ -8,7 +8,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     csv_columns = ['timestamp', 'id', 'bet_on', 'outcome', 'trade_price', 'signal_strength', 'trade_volume']
     trades_df = pd.read_csv(csv_path, usecols=csv_columns, dtype={'id': str})
 
-    # Convert timestamps to datetime objects
+    # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
     
     is_no_trade = trades_df['bet_on'].astype(str).str.lower() == 'no'
@@ -19,12 +19,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     # Flip the price to the implied "yes" price
     trades_df.loc[is_no_trade, 'trade_price'] = 1.0 - trades_df.loc[is_no_trade, 'trade_price']
     
-    # Apply Price AND Volume filters to the entire dataset right away
-    trades_df = trades_df[
-        (trades_df['trade_price'] >= 0.05) & 
-        (trades_df['trade_price'] <= 0.95) & 
-        (trades_df['trade_volume'] > 0.0)
-    ]
+    trades_df = trades_df[(trades_df['trade_price'] >= 0.05) & (trades_df['trade_price'] <= 0.95)]
     
     # 2. Load ONLY the necessary columns from the Parquet file
     parquet_columns = ['market_id', 'resolution_timestamp']
@@ -39,9 +34,6 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     for threshold in thresholds:
         print(f"Processing threshold: {threshold}...")
         
-        # ==========================================
-        # === POSITIVE SIGNAL PROCESSING BLOCK ===
-        # ==========================================
         # Filter by Signal and Deduplicate BEFORE merging
         sig_filtered = trades_df[trades_df['signal_strength'] >= threshold]
         
@@ -54,7 +46,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         # Calculate duration in days
         merged_df['duration_days'] = (merged_df['resolution_timestamp'] - merged_df['timestamp']).dt.total_seconds() / (24 * 3600)
         
-        # Drop rows with negative duration, or where the trade price is 0.0
+        # Drop rows with negative duration, or where the trade price is 0.0 (which causes division by zero)
         merged_df = merged_df[(merged_df['duration_days'] > 0) & (merged_df['trade_price'] > 0)].copy() 
 
         # SAFEY CAP: If duration is less than 1 day, treat it as 1 day to prevent infinite annualization exponents
@@ -63,20 +55,18 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         # Determine payout
         merged_df['payout'] = np.where(merged_df['outcome'] == 1.0, 1.0, 0.0)
 
-        # Calculate Annualized IRR (Fixed formula)
+        # Calculate Annualized IRR
         merged_df['irr'] = np.where(
             merged_df['payout'] == 0.0,
             -1.0, 
-            (merged_df['payout'] / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
+            ((merged_df['payout'] -  merged_df['trade_price']) / merged_df['trade_price']) ** (1 / merged_df['duration_years']) - 1
         )
         
-        # Scrub infs, drop NAs, apply max cap
-        merged_df['irr'] = merged_df['irr'].replace([np.inf, -np.inf], np.nan)
-        merged_df = merged_df.dropna(subset=['irr'])
+        # Scrub any lingering infinity values into NaN, then drop them so they don't corrupt the mean
         merged_df['irr'] = merged_df['irr'].clip(upper=100.0)
-        
-        # Apply 500% IRR filter (keeping losses)
+        merged_df = merged_df.dropna(subset=['irr'])
         merged_df = merged_df[(merged_df['irr'] > 5.0) | (merged_df['outcome'] == 0.0)]
+        merged_df = merged_df[(merged_df['trade_volume'] > 0.0)]
         
         # 5. Calculate Average IRR & Win/Loss Metrics
         avg_irr = merged_df['irr'].mean()
@@ -87,20 +77,24 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         wins = (merged_df['outcome'] == 1.0).sum()
         losses = (merged_df['outcome'] == 0.0).sum()
         
+        # Calculate win rate and handle potential division by zero
         win_rate = (wins / trade_count) * 100 if trade_count > 0 else 0.0
+        
+        # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
         win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
+
         total_return = (avg_irr * trade_count) / 100
         
-        # Store everything in our results dictionary (Standardized key names)
+        # Store everything in our results dictionary
         results[threshold] = {
             'Average Price': avg_price,
-            'Overall Average IRR': avg_irr,
-            'Total Return': total_return,
+            'Average IRR': avg_irr,
             'Number of Trades': trade_count,
             'Wins': wins,
             'Losses': losses,
             'Win Rate (%)': win_rate,
-            'Win/Loss Ratio': win_loss_ratio
+            'Win/Loss Ratio': win_loss_ratio,
+            'Total Return': total_return
         }
 
         # ==========================================
@@ -115,7 +109,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         neg_merged['trade_price'] = 1.0 - neg_merged['trade_price']
         neg_merged['outcome'] = 1.0 - neg_merged['outcome']
         
-        # Calculate duration (Fixed resolution column name)
+        # Calculate duration
         neg_merged['duration_days'] = (neg_merged['resolution_timestamp'] - neg_merged['timestamp']).dt.total_seconds() / (24 * 3600)
         neg_merged = neg_merged[(neg_merged['duration_days'] > 0) & (neg_merged['trade_price'] > 0)].copy() 
         neg_merged['duration_years'] = np.maximum(neg_merged['duration_days'] / 365.25, 1 / 365.25)
@@ -125,25 +119,21 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         neg_merged['irr'] = np.where(
             neg_merged['payout'] == 0.0,
             -1.0, 
-            (neg_merged['payout'] / neg_merged['trade_price']) ** (1 / neg_merged['duration_years']) - 1
+            ((neg_merged['payout'] - neg_merged['trade_price']) / neg_merged['trade_price']) ** (1 / neg_merged['duration_years']) - 1
         )
         
         # Clean IRR
-        neg_merged['irr'] = neg_merged['irr'].replace([np.inf, -np.inf], np.nan)
-        neg_merged = neg_merged.dropna(subset=['irr'])
         neg_merged['irr'] = neg_merged['irr'].clip(upper=100.0)
-
-        # Apply 500% IRR filter (keeping losses) so it perfectly matches the positive side
+        neg_merged = neg_merged.dropna(subset=['irr'])
         neg_merged = neg_merged[(neg_merged['irr'] > 5.0) | (neg_merged['outcome'] == 0.0)]
+        neg_merged = neg_merged[(neg_merged['trade_volume'] > 0.0)]
         
         # Calculate metrics
         neg_avg_price = neg_merged['trade_price'].mean()
         neg_avg_irr = neg_merged['irr'].mean()
         neg_trade_count = len(neg_merged)
-        
         neg_wins = (neg_merged['outcome'] == 1.0).sum()
         neg_losses = (neg_merged['outcome'] == 0.0).sum()
-        
         neg_win_rate = (neg_wins / neg_trade_count) * 100 if neg_trade_count > 0 else 0.0
         neg_win_loss_ratio = (neg_wins / neg_losses) if neg_losses > 0 else float('inf')
         neg_total_return = (neg_avg_irr * neg_trade_count) / 100
@@ -151,13 +141,13 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         # Store in negative results dictionary
         neg_results[-threshold] = {
             'Average Price': neg_avg_price,
-            'Overall Average IRR': neg_avg_irr,
-            'Total Return': neg_total_return,
+            'Average IRR': neg_avg_irr,
             'Number of Trades': neg_trade_count,
             'Wins': neg_wins,
             'Losses': neg_losses,
             'Win Rate (%)': neg_win_rate,
-            'Win/Loss Ratio': neg_win_loss_ratio
+            'Win/Loss Ratio': neg_win_loss_ratio,
+            'Total Return': neg_total_return
         }
 
     # Format POSITIVE results into a DataFrame
@@ -168,8 +158,8 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     neg_results_df = pd.DataFrame.from_dict(neg_results, orient='index')
     neg_results_df.index.name = 'Signal Threshold'
     
-    # Round the numbers (Now works on both correctly!)
-    rounding_rules = {'Average Price': 4, 'Overall Average IRR': 4, 'Total Return': 4, 'Win Rate (%)': 2, 'Win/Loss Ratio': 2}
+    # Round the numbers
+    rounding_rules = {'Average Price': 4, 'Average IRR': 4, 'Total Return': 4, 'Win Rate (%)': 2, 'Win/Loss Ratio': 2}
     pos_results_df = pos_results_df.round(rounding_rules)
     neg_results_df = neg_results_df.round(rounding_rules)
     
@@ -185,7 +175,9 @@ if __name__ == "__main__":
     # Run the optimized analysis
     pos_results, neg_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS)
     
+    # Prevent columns from hiding and prevent text from wrapping onto new lines
     pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000) 
     
     print("\n--- POSITIVE Signal Results (Betting YES) ---")
     print(pos_results)
