@@ -50,11 +50,25 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds, days_
     trades_df = trades_df[(trades_df['trade_price'] >= 0.05) & (trades_df['trade_price'] <= 0.95)]
     
     # 2. Load ONLY the necessary columns from the Parquet file
-    parquet_columns = ['market_id', 'resolution_timestamp']
+    parquet_columns = ['market_id', 'resolution_timestamp', 'start_date']
     markets_df = pd.read_parquet(parquet_path, columns=parquet_columns)
     
     markets_df['resolution_timestamp'] = pd.to_datetime(markets_df['resolution_timestamp'])
+    markets_df['start_date'] = pd.to_datetime(markets_df['start_date'])
 
+    # Find the "Present Day" anchor
+    anchor_date = trades_df['timestamp'].max()
+    cutoff_date = anchor_date - pd.Timedelta(days=days_back)
+        
+    # 1. Filter markets to ONLY include those that started after the cutoff
+    markets_df = markets_df[markets_df['start_date'] >= cutoff_date]
+        
+    # 2. Purge the trades dataframe of any trades belonging to old markets
+    trades_df = trades_df[trades_df['id'].isin(markets_df['market_id'])]
+        
+    print(f"\nFiltering for fresh markets created in the last {days_back} days (since {cutoff_date.date()})...")
+    print(f"Valid markets remaining: {len(markets_df)}\n")
+        
     results = {}
     neg_results = {}
     
@@ -206,7 +220,7 @@ if __name__ == "__main__":
     DAYS_BACK = 90
     TRADES_CSV_PATH = 'simulation_results.csv' 
     PARQUET_PATH = './data-cache/polymarket_cache/gamma_markets_all_tokens.parquet'
-    MY_THRESHOLDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+    MY_THRESHOLDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50, 75, 100, 250, 500, 1000]
 
     # Run the optimized analysis
     pos_results, neg_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS, DAYS_BACK)
