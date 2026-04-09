@@ -296,10 +296,12 @@ def main():
                                 if position_roi < 0.0:
                                     hist.downside_sq_sum += (position_roi ** 2)
                                 
-                                if hist.trades >= 5 and hist.invested > 1000.0:
+                                if hist.trades >= 1 and hist.invested > 100.0:
                                     dw_avg_irr = hist.weighted_irr_sum / hist.invested
                                     downside_dev = math.sqrt(hist.downside_sq_sum / hist.trades)
-                                    custom_score = dw_avg_irr / ((1.0 + hist.max_dd_percent) * (1.0 + downside_dev))
+                                    custom_score = dw_avg_irr / (((1.0 + hist.max_dd_percent) + (1.0 + downside_dev)) / 2 )
+                                    if hist.trades < 6:
+                                        custom_score = custom_score / ( 6 - hist.trades )
                                     scorer.wallet_scores[u] = custom_score
                                   
                         
