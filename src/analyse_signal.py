@@ -58,7 +58,12 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds, days_
 
     # Find the "Present Day" anchor
     anchor_date = trades_df['timestamp'].max()
-    cutoff_date = anchor_date - pd.Timedelta(days=days_back)
+    
+    if days_back:
+        cutoff_date = anchor_date - pd.Timedelta(days=days_back)
+
+    else:
+        cutoff_date = trades_df['timestamp'].min()
         
     # 1. Filter markets to ONLY include those that started after the cutoff
     markets_df = markets_df[markets_df['start_date'] >= cutoff_date]
