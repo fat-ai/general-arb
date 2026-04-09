@@ -54,6 +54,7 @@ class PositionMetrics:
     cost_long: float = 0.0
     qty_short: float = 0.0
     cost_short: float = 0.0
+    duration_weight_sum: float = 0.0
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -61,8 +62,10 @@ class UserMetrics:
     pnl: float = 0.0
     peak: float = 0.0
     max_dd: float = 0.0
+    max_dd_percent: float = 0.0
     trades: int = 0
     downside_sq_sum: float = 0.0
+    weighted_irr_sum: float = 0.0
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -261,26 +264,41 @@ def main():
                                 payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
-
+                                
+                                # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
+                                avg_days_held = pos.duration_weight_sum / invested if invested > 0 else 1.0
+                                avg_days_held = max(avg_days_held, 1.0) # Apply our 1-day safety floor
+                                
+                                # 2. Calculate Annualized IRR (Compound)
+                                clamped_roi = max(position_roi, -0.999999) # Prevent exact -1.0 bounds errors
+                                annualized_irr = math.pow(1.0 + clamped_roi, 365.0 / avg_days_held) - 1.0
                                 
                                 hist = user_history[u]
                                 hist.invested += invested
                                 hist.pnl += pnl
                                 hist.trades += 1
+                                hist.weighted_irr_sum += (annualized_irr * invested)
+                                
+                                # 3. Update Drawdowns (Absolute and Percentage)
                                 hist.peak = max(hist.peak, hist.pnl)
-                                hist.max_dd = max(hist.max_dd, hist.peak - hist.pnl)
-
+                                current_dd = hist.peak - hist.pnl
+                                hist.max_dd = max(hist.max_dd, current_dd)
+                                
+                                # Use max(peak, invested) as the denominator to handle users who only lose from day 1
+                                equity_basis = max(hist.peak, hist.invested, 1e-6)
+                                current_dd_percent = current_dd / equity_basis
+                                hist.max_dd_percent = max(hist.max_dd_percent, current_dd_percent)
+                                
+                                # 4. Update Sortino Downside Tracker
                                 if position_roi < 0.0:
                                     hist.downside_sq_sum += (position_roi ** 2)
                                 
-                                # Calmar / ROI Update
                                 if hist.trades >= 5 and hist.invested > 1000.0:
-                                    calmar = hist.pnl / max(hist.max_dd, 1e-6)
-                                    roi = hist.pnl / hist.invested
+                                    dw_avg_irr = hist.weighted_irr_sum / hist.invested
                                     downside_dev = math.sqrt(hist.downside_sq_sum / hist.trades)
-                                    sortino = roi / max(downside_dev, 1e-6)
-                                    scorer.wallet_scores[u] = min(calmar, 5.0) * sortino
+                                    custom_score = dw_avg_irr / ((1.0 + hist.max_dd_percent) * (1.0 + downside_dev))
+                                    scorer.wallet_scores[u] = custom_score
                                   
                         
                         # Update Fresh Wallet Calibration Buffer
@@ -355,6 +373,10 @@ def main():
                 
                 # Accumulate internal tracking state
                 pos = contract_positions[cid][user]
+
+                days_to_expiry = (m['end'] - ts).total_seconds() / 86400.0 if m['end'] is not None else 1.0
+                pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
+                
                 if is_buying:
                     pos.qty_long += qty           
                     pos.cost_long += price * qty
