@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
+def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds, days_back=None):
     print("Loading data efficiently...")
     
     # 1. Load ONLY the necessary columns from the CSV to save memory
@@ -10,6 +10,13 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
 
     # Convert timestamps to datetime objects (using %Y for the 4-digit year fix!)
     trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'], format='%Y-%m-%d %H:%M:%S')
+
+    # === NEW TIMEFRAME FILTER ===
+    if days_back is not None:
+        anchor_date = trades_df['timestamp'].max()
+        cutoff_date = anchor_date - pd.Timedelta(days=days_back)
+        trades_df = trades_df[trades_df['timestamp'] >= cutoff_date]
+        print(f"Filtering data for the last {days_back} days (since {cutoff_date.date()})...")
 
     # ==========================================
     # === CHECK BASELINE MARKET RESOLUTIONS ===
@@ -196,12 +203,13 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
 # === Implementation ===
 if __name__ == "__main__":
     # Define your file paths and thresholds
+    DAYS_BACK = 90
     TRADES_CSV_PATH = 'simulation_results.csv' 
     PARQUET_PATH = './data-cache/polymarket_cache/gamma_markets_all_tokens.parquet'
     MY_THRESHOLDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
     # Run the optimized analysis
-    pos_results, neg_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS)
+    pos_results, neg_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS, DAYS_BACK)
     
     # Prevent columns from hiding and prevent text from wrapping onto new lines
     pd.set_option('display.max_columns', None)
