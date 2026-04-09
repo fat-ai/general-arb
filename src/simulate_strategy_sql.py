@@ -274,7 +274,7 @@ def main():
                                 clamped_roi = max(position_roi, -0.999999) # Prevent exact -1.0 bounds errors
                                 
                                 safe_days_held = max(avg_days_held, 1.0) 
-                                annualized_irr = math.pow(1.0 + clamped_roi, 365.0 / safe_days_held) - 1.0
+                                annualized_irr = clamped_roi * (365.0 / safe_days_held)
                                 
                                 hist = user_history[u]
                                 hist.invested += invested
