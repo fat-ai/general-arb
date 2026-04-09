@@ -130,7 +130,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds, days_
         # Calculate win/loss ratio and handle 0 losses (which would cause a division error)
         win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
         margin = win_rate - avg_price
-        percent_margin = (margin / avg_price) - 1       
+        percent_margin = margin / avg_price     
         total_return = (margin * trade_count) / 100
         
         # Store everything in our results dictionary
@@ -187,7 +187,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds, days_
         neg_win_rate = (neg_wins / neg_trade_count) if neg_trade_count > 0 else 0.0
         neg_win_loss_ratio = (neg_wins / neg_losses) if neg_losses > 0 else float('inf')
         neg_margin = neg_win_rate - neg_avg_price
-        neg_percent_margin = (neg_margin / neg_avg_price) - 1
+        neg_percent_margin = neg_margin / neg_avg_price
         neg_total_return = (neg_margin * neg_trade_count) / 100
         
         # Store everything in our results dictionary
