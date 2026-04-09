@@ -373,7 +373,7 @@ def main():
                 
                 # Accumulate internal tracking state
                 pos = contract_positions[cid][user]
-
+                invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
                 days_to_expiry = (m['end'] - ts).total_seconds() / 86400.0 if m['end'] is not None else 1.0
                 pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
                 
