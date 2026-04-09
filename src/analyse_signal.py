@@ -28,6 +28,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
     markets_df['resolution_timestamp'] = pd.to_datetime(markets_df['resolution_timestamp'])
 
     results = {}
+    neg_results = {}
     
     # 3. Loop through thresholds
     for threshold in thresholds:
@@ -95,18 +96,72 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
             'Total Return': total_return
         }
 
-    # Format into a clean DataFrame
-    results_df = pd.DataFrame.from_dict(results, orient='index')
-    results_df.index.name = 'Signal Threshold'
+        # ==========================================
+        # === NEGATIVE SIGNAL PROCESSING BLOCK ===
+        # ==========================================
+        # 1. Filter and deduplicate for negative thresholds
+        neg_filtered = trades_df[trades_df['signal_strength'] <= -threshold]
+        neg_first_trades = neg_filtered.sort_values('timestamp').drop_duplicates(subset=['id'], keep='first')
+        neg_merged = neg_first_trades.merge(markets_df, left_on='id', right_on='market_id', how='inner')
+
+        # 2. Convert implied 'yes' data to implied 'no' bets
+        neg_merged['trade_price'] = 1.0 - neg_merged['trade_price']
+        neg_merged['outcome'] = 1.0 - neg_merged['outcome']
+        
+        # Calculate duration
+        neg_merged['duration_days'] = (neg_merged[resolution_col] - neg_merged['timestamp']).dt.total_seconds() / (24 * 3600)
+        neg_merged = neg_merged[(neg_merged['duration_days'] > 0) & (neg_merged['trade_price'] > 0)].copy() 
+        neg_merged['duration_years'] = neg_merged['duration_days'] / 365.25
+
+        # Determine payout and IRR
+        neg_merged['payout'] = np.where(neg_merged['outcome'] == 1.0, 1.0, 0.0)
+        neg_merged['irr'] = np.where(
+            neg_merged['payout'] == 0.0,
+            -1.0, 
+            (neg_merged['payout'] / neg_merged['trade_price']) ** (1 / neg_merged['duration_years']) - 1
+        )
+        
+        # Clean IRR
+        neg_merged['irr'] = neg_merged['irr'].replace([np.inf, -np.inf], np.nan)
+        neg_merged = neg_merged.dropna(subset=['irr'])
+        neg_merged['irr'] = neg_merged['irr'].clip(upper=100.0)
+        
+        # Calculate metrics
+        neg_avg_price = neg_merged['trade_price'].mean()
+        neg_avg_irr = neg_merged['irr'].mean()
+        neg_trade_count = len(neg_merged)
+        neg_wins = (neg_merged['outcome'] == 1.0).sum()
+        neg_losses = (neg_merged['outcome'] == 0.0).sum()
+        neg_win_rate = (neg_wins / neg_trade_count) * 100 if neg_trade_count > 0 else 0.0
+        neg_win_loss_ratio = (neg_wins / neg_losses) if neg_losses > 0 else float('inf')
+        neg_total_return = (neg_avg_irr * neg_trade_count) / 100
+        
+        # Store in negative results dictionary
+        neg_results[-threshold] = {
+            'Average Price': neg_avg_price,
+            'Overall Average IRR': neg_avg_irr,
+            'Total Return': neg_total_return,
+            'Number of Trades': neg_trade_count,
+            'Wins': neg_wins,
+            'Losses': neg_losses,
+            'Win Rate (%)': neg_win_rate,
+            'Win/Loss Ratio': neg_win_loss_ratio
+        }
+
+    # Format POSITIVE results into a DataFrame
+    pos_results_df = pd.DataFrame.from_dict(results, orient='index')
+    pos_results_df.index.name = 'Signal Threshold'
     
-    # Round the numbers to make the terminal output easier to read
-    results_df = results_df.round({
-        'Average IRR': 4, 
-        'Win Rate (%)': 2, 
-        'Win/Loss Ratio': 2
-    })
+    # Format NEGATIVE results into a DataFrame
+    neg_results_df = pd.DataFrame.from_dict(neg_results, orient='index')
+    neg_results_df.index.name = 'Signal Threshold'
     
-    return results_df
+    # Round the numbers
+    rounding_rules = {'Average Price': 4, 'Overall Average IRR': 4, 'Total Return': 4, 'Win Rate (%)': 2, 'Win/Loss Ratio': 2}
+    pos_results_df = pos_results_df.round(rounding_rules)
+    neg_results_df = neg_results_df.round(rounding_rules)
+    
+    return pos_results_df, neg_results_df
 
 # === Implementation ===
 if __name__ == "__main__":
@@ -116,7 +171,12 @@ if __name__ == "__main__":
     MY_THRESHOLDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
     # Run the optimized analysis
-    final_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS)
+    pos_results, neg_results = calculate_signal_returns_optimized(TRADES_CSV_PATH, PARQUET_PATH, MY_THRESHOLDS)
     
-    print("\n--- Optimized Backtest Results ---")
-    print(final_results)
+    pd.set_option('display.max_columns', None)
+    
+    print("\n--- POSITIVE Signal Results (Betting YES) ---")
+    print(pos_results)
+    
+    print("\n--- NEGATIVE Signal Results (Betting NO) ---")
+    print(neg_results)
