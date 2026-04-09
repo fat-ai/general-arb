@@ -144,7 +144,7 @@ def calculate_signal_returns_optimized(csv_path, parquet_path, thresholds):
         neg_total_return = (neg_margin * neg_trade_count) / 100
         
         # Store everything in our results dictionary
-        results[threshold] = {
+        neg_results[threshold] = {
             'Average Price': neg_avg_price,
             'Average IRR': neg_avg_irr,
             'Number of Trades': neg_trade_count,
