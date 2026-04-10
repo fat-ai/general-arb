@@ -8,6 +8,7 @@ from decimal import Decimal
 from download_data_sql import DataFetcher, _safe_is_null
 from config import MARKETS_FILE
 import gc
+import random
 
 def process_raw_market_to_rows(raw_dict):
     """
@@ -173,7 +174,7 @@ def fill_gaps():
                     
                 else:
                     # Rate limited (429) or server error (500+). Apply backoff.
-                    sleep_time = BASE_DELAY * (2 ** attempt)
+                    sleep_time = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
                     print(f"\n⚠️ API returned {resp.status_code} for ID {mid}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
                     time.sleep(sleep_time)
                     
@@ -197,8 +198,10 @@ def fill_gaps():
             updated_df = pd.concat([current_existing, new_df], ignore_index=True)
             updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
             updated_df.to_parquet(market_file)
-            
-            # Clear memory for the next batch
+            if successfully_added_ids:
+                with open("added_ids.txt", "a") as f:
+                    f.write("\n".join(successfully_added_ids) + "\n")
+                successfully_added_ids.clear()
             all_new_processed.clear()
             del new_df, current_existing, updated_df
             gc.collect()
@@ -211,18 +214,14 @@ def fill_gaps():
         updated_df = pd.concat([current_existing, new_df], ignore_index=True)
         updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
         updated_df.to_parquet(market_file)
+        if successfully_added_ids:
+            with open("added_ids.txt", "a") as f:
+                f.write("\n".join(successfully_added_ids) + "\n")
+            successfully_added_ids.clear()
         
         all_new_processed.clear()
         del new_df, current_existing, updated_df
         gc.collect()
-
-    if successfully_added_ids:
-        print(f"\n✅ Done. Added {len(successfully_added_ids)} total missing markets.")
-        with open("added_ids.txt", "w") as f:
-            f.write("\n".join(successfully_added_ids))
-        print("📝 List of added IDs saved to added_ids.txt")
-    else:
-        print("\n✅ Done. No new markets were successfully added.")
 
 if __name__ == "__main__":
     fill_gaps()
