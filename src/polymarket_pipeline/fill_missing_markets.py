@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 from decimal import Decimal
-from download_data_sql import DataFetcher, CACHE_DIR, MARKETS_FILE, GAMMA_API_URL, _safe_is_null
+from download_data_sql import DataFetcher, MARKETS_FILE, _safe_is_null
 
 def process_raw_market_to_rows(raw_dict):
     """
@@ -83,12 +83,13 @@ def process_raw_market_to_rows(raw_dict):
     df['outcome'] = df.apply(final_payout, axis=1)
     
     # Cleanup to match original drops
-    drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices']
+    drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
     return df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
 
 def fill_gaps():
     fetcher = DataFetcher()
-    market_file = CACHE_DIR / MARKETS_FILE
+    market_file = MARKETS_FILE
+    GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets/'
     
     if not market_file.exists():
         print("❌ Markets file not found.")
@@ -123,6 +124,11 @@ def fill_gaps():
         final_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
         final_df.to_parquet(market_file)
         print(f"\n✅ Done. Added {len(new_df)} token rows.")
+        with open("added_ids.txt", "w") as f:
+            f.write("\n".join(successfully_added_ids))
+        
+        print(f"\n✅ Done. Added {len(new_df)} token rows.")
+        print(f"📝 List of added IDs saved to added_ids.txt")
 
 if __name__ == "__main__":
     fill_gaps()
