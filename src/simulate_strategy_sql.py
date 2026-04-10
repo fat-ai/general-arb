@@ -406,7 +406,7 @@ def main():
                 if ts < simulation_start_date: continue
 
                 usdc_vol = amount * price
-                m['volume'] += usdc_vol
+                m['volume'] += amount
                 cum_vol = m['volume']
                 bet_on = m['outcome_label']
     
@@ -522,8 +522,6 @@ def main():
                             hit_rate = round(100 * (wins / total_bets), 1)
                             log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
     
-       
-
                 if len(executions_buffer) >= 1000:
                     with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
                         csv.writer(f).writerows(executions_buffer)
