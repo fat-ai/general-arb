@@ -9,7 +9,7 @@ from datetime import datetime
 from collections import defaultdict
 
 # Import your existing configuration and fetcher
-from download_data_sql import DataFetcher, CACHE_DIR, FIXED_START_DATE
+from download_data_sql import DataFetcher, FIXED_START_DATE
 from config import MARKETS_FILE, GRAPH_URL
 
 def get_missing_tokens():
