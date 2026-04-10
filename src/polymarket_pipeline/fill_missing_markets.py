@@ -5,16 +5,19 @@ import json
 import time
 from pathlib import Path
 from decimal import Decimal
-from download_data_sql import DataFetcher, MARKETS_FILE, _safe_is_null
+from download_data_sql import DataFetcher, _safe_is_null
+from config import MARKETS_FILE
 
 def process_raw_market_to_rows(raw_dict):
     """
-    Applies the exact transformation logic from your original script
-    to a single market JSON object.
+    Applies the exact transformation logic mirroring download_data_sql.py
     """
+    if not raw_dict:
+        return pd.DataFrame()
+        
     df = pd.DataFrame([raw_dict])
 
-    # 1. Rename columns to match schema
+    # 1. Rename columns
     rename_map = {
         'id': 'market_id', 'question': 'question', 'conditionId': 'condition_id',
         'slug': 'slug', 'endDate': 'resolution_timestamp', 'startDate': 'start_date',
@@ -40,9 +43,19 @@ def process_raw_market_to_rows(raw_dict):
     # 2. Extract Token IDs
     def extract_tokens(row):
         raw = row.get('clobTokenIds') or row.get('tokens')
-        if isinstance(raw, list) and len(raw) >= 2:
-            clean = [str(t.get('token_id') if isinstance(t, dict) else t).strip() for t in raw]
-            return ",".join(clean)
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except (json.JSONDecodeError, ValueError): pass
+        if isinstance(raw, list):
+            clean_tokens = []
+            for t in raw:
+                if isinstance(t, dict):
+                    tid = t.get('token_id') or t.get('id') or t.get('tokenId')
+                    if tid: clean_tokens.append(str(tid).strip())
+                else:
+                    clean_tokens.append(str(t).strip())
+            if len(clean_tokens) >= 2:
+                return ",".join(clean_tokens)
         return None
 
     df['contract_id'] = df.apply(extract_tokens, axis=1)
@@ -50,29 +63,43 @@ def process_raw_market_to_rows(raw_dict):
 
     # 3. Derive Outcome
     def derive_outcome(row):
+        val = row.get('outcome')
+        if not _safe_is_null(val):
+            try: return float(str(val).replace('"', '').strip())
+            except (TypeError, ValueError): pass
+            
         prices = row.get('outcomePrices')
         if prices:
             try:
-                p_floats = [float(p) for p in (json.loads(prices) if isinstance(prices, str) else prices)]
-                for i, p in enumerate(p_floats):
-                    if p >= 0.95: return float(i)
-            except: pass
+                if isinstance(prices, str): prices = json.loads(prices)
+                if isinstance(prices, list):
+                    p_floats = [float(p) for p in prices]
+                    for i, p in enumerate(p_floats):
+                        if p >= 0.95: return float(i)
+            except (TypeError, ValueError, json.JSONDecodeError): pass
         return np.nan
 
     df['outcome'] = df.apply(derive_outcome, axis=1)
+
+    # 4. Clean dates
+    date_cols_iso = ['resolution_timestamp', 'created_at', 'updated_at', 'start_date']
+    date_cols_mixed = ['closed_time', 'game_start_time']
     
-    # Clean dates
-    for col in ['resolution_timestamp', 'created_at', 'updated_at', 'start_date']:
+    for col in date_cols_iso:
         if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce', utc=True).dt.tz_convert(None)
+            df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='ISO8601').dt.tz_convert(None)
+    for col in date_cols_mixed:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='mixed').dt.tz_convert(None)
 
     df = df.dropna(subset=['resolution_timestamp', 'outcome'])
     if df.empty: return pd.DataFrame()
 
-    # 4. Explode into Yes/No Rows
+    # 5. Explode into Yes/No Rows
     df['contract_id_list'] = df['contract_id'].str.split(',')
+    df['market_row_id'] = df.index
     df = df.explode('contract_id_list')
-    df['token_index'] = df.groupby('market_id').cumcount()
+    df['token_index'] = df.groupby('market_row_id').cumcount()
     df['contract_id'] = df['contract_id_list'].str.strip()
     df['token_outcome_label'] = np.where(df['token_index'] == 0, "Yes", "No")
 
@@ -81,18 +108,23 @@ def process_raw_market_to_rows(raw_dict):
         return 1.0 if row['token_index'] == winning_idx else 0.0
 
     df['outcome'] = df.apply(final_payout, axis=1)
-    
-    # Cleanup to match original drops
-    drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
-    return df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
 
+    # 6. JSON stringify complex types (Crucial for Parquet)
+    for col in df.columns:
+        df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
+
+    # 7. Cleanup
+    drops = ['contract_id_list', 'token_index', 'clobTokenIds', 'tokens', 'outcomePrices', 'market_row_id']
+    df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
+    return df.drop_duplicates(subset=['contract_id'], keep='last')
+    
 def fill_gaps():
     fetcher = DataFetcher()
-    market_file = MARKETS_FILE
+    market_file = Path(MARKETS_FILE) 
     GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets/'
     
     if not market_file.exists():
-        print("❌ Markets file not found.")
+        print(f"❌ Markets file not found at {market_file}")
         return
 
     df_existing = pd.read_parquet(market_file)
@@ -106,6 +138,8 @@ def fill_gaps():
     print(f"🚀 Found {len(missing_ids)} missing IDs. Fetching...")
     
     all_new_processed = []
+    successfully_added_ids = []
+    
     for i, mid in enumerate(missing_ids):
         try:
             resp = fetcher.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
@@ -113,8 +147,9 @@ def fill_gaps():
                 processed_df = process_raw_market_to_rows(resp.json())
                 if not processed_df.empty:
                     all_new_processed.append(processed_df)
+                    successfully_added_ids.append(str(mid)) # <-- TRACK THE SUCCESSFUL ID
                 print(f"   [{i+1}/{len(missing_ids)}] Processed Market {mid}", end='\r')
-            time.sleep(0.1) # Be gentle
+            time.sleep(0.1) 
         except Exception as e:
             print(f"\n❌ Error ID {mid}: {e}")
 
