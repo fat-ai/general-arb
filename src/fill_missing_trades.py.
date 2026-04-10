@@ -1,0 +1,207 @@
+import json
+import time
+import sqlite3
+import contextlib
+import pandas as pd
+from pathlib import Path
+from decimal import Decimal
+from datetime import datetime
+from collections import defaultdict
+
+# Import your existing configuration and fetcher
+from download_data_sql import DataFetcher, CACHE_DIR, FIXED_START_DATE
+from config import MARKETS_FILE, GRAPH_URL
+
+def get_missing_tokens():
+    """Step 1: Read the text file and extract the associated token IDs."""
+    ids_file = Path("added_ids.txt")
+    if not ids_file.exists():
+        print("❌ 'added_ids.txt' not found. No missing markets to process.")
+        return []
+
+    with open(ids_file, "r") as f:
+        missing_market_ids = [line.strip() for line in f if line.strip()]
+
+    if not missing_market_ids:
+        print("ℹ️ 'added_ids.txt' is empty.")
+        return []
+
+    market_file = Path(MARKETS_FILE)
+    if not market_file.exists():
+        print(f"❌ Markets file not found at {market_file}")
+        return []
+
+    # Load only the necessary columns from the parquet file
+    df = pd.read_parquet(market_file, columns=['market_id', 'contract_id'])
+    
+    # Filter for the markets we just added
+    df_missing = df[df['market_id'].astype(str).isin(missing_market_ids)]
+    
+    target_tokens = set()
+    for val in df_missing['contract_id'].dropna():
+        s = str(val).strip().lower()
+        try:
+            if s.startswith("0x"): target_tokens.add(int(s, 16))
+            elif "e+" in s: target_tokens.add(int(float(s)))
+            else: target_tokens.add(int(Decimal(s)))
+        except Exception:
+            continue
+            
+    print(f"✅ Extracted {len(target_tokens)} unique tokens from {len(missing_market_ids)} missing markets.")
+    return list(target_tokens)
+
+def fetch_missing_trades():
+    target_tokens = get_missing_tokens()
+    if not target_tokens:
+        return
+
+    fetcher = DataFetcher()
+    db_file = "./data-cache/polymarket_cache/gamma_trades.db"
+    
+    TOKEN_BATCH_SIZE = 50 
+    MAX_RETRIES = 5
+    global_stop_ts = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
+    
+    total_captured = 0
+
+    with contextlib.closing(sqlite3.connect(db_file)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        
+        for i in range(0, len(target_tokens), TOKEN_BATCH_SIZE):
+            batch_tokens = target_tokens[i:i + TOKEN_BATCH_SIZE]
+            batch_tokens_set = set(batch_tokens) # Fix 4: O(1) membership checks
+            
+            token_strs = [f'"{str(t)}"' for t in batch_tokens]
+            tokens_list_str = "[" + ",".join(token_strs) + "]"
+            
+            batch_num = (i // TOKEN_BATCH_SIZE) + 1
+            total_batches = math.ceil(len(target_tokens) / TOKEN_BATCH_SIZE) 
+            print(f"\n🚀 Processing Token Batch {batch_num}/{total_batches} ({len(batch_tokens)} tokens)...")
+
+            seen_trade_ids = set() 
+            
+            for side_filter in ["makerAssetId_in", "takerAssetId_in"]:
+                current_ts = int(time.time())
+                side_captured = 0
+                
+                print(f"   🔍 Fetching trades where token is {side_filter.split('_')[0]}...", end="")
+                
+                while current_ts > global_stop_ts:
+                    query = f"""
+                    query {{
+                        orderFilledEvents(
+                            first: 1000, 
+                            orderBy: timestamp, 
+                            orderDirection: desc, 
+                            where: {{ timestamp_lt: {current_ts}, timestamp_gte: {global_stop_ts}, {side_filter}: {tokens_list_str} }}
+                        ) {{
+                            id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
+                        }}
+                    }}
+                    """
+                    
+                    success = False
+                    for attempt in range(MAX_RETRIES):
+                        try:
+                            resp = fetcher.session.post(GRAPH_URL, json={'query': query}, timeout=10)
+                            if resp.status_code == 200:
+                                success = True
+                                break
+                            else:
+                                print(f"\n   ⚠️ HTTP {resp.status_code}. Retrying ({attempt+1}/{MAX_RETRIES})...", end="")
+                                time.sleep(2 ** attempt)
+                        except Exception as e:
+                            print(f"\n   ⚠️ Network error: {e}. Retrying ({attempt+1}/{MAX_RETRIES})...", end="")
+                            time.sleep(2 ** attempt)
+                            
+                    if not success:
+                        print("\n   ❌ Max retries reached. Skipping remaining time window for this side.")
+                        break
+
+                    data = resp.json().get('data', {}).get('orderFilledEvents', [])
+                    if not data:
+                        break
+
+                    by_ts = defaultdict(list)
+                    for row in data:
+                        ts = int(row['timestamp'])
+                        by_ts[ts].append(row)
+                    
+                    sorted_ts = sorted(by_ts.keys(), reverse=True)
+                    oldest_ts = sorted_ts[-1]
+                    is_full_batch = (len(data) >= 1000)
+                    
+                    out_rows = []
+                    
+                    for ts in sorted_ts:
+                        if ts <= global_stop_ts: 
+                            continue
+                        if is_full_batch and ts == oldest_ts: 
+                            continue
+                        
+                        for r in by_ts[ts]:
+                            trade_id = r['id']
+                            
+                            # Fix 3: Deduplication check
+                            if trade_id in seen_trade_ids:
+                                continue
+                            seen_trade_ids.add(trade_id)
+                                
+                            if r.get('maker') == r.get('taker'):
+                                continue
+                            
+                            m_raw = str(r.get('makerAssetId', '0')).strip()
+                            m_int = int(m_raw, 16) if m_raw.startswith("0x") else int(Decimal(m_raw))
+                            
+                            t_raw = str(r.get('takerAssetId', '0')).strip()
+                            t_int = int(t_raw, 16) if t_raw.startswith("0x") else int(Decimal(t_raw))
+                            
+                            tid = None; mult = 0
+                            if m_int in batch_tokens_set:
+                                tid = m_int; mult = 1
+                                val_usdc = float(r['takerAmountFilled']) / 1e6
+                                val_size = float(r['makerAmountFilled']) / 1e6
+                            elif t_int in batch_tokens_set:
+                                tid = t_int; mult = -1
+                                val_usdc = float(r['makerAmountFilled']) / 1e6
+                                val_size = float(r['takerAmountFilled']) / 1e6
+                            
+                            if tid is None:
+                                print(f"\n   ⚠️ Warning: Trade {trade_id} matched no batch token. Parsing bug?")
+                                continue
+                            
+                            if val_usdc > 0 and val_size > 0:
+                                price = val_usdc / val_size
+                                if 0.000001 <= price <= 1.00:
+                                    out_rows.append((
+                                        trade_id, 
+                                        datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                        val_usdc, 
+                                        val_size * mult,
+                                        r['taker'], 
+                                        str(tid),
+                                        price, 
+                                        val_size, 
+                                        mult
+                                    ))
+
+                    if out_rows:
+                        conn.executemany("""
+                            INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, out_rows)
+                        conn.commit()
+                        side_captured += len(out_rows)
+
+                    current_ts = oldest_ts
+
+                    time.sleep(0.2)
+                    
+                print(f" Done. ({side_captured} inserted)")
+                total_captured += side_captured
+
+    print(f"\n🏁 Complete! Safely inserted {total_captured} historical trades for the missing markets.")
+
+if __name__ == "__main__":
+    fetch_missing_trades()
