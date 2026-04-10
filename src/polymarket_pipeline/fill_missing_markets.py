@@ -135,7 +135,8 @@ def fill_gaps():
     if not missing_ids:
         print("✅ No gaps found.")
         return
-
+        
+    existing_columns = df_existing.columns
     del df_existing
     del ids
     gc.collect()
@@ -189,7 +190,7 @@ def fill_gaps():
         if len(all_new_processed) >= BATCH_SIZE:
             print(f"\n💾 Batch size reached ({BATCH_SIZE}). Merging and saving to disk...")
             new_df = pd.concat(all_new_processed, ignore_index=True)
-            new_df = new_df.reindex(columns=df_existing.columns)
+            new_df = new_df.reindex(columns=existing_columns)
             
             # Briefly load existing data, merge, and save
             current_existing = pd.read_parquet(market_file)
