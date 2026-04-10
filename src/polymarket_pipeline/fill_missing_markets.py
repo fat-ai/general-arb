@@ -159,6 +159,9 @@ def fill_gaps():
                 resp = fetcher.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
                 
                 if resp.status_code == 200:
+                    raw_data = resp.json()
+                    if not isinstance(raw_data, dict) or 'id' not in raw_data:
+                        raise ValueError("Payload is missing standard market data.")
                     processed_df = process_raw_market_to_rows(resp.json())
                     if not processed_df.empty:
                         all_new_processed.append(processed_df)
@@ -182,6 +185,11 @@ def fill_gaps():
                 # Catch connection errors, timeouts, etc.
                 sleep_time = BASE_DELAY * (2 ** attempt)
                 print(f"\n⚠️ Network error for ID {mid}: {e}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
+                time.sleep(sleep_time)
+
+            except (KeyError, ValueError, TypeError) as e:
+                sleep_time = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                print(f"\n⚠️ Corrupted payload for ID {mid} ({e}). Retrying in {sleep_time:.2f}s ({attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(sleep_time)
                 
         if not success:
