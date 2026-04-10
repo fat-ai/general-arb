@@ -165,7 +165,7 @@ class SignalEngine:
         # 4. Calculate Impact
         #raw_impact = usdc_vol * weight_multiplier
 
-        raw_impact = score * np.log1p(usdc_vol)
+        raw_impact = score * usdc_vol
         
         # 5. Apply Direction
                           
