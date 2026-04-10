@@ -721,7 +721,7 @@ class LiveTrader:
                 direction = -1.0 if is_buy else 1.0
                 
             # 6. Update Cumulative Volume
-            self.cumulative_volumes[mid] = self.cumulative_volumes.get(mid, 0.0) + usdc_vol
+            self.cumulative_volumes[mid] = self.cumulative_volumes.get(mid, 0.0) + amount
             cum_vol = self.cumulative_volumes[mid]
 
             # 7. Process Signal with WalletScorer
@@ -730,7 +730,7 @@ class LiveTrader:
             raw_weight = self.signal_engine.process_trade(
                 wallet=wallet, 
                 token_id=mid, 
-                usdc_vol=usdc_vol, 
+                usdc_vol=amount, 
                 total_vol=cum_vol, 
                 direction=direction, 
                 price=price,
