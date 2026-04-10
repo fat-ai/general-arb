@@ -7,6 +7,7 @@ from pathlib import Path
 from decimal import Decimal
 from download_data_sql import DataFetcher, _safe_is_null
 from config import MARKETS_FILE
+import gc
 
 def process_raw_market_to_rows(raw_dict):
     """
@@ -135,35 +136,91 @@ def fill_gaps():
         print("✅ No gaps found.")
         return
 
+    del df_existing
+    del ids
+    gc.collect()
+
     print(f"🚀 Found {len(missing_ids)} missing IDs. Fetching...")
     
     all_new_processed = []
     successfully_added_ids = []
     
+    MAX_RETRIES = 20
+    BASE_DELAY = 1.0  # Base delay in seconds for exponential backoff
+    BATCH_SIZE = 20
+    
     for i, mid in enumerate(missing_ids):
-        try:
-            resp = fetcher.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
-            if resp.status_code == 200:
-                processed_df = process_raw_market_to_rows(resp.json())
-                if not processed_df.empty:
-                    all_new_processed.append(processed_df)
-                    successfully_added_ids.append(str(mid)) # <-- TRACK THE SUCCESSFUL ID
-                print(f"   [{i+1}/{len(missing_ids)}] Processed Market {mid}", end='\r')
-            time.sleep(0.1) 
-        except Exception as e:
-            print(f"\n❌ Error ID {mid}: {e}")
-
+        success = False
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = fetcher.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
+                
+                if resp.status_code == 200:
+                    processed_df = process_raw_market_to_rows(resp.json())
+                    if not processed_df.empty:
+                        all_new_processed.append(processed_df)
+                        successfully_added_ids.append(str(mid))
+                    print(f"   [{i+1}/{len(missing_ids)}] Processed Market {mid}        ", end='\r')
+                    success = True
+                    break  # Success! Break out of the retry loop
+                    
+                elif resp.status_code == 404:
+                    # The market ID doesn't exist on the server. No need to retry.
+                    success = True 
+                    break 
+                    
+                else:
+                    # Rate limited (429) or server error (500+). Apply backoff.
+                    sleep_time = BASE_DELAY * (2 ** attempt)
+                    print(f"\n⚠️ API returned {resp.status_code} for ID {mid}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
+                    time.sleep(sleep_time)
+                    
+            except requests.exceptions.RequestException as e:
+                # Catch connection errors, timeouts, etc.
+                sleep_time = BASE_DELAY * (2 ** attempt)
+                print(f"\n⚠️ Network error for ID {mid}: {e}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
+                time.sleep(sleep_time)
+                
+        if not success:
+            print(f"\n❌ Failed to fetch ID {mid} after {MAX_RETRIES} attempts. Skipping.")
+            
+        time.sleep(0.1)
+        if len(all_new_processed) >= BATCH_SIZE:
+            print(f"\n💾 Batch size reached ({BATCH_SIZE}). Merging and saving to disk...")
+            new_df = pd.concat(all_new_processed, ignore_index=True)
+            
+            # Briefly load existing data, merge, and save
+            current_existing = pd.read_parquet(market_file)
+            updated_df = pd.concat([current_existing, new_df], ignore_index=True)
+            updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
+            updated_df.to_parquet(market_file)
+            
+            # Clear memory for the next batch
+            all_new_processed.clear()
+            del new_df, current_existing, updated_df
+            gc.collect()
+            print("✅ Batch saved. Resuming fetch...")
+            
     if all_new_processed:
+        print(f"\n💾 Saving final batch of {len(all_new_processed)} markets...")
         new_df = pd.concat(all_new_processed, ignore_index=True)
-        final_df = pd.concat([df_existing, new_df], ignore_index=True)
-        final_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
-        final_df.to_parquet(market_file)
-        print(f"\n✅ Done. Added {len(new_df)} token rows.")
+        current_existing = pd.read_parquet(market_file)
+        updated_df = pd.concat([current_existing, new_df], ignore_index=True)
+        updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
+        updated_df.to_parquet(market_file)
+        
+        all_new_processed.clear()
+        del new_df, current_existing, updated_df
+        gc.collect()
+
+    if successfully_added_ids:
+        print(f"\n✅ Done. Added {len(successfully_added_ids)} total missing markets.")
         with open("added_ids.txt", "w") as f:
             f.write("\n".join(successfully_added_ids))
-        
-        print(f"\n✅ Done. Added {len(new_df)} token rows.")
-        print(f"📝 List of added IDs saved to added_ids.txt")
+        print("📝 List of added IDs saved to added_ids.txt")
+    else:
+        print("\n✅ Done. No new markets were successfully added.")
 
 if __name__ == "__main__":
     fill_gaps()
