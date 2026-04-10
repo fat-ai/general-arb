@@ -413,7 +413,7 @@ def main():
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=usdc_vol, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
+                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
                 sig = sig / cum_vol
 
                 current_event_id = m.get('event_id')
