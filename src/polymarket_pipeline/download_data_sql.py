@@ -295,9 +295,8 @@ class DataFetcher:
             if cache_file.exists():
                 print(f"   🔄 Checking for unresolved market updates...")
                 try:
-                    df_ext = pd.read_parquet(cache_file, columns=['market_id', 'outcome'])
-                    # Find markets where the outcome is still NaN
-                    unresolved_ids = df_ext[df_ext['outcome'].isna()]['market_id'].dropna().astype(int).unique()
+                    df_ext = pd.read_parquet(cache_file, columns=['market_id', 'closed'])
+                    unresolved_ids = df_ext[(df_ext['closed'] == True)]['market_id'].dropna().astype(int).unique()
                     del df_ext
                     gc.collect()
                     
