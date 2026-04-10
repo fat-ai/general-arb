@@ -13,6 +13,39 @@ from collections import defaultdict
 from download_data_sql import DataFetcher, FIXED_START_DATE
 from config import MARKETS_FILE, GRAPH_URL
 
+def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
+    """
+    Reads the markets parquet, removes rows where volume == 0 for the given
+    market IDs, writes the file back, and returns the filtered list of market IDs
+    to continue processing.
+    """
+    market_file = Path(MARKETS_FILE)
+    if not market_file.exists():
+        print(f"❌ Markets file not found at {market_file}")
+        return missing_market_ids
+
+    df = pd.read_parquet(market_file)
+
+    target_mask = df['market_id'].astype(str).isin(missing_market_ids)
+    zero_volume_mask = target_mask & (df['volume'] == 0)
+    
+    zero_volume_ids = df.loc[zero_volume_mask, 'market_id'].astype(str).tolist()
+    n_dropped = len(zero_volume_ids)
+
+    if n_dropped == 0:
+        print("ℹ️ No zero-volume markets found. Nothing to remove.")
+        return missing_market_ids
+
+    print(f"🗑️ Removing {n_dropped} zero-volume market(s) from parquet: {zero_volume_ids}")
+    
+    df = df[~zero_volume_mask].reset_index(drop=True)
+    df.to_parquet(market_file, index=False)
+    
+    print(f"✅ Parquet updated. {n_dropped} row(s) removed.")
+
+    surviving_ids = [mid for mid in missing_market_ids if mid not in set(zero_volume_ids)]
+    return surviving_ids
+
 def get_missing_tokens():
     """Step 1: Read the text file and extract the associated token IDs."""
     ids_file = Path("added_ids.txt")
@@ -30,6 +63,11 @@ def get_missing_tokens():
     market_file = Path(MARKETS_FILE)
     if not market_file.exists():
         print(f"❌ Markets file not found at {market_file}")
+        return []
+
+    missing_market_ids = remove_zero_volume_markets(missing_market_ids)
+    if not missing_market_ids:
+        print("ℹ️ All missing markets had zero volume. Nothing to process.")
         return []
 
     # Load only the necessary columns from the parquet file
