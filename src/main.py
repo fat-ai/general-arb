@@ -532,88 +532,83 @@ class LiveTrader:
                 await self._ensure_session()
                 redeemed_any = False
     
-                for batch in _chunked(list(market_map.keys()), 5):
-                    url = GAMMA_API_URL + "?" + "&".join(f"id={fpmm}" for fpmm in batch)
+                for fpmm_id in market_map.keys():
+ 
+                    url = f"{GAMMA_API_URL.rstrip('/')}/{fpmm_id}"
     
                     # Fetch with exponential backoff
                     data = None
                     for attempt in range(10):
                         try:
                             async with self.http_session.get(url) as resp:
+                                if resp.status == 404:
+                                    break  # Stop retrying if the market flat-out doesn't exist
                                 if resp.status != 200:
                                     raise RuntimeError(f"HTTP {resp.status}")
                                 data = await resp.json()
                                 break
                         except Exception as e:
                             if attempt == 9:
-                                log.error(f"Resolution batch failed after 10 attempts: {e}")
+                                log.error(f"Resolution fetch failed for {fpmm_id} after 10 attempts: {e}")
                             else:
                                 await asyncio.sleep(min(2 ** attempt, 10))
     
                     if not data:
                         continue
+
+                    mkt = data
+                    
+                    try:
+                        if not mkt or mkt.get("closed") is not True:
+                            continue
     
-                    markets = data.get("data") if isinstance(data, dict) else data
-                    if not isinstance(markets, list):
-                        log.warning(f"Unexpected markets payload type: {type(markets)}")
-                        continue
+                        outcome_tokens = _safe_json_load(mkt.get("tokens"))
+                        outcome_prices_raw = _safe_json_load(mkt.get("outcomePrices"))
     
-                    for mkt in markets:
-                        try:
-                            if not mkt or mkt.get("closed") is not True:
+                        if not outcome_prices_raw:
+                            continue
+    
+                        outcome_prices = [float(p) for p in outcome_prices_raw]
+    
+                        if (
+                            not outcome_tokens
+                            or not isinstance(outcome_tokens, list)
+                            or not isinstance(outcome_prices, list)
+                            or len(outcome_tokens) != len(outcome_prices)
+                        ):
+                            continue
+    
+                        winner_idx = max(range(len(outcome_prices)), key=lambda i: outcome_prices[i])
+                        if outcome_prices[winner_idx] < 0.99:
+                            continue  # Market not conclusively resolved yet
+    
+                        for token_id in market_map.get(fpmm_id, []):
+                            pos = positions.get(token_id)
+                            if not pos or pos.get("redeemed"):
                                 continue
     
-                            fpmm_id = (mkt.get("id") or "").lower()
-                            if not fpmm_id:
-                                continue
+                            is_winner = outcome_tokens[winner_idx] == token_id
+                            payout = 1.0 if is_winner else 0.0
     
-                            outcome_tokens = _safe_json_load(mkt.get("tokens"))
-                            outcome_prices_raw = _safe_json_load(mkt.get("outcomePrices"))
+                            pos["redeemed"] = True
+                            await self.persistence.save_async()
     
-                            if not outcome_prices_raw:
-                                continue
-    
-                            outcome_prices = [float(p) for p in outcome_prices_raw]
-    
-                            if (
-                                not outcome_tokens
-                                or not isinstance(outcome_tokens, list)
-                                or not isinstance(outcome_prices, list)
-                                or len(outcome_tokens) != len(outcome_prices)
-                            ):
-                                continue
-    
-                            winner_idx = max(range(len(outcome_prices)), key=lambda i: outcome_prices[i])
-                            if outcome_prices[winner_idx] < 0.99:
-                                continue  # Market not conclusively resolved yet
-    
-                            for token_id in market_map.get(fpmm_id, []):
-                                pos = positions.get(token_id)
-                                if not pos or pos.get("redeemed"):
-                                    continue
-    
-                                is_winner = outcome_tokens[winner_idx] == token_id
-                                payout = 1.0 if is_winner else 0.0
-    
-                                pos["redeemed"] = True
+                            try:
+                                await self.broker.redeem_position(token_id, payout)
+                                redeemed_any = True
+                                log.info(
+                                    f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
+                                    f"Token: {token_id} | Win: {is_winner}"
+                                )
+                            except Exception as e:
+                                pos["redeemed"] = False
                                 await self.persistence.save_async()
+                                log.error(f"Redeem failed for {token_id}: {e}")
     
-                                try:
-                                    await self.broker.redeem_position(token_id, payout)
-                                    redeemed_any = True
-                                    log.info(
-                                        f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
-                                        f"Token: {token_id} | Win: {is_winner}"
-                                    )
-                                except Exception as e:
-                                    pos["redeemed"] = False
-                                    await self.persistence.save_async()
-                                    log.error(f"Redeem failed for {token_id}: {e}")
+                    except Exception as e:
+                        log.error(f"Market processing error for {fpmm_id}: {e}")
     
-                        except Exception as e:
-                            log.error(f"Market processing error: {e}")
-    
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.2)
     
                 await asyncio.sleep(5 if redeemed_any else 60)
     
