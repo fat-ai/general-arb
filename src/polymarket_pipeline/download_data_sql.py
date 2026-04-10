@@ -182,7 +182,9 @@ class DataFetcher:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='mixed').dt.tz_convert(None)
 
-            df = df.dropna(subset=['resolution_timestamp', 'outcome'])
+            if 'resolution_timestamp' not in df.columns:
+                return
+            df = df.dropna(subset=['resolution_timestamp'])
             if df.empty:
                 return
 
@@ -194,6 +196,8 @@ class DataFetcher:
             df['token_outcome_label'] = np.where(df['token_index'] == 0, "Yes", "No")
 
             def final_payout(row):
+                if pd.isna(row['outcome']):
+                    return np.nan
                 winning_idx = int(round(row['outcome']))
                 return 1.0 if row['token_index'] == winning_idx else 0.0
 
@@ -213,6 +217,45 @@ class DataFetcher:
             df.to_parquet(temp_path)
             temp_files.append(temp_path)
             print(f"   💾 Saved chunk {chunk_idx} ({len(df)} rows)")
+
+        if cache_file.exists():
+            print(f"   🔄 Checking for unresolved market updates...")
+            try:
+                df_ext = pd.read_parquet(cache_file, columns=['market_id', 'outcome'])
+                # Find markets where the outcome is still NaN
+                unresolved_ids = df_ext[df_ext['outcome'].isna()]['market_id'].dropna().astype(int).unique()
+                del df_ext
+                gc.collect()
+                
+                if len(unresolved_ids) > 0:
+                    import random
+                    updated_raw_rows = []
+                    print(f"   🚀 Fetching updates for {len(unresolved_ids)} unresolved markets...")
+                    
+                    for i, mid in enumerate(unresolved_ids):
+                        for attempt in range(3): # Short retry loop for updates
+                            try:
+                                resp = self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
+                                if resp.status_code == 200:
+                                    raw_data = resp.json()
+                                    if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
+                                        updated_raw_rows.append(raw_data)
+                                    break
+                                elif resp.status_code == 404:
+                                    break
+                                else:
+                                    time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+                            except Exception:
+                                time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+                        print(f"      [{i+1}/{len(unresolved_ids)}] Checked     ", end='\r')
+                    
+                    if updated_raw_rows:
+                        # Feed the updated rows straight into the chunk saver
+                        process_and_save_chunk(updated_raw_rows, "unresolved_updates")
+                        print("\n   ✅ Unresolved updates saved to temp chunk.")
+            except Exception as e:
+                print(f"\n   ⚠️ Could not process unresolved updates: {e}")
+        # ---------------------------------------------------
 
         BATCH_SIZE = 500
         MAX_API_RETRIES = 5
@@ -270,7 +313,11 @@ class DataFetcher:
                     valid_batch.append(r)
 
                 current_raw_rows.extend(valid_batch)
-                offset += len(batch)
+                if len(batch) == BATCH_SIZE:
+                    offset += (BATCH_SIZE - 50)
+                else:
+                    offset += len(batch)
+                
                 print(".", end="", flush=True)
 
                 if len(current_raw_rows) >= 1000:
