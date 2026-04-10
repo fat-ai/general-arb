@@ -869,7 +869,13 @@ class LiveTrader:
 
         # 2. Wait for Initial Liquidity
         raw_book = self.order_books.get(token_id)
+            
         if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
+            
+            if _resubscribe_attempts >= 50:
+                log.error(f"❌ Aborting execution for {token_id}. Book never populated after multiple resubscribe attempts.")
+                return
+                
             if _retries >= 10:
                 log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
                 self.ws_client.resubscribe_single(token_id)
