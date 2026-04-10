@@ -27,7 +27,7 @@ def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
     df = pd.read_parquet(market_file)
 
     target_mask = df['market_id'].astype(str).isin(missing_market_ids)
-    zero_volume_mask = target_mask & (df['volume'] == 0)
+    zero_volume_mask = target_mask & (int(df['volume']) == 0)
     
     zero_volume_ids = df.loc[zero_volume_mask, 'market_id'].astype(str).tolist()
     n_dropped = len(zero_volume_ids)
