@@ -160,18 +160,27 @@ def fill_gaps():
                 
                 if resp.status_code == 200:
                     raw_data = resp.json()
+                    
                     if not isinstance(raw_data, dict) or 'id' not in raw_data:
                         raise ValueError("Payload is missing standard market data.")
+
+                    if raw_data.get('endDate') is None:
+                        success = True 
+                        break
+                        
                     processed_df = process_raw_market_to_rows(resp.json())
                     if not processed_df.empty:
                         all_new_processed.append(processed_df)
                         successfully_added_ids.append(str(mid))
+                        with open("added_ids.txt", "a") as f:
+                            f.write(f"{mid}\n")
                     print(f"   [{i+1}/{len(missing_ids)}] Processed Market {mid}        ", end='\r')
                     success = True
                     break  # Success! Break out of the retry loop
                     
                 elif resp.status_code == 404:
                     # The market ID doesn't exist on the server. No need to retry.
+                    print(f"404: Market ID {mid} not found")
                     success = True 
                     break 
                     
@@ -206,10 +215,6 @@ def fill_gaps():
             updated_df = pd.concat([current_existing, new_df], ignore_index=True)
             updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
             updated_df.to_parquet(market_file)
-            if successfully_added_ids:
-                with open("added_ids.txt", "a") as f:
-                    f.write("\n".join(successfully_added_ids) + "\n")
-                successfully_added_ids.clear()
             all_new_processed.clear()
             del new_df, current_existing, updated_df
             gc.collect()
@@ -222,10 +227,6 @@ def fill_gaps():
         updated_df = pd.concat([current_existing, new_df], ignore_index=True)
         updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
         updated_df.to_parquet(market_file)
-        if successfully_added_ids:
-            with open("added_ids.txt", "a") as f:
-                f.write("\n".join(successfully_added_ids) + "\n")
-            successfully_added_ids.clear()
         
         all_new_processed.clear()
         del new_df, current_existing, updated_df
