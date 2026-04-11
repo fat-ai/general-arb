@@ -99,7 +99,7 @@ def main():
             CREATE TABLE first_ts AS
             SELECT
                 user           AS wallet_id,
-                MIN(timestamp) AS first_timestamp
+                MIN(CAST(t.timestamp AS BIGINT)) AS first_timestamp
             FROM source_db.trades
             WHERE price >= 0.0
               AND price <= 1.0
