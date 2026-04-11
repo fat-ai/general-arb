@@ -1,3 +1,6 @@
+import os
+import pyarrow as pa
+import pyarrow.parquet as pq
 import json
 import math
 import time
@@ -9,46 +12,79 @@ from decimal import Decimal
 from datetime import datetime
 from collections import defaultdict
 
+
 # Import your existing configuration and fetcher
 from download_data_sql import DataFetcher, FIXED_START_DATE
 from config import MARKETS_FILE, GRAPH_URL
 
 def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
     """
-    Reads the markets parquet, removes rows where volume == 0 for the given
-    market IDs, writes the file back, and returns the filtered list of market IDs
-    to continue processing.
+    Streams the markets parquet in small batches to prevent Out-Of-Memory (OOM) crashes,
+    removes rows where volume == 0, writes the file back, and returns the surviving IDs.
     """
     market_file = Path(MARKETS_FILE)
     if not market_file.exists():
         print(f"❌ Markets file not found at {market_file}")
         return missing_market_ids
 
-    df = pd.read_parquet(market_file)
-
-    # Convert to set for faster masking
     missing_set = set(missing_market_ids)
-    target_mask = df['market_id'].astype(str).isin(missing_set)
-    zero_volume_mask = target_mask & (df['volume'] == 0)
+    zero_volume_ids = []
     
-    zero_volume_ids = df.loc[zero_volume_mask, 'market_id'].astype(str).tolist()
-    n_dropped = len(zero_volume_ids)
+    # We write to a temporary file to prevent keeping everything in RAM
+    temp_file = market_file.with_name(market_file.name + ".tmp")
+    
+    try:
+        parquet_file = pq.ParquetFile(market_file)
+        
+        print("⏳ Streaming Parquet file to filter zero-volume markets safely...")
+        
+        # Open a writer for the new file using the exact same structure
+        with pq.ParquetWriter(temp_file, parquet_file.schema_arrow) as writer:
+            
+            # Process the file in memory-friendly chunks of 50,000 rows
+            for batch in parquet_file.iter_batches(batch_size=50000):
+                
+                # Extract just the columns we need to check
+                market_ids = batch["market_id"].to_pylist()
+                volumes = batch["volume"].to_pylist()
+                
+                keep_mask = []
+                for mid, vol in zip(market_ids, volumes):
+                    mid_str = str(mid)
+                    # Drop if it is in our missing set AND volume is exactly 0
+                    if mid_str in missing_set and vol == '0':
+                        keep_mask.append(False)
+                        zero_volume_ids.append(mid_str)
+                    else:
+                        keep_mask.append(True)
+                
+                # Apply the filter mask at the C++ level (extremely fast and memory efficient)
+                mask_array = pa.array(keep_mask, type=pa.bool_())
+                filtered_batch = batch.filter(mask_array)
+                
+                # Write the surviving rows to disk immediately
+                writer.write_batch(filtered_batch)
 
-    if n_dropped == 0:
-        print("ℹ️ No zero-volume markets found. Nothing to remove.")
+        n_dropped = len(zero_volume_ids)
+        if n_dropped == 0:
+            print("ℹ️ No zero-volume markets found. Nothing to remove.")
+            if temp_file.exists():
+                os.remove(temp_file)
+            return missing_market_ids
+
+        print(f"🗑️ Removing {n_dropped} zero-volume market(s) from parquet...")
+        
+        # Atomically replace the old massive file with our clean new file
+        os.replace(temp_file, market_file)
+        print("✅ Parquet updated safely without memory spikes.")
+        
+    except Exception as e:
+        if temp_file.exists():
+            os.remove(temp_file)
+        print(f"❌ Error during chunked parquet processing: {e}")
         return missing_market_ids
 
-    print(f"🗑️ Removing {n_dropped} zero-volume market(s) from parquet...")
-
-    df.drop(df[zero_volume_mask].index, inplace=True)
-    
-    del target_mask
-    del zero_volume_mask
-
-    df.to_parquet(market_file, index=False)
-    
-    print(f"✅ Parquet updated. {n_dropped} row(s) removed.")
-
+    # Calculate and return the remaining IDs
     zero_vol_set = set(zero_volume_ids)
     surviving_ids = [mid for mid in missing_market_ids if mid not in zero_vol_set]
     
