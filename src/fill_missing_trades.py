@@ -259,7 +259,7 @@ def fetch_missing_trades():
                                 if 0.000001 <= price <= 1.00:
                                     out_rows.append((
                                         trade_id, 
-                                        datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                        int(r['timestamp']),
                                         val_usdc, 
                                         val_size * mult,
                                         r['taker'], 
