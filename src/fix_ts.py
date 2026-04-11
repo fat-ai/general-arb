@@ -17,17 +17,22 @@ def fix_database():
         cursor.execute(f"SELECT id, timestamp FROM trades WHERE typeof(timestamp) = 'text' LIMIT {chunk_size}")
         rows = cursor.fetchall()
         
-        # If the query returns empty, we've successfully processed the whole database!
         if not rows:
             break
         
         updates = []
         for row_id, ts_str in rows:
             try:
-                # Safely parse the ISO string and convert back to Unix integer
-                if not ts_str.endswith('Z') and '+' not in ts_str:
-                    ts_str += '+00:00'
-                ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+                # FIX: Check if it is just a number stored as a string (e.g., "1774648931")
+                if ts_str.replace('.', '', 1).isdigit():
+                    ts_int = int(float(ts_str))
+                    
+                # Otherwise, it must be an old ISO date string (e.g., "2026-04-11T13:56:19")
+                else:
+                    if not ts_str.endswith('Z') and '+' not in ts_str:
+                        ts_str += '+00:00'
+                    ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+                    
                 updates.append((ts_int, row_id))
             except Exception as e:
                 print(f"Failed to parse {ts_str}: {e}")
