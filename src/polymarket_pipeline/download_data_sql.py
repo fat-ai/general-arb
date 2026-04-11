@@ -444,7 +444,7 @@ class DataFetcher:
             db_cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
                     id TEXT PRIMARY KEY,
-                    timestamp TEXT,
+                    timestamp INTEGER,
                     tradeAmount REAL,
                     outcomeTokensAmount REAL,
                     user TEXT,
@@ -460,13 +460,12 @@ class DataFetcher:
             
             print(f"📂 Checking existing SQLite database bounds...")
             db_cursor.execute("SELECT MAX(timestamp), MIN(timestamp) FROM trades")
-            max_ts_str, min_ts_str = db_cursor.fetchone()
+            max_val, min_val = db_cursor.fetchone()
             
-            if max_ts_str and min_ts_str:
-                parsed_high = parse_iso_to_ts(max_ts_str)
-                parsed_low = parse_iso_to_ts(min_ts_str)
-                
-                # Halt to prevent massive re-download if DB contains unparseable bounds
+            if max_val is not None and min_val is not None:
+                parsed_high = parse_iso_to_ts(max_val) if isinstance(max_val, str) else float(max_val)
+                parsed_low = parse_iso_to_ts(min_val) if isinstance(min_val, str) else float(min_val)
+
                 if parsed_high is None or parsed_low is None:
                     log.error("CRITICAL: Failed to parse timestamp bounds from the database. Aborting trades fetch.")
                     return
@@ -564,7 +563,7 @@ class DataFetcher:
                                         
                                     out_rows.append((
                                         r['id'], 
-                                        datetime.utcfromtimestamp(int(r['timestamp'])).isoformat(),
+                                        int(r['timestamp']), # ✅ FIX: Store raw integer directly
                                         val_usdc, 
                                         val_size * mult,
                                         r['taker'], 
