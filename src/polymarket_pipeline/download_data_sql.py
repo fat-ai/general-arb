@@ -420,17 +420,6 @@ class DataFetcher:
         
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
-        
-        def parse_iso_to_ts(iso_str):
-            try:
-                ts_obj = pd.to_datetime(iso_str)
-                # Force the naive database timestamp to be recognized as UTC
-                if ts_obj.tz is None:
-                    ts_obj = ts_obj.tz_localize('UTC')
-                return ts_obj.timestamp()
-            except Exception as e: 
-                log.warning(f"Failed to parse timestamp from {iso_str}: {e}")
-                return None
 
         with contextlib.closing(sqlite3.connect(db_file)) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -459,7 +448,6 @@ class DataFetcher:
             max_val, min_val = db_cursor.fetchone()
             
             if max_val is not None and min_val is not None:
-                # ✅ FIX: Database is fully migrated to integers, no string parsing needed!
                 existing_high_ts = int(max_val)
                 existing_low_ts = int(min_val)
                 
