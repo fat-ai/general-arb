@@ -459,15 +459,10 @@ class DataFetcher:
             max_val, min_val = db_cursor.fetchone()
             
             if max_val is not None and min_val is not None:
-                parsed_high = parse_iso_to_ts(max_val) if isinstance(max_val, str) else float(max_val)
-                parsed_low = parse_iso_to_ts(min_val) if isinstance(min_val, str) else float(min_val)
-
-                if parsed_high is None or parsed_low is None:
-                    log.error("CRITICAL: Failed to parse timestamp bounds from the database. Aborting trades fetch.")
-                    return
+                # ✅ FIX: Database is fully migrated to integers, no string parsing needed!
+                existing_high_ts = int(max_val)
+                existing_low_ts = int(min_val)
                 
-                existing_high_ts = parsed_high
-                existing_low_ts = parsed_low
                 print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
             else:
                 print("⚠️ Database is empty or new. Starting full fetch.")
