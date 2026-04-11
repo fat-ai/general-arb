@@ -204,7 +204,7 @@ def main():
                 chunk['outcome'] < 0.5,
             )
 
-            ts = pd.to_datetime(chunk['ts_date'], errors='coerce')
+            ts = pd.to_datetime(chunk['ts_date'], unit='s', errors='coerce')
             bad_ts_total += int(ts.isna().sum())
             chunk['ts_date'] = ts
             chunk.dropna(subset=['ts_date'], inplace=True)
