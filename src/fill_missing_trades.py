@@ -26,8 +26,10 @@ def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
 
     df = pd.read_parquet(market_file)
 
-    target_mask = df['market_id'].astype(str).isin(missing_market_ids)
-    zero_volume_mask = target_mask & (df['volume') == "0")
+    # Convert to set for faster masking
+    missing_set = set(missing_market_ids)
+    target_mask = df['market_id'].astype(str).isin(missing_set)
+    zero_volume_mask = target_mask & (df['volume'] == 0)
     
     zero_volume_ids = df.loc[zero_volume_mask, 'market_id'].astype(str).tolist()
     n_dropped = len(zero_volume_ids)
@@ -36,14 +38,20 @@ def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
         print("ℹ️ No zero-volume markets found. Nothing to remove.")
         return missing_market_ids
 
-    print(f"🗑️ Removing {n_dropped} zero-volume market(s) from parquet: {zero_volume_ids}")
+    print(f"🗑️ Removing {n_dropped} zero-volume market(s) from parquet...")
+
+    df.drop(df[zero_volume_mask].index, inplace=True)
     
-    df = df[~zero_volume_mask].reset_index(drop=True)
+    del target_mask
+    del zero_volume_mask
+
     df.to_parquet(market_file, index=False)
     
     print(f"✅ Parquet updated. {n_dropped} row(s) removed.")
 
-    surviving_ids = [mid for mid in missing_market_ids if mid not in set(zero_volume_ids)]
+    zero_vol_set = set(zero_volume_ids)
+    surviving_ids = [mid for mid in missing_market_ids if mid not in zero_vol_set]
+    
     return surviving_ids
 
 def get_missing_tokens():
