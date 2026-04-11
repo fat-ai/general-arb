@@ -54,7 +54,7 @@ class DataFetcher:
         min_created_at = None
         max_created_at = None
 
-        .exists():
+        if cache_file.exists():
                 print(f"   📂 Loading existing markets cache to determine update range...")
                 date_df = pd.read_parquet(cache_file, columns=['created_at'])
                 if not date_df.empty and 'created_at' in date_df.columns:
@@ -383,7 +383,7 @@ class DataFetcher:
         new_df = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
-        .exists() and max_created_at is not None:
+        if cache_file.exists() and max_created_at is not None:
             existing_ids = pd.read_parquet(cache_file, columns=['contract_id'])
             new_ids_set = set(new_df['contract_id'])
             keep_mask = ~existing_ids['contract_id'].isin(new_ids_set)
