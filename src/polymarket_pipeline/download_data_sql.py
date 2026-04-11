@@ -12,6 +12,7 @@ from decimal import Decimal
 from collections import defaultdict
 import logging
 import gc
+import random
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -123,8 +124,15 @@ class DataFetcher:
                 'rewardsMinSize':   'rewards_min_size',
                 'rewardsMaxSpread': 'rewards_max_spread',
             }
+            
             df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
+            
+            critical_cols = ['market_id', 'resolution_timestamp', 'created_at']
+            missing_cols = [c for c in critical_cols if c not in df.columns]
+            
+            if missing_cols:
+                log.error(f"🚨 SCHEMA WARNING: Missing critical columns {missing_cols} after mapping! Did the Gamma API schema change?")
+                
             def extract_tokens(row):
                 raw = row.get('clobTokenIds') or row.get('tokens')
                 if isinstance(raw, str):
@@ -301,7 +309,7 @@ class DataFetcher:
                     gc.collect()
                     
                     if len(unresolved_ids) > 0:
-                        import random
+                        
                         updated_raw_rows = []
                         print(f"   🚀 Fetching updates for {len(unresolved_ids)} unresolved markets...")
                         
@@ -339,7 +347,6 @@ class DataFetcher:
                     gc.collect()
     
                     if missing_ids:
-                        import random
                         gap_raw_rows = []
                         print(f"   🚀 Fetching {len(missing_ids)} missing sequence IDs...")
                         
