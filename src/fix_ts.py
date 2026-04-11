@@ -1,40 +1,47 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
 db_file = "./data-cache/polymarket_cache/gamma_trades.db"
 
 def fix_database():
-    print("🔧 Connecting to database to fix mixed timestamps...")
+    print("🔧 Connecting to database to safely fix mixed timestamps...")
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     
-    # Find all rows where the timestamp is stored as TEXT (strings)
-    cursor.execute("SELECT id, timestamp FROM trades WHERE typeof(timestamp) = 'text'")
-    rows = cursor.fetchall()
+    # We process in chunks to prevent Out-Of-Memory (OOM) errors
+    chunk_size = 100000
+    total_updated = 0
     
-    if not rows:
-        print("✅ No string timestamps found. You are good to go!")
-        return
+    while True:
+        # 1. Grab a manageable chunk of rows that are still text
+        cursor.execute(f"SELECT id, timestamp FROM trades WHERE typeof(timestamp) = 'text' LIMIT {chunk_size}")
+        rows = cursor.fetchall()
+        
+        # If the query returns empty, we've successfully processed the whole database!
+        if not rows:
+            break
+        
+        updates = []
+        for row_id, ts_str in rows:
+            try:
+                # Safely parse the ISO string and convert back to Unix integer
+                if not ts_str.endswith('Z') and '+' not in ts_str:
+                    ts_str += '+00:00'
+                ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+                updates.append((ts_int, row_id))
+            except Exception as e:
+                print(f"Failed to parse {ts_str}: {e}")
 
-    print(f"🔄 Found {len(rows)} string timestamps. Converting to integers...")
-    
-    updates = []
-    for row_id, ts_str in rows:
-        try:
-            # Safely parse the ISO string and convert back to Unix integer
-            if not ts_str.endswith('Z') and '+' not in ts_str:
-                ts_str += '+00:00' # Ensure UTC
-            ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
-            updates.append((ts_int, row_id))
-        except Exception as e:
-            print(f"Failed to parse {ts_str}: {e}")
+        # 2. Bulk update this specific chunk and clear it from memory
+        if updates:
+            cursor.executemany("UPDATE trades SET timestamp = ? WHERE id = ?", updates)
+            conn.commit()
+            
+            total_updated += len(updates)
+            print(f"✅ Processed chunk... Total updated so far: {total_updated}")
 
-    # Bulk update the database
-    cursor.executemany("UPDATE trades SET timestamp = ? WHERE id = ?", updates)
-    conn.commit()
     conn.close()
-    
-    print(f"✅ Successfully converted {len(updates)} timestamps to integers!")
+    print(f"\n🏁 Complete! Successfully converted {total_updated} timestamps to integers without crashing.")
 
 if __name__ == "__main__":
     fix_database()
