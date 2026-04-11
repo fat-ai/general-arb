@@ -193,7 +193,7 @@ def main():
                 t.tradeAmount, 
                 t.outcomeTokensAmount, 
                 t.price, 
-                to_timestamp(t.timestamp) AS ts
+                to_timestamp(CAST(t.timestamp AS BIGINT)) AS ts
             FROM source_db.trades t
             JOIN valid_markets v ON t.contract_id = v.clean_cid
             WHERE t.timestamp IS NOT NULL
