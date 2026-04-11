@@ -143,7 +143,7 @@ def fetch_missing_trades():
     
     TOKEN_BATCH_SIZE = 50 
     MAX_RETRIES = 5
-    global_stop_ts = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
+    global_stop_ts = 0
     
     total_captured = 0
 
