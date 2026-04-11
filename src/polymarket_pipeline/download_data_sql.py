@@ -265,7 +265,7 @@ class DataFetcher:
                     if c_date:
                         try:
                             ts = pd.to_datetime(c_date, utc=True).tz_convert(None)
-                            if ts <= cutoff_date:
+                            if ts < cutoff_date:
                                 stop_signal = True
                                 break
                         except (TypeError, ValueError):
@@ -296,7 +296,7 @@ class DataFetcher:
                 print(f"   🔄 Checking for unresolved market updates...")
                 try:
                     df_ext = pd.read_parquet(cache_file, columns=['market_id', 'closed'])
-                    unresolved_ids = df_ext[(df_ext['closed'] == True)]['market_id'].dropna().astype(int).unique()
+                    unresolved_ids = df_ext[(df_ext['closed'] == False)]['market_id'].dropna().astype(int).unique()
                     del df_ext
                     gc.collect()
                     
