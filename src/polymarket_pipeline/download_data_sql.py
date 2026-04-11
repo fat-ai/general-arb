@@ -54,7 +54,7 @@ class DataFetcher:
         min_created_at = None
         max_created_at = None
 
-        if cache_file.exists():
+        .exists():
                 print(f"   📂 Loading existing markets cache to determine update range...")
                 date_df = pd.read_parquet(cache_file, columns=['created_at'])
                 if not date_df.empty and 'created_at' in date_df.columns:
@@ -372,7 +372,7 @@ class DataFetcher:
                 except Exception as e:
                     print(f"\n   ⚠️ Could not process gap updates: {e}")
                     
-                process_and_save_chunk(current_raw_rows, chunk_idx)
+        process_and_save_chunk(current_raw_rows, chunk_idx)
 
         if not temp_files:
             print("   ℹ️  No new market data to save.")
@@ -383,7 +383,7 @@ class DataFetcher:
         new_df = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
-        if cache_file.exists() and max_created_at is not None:
+        .exists() and max_created_at is not None:
             existing_ids = pd.read_parquet(cache_file, columns=['contract_id'])
             new_ids_set = set(new_df['contract_id'])
             keep_mask = ~existing_ids['contract_id'].isin(new_ids_set)
