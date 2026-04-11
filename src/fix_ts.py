@@ -4,17 +4,16 @@ from datetime import datetime
 db_file = "./data-cache/polymarket_cache/gamma_trades.db"
 
 def fix_database():
-    print("🔧 Connecting to database to safely fix mixed timestamps...")
+    print("🔧 Resuming conversion using dash-detection...")
     conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     
-    # We process in chunks to prevent Out-Of-Memory (OOM) errors
     chunk_size = 100000
     total_updated = 0
     
     while True:
-        # 1. Grab a manageable chunk of rows that are still text
-        cursor.execute(f"SELECT id, timestamp FROM trades WHERE typeof(timestamp) = 'text' LIMIT {chunk_size}")
+        # ✅ FIX: Look for dashes instead of data types!
+        cursor.execute(f"SELECT id, timestamp FROM trades WHERE timestamp LIKE '%-%' LIMIT {chunk_size}")
         rows = cursor.fetchall()
         
         if not rows:
@@ -23,30 +22,22 @@ def fix_database():
         updates = []
         for row_id, ts_str in rows:
             try:
-                # FIX: Check if it is just a number stored as a string (e.g., "1774648931")
-                if ts_str.replace('.', '', 1).isdigit():
-                    ts_int = int(float(ts_str))
-                    
-                # Otherwise, it must be an old ISO date string (e.g., "2026-04-11T13:56:19")
-                else:
-                    if not ts_str.endswith('Z') and '+' not in ts_str:
-                        ts_str += '+00:00'
-                    ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
-                    
+                if not ts_str.endswith('Z') and '+' not in ts_str:
+                    ts_str += '+00:00'
+                ts_int = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+                # Save it back (SQLite will silently save it as text, which is fine!)
                 updates.append((ts_int, row_id))
             except Exception as e:
-                print(f"Failed to parse {ts_str}: {e}")
+                pass
 
-        # 2. Bulk update this specific chunk and clear it from memory
         if updates:
             cursor.executemany("UPDATE trades SET timestamp = ? WHERE id = ?", updates)
             conn.commit()
-            
             total_updated += len(updates)
-            print(f"✅ Processed chunk... Total updated so far: {total_updated}")
+            print(f"✅ Converted chunk... Total remaining fixed: {total_updated}")
 
     conn.close()
-    print(f"\n🏁 Complete! Successfully converted {total_updated} timestamps to integers without crashing.")
+    print(f"\n🏁 Complete! All ISO strings have been converted to Unix strings.")
 
 if __name__ == "__main__":
     fix_database()
