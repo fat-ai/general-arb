@@ -391,16 +391,12 @@ class DataFetcher:
         new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
 
         if cache_file.exists() and max_created_at is not None:
-            existing_ids = pd.read_parquet(cache_file, columns=['contract_id'])
+            existing_df = pd.read_parquet(cache_file)
+            
             new_ids_set = set(new_df['contract_id'])
-            keep_mask = ~existing_ids['contract_id'].isin(new_ids_set)
+            existing_df = existing_df[~existing_df['contract_id'].isin(new_ids_set)]
             
-            del existing_ids
-            gc.collect()
-
-            existing_df = pd.read_parquet(cache_file)[keep_mask]
-            
-            del keep_mask
+            del new_ids_set
             gc.collect()
 
             merged = pd.concat([existing_df, new_df], ignore_index=True)
@@ -477,7 +473,8 @@ class DataFetcher:
                 print("⚠️ Database is empty or new. Starting full fetch.")
 
             global_start_cursor = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
-            global_stop_ts = int(end_date.tz_localize('UTC').timestamp())
+            safe_end_date = end_date if end_date.tzinfo else end_date.tz_localize('UTC')
+            global_stop_ts = int(safe_end_date.timestamp())
                     
             def fetch_segment(start_ts, end_ts, db_conn, segment_name):
                 current_ts = int(start_ts)
