@@ -98,12 +98,15 @@ def main():
         con.execute("""
             CREATE TABLE first_ts AS
             SELECT
-                user           AS wallet_id,
-                MIN(CAST(t.timestamp AS BIGINT)) AS first_timestamp
-            FROM source_db.trades
-            WHERE price >= 0.0
-              AND price <= 1.0
-            GROUP BY user;
+                t.user             AS wallet_id,
+                MIN(COALESCE(
+                    to_timestamp(TRY_CAST(t.timestamp AS BIGINT)), 
+                    CAST(t.timestamp AS TIMESTAMP)
+                ))                 AS first_timestamp
+            FROM source_db.trades t
+            WHERE t.price >= 0.0
+              AND t.price <= 1.0
+            GROUP BY t.user;
         """)
         ts_count = con.execute("SELECT COUNT(*) FROM first_ts").fetchone()[0]
         print(f"   -> {ts_count:,} unique wallets found.", flush=True)
@@ -115,16 +118,22 @@ def main():
             FROM (
                 SELECT
                     t.user                                         AS wallet_id,
-                    LOWER(TRIM(REPLACE(t.contract_id, '0x', ''))) AS target_contract,
-                    (t.outcomeTokensAmount > 0)                   AS target_is_long,
+                    LOWER(TRIM(REPLACE(t.contract_id, '0x', '')))  AS target_contract,
+                    (t.outcomeTokensAmount > 0)                    AS target_is_long,
                     ROW_NUMBER() OVER (
                         PARTITION BY t.user
-                        ORDER BY t.timestamp ASC
+                        ORDER BY COALESCE(
+                            to_timestamp(TRY_CAST(t.timestamp AS BIGINT)),
+                            CAST(t.timestamp AS TIMESTAMP)
+                        ) ASC
                     )                                              AS rn
                 FROM source_db.trades t
                 INNER JOIN first_ts f
-                    ON  t.user      = f.wallet_id
-                    AND t.timestamp = f.first_timestamp
+                    ON  t.user = f.wallet_id
+                    AND COALESCE(
+                            to_timestamp(TRY_CAST(t.timestamp AS BIGINT)), 
+                            CAST(t.timestamp AS TIMESTAMP)
+                        ) = f.first_timestamp
                 WHERE t.price >= 0.0
                   AND t.price <= 1.0
             )
