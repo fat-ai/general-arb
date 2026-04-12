@@ -13,6 +13,8 @@ from collections import defaultdict
 import logging
 import gc
 import random
+import duckdb
+import shutil
 
 # Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -347,22 +349,16 @@ class DataFetcher:
 
         print(f"\n   🔀 Merging {len(temp_files)} chunk(s) (Streaming DuckDB)...")
         
-        import duckdb
-        import shutil
-        
         temp_files_str = [str(p) for p in temp_files]
         temp_output = str(cache_file) + ".tmp.parquet"
         
         con = duckdb.connect()
-        # Keep DuckDB safely inside a rigid memory boundary
         con.execute("PRAGMA memory_limit='4GB';")
         
         try:
-            # 1. Load the new chunks into a lightweight internal table
-            con.execute(f"CREATE TABLE raw_new AS SELECT * FROM read_parquet({temp_files_str})")
+            # ✅ FIX 1: Add union_by_name=True so DuckDB handles missing columns like Pandas
+            con.execute(f"CREATE TABLE raw_new AS SELECT * FROM read_parquet({temp_files_str}, union_by_name=True)")
             
-            # 2. Deduplicate the new rows, keeping the "last" entry just like Pandas did
-            # We use DuckDB's internal 'rowid' which naturally tracks insertion order
             con.execute("""
                 CREATE TABLE new_data AS 
                 SELECT * EXCLUDE(rn) FROM (
@@ -371,12 +367,12 @@ class DataFetcher:
                 ) WHERE rn = 1
             """)
             
-            # 3. Stream the merge directly to the hard drive, bypassing RAM almost entirely
             if cache_file.exists() and max_created_at is not None:
+                # ✅ FIX 2: Change to UNION ALL BY NAME to gracefully merge the old cache with new data
                 con.execute(f"""
                     COPY (
                         SELECT * FROM new_data
-                        UNION ALL
+                        UNION ALL BY NAME
                         SELECT * FROM read_parquet('{str(cache_file)}') 
                         WHERE contract_id NOT IN (SELECT contract_id FROM new_data)
                     ) TO '{temp_output}' (FORMAT PARQUET)
@@ -388,13 +384,11 @@ class DataFetcher:
                     ) TO '{temp_output}' (FORMAT PARQUET)
                 """)
                 
-            # Grab the final row count for the log
             final_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{temp_output}')").fetchone()[0]
             
         finally:
             con.close()
             
-        # 4. Safely overwrite the old cache file with the new merged file
         shutil.move(temp_output, str(cache_file))
         
         print(f"   ✅ Markets saved: {final_count:,} total rows → {cache_file}")
