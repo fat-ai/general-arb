@@ -345,29 +345,59 @@ class DataFetcher:
             print("   ℹ️  No new market data to save.")
             return
 
-        print(f"\n   🔀 Merging {len(temp_files)} chunk(s) (Memory-Optimized Pandas)...")
+        print(f"\n   🔀 Merging {len(temp_files)} chunk(s) (Streaming DuckDB)...")
         
-        new_df = pd.concat([pd.read_parquet(p) for p in temp_files], ignore_index=True)
-        new_df = new_df.drop_duplicates(subset=['contract_id'], keep='last')
-
-        if cache_file.exists() and max_created_at is not None:
-            existing_df = pd.read_parquet(cache_file)
+        import duckdb
+        import shutil
+        
+        temp_files_str = [str(p) for p in temp_files]
+        temp_output = str(cache_file) + ".tmp.parquet"
+        
+        con = duckdb.connect()
+        # Keep DuckDB safely inside a rigid memory boundary
+        con.execute("PRAGMA memory_limit='4GB';")
+        
+        try:
+            # 1. Load the new chunks into a lightweight internal table
+            con.execute(f"CREATE TABLE raw_new AS SELECT * FROM read_parquet({temp_files_str})")
             
-            new_ids_set = set(new_df['contract_id'])
-            existing_df = existing_df[~existing_df['contract_id'].isin(new_ids_set)]
+            # 2. Deduplicate the new rows, keeping the "last" entry just like Pandas did
+            # We use DuckDB's internal 'rowid' which naturally tracks insertion order
+            con.execute("""
+                CREATE TABLE new_data AS 
+                SELECT * EXCLUDE(rn) FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY rowid DESC) as rn 
+                    FROM raw_new
+                ) WHERE rn = 1
+            """)
             
-            del new_ids_set
-            gc.collect()
-
-            merged = pd.concat([existing_df, new_df], ignore_index=True)
+            # 3. Stream the merge directly to the hard drive, bypassing RAM almost entirely
+            if cache_file.exists() and max_created_at is not None:
+                con.execute(f"""
+                    COPY (
+                        SELECT * FROM new_data
+                        UNION ALL
+                        SELECT * FROM read_parquet('{str(cache_file)}') 
+                        WHERE contract_id NOT IN (SELECT contract_id FROM new_data)
+                    ) TO '{temp_output}' (FORMAT PARQUET)
+                """)
+            else:
+                con.execute(f"""
+                    COPY (
+                        SELECT * FROM new_data
+                    ) TO '{temp_output}' (FORMAT PARQUET)
+                """)
+                
+            # Grab the final row count for the log
+            final_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{temp_output}')").fetchone()[0]
             
-            del existing_df, new_df
-            gc.collect()
-        else:
-            merged = new_df
-
-        merged.to_parquet(cache_file)
-        print(f"   ✅ Markets saved: {len(merged)} total rows → {cache_file}")
+        finally:
+            con.close()
+            
+        # 4. Safely overwrite the old cache file with the new merged file
+        shutil.move(temp_output, str(cache_file))
+        
+        print(f"   ✅ Markets saved: {final_count:,} total rows → {cache_file}")
 
         del merged
         gc.collect()
