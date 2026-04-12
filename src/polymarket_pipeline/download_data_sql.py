@@ -353,16 +353,17 @@ class DataFetcher:
                         for i, mid in enumerate(missing_ids):
                             for attempt in range(3):
                                 try:
-                                    resp = self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
-                                    if resp.status_code == 200:
-                                        raw_data = resp.json()
-                                        if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
-                                            gap_raw_rows.append(raw_data)
-                                        break
-                                    elif resp.status_code == 404:
-                                        break
-                                    else:
-                                        time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+                                    # ✅ FIX: Using 'with' forces Python to instantly clear the memory and socket
+                                    with self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10) as resp:
+                                        if resp.status_code == 200:
+                                            raw_data = resp.json()
+                                            if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
+                                                gap_raw_rows.append(raw_data)
+                                            break
+                                        elif resp.status_code == 404:
+                                            break # 'with' block will auto-close the dangling 404 response
+                                        else:
+                                            time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                                 except Exception:
                                     time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                             
@@ -371,7 +372,8 @@ class DataFetcher:
                             # Batch save to prevent memory spikes if there are many gaps
                             if len(gap_raw_rows) >= 500:
                                 process_and_save_chunk(gap_raw_rows, f"gap_fill_{mid}")
-                                gap_raw_rows = []
+                                gap_raw_rows.clear() # Faster than reassigning []
+                                gc.collect()
     
                         if gap_raw_rows:
                             process_and_save_chunk(gap_raw_rows, "gap_fill_final")
