@@ -393,9 +393,6 @@ class DataFetcher:
         
         print(f"   ✅ Markets saved: {final_count:,} total rows → {cache_file}")
 
-        del merged
-        gc.collect()
-
         for p in temp_files:
             Path(p).unlink(missing_ok=True)
             
