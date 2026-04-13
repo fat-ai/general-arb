@@ -304,5 +304,10 @@ def fill_gaps():
         
         print("✅ Merge complete! Main dataset successfully updated without memory spikes.")
 
+        added_ids_log = Path("added_ids.txt")
+        if added_ids_log.exists():
+            added_ids_log.unlink()
+            print("🧹 Cleared the 'added_ids.txt' log file.")
+
 if __name__ == "__main__":
     fill_gaps()
