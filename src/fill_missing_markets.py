@@ -149,6 +149,14 @@ def fill_gaps():
     min_id, max_id = int(ids.min()), int(ids.max())
     full_range = set(range(min_id, max_id + 1))
     missing_ids = sorted(list(full_range - set(ids)))
+
+    zero_vol_file = Path("zero_volume_ids.txt")
+    
+    if zero_vol_file.exists():
+        with open(zero_vol_file, "r") as f:
+            zero_vol_ids = {int(line.strip()) for line in f if line.strip().isdigit()}
+        missing_ids = sorted(list(set(missing_ids) - zero_vol_ids))
+        print(f"⏭️ Excluded {len(zero_vol_ids)} known zero-volume IDs from fetch list.")
     
     if not missing_ids:
         print("✅ No gaps found.")
@@ -180,6 +188,14 @@ def fill_gaps():
                     
                     if not isinstance(raw_data, dict) or 'id' not in raw_data:
                         raise ValueError("Payload is missing standard market data.")
+
+                    volume = raw_data.get('volume', '0')
+                    if str(volume) == '0' or str(volume) == '0.0':
+                        with open("zero_volume_ids.txt", "a") as f:
+                            f.write(f"{mid}\n")
+                        print(f"   [{i+1}/{len(missing_ids)}] Skipped Market {mid} (Zero Vol)        ", end='\r')
+                        success = True
+                        break
 
                     if raw_data.get('endDate') is None:
                         success = True 
