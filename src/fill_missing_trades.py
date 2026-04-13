@@ -285,6 +285,11 @@ def fetch_missing_trades():
                 total_captured += side_captured
 
     print(f"\n🏁 Complete! Safely inserted {total_captured} historical trades for the missing markets.")
+    
+    added_ids_log = Path("added_ids.txt")
+        if added_ids_log.exists():
+            added_ids_log.unlink()
+            print("🧹 Cleared the 'added_ids.txt' log file.")
 
 if __name__ == "__main__":
     fetch_missing_trades()
