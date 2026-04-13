@@ -207,6 +207,9 @@ def main():
                 (chunk['outcome'] - chunk['vwap']) / chunk['vwap'],
                 (chunk['vwap'] - chunk['outcome']) / (1.0 - chunk['vwap']),
             )
+            
+            chunk['roi'] = chunk['roi'].replace([np.inf, -np.inf], np.nan)
+            chunk.dropna(subset=['roi', 'vwap'], inplace=True)
 
             chunk['won_bet'] = np.where(
                 chunk['is_long'] == 1,
@@ -214,7 +217,7 @@ def main():
                 chunk['outcome'] < 0.5,
             )
 
-            ts = pd.to_datetime(chunk['ts_date'], unit='s', errors='coerce')
+            ts = pd.to_datetime(chunk['ts_date'], errors='coerce')
             bad_ts_total += int(ts.isna().sum())
             chunk['ts_date'] = ts
             chunk.dropna(subset=['ts_date'], inplace=True)
@@ -274,7 +277,7 @@ def main():
         if len(df_recent) >= 50:
             X_features = df_recent[['log_vol', 'vwap']]
             X_const    = sm.add_constant(X_features)
-            model_ols  = sm.OLS(df_recent['roi'], X_const).fit()
+            model_ols  = sm.OLS(df_recent['roi'], X_const, missing='drop').fit()
 
             print(f"OLS Intercept:   {model_ols.params['const']:.8f}")
             print(f"OLS Vol Slope:   {model_ols.params['log_vol']:.8f}")
