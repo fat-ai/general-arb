@@ -176,6 +176,7 @@ def main():
                 SELECT LOWER(TRIM(CAST(contract_id AS VARCHAR))) AS contract_id,
                        outcome
                 FROM   read_parquet('{outcomes_path}')
+                WHERE  outcome IS NOT NULL  -- ✅ FIX: Only pull resolved markets
             ) m ON f.target_contract = m.contract_id
             WHERE t.price >= 0.0
               AND t.price <= 1.0
