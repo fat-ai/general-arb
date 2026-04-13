@@ -339,7 +339,52 @@ class DataFetcher:
                 except Exception as e:
                     print(f"\n   ⚠️ Could not process unresolved updates: {e}")
 
-            
+            if cache_file.exists():
+                if temp_files: # ✅ Only run if we actually downloaded new chunks this session
+                print(f"   🕵️ Checking for missing market IDs (Gaps in current session)...")
+                try:
+                    # ✅ Read ONLY the newly downloaded session chunks instead of the massive cache
+                    df_new = pd.concat([pd.read_parquet(p, columns=['market_id']) for p in temp_files], ignore_index=True)
+                    ids = np.sort(df_new['market_id'].dropna().astype(int).unique())
+                    missing_ids = [m for i in range(len(ids)-1) for m in range(ids[i]+1, ids[i+1])]
+                    
+                    del df_new
+                    gc.collect()
+                      
+                    if missing_ids:
+                        gap_raw_rows = []
+                        print(f"   🚀 Fetching {len(missing_ids)} missing sequence IDs...")
+                        
+                        for i, mid in enumerate(missing_ids):
+                            for attempt in range(3):
+                                try:
+                                    # ✅ FIX: Using 'with' forces Python to instantly clear the memory and socket
+                                    with self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10) as resp:
+                                        if resp.status_code == 200:
+                                            raw_data = resp.json()
+                                            if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
+                                                gap_raw_rows.append(raw_data)
+                                            break
+                                        elif resp.status_code == 404:
+                                            break # 'with' block will auto-close the dangling 404 response
+                                        else:
+                                            time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+                                except Exception:
+                                    time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
+                            
+                            print(f"      [{i+1}/{len(missing_ids)}] Gap Checked: ID {mid}      ", end='\r')
+                            
+                            # Batch save to prevent memory spikes if there are many gaps
+                            if len(gap_raw_rows) >= 500:
+                                process_and_save_chunk(gap_raw_rows, f"gap_fill_{mid}")
+                                gap_raw_rows.clear() # Faster than reassigning []
+                                gc.collect()
+    
+                        if gap_raw_rows:
+                            process_and_save_chunk(gap_raw_rows, "gap_fill_final")
+                            print("\n   ✅ Gap updates saved to temp chunks.")
+                except Exception as e:
+                    print(f"\n   ⚠️ Could not process gap updates: {e}")
                     
         process_and_save_chunk(current_raw_rows, chunk_idx)
 
