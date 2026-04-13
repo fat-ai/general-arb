@@ -9,6 +9,9 @@ from download_data_sql import DataFetcher, _safe_is_null
 from config import MARKETS_FILE
 import gc
 import random
+import pyarrow as pa
+import pyarrow.parquet as pq
+import shutil
 
 def process_raw_market_to_rows(raw_dict):
     """
@@ -125,31 +128,44 @@ def fill_gaps():
     market_file = Path(MARKETS_FILE) 
     GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets/'
     
+    # 1. Setup a temporary directory for our batches
+    temp_dir = Path("temp_market_batches")
+    temp_dir.mkdir(exist_ok=True)
+    
     if not market_file.exists():
         print(f"❌ Markets file not found at {market_file}")
         return
 
-    df_existing = pd.read_parquet(market_file)
-    ids = np.sort(df_existing['market_id'].astype(int).unique())
+    # Load ONLY the market_id column to save massive amounts of RAM
+    print("📊 Scanning existing dataset for gaps...")
+    df_existing_ids = pd.read_parquet(market_file, columns=['market_id'])
     
-    missing_ids = [m for i in range(len(ids)-1) for m in range(ids[i]+1, ids[i+1])]
+    # We need the full columns list later to ensure our new data matches
+    existing_columns = pd.read_parquet(market_file).columns 
+    
+    ids = np.sort(df_existing_ids['market_id'].astype(int).unique())
+    
+    # 2. Faster gap finding using Set difference
+    min_id, max_id = int(ids.min()), int(ids.max())
+    full_range = set(range(min_id, max_id + 1))
+    missing_ids = sorted(list(full_range - set(ids)))
+    
     if not missing_ids:
         print("✅ No gaps found.")
         return
         
-    existing_columns = df_existing.columns
-    del df_existing
+    # Free up memory immediately
+    del df_existing_ids
     del ids
     gc.collect()
 
     print(f"🚀 Found {len(missing_ids)} missing IDs. Fetching...")
     
     all_new_processed = []
-    successfully_added_ids = []
-    
     MAX_RETRIES = 20
-    BASE_DELAY = 1.0  # Base delay in seconds for exponential backoff
-    BATCH_SIZE = 20
+    BASE_DELAY = 1.0  
+    BATCH_SIZE = 100  
+    batch_count = 0
     
     for i, mid in enumerate(missing_ids):
         success = False
@@ -168,69 +184,101 @@ def fill_gaps():
                         success = True 
                         break
                         
-                    processed_df = process_raw_market_to_rows(resp.json())
+                    processed_df = process_raw_market_to_rows(raw_data)
                     if not processed_df.empty:
                         all_new_processed.append(processed_df)
-                        successfully_added_ids.append(str(mid))
                         with open("added_ids.txt", "a") as f:
                             f.write(f"{mid}\n")
+                            
                     print(f"   [{i+1}/{len(missing_ids)}] Processed Market {mid}        ", end='\r')
                     success = True
-                    break  # Success! Break out of the retry loop
+                    break  
                     
                 elif resp.status_code == 404:
-                    # The market ID doesn't exist on the server. No need to retry.
-                    print(f"404: Market ID {mid} not found")
                     success = True 
                     break 
                     
                 else:
-                    # Rate limited (429) or server error (500+). Apply backoff.
                     sleep_time = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
-                    print(f"\n⚠️ API returned {resp.status_code} for ID {mid}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
                     time.sleep(sleep_time)
                     
             except requests.exceptions.RequestException as e:
-                # Catch connection errors, timeouts, etc.
                 sleep_time = BASE_DELAY * (2 ** attempt)
-                print(f"\n⚠️ Network error for ID {mid}: {e}. Retrying in {sleep_time}s ({attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(sleep_time)
 
             except (KeyError, ValueError, TypeError) as e:
                 sleep_time = BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
-                print(f"\n⚠️ Corrupted payload for ID {mid} ({e}). Retrying in {sleep_time:.2f}s ({attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(sleep_time)
                 
         if not success:
             print(f"\n❌ Failed to fetch ID {mid} after {MAX_RETRIES} attempts. Skipping.")
             
-        time.sleep(0.1)
-        if len(all_new_processed) >= BATCH_SIZE:
-            print(f"\n💾 Batch size reached ({BATCH_SIZE}). Merging and saving to disk...")
-            new_df = pd.concat(all_new_processed, ignore_index=True)
-            new_df = new_df.reindex(columns=existing_columns)
-            
-            # Briefly load existing data, merge, and save
-            current_existing = pd.read_parquet(market_file)
-            updated_df = pd.concat([current_existing, new_df], ignore_index=True)
-            updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
-            updated_df.to_parquet(market_file)
-            all_new_processed.clear()
-            del new_df, current_existing, updated_df
-            gc.collect()
-            print("✅ Batch saved. Resuming fetch...")
-            
-    if all_new_processed:
-        print(f"\n💾 Saving final batch of {len(all_new_processed)} markets...")
-        new_df = pd.concat(all_new_processed, ignore_index=True)
-        current_existing = pd.read_parquet(market_file)
-        updated_df = pd.concat([current_existing, new_df], ignore_index=True)
-        updated_df.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
-        updated_df.to_parquet(market_file)
+        time.sleep(0.1) 
         
+        # 3. Save batches to temporary files
+        if len(all_new_processed) >= BATCH_SIZE:
+            batch_count += 1
+            new_df = pd.concat(all_new_processed, ignore_index=True)
+            # Ensure columns match the main dataset perfectly
+            new_df = new_df.reindex(columns=existing_columns) 
+            
+            temp_file_path = temp_dir / f"batch_{batch_count}.parquet"
+            new_df.to_parquet(temp_file_path)
+            
+            all_new_processed.clear()
+            del new_df
+            gc.collect()
+            print(f"\n✅ Batch {batch_count} saved to temporary storage. Resuming fetch...")
+            
+    # Save any remaining stragglers in the final batch
+    if all_new_processed:
+        batch_count += 1
+        new_df = pd.concat(all_new_processed, ignore_index=True)
+        new_df = new_df.reindex(columns=existing_columns)
+        new_df.to_parquet(temp_dir / f"batch_{batch_count}.parquet")
         all_new_processed.clear()
-        del new_df, current_existing, updated_df
+        del new_df
         gc.collect()
+
+    # 4. Final Merge: Read, combine, and save using PyArrow streaming
+    temp_files = list(temp_dir.glob("*.parquet"))
+    if temp_files:
+        print(f"\n💾 Merging {len(temp_files)} temporary batches using PyArrow...")
+        
+        # Step A: Combine and deduplicate ONLY the new data 
+        # (Since we fetched missing gaps, there is zero overlap with the main dataset!)
+        new_dfs = [pd.read_parquet(f) for f in temp_files]
+        new_combined = pd.concat(new_dfs, ignore_index=True)
+        new_combined.drop_duplicates(subset=['contract_id'], keep='last', inplace=True)
+        
+        # Step B: Prepare PyArrow streaming
+        existing_pf = pq.ParquetFile(market_file)
+        
+        # Convert new data to a PyArrow Table, enforcing the exact schema of the original file
+        new_table = pa.Table.from_pandas(new_combined, schema=existing_pf.schema_arrow)
+        
+        # Step C: Stream data row-group by row-group to avoid OOM
+        temp_merged_path = temp_dir / "merged_temp.parquet"
+        
+        with pq.ParquetWriter(temp_merged_path, existing_pf.schema_arrow) as writer:
+            
+            print("   Streaming existing data...")
+            # 1. Stream the massive existing file in chunks (very low memory footprint)
+            for i in range(existing_pf.num_row_groups):
+                writer.write_table(existing_pf.read_row_group(i))
+                
+            print("   Appending new batches...")
+            # 2. Append our clean, new batch at the very end
+            writer.write_table(new_table)
+            
+        # Step D: Replace the old file and clean up
+        shutil.move(temp_merged_path, market_file)
+        
+        for f in temp_files:
+            f.unlink() 
+        temp_dir.rmdir() 
+        
+        print("✅ Merge complete! Main dataset successfully updated without memory spikes.")
 
 if __name__ == "__main__":
     fill_gaps()
