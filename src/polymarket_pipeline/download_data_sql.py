@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 # Constants
 # Construct an aware UTC timestamp, then safely convert to naive
-FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC').tz_convert(None)
+FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC')
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
@@ -385,7 +385,8 @@ class DataFetcher:
                                 print("\n   ✅ Gap updates saved to temp chunks.")
                     except Exception as e:
                         print(f"\n   ⚠️ Could not process gap updates: {e}")
-                    
+                        
+        chunk_idx += 1            
         process_and_save_chunk(current_raw_rows, chunk_idx)
 
         if not temp_files:
@@ -492,7 +493,7 @@ class DataFetcher:
             else:
                 print("⚠️ Database is empty or new. Starting full fetch.")
 
-            global_start_cursor = int(FIXED_START_DATE.tz_localize('UTC').timestamp())
+            global_start_cursor = int(FIXED_START_DATE.timestamp())
             safe_end_date = end_date if end_date.tzinfo else end_date.tz_localize('UTC')
             global_stop_ts = int(safe_end_date.timestamp())
                     
@@ -618,7 +619,7 @@ class DataFetcher:
                 else:
                     print(f"\n🌊 Fetching Newer Data Skipped (Configured End Date <= Existing Head)")
 
-            if existing_low_ts:
+            if existing_low_ts is not None:
                 if existing_low_ts > global_start_cursor:
                     print(f"\n📜 Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
                     count = fetch_segment(existing_low_ts, global_start_cursor, conn, "OLD_TAIL")
