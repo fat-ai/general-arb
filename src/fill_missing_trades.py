@@ -137,7 +137,24 @@ def fetch_missing_trades():
     target_tokens = get_missing_tokens()
     if not target_tokens:
         return
+    START_TIME = time.time()
+    MAX_RUNTIME_SECONDS = 60 * 60 * 5
 
+    completed_tokens_file = Path("completed_tokens.txt")
+    if completed_tokens_file.exists():
+        with open(completed_tokens_file, "r") as f:
+            completed = {int(line.strip()) for line in f if line.strip().isdigit()}
+        target_tokens = [t for t in target_tokens if t not in completed]
+        print(f"⏭️ Resuming: Skipped {len(completed)} previously completed tokens.")
+
+    if not target_tokens:
+        print("ℹ️ All extracted tokens have already been processed.")
+        # If we resume and everything is already done, clean up now
+        added_ids_log = Path("added_ids.txt")
+        if added_ids_log.exists(): added_ids_log.unlink()
+        if completed_tokens_file.exists(): completed_tokens_file.unlink()
+        return
+    
     fetcher = DataFetcher()
     db_file = "./data-cache/polymarket_cache/gamma_trades.db"
     
@@ -150,8 +167,16 @@ def fetch_missing_trades():
     with contextlib.closing(sqlite3.connect(db_file)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+
+        finished_naturally = True
         
         for i in range(0, len(target_tokens), TOKEN_BATCH_SIZE):
+
+            if time.time() - START_TIME > MAX_RUNTIME_SECONDS:
+                print(f"\n⏱️ Time limit of {MAX_RUNTIME_SECONDS}s reached. Stopping current batch.")
+                finished_naturally = False
+                break
+            
             batch_tokens = target_tokens[i:i + TOKEN_BATCH_SIZE]
             batch_tokens_set = set(batch_tokens) # Fix 4: O(1) membership checks
             
@@ -283,13 +308,25 @@ def fetch_missing_trades():
                     
                 print(f" Done. ({side_captured} inserted)")
                 total_captured += side_captured
+                
+            with open("completed_tokens.txt", "a") as f:
+                for t in batch_tokens:
+                    f.write(f"{t}\n")
 
     print(f"\n🏁 Complete! Safely inserted {total_captured} historical trades for the missing markets.")
     
-    added_ids_log = Path("added_ids.txt")
-        if added_ids_log.exists():
-            added_ids_log.unlink()
-            print("🧹 Cleared the 'added_ids.txt' log file.")
+    if finished_naturally:
+        added_ids_log = Path("added_ids.txt")
+        if added_ids_log.exists():
+            added_ids_log.unlink()
+            print("🧹 Cleared the 'added_ids.txt' log file.")
+        
+        completed_tokens_file = Path("completed_tokens.txt")
+        if completed_tokens_file.exists():
+            completed_tokens_file.unlink()
+            print("🧹 Cleared the 'completed_tokens.txt' file.")
+    else:
+        print("⏳ Script paused due to time limit. Progress saved for the next run.")
 
 if __name__ == "__main__":
     fetch_missing_trades()
