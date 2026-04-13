@@ -127,6 +127,8 @@ def fill_gaps():
     fetcher = DataFetcher()
     market_file = Path(MARKETS_FILE) 
     GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets/'
+    START_TIME = time.time()
+    MAX_RUNTIME_SECONDS = 60 * 60 * 10
     
     # 1. Setup a temporary directory for our batches
     temp_dir = Path("temp_market_batches")
@@ -176,6 +178,11 @@ def fill_gaps():
     batch_count = 0
     
     for i, mid in enumerate(missing_ids):
+
+      if time.time() - START_TIME > MAX_RUNTIME_SECONDS:
+            print(f"\n⏱️ Time limit of {MAX_RUNTIME_SECONDS}s reached. Saving current progress and exiting...")
+            break
+
       if int(mid) > 1400000:
         success = False
         
