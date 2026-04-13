@@ -168,6 +168,7 @@ def fill_gaps():
     batch_count = 0
     
     for i, mid in enumerate(missing_ids):
+      if int(mid) > 1400000:
         success = False
         
         for attempt in range(MAX_RETRIES):
