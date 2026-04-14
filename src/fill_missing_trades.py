@@ -18,14 +18,25 @@ from download_data_sql import DataFetcher, FIXED_START_DATE
 from config import MARKETS_FILE, GRAPH_URL
 
 def remove_zero_volume_markets(missing_market_ids: list[str]) -> list[str]:
-    """
-    Streams the markets parquet in small batches to prevent Out-Of-Memory (OOM) crashes,
-    removes rows where volume == 0, writes the file back, and returns the surviving IDs.
-    """
     market_file = Path(MARKETS_FILE)
     if not market_file.exists():
         print(f"❌ Markets file not found at {market_file}")
         return missing_market_ids
+
+    # Pre-filter: only keep IDs that actually exist in the markets file
+    df_ids = pd.read_parquet(market_file, columns=['market_id'])
+    existing_in_file = set(df_ids['market_id'].astype(str).values)
+    
+    original_count = len(missing_market_ids)
+    missing_market_ids = [mid for mid in missing_market_ids if mid in existing_in_file]
+    skipped = original_count - len(missing_market_ids)
+    
+    if skipped > 0:
+        print(f"⚠️ Skipped {skipped} ID(s) from added_ids.txt that aren't in the markets file.")
+    
+    if not missing_market_ids:
+        print("ℹ️ None of the IDs in added_ids.txt exist in the markets file.")
+        return []
 
     missing_set = set(missing_market_ids)
     zero_volume_ids = []
