@@ -16,7 +16,9 @@ from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
 import sqlite3
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import array
+import bisect
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,6 +68,7 @@ class UserMetrics:
     trades: int = 0
     downside_sq_sum: float = 0.0
     weighted_irr_sum: float = 0.0
+    trade_history: array.array = field(default_factory=lambda: array.array('H'))
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -264,6 +267,30 @@ def main():
                                 payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
+
+                                # Check if they had a long position ("Yes")
+                                if pos.qty_long > 0:
+                                    avg_entry_long = pos.cost_long / pos.qty_long
+                                    is_win = 1 if outcome > 0.5 else 0
+                                    
+                                    # Convert price to an integer between 0 and 1000
+                                    price_int = max(0, min(1000, int(avg_entry_long * 1000)))
+                                    
+                                    # Shift price left by 1 bit, and append the outcome bit
+                                    packed_long = (price_int << 1) | is_win
+                                    
+                                    # insort naturally sorts by the higher bits (the price!)
+                                    bisect.insort(user_trade_history[u], packed_long)
+
+                                # Check if they had a short position ("No")
+                                if pos.qty_short > 0:
+                                    # The actual price they paid for "No" is tracked in cost_short
+                                    avg_entry_short = pos.cost_short / pos.qty_short
+                                    is_win = 1 if outcome < 0.5 else 0
+                                    
+                                    price_int = max(0, min(1000, int(avg_entry_short * 1000)))
+                                    packed_short = (price_int << 1) | is_win
+                                    bisect.insort(user_history[u].trade_history, packed_long)
                                 
                                 # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
