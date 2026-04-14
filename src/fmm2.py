@@ -129,7 +129,7 @@ def fill_gaps():
     GAMMA_API_URL = 'https://gamma-api.polymarket.com/markets/'
     
     # 1. Setup a temporary directory for our batches
-    temp_dir = Path("temp_market_batches")
+    temp_dir = Path("temp_market_batches_2")
     temp_dir.mkdir(exist_ok=True)
     
     if not market_file.exists():
@@ -169,8 +169,10 @@ def fill_gaps():
     
     except FileNotFoundError:
         print(f"Error: The file '{file_path}' was not found.")
+        return
     except ValueError:
         print("Error: The file contains a value that is not a valid number.")
+        return
       
     existing_id_set = set(df_existing_ids['market_id'].astype(int).values)
   
@@ -227,7 +229,7 @@ def fill_gaps():
         time.sleep(0.1) 
         
         # 3. Save batches to temporary files
-        if len(all_new_processed) >= BATCH_SIZE:
+    if len(all_new_processed) >= BATCH_SIZE:
             batch_count += 1
             new_df = pd.concat(all_new_processed, ignore_index=True)
             # Ensure columns match the main dataset perfectly
