@@ -279,8 +279,8 @@ def main():
                                     # Shift price left by 1 bit, and append the outcome bit
                                     packed_long = (price_int << 1) | is_win
                                     
-                                    # insort naturally sorts by the higher bits (the price!)
-                                    bisect.insort(user_trade_history[u], packed_long)
+                                    # CORRECTED: Insert into the UserMetrics dataclass array
+                                    bisect.insort(user_history[u].trade_history, packed_long)
 
                                 # Check if they had a short position ("No")
                                 if pos.qty_short > 0:
@@ -290,7 +290,9 @@ def main():
                                     
                                     price_int = max(0, min(1000, int(avg_entry_short * 1000)))
                                     packed_short = (price_int << 1) | is_win
-                                    bisect.insort(user_history[u].trade_history, packed_long)
+                                    
+                                    # CORRECTED: Insert packed_short instead of packed_long
+                                    bisect.insort(user_history[u].trade_history, packed_short)
                                 
                                 # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
