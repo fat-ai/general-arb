@@ -251,13 +251,31 @@ def main():
         }
 
         if market['id'] not in result_map:
-            result_map[market['id']] = {'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome']}
+            result_map[mid] = {
+                'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome'],
+                'yes_cid': None, 'no_cid': None
+            }
+
+        # Slot the CID into the parent market tracker
+        if outcome_label == "yes":
+            result_map[mid]['yes_cid'] = cid
+        else:
+            result_map[mid]['no_cid'] = cid
+            
+        # The moment we have both siblings, link them natively in the market_map!
+        yes_cid = result_map[mid]['yes_cid']
+        no_cid = result_map[mid]['no_cid']
+        
+        if yes_cid and no_cid:
+            market_map[yes_cid]['sibling_cid'] = no_cid
+            market_map[no_cid]['sibling_cid'] = yes_cid
 
     result_map['performance'] = { 
         'equity': CONFIG["initial_capital"], 'cash': CONFIG["initial_capital"], 
         'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0,
         'wins': 0, 'losses': 0 
     }
+    
     result_map['resolutions'] = []
 
     del markets_pl
@@ -270,6 +288,7 @@ def main():
     contract_positions = defaultdict(lambda: defaultdict(PositionMetrics))
     user_history = defaultdict(UserMetrics)
     traded_events = set()
+    active_portfolio = {}
     
     # Fresh wallet tracking
     known_users = set()
