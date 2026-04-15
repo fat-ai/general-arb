@@ -68,7 +68,40 @@ class UserMetrics:
     trades: int = 0
     downside_sq_sum: float = 0.0
     weighted_irr_sum: float = 0.0
-    trade_history: array.array = field(default_factory=lambda: array.array('H'))
+    trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
+    trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
+
+# ==========================================
+# BAYESIAN ESTIMATOR GLOBALS & LUTS
+# ==========================================
+# 1. Look-Up Tables (LUTs) for Fast Exponential Dampening
+PRICE_HALF_LIFE = 50  # 5 cents (50 thousandths)
+TIME_HALF_LIFE = 182  # ~20% time distance in scaled log space (ln(1.2) * 1000)
+
+PRICE_LUT = [0.0] * 1001
+_lambda_p = -math.log(0.5) / PRICE_HALF_LIFE
+for i in range(1001):
+    w = math.exp(-_lambda_p * i)
+    # Snap microscopically small weights to 0.0 to save CPU calculations later
+    PRICE_LUT[i] = w if w >= 0.01 else 0.0
+
+TIME_LUT_SIZE = 20000  # Safely covers massive time differences
+TIME_LUT = [0.0] * TIME_LUT_SIZE
+_lambda_t = -math.log(0.5) / TIME_HALF_LIFE
+for i in range(TIME_LUT_SIZE):
+    w = math.exp(-_lambda_t * i)
+    TIME_LUT[i] = w if w >= 0.01 else 0.0
+
+# 2. Empirical Bayes Variance Trackers & Polynomial Coefficients
+# We keep a rolling window of recent squared errors to calculate variance daily
+daily_variance_yes = deque(maxlen=100000)
+daily_variance_no = deque(maxlen=100000)
+
+# Coefficients for Variance = a*(P^2) + b*(P) + c
+# Initialized to the exact mathematical theoretical baseline: P(1-P) = -1(P^2) + 1(P) + 0
+poly_coeffs_yes = [-1.0, 1.0, 0.0] 
+poly_coeffs_no = [-1.0, 1.0, 0.0] 
+# ==========================================
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
