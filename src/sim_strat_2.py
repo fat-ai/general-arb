@@ -286,6 +286,10 @@ def main():
                     
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
+                        outcome_label = market_map[r_cid]['outcome_label']
+                        is_yes = True
+                        if outcome_label.lower() == "no":
+                            is_yes = False
                         end_date = market_map[r_cid]['end']
                         market_map[r_cid]['resolved'] = True
                         last_recorded_signal.pop(r_cid, None)
@@ -304,34 +308,36 @@ def main():
                                 ttr_hours = max(1.0, (resolution_timestamp - trade_timestamp).total_seconds() / 3600.0)
                                 log_ttr_int = int(math.log(ttr_hours) * 1000)
                                 log_ttr_int = min(log_ttr_int, 2097151) 
-                                packed_trade = (price_int << 22) | (log_ttr_int << 1) | outcome_int
                                 squared_error = (outcome_int - trade_price) ** 2
 
-                                # Check if they had a long position ("Yes")
+                                # Check if they had a long position
                                 if pos.qty_long > 0:
                                     avg_entry_long = pos.cost_long / pos.qty_long
                                     is_win = 1 if outcome > 0.5 else 0
                                     
                                     # Convert price to an integer between 0 and 1000
-                                    price_int = max(0, min(1000, int(avg_entry_long * 1000)))
+                                    price_long_int = max(0, min(1000, int(avg_entry_long * 1000)))
                                     
                                     # Shift price left by 1 bit, and append the outcome bit
-                                    packed_long = (price_int << 1) | is_win
-                                    
-                                    # CORRECTED: Insert into the UserMetrics dataclass array
-                                    bisect.insort(user_history[u].trade_history, packed_long)
+                                    packed_long = (price_long_int << 22) | (log_ttr_int << 1) | is_win
 
-                                # Check if they had a short position ("No")
+                                    if is_yes:
+                                        bisect.insort(user_history[u].trade_history_yes, packed_long)
+                                    else:
+                                        bisect.insort(user_history[u].trade_history_no, packed_long)
+
+                                # Check if they had a short position
                                 if pos.qty_short > 0:
-                                    # The actual price they paid for "No" is tracked in cost_short
                                     avg_entry_short = pos.cost_short / pos.qty_short
                                     is_win = 1 if outcome < 0.5 else 0
                                     
-                                    price_int = max(0, min(1000, int(avg_entry_short * 1000)))
-                                    packed_short = (price_int << 1) | is_win
+                                    price_short_int = max(0, min(1000, int(avg_entry_short * 1000)))
+                                    packed_short = (price_short_int << 22) | (log_ttr_int << 1) | is_win
                                     
-                                    # CORRECTED: Insert packed_short instead of packed_long
-                                    bisect.insort(user_history[u].trade_history, packed_short)
+                                    if is_yes:
+                                        bisect.insort(user_history[u].trade_history_yes, packed_short)
+                                    else:
+                                        bisect.insort(user_history[u].trade_history_no, packed_short)  
                                 
                                 # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
