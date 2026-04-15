@@ -581,6 +581,7 @@ def main():
                 sibling_cid = m.get('sibling_cid')
                 if sibling_cid and sibling_cid in market_map:
                     market_map[sibling_cid]['last_price'] = 1.0 - price
+                    market_map[sibling_cid]['last_update_ts'] = ts
                     
                 # Accumulate internal tracking state
                 pos = contract_positions[cid][user]
@@ -694,7 +695,14 @@ def main():
                     
                     for scan_cid, scan_m in market_map.items():
                         if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
-                        if 'last_price' not in scan_m: continue
+                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
+                        
+                        # --- STALENESS FILTER ---
+                        # If the last trade was more than 24 hours ago, the edge is stale. Ignore it.
+                        hours_since_trade = (ts - scan_m['last_update_ts']).total_seconds() / 3600.0
+                        if hours_since_trade > 24.0: 
+                            continue
+                        # ------------------------
                         
                         scan_ttr = max(1.0, (scan_m['end'] - ts).total_seconds() / 3600.0)
                         annualization_factor = 8760.0 / scan_ttr
