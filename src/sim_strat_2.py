@@ -613,7 +613,9 @@ def main():
                     time_lut=TIME_LUT,
                     scorer=scorer
                 )
-
+                
+                m['margin'] = sig
+                
                 current_event_id = m.get('event_id')
                 
                 if abs(sig) > 10 and 0.05 < price < 0.95:
