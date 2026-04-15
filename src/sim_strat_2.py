@@ -105,7 +105,7 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
-def process_trade(self, wallet, price, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+def process_trade(self, wallet, price, direction, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_price_int = max(0, min(1000, int(price * 1000)))
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
@@ -597,10 +597,10 @@ def main():
                 
                 ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
                 
-                # Execute the Bayesian 2D Kernel Estimator
                 sig = process_trade(
                     wallet=user, 
                     price=price, 
+                    direction=direction,
                     ttr_hours=ttr_hours,
                     user_metrics=user_history[user],
                     poly_yes=poly_coeffs_yes,
