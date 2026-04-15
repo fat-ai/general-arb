@@ -431,6 +431,7 @@ def main():
                 
                 qty = abs(tokens)
                 is_buying = (tokens > 0)
+                bet_on = m['outcome_label']
                 
                 # Accumulate internal tracking state
                 pos = contract_positions[cid][user]
@@ -478,7 +479,6 @@ def main():
                 usdc_vol = amount * price
                 m['volume'] += amount
                 cum_vol = m['volume']
-                bet_on = m['outcome_label']
     
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
