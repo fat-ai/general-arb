@@ -496,15 +496,23 @@ def main():
                                 roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
                                 
                                 # Append to parallel deques to avoid dictionary memory bloat
-                                calib_dates.append(end_date)
+                                calib_dates.append(pd.Timestamp(current_sim_day))
                                 calib_X.append([bet['log_vol'], vwap])
                                 calib_y.append(roi)
                                 
-                    orphan_cutoff = current_sim_day - timedelta(days=30)
-                    orphan_cids = [
-                        c for c, m in market_map.items()
-                        if m['end'] is not None and m['end'].date() < orphan_cutoff and not m['resolved']
-                    ]
+                    orphan_cutoff = current_sim_day - timedelta(days=10)
+                    orphan_cids = []
+                    for c, m in market_map.items():
+                        if m['resolved']: continue
+                        
+                        # Condition 1: Past official end date by 10 days
+                        is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff
+                        
+                        # Condition 2: No end date, but mathematically dead (no trades for 10 days)
+                        is_dead = m['end'] is None and m.get('last_update_ts', pd.Timestamp(current_sim_day)) < orphan_cutoff_ts
+                        
+                        if is_past_end or is_dead:
+                            orphan_cids.append(c)
                     
                     # Silently clear their tracked data to free RAM
                     for o_cid in orphan_cids:
