@@ -105,7 +105,7 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
-def process_trade(self, wallet, direction, price, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+def process_trade(self, wallet, price, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_price_int = max(0, min(1000, int(price * 1000)))
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
@@ -187,10 +187,7 @@ def process_trade(self, wallet, direction, price, ttr_hours, user_metrics, poly_
         # Expected Margin: (Expected Accuracy - Price) / Price
         margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
         
-        # Orient the signal downstream: 
-        # A positive margin on a Yes bet (+1) yields a positive signal (Buy Yes).
-        # A positive margin on a No bet (-1) yields a negative signal (Buy No).
-        return margin * direction
+        return margin
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -603,7 +600,6 @@ def main():
                 # Execute the Bayesian 2D Kernel Estimator
                 sig = process_trade(
                     wallet=user, 
-                    direction=direction, 
                     price=price, 
                     ttr_hours=ttr_hours,
                     user_metrics=user_history[user],
