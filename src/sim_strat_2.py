@@ -414,7 +414,35 @@ def main():
                         except Exception:
                             log.warning(f"OLS calibration failed: {e}")
                             pass
-                    
+                            
+                    if len(daily_variance_yes) >= 1000:
+                        try:
+                            v_data_yes = np.array(daily_variance_yes)
+                            prices_yes = v_data_yes[:, 0]
+                            y_var_yes = v_data_yes[:, 1] # Target: The Individual Squared Errors
+                            
+                            # Features: [Price^2, Price, 1 (Constant)]
+                            X_var_yes = np.column_stack((prices_yes**2, prices_yes, np.ones_like(prices_yes)))
+                            
+                            model_yes = sm.OLS(y_var_yes, X_var_yes).fit()
+                            # Slice assignment [:] mutates our global list directly without needing 'global' keyword
+                            poly_coeffs_yes[:] = model_yes.params 
+                        except Exception as e:
+                            log.warning(f"Variance YES OLS failed: {e}")
+                            
+                    if len(daily_variance_no) >= 1000:
+                        try:
+                            v_data_no = np.array(daily_variance_no)
+                            prices_no = v_data_no[:, 0]
+                            y_var_no = v_data_no[:, 1]
+                            
+                            X_var_no = np.column_stack((prices_no**2, prices_no, np.ones_like(prices_no)))
+                            
+                            model_no = sm.OLS(y_var_no, X_var_no).fit()
+                            poly_coeffs_no[:] = model_no.params
+                        except Exception as e:
+                            log.warning(f"Variance NO OLS failed: {e}")
+                            
                     current_sim_day = trade_date
 
                     gc.collect()
