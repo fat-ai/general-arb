@@ -57,6 +57,8 @@ class PositionMetrics:
     qty_short: float = 0.0
     cost_short: float = 0.0
     duration_weight_sum: float = 0.0
+    pending_yes: array.array = field(default_factory=lambda: array.array('I'))
+    pending_no: array.array = field(default_factory=lambda: array.array('I'))
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -305,40 +307,21 @@ def main():
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
 
-                                ttr_hours = max(1.0, (resolution_timestamp - trade_timestamp).total_seconds() / 3600.0)
-                                log_ttr_int = int(math.log(ttr_hours) * 1000)
-                                log_ttr_int = min(log_ttr_int, 2097151) 
-                                squared_error = (outcome_int - trade_price) ** 2
-
-                                # Check if they had a long position
-                                if pos.qty_long > 0:
-                                    avg_entry_long = pos.cost_long / pos.qty_long
-                                    is_win = 1 if outcome > 0.5 else 0
-                                    
-                                    # Convert price to an integer between 0 and 1000
-                                    price_long_int = max(0, min(1000, int(avg_entry_long * 1000)))
-                                    
-                                    # Shift price left by 1 bit, and append the outcome bit
-                                    packed_long = (price_long_int << 22) | (log_ttr_int << 1) | is_win
-
-                                    if is_yes:
-                                        bisect.insort(user_history[u].trade_history_yes, packed_long)
-                                    else:
-                                        bisect.insort(user_history[u].trade_history_no, packed_long)
-
-                                # Check if they had a short position
-                                if pos.qty_short > 0:
-                                    avg_entry_short = pos.cost_short / pos.qty_short
-                                    is_win = 1 if outcome < 0.5 else 0
-                                    
-                                    price_short_int = max(0, min(1000, int(avg_entry_short * 1000)))
-                                    packed_short = (price_short_int << 22) | (log_ttr_int << 1) | is_win
-                                    
-                                    if is_yes:
-                                        bisect.insort(user_history[u].trade_history_yes, packed_short)
-                                    else:
-                                        bisect.insort(user_history[u].trade_history_no, packed_short)  
+                                is_yes_win = 1 if outcome > 0.5 else 0
+                                is_no_win = 1 if outcome <= 0.5 else 0
                                 
+                                for partial in pos.pending_yes:
+                                    final_packed = partial | is_yes_win
+                                    bisect.insort(user_history[u].trade_history_yes, final_packed)
+                                    exact_price = (partial >> 22) / 1000.0
+                                    daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                                    
+                                for partial in pos.pending_no:
+                                    final_packed = partial | is_no_win
+                                    bisect.insort(user_history[u].trade_history_no, final_packed)
+                                    exact_price = (partial >> 22) / 1000.0
+                                    daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
+                                    
                                 # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
                                 avg_days_held = pos.duration_weight_sum / invested if invested > 0 else 1.0
@@ -454,6 +437,19 @@ def main():
                 invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
                 days_to_expiry = (m['end'] - ts).total_seconds() / 86400.0 if m['end'] is not None else 1.0
                 pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
+
+                price_int = max(0, min(1000, int(price * 1000)))
+                ttr_hours = max(1.0, days_to_expiry * 24.0)
+                log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+                
+                partial_packed = (price_int << 22) | (log_ttr_int << 1)
+                
+                if is_buying: # They bought the token
+                    if bet_on == "yes": pos.pending_yes.append(partial_packed)
+                    else: pos.pending_no.append(partial_packed)
+                else: # They shorted/sold the token
+                    if bet_on == "yes": pos.pending_no.append(partial_packed)
+                    else: pos.pending_yes.append(partial_packed)
                 
                 if is_buying:
                     pos.qty_long += qty           
