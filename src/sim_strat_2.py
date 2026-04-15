@@ -105,6 +105,93 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
+def process_trade(self, wallet, direction, price, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+        # 1. Format Current Market State
+        current_price_int = max(0, min(1000, int(price * 1000)))
+        current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
+        
+        is_yes = (direction > 0)
+        
+        # 2. Select Directional Bias Arrays and Coefficients
+        if is_yes:
+            history_array = user_metrics.trade_history_yes
+            coeffs = poly_yes
+            expected_p = price
+        else:
+            history_array = user_metrics.trade_history_no
+            coeffs = poly_no
+            expected_p = 1.0 - price  # Inverse the odds for No bets
+
+        # 3. Fast Bounded Slice (± 50 cents)
+        # We only search within 500 integer units. The exponential LUT crushes anything further to zero anyway.
+        min_p = max(0, current_price_int - 500)
+        max_p = min(1000, current_price_int + 500)
+        
+        # Shift to the top 10 bits to match the array packing architecture
+        left_bound = min_p << 22
+        right_bound = ((max_p + 1) << 22) - 1
+        
+        start_idx = bisect.bisect_left(history_array, left_bound)
+        end_idx = bisect.bisect_right(history_array, right_bound)
+
+        # 4. The Global Trust Multiplier
+        # Extract the user's global skill score, bounded safely so noise doesn't overwhelm math
+        raw_score = scorer.wallet_scores.get(wallet, 1.0)
+        trust_multiplier = max(0.1, min(3.0, raw_score))
+
+        N_eff = 0.0
+        W_eff = 0.0
+
+        # 5. Tally the Effective Evidence (2D Kernel)
+        for i in range(start_idx, end_idx):
+            packed = history_array[i]
+            
+            # Bitwise Unpacking
+            hist_price_int = packed >> 22
+            hist_log_ttr = (packed >> 1) & 0x1FFFFF  # Bitmask for the middle 21 bits
+            hist_outcome = packed & 1
+
+            price_dist = abs(hist_price_int - current_price_int)
+            time_dist = abs(hist_log_ttr - current_log_ttr)
+
+            # Ignore outliers that slipped through or exceed LUT bounds
+            if price_dist > 1000 or time_dist >= len(time_lut):
+                continue
+
+            # Constant O(1) Look-up and combined damping
+            combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
+            
+            N_eff += combined_weight
+            if hist_outcome == 1:
+                W_eff += combined_weight
+
+        # 6. Empirical Bayes Population Priors (Polynomial Smoothing)
+        a, b, c = coeffs
+        V = (a * (expected_p ** 2)) + (b * expected_p) + c
+        
+        theoretical_v = expected_p * (1.0 - expected_p)
+        
+        # Safety clamp: If the OLS regression bows out of physical probability bounds, snap to theoretical math
+        if V <= 0.0001 or V > 0.25:
+            V = max(0.0001, theoretical_v)
+            
+        # Calculate Prior Weight (M)
+        M = max(1.0, (theoretical_v / V) - 1.0)
+        
+        alpha = M * expected_p
+        beta = M * (1.0 - expected_p)
+
+        # 7. Final Bayesian Calculation
+        smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
+        
+        # Expected Margin: (Expected Accuracy - Price) / Price
+        margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
+        
+        # Orient the signal downstream: 
+        # A positive margin on a Yes bet (+1) yields a positive signal (Buy Yes).
+        # A positive margin on a No bet (-1) yields a negative signal (Buy No).
+        return margin * direction
+
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
 
@@ -511,8 +598,21 @@ def main():
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                sig = engine.process_trade(wallet=user, token_id=m['id'], usdc_vol=amount, total_vol=cum_vol, direction=direction, price=price, scorer=scorer)
-                sig = sig / cum_vol
+                ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
+                
+                # Execute the Bayesian 2D Kernel Estimator
+                sig = process_trade(
+                    wallet=user, 
+                    direction=direction, 
+                    price=price, 
+                    ttr_hours=ttr_hours,
+                    user_metrics=user_history[user],
+                    poly_yes=poly_coeffs_yes,
+                    poly_no=poly_coeffs_no,
+                    price_lut=PRICE_LUT,
+                    time_lut=TIME_LUT,
+                    scorer=scorer
+                )
 
                 current_event_id = m.get('event_id')
                 
