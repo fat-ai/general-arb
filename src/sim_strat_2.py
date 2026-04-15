@@ -105,10 +105,15 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
-def process_trade(self, wallet, price, direction, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+def process_trade(self, wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_price_int = max(0, min(1000, int(price * 1000)))
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
+
+        if is_buying:
+            expected_p = price
+        else:
+            expected_p = 1.0 - price
         
         is_yes = (direction > 0)
         
@@ -116,11 +121,9 @@ def process_trade(self, wallet, price, direction, ttr_hours, user_metrics, poly_
         if is_yes:
             history_array = user_metrics.trade_history_yes
             coeffs = poly_yes
-            expected_p = price
         else:
             history_array = user_metrics.trade_history_no
             coeffs = poly_no
-            expected_p = 1.0 - price  # Inverse the odds for No bets
 
         # 3. Fast Bounded Slice (± 50 cents)
         # We only search within 500 integer units. The exponential LUT crushes anything further to zero anyway.
@@ -601,6 +604,7 @@ def main():
                     wallet=user, 
                     price=price, 
                     direction=direction,
+                    is_buying=is_buying,
                     ttr_hours=ttr_hours,
                     user_metrics=user_history[user],
                     poly_yes=poly_coeffs_yes,
