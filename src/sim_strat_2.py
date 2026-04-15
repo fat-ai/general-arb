@@ -614,158 +614,169 @@ def main():
                         }
     
                 # ---------------------------------------------------------
-                # C. SIMULATE SIGNALS (Post Warm-Up)
+                # C. SIMULATE SIGNALS (Signal Logging Only)
                 # ---------------------------------------------------------
                 if m['start'] is None or m['start'] < simulation_start_date: continue
                 if ts < simulation_start_date: continue
 
                 usdc_vol = amount * price
                 m['volume'] += amount
-                cum_vol = m['volume']
-    
+                
+                ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
-                
                 marg, perc_marg = process_trade(
-                    wallet=user, 
-                    price=price, 
-                    direction=direction,
-                    is_buying=is_buying,
-                    ttr_hours=ttr_hours,
-                    user_metrics=user_history[user],
-                    poly_yes=poly_coeffs_yes,
-                    poly_no=poly_coeffs_no,
-                    price_lut=PRICE_LUT,
-                    time_lut=TIME_LUT,
-                    scorer=scorer
+                    wallet=user, price=price, direction=direction, is_buying=is_buying,
+                    ttr_hours=ttr_hours, user_metrics=user_history[user],
+                    poly_yes=poly_coeffs_yes, poly_no=poly_coeffs_no,
+                    price_lut=PRICE_LUT, time_lut=TIME_LUT, scorer=scorer
                 )
                 
-                m['margin'] = [marg, perc_marg]
-                
-                current_event_id = m.get('event_id')
-                
-                if abs(sig) > 10 and 0.05 < price < 0.95:
-                    if not result_map[m['id']].get('traded') and m['end'] is not None and m['end'] < datetime.now():
-                        score = scorer.get_score(user, usdc_vol, price)
-                        mid = m['id']
-                        
-                        verdict = "WRONG!"
-                        if result_map[mid]['outcome'] > 0 and sig > 0: verdict = "RIGHT!"
-                        elif result_map[mid]['outcome'] <= 0 and sig < 0: verdict = "RIGHT!"
-    
-                        bet_size = min(MAX_BET, 0.01 * result_map['performance']['equity'])
-                       # min_irr = 5.0
-                        slippage = MAX_SLIPPAGE * (bet_size / MAX_BET)
-                        
-                        # Clean Boolean check logic (DRY Principle)
-                        is_winning_side = (
-                            (result_map[mid]['outcome'] > 0 and bet_on == "yes") or 
-                            (result_map[mid]['outcome'] <= 0 and bet_on == "no")
-                        )
-    
-                        if is_winning_side:
-                            execution_price = price * (1 + slippage)
-                            profit = 1 - execution_price
-                            contracts = bet_size / execution_price
-                        else:
-                            execution_price = price * (1 - slippage)
-                            profit = execution_price
-                            contracts = bet_size / (1 - execution_price)
-                            
-                        profit = profit * contracts
-                        roi = profit / bet_size
-                        duration = m['end'] - ts
-                        time_factor = max(duration.days,1) / 365
-                        
-                        if result_map['performance']['cash'] < bet_size:  
-                            result_map['performance']['ins_cash'] += 1
-   
-                        if result_map['performance']['cash'] > bet_size:
-                            if verdict == "WRONG!":
-                                roi = -1.00
-                                profit = -bet_size
-                                result_map['performance']['losses'] += 1
-                            else:
-                                result_map['performance']['wins'] += 1
-
-                            result_map['resolutions'].append([m['end'], profit, bet_size])
-                            result_map['performance']['cash'] -= bet_size
-                            result_map[mid]['traded'] = True
-                            traded_events.add(current_event_id)
-                            
-                            executions_buffer.append([
-                                ts, mid, verdict, bet_on, direction, price, slippage, 
-                                bet_size, profit, roi, duration.days, score, 
-                                round(direction * score * (usdc_vol/cum_vol), 1)
-                            ])
-                            
-                            log.info(f"TRADE TRIGGERED! {mid} - Verdict: {verdict}")
-    
-                # ---------------------------------------------------------
-                # D. PERFORMANCE HEARTBEAT & SETTLEMENT (Deterministic Sim Time)
-                # ---------------------------------------------------------
-                if heartbeat is None:
-                    heartbeat = ts
-    
-                # Fire deterministically every 1 simulated hour (3600 seconds)
-                if abs((ts - heartbeat).total_seconds()) >= 3600:
-                    heartbeat = ts
-                    
-                    if len(result_map['resolutions']) > 0:
-                        result_map['performance']['resolutions'] = len(result_map['resolutions'])
-                        
-                        for res in result_map['resolutions']:
-                            # Settle payouts for simulated bets where the market end date has passed
-                            if res[0] <= ts:
-                                result_map['performance']['pnl'] += res[1]
-                                result_map['performance']['equity'] += res[1]
-                                result_map['performance']['cash'] += res[1] + res[2]
-    
-                        # Keep only unresolved bets
-                        result_map['resolutions'] = [res for res in result_map['resolutions'] if res[0] > ts]
-                        
-                        # Calculate High-Water Mark and Drawdowns
-                        if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
-                            result_map['performance']['peak_equity'] = result_map['performance']['equity']
-                            
-                        drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
-                        if drawdown > result_map['performance']['max_drawdown'][0]:
-                            result_map['performance']['max_drawdown'][0] = drawdown
-                            
-                        percent_drawdown = drawdown / result_map['performance']['peak_equity']
-                        if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
-                            result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
-                            
-                        calmar = min(result_map['performance']['pnl'] / max(result_map['performance']['max_drawdown'][0], 0.0001), 100000)
-                        result_map['performance']['Calmar'] = round(calmar, 1)
-    
-                        # Tally Hit Rate
-                        wins = result_map['performance']['wins']
-                        losses = result_map['performance']['losses']
-                        total_bets = wins + losses
-                        
-                        if total_bets > 0:
-                            hit_rate = round(100 * (wins / total_bets), 1)
-                            log.info(f"RESULTS! Hit rate = {hit_rate}% out of {total_bets} bets | Perf: {result_map['performance']}")
-    
-                if len(executions_buffer) >= 1000:
-                    with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
-                        csv.writer(f).writerows(executions_buffer)
-                    executions_buffer.clear()
-                
+                sig = marg * 100 
                 last_sig = last_recorded_signal.get(cid)
-                
                 if last_sig is None or abs(sig - last_sig) >= 0.1:
                     last_recorded_signal[cid] = sig
                     results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
-                    
                     if len(results_buffer) >= 10000:
                         with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
                             csv.writer(f).writerows(results_buffer)
                         results_buffer.clear()
-            
+
+                # ---------------------------------------------------------
+                # D. THE HEDGE FUND HEARTBEAT (Hourly Rotation)
+                # ---------------------------------------------------------
+                if heartbeat is None:
+                    heartbeat = ts
+    
+                if abs((ts - heartbeat).total_seconds()) >= 3600:
+                    heartbeat = ts
+                    
+                    # 1. SETTLE EXPIRED POSITIONS 
+                    cids_to_remove = []
+                    for p_cid, p_data in active_portfolio.items():
+                        pm = market_map[p_cid]
+                        if pm['end'] is not None and ts >= pm['end']:
+                            mid = pm['id']
+                            actual_outcome = result_map[mid]['outcome']
+                            
+                            is_winning_side = ((actual_outcome > 0 and p_data['direction'] == "yes") or 
+                                               (actual_outcome <= 0 and p_data['direction'] == "no"))
+                            
+                            payout = p_data['contracts'] * 1.0 if is_winning_side else 0.0
+                            profit = payout - p_data['bet_size']
+                            
+                            result_map['performance']['cash'] += payout
+                            result_map['performance']['equity'] += profit
+                            if profit > 0: result_map['performance']['wins'] += 1
+                            else: result_map['performance']['losses'] += 1
+                            
+                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                            cids_to_remove.append(p_cid)
+                            
+                    for c in cids_to_remove: del active_portfolio[c]
+
+                    # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
+                    candidates = []
+                    dummy_metrics = UserMetrics() 
+                    
+                    for scan_cid, scan_m in market_map.items():
+                        if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
+                        if 'last_price' not in scan_m: continue
+                        
+                        scan_ttr = max(1.0, (scan_m['end'] - ts).total_seconds() / 3600.0)
+                        annualization_factor = 8760.0 / scan_ttr
+                        
+                        # Set up the scan direction natively based on the token
+                        scan_price = scan_m['last_price']
+                        scan_dir = 1.0 if scan_m['outcome_label'] == "yes" else -1.0
+                        
+                        marg, p_marg = process_trade(
+                            wallet="BOT", price=scan_price, direction=scan_dir, is_buying=True, 
+                            ttr_hours=scan_ttr, user_metrics=dummy_metrics, 
+                            poly_yes=poly_coeffs_yes, poly_no=poly_coeffs_no, 
+                            price_lut=PRICE_LUT, time_lut=TIME_LUT, scorer=scorer
+                        )
+                        
+                        aer = p_marg * annualization_factor
+                        if aer > 5.0:
+                            candidates.append({
+                                'cid': scan_cid, 
+                                'dir': scan_m['outcome_label'], 
+                                'aer': aer, 
+                                'price': scan_price
+                            })
+                            
+                    # Rank and slice the Top 100
+                    candidates.sort(key=lambda x: x['aer'], reverse=True)
+                    target_portfolio = candidates[:100]
+                    target_cids = {c['cid']: c for c in target_portfolio}
+
+                    # 3. SELL DECAYED POSITIONS 
+                    cids_to_sell = []
+                    for p_cid, p_data in active_portfolio.items():
+                        if p_cid not in target_cids:
+                            sm = market_map[p_cid]
+                            sell_price = sm['last_price'] * (1.0 - MAX_SLIPPAGE)
+                            
+                            payout = p_data['contracts'] * sell_price
+                            profit = payout - p_data['bet_size']
+                            
+                            result_map['performance']['cash'] += payout
+                            result_map['performance']['equity'] += profit
+                            if profit > 0: result_map['performance']['wins'] += 1
+                            else: result_map['performance']['losses'] += 1
+                            
+                            executions_buffer.append([ts, sm['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                            cids_to_sell.append(p_cid)
+                            
+                    for c in cids_to_sell: del active_portfolio[c]
+
+                    # 4. BUY NEW POSITIONS (Fill the 1% Slots)
+                    target_slot_size = result_map['performance']['equity'] * 0.01
+                    
+                    for target in target_portfolio:
+                        if len(active_portfolio) >= 100: break
+                        t_cid = target['cid']
+                        
+                        # Prevent Directional Flipping Collision
+                        # We must ensure we don't own the sibling CID before we buy this one
+                        sibling_check = market_map[t_cid].get('sibling_cid')
+                        if sibling_check in active_portfolio:
+                            continue 
+                        
+                        if t_cid not in active_portfolio:
+                            buy_price = min(0.99, target['price'] * (1.0 + MAX_SLIPPAGE))
+                            actual_bet = min(target_slot_size, result_map['performance']['cash'])
+                            
+                            if actual_bet > 1.0: 
+                                contracts = actual_bet / buy_price
+                                active_portfolio[t_cid] = {
+                                    'direction': target['dir'],
+                                    'entry_price': buy_price,
+                                    'contracts': contracts,
+                                    'bet_size': actual_bet
+                                }
+                                result_map['performance']['cash'] -= actual_bet
+                                executions_buffer.append([ts, market_map[t_cid]['id'], "BOUGHT", target['dir'], 0, buy_price, MAX_SLIPPAGE, actual_bet, 0, 0, 0, 0, target['aer']])
+                    
+                    # 5. HIGH-WATER MARK TRACKING
+                    if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
+                        result_map['performance']['peak_equity'] = result_map['performance']['equity']
+                        
+                    drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
+                    if drawdown > result_map['performance']['max_drawdown'][0]:
+                        result_map['performance']['max_drawdown'][0] = drawdown
+                        
+                    percent_drawdown = drawdown / result_map['performance']['peak_equity']
+                    if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
+                        result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
+
+                    if len(executions_buffer) >= 1000:
+                        with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
+                            csv.writer(f).writerows(executions_buffer)
+                        executions_buffer.clear()
+                        
         if results_buffer:
             with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerows(results_buffer)
