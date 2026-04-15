@@ -105,7 +105,7 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
-def process_trade(self, wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_price_int = max(0, min(1000, int(price * 1000)))
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
