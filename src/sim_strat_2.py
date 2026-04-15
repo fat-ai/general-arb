@@ -250,7 +250,8 @@ def main():
             'resolved': False
         }
 
-        if market['id'] not in result_map:
+        mid = market['id']
+        if mid not in result_map:
             result_map[mid] = {
                 'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome'],
                 'yes_cid': None, 'no_cid': None
@@ -660,16 +661,19 @@ def main():
                             mid = pm['id']
                             actual_outcome = result_map[mid]['outcome']
                             
-                            is_winning_side = ((actual_outcome > 0 and p_data['direction'] == "yes") or 
-                                               (actual_outcome <= 0 and p_data['direction'] == "no"))
-                            
-                            payout = p_data['contracts'] * 1.0 if is_winning_side else 0.0
+                            # Multiply directly by the outcome float. 
+                            # If outcome is 0.5 (void), the bot gets back exactly 50 cents per token.
+                            if p_data['direction'] == "yes":
+                                payout = p_data['contracts'] * actual_outcome
+                            else:
+                                payout = p_data['contracts'] * (1.0 - actual_outcome)
+                                
                             profit = payout - p_data['bet_size']
                             
                             result_map['performance']['cash'] += payout
                             result_map['performance']['equity'] += profit
                             if profit > 0: result_map['performance']['wins'] += 1
-                            else: result_map['performance']['losses'] += 1
+                            elif profit < 0: result_map['performance']['losses'] += 1
                             
                             executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
                             cids_to_remove.append(p_cid)
@@ -746,7 +750,7 @@ def main():
                             continue 
                         
                         if t_cid not in active_portfolio:
-                            buy_price = min(0.99, target['price'] * (1.0 + MAX_SLIPPAGE))
+                            buy_price = max(0.001, min(0.99, target['price'] * (1.0 + MAX_SLIPPAGE)))
                             actual_bet = min(target_slot_size, result_map['performance']['cash'])
                             
                             if actual_bet > 1.0: 
