@@ -593,7 +593,7 @@ def main():
                 bet_on = m['outcome_label']
                 
                 m['last_price'] = price
-                m['last_update_ts']
+                m['last_update_ts'] = ts
                 sibling_cid = m.get('sibling_cid')
                 if sibling_cid and sibling_cid in market_map:
                     market_map[sibling_cid]['last_price'] = 1.0 - price
@@ -675,18 +675,6 @@ def main():
                         with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
                             csv.writer(f).writerows(results_buffer)
                         results_buffer.clear()
-                
-                sig = marg * 100
-                
-                last_sig = last_recorded_signal.get(cid)
-                
-                if last_sig is None or abs(sig - last_sig) >= 0.1:
-                    last_recorded_signal[cid] = sig
-                    results_buffer.append([ts, m['id'], cid, m['question'], bet_on, m['outcome'], price, amount, sig])
-                    if len(results_buffer) >= 10000:
-                        with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
-                            csv.writer(f).writerows(results_buffer)
-                        results_buffer.clear()
 
                 # ---------------------------------------------------------
                 # D. THE HEDGE FUND HEARTBEAT (Hourly Rotation)
@@ -749,8 +737,6 @@ def main():
                         
                         # Require > 500% AER AND a raw absolute edge of at least 2% to cover slippage
                         if aer > 5.0 and p_marg > 0.02:
-                            
-                            aer = p_marg * annualization_factor
                             if aer > 5.0:
                                 candidates.append({
                                     'cid': scan_cid, 
