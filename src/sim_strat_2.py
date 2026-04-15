@@ -36,7 +36,11 @@ OUTPUT_PATH = CACHE_DIR / SIGNAL_FILE
 
 if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
     
-headers = ["timestamp", "id", "cid", "question", "bet_on", "outcome", "trade_price", "trade_volume", "signal_strength"]
+headers = [
+    "timestamp", "market_id", "cid", "bet_on", 
+    "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
+    "end_timestamp", "actual_outcome"
+]
 with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
     csv.writer(f).writerow(headers)
         
@@ -204,7 +208,7 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
         margin = smoothed_win_rate - expected_p
         perc_margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
         
-        return margin, perc_margin
+        return smoothed_win_rate, margin, perc_margin
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -645,7 +649,7 @@ def main():
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                marg, perc_marg = process_trade(
+                smooth_prob, marg, perc_marg = process_trade(
                     wallet=user, price=price, direction=direction, is_buying=is_buying,
                     ttr_hours=ttr_hours, user_metrics=user_history[user],
                     poly_yes=poly_coeffs_yes, poly_no=poly_coeffs_no,
@@ -653,6 +657,24 @@ def main():
                 )
                 
                 m['last_perc_marg'] = perc_marg
+
+                last_logged_price = m.get('log_price', 0.0)
+                last_logged_ts = m.get('log_ts', datetime.min)
+                
+                # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
+                if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts).total_seconds() >= 3600:
+                    m['log_price'] = price
+                    m['log_ts'] = ts
+                    
+                    results_buffer.append([
+                        ts, m['id'], cid, bet_on, price, ttr_hours, 
+                        smooth_prob, marg, perc_marg, m['end'], m['outcome']
+                    ])
+                    
+                    if len(results_buffer) >= 10000:
+                        with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                            csv.writer(f).writerows(results_buffer)
+                        results_buffer.clear()
                 
                 sig = marg * 100
                 
