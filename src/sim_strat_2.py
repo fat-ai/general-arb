@@ -258,7 +258,7 @@ def main():
             }
 
         # Slot the CID into the parent market tracker
-        if outcome_label == "yes":
+        if market['token_outcome_label'] == "yes":
             result_map[mid]['yes_cid'] = cid
         else:
             result_map[mid]['no_cid'] = cid
@@ -527,7 +527,7 @@ def main():
                             scorer.intercept = model.params[0]
                             scorer.slope_vol = model.params[1]
                             scorer.slope_price = model.params[2]
-                        except Exception:
+                        except Exception as e:
                             log.warning(f"OLS calibration failed: {e}")
                             pass
                             
@@ -728,8 +728,8 @@ def main():
                     cids_to_sell = []
                     for p_cid, p_data in active_portfolio.items():
                         if p_cid not in target_cids:
-                            sm = market_map[p_cid]
-                            sell_price = sm['last_price'] * (1.0 - MAX_SLIPPAGE)
+                            smkt = market_map[p_cid]
+                            sell_price = smkt['last_price'] * (1.0 - MAX_SLIPPAGE)
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
@@ -739,7 +739,7 @@ def main():
                             if profit > 0: result_map['performance']['wins'] += 1
                             else: result_map['performance']['losses'] += 1
                             
-                            executions_buffer.append([ts, sm['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                            executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
                             cids_to_sell.append(p_cid)
                             
                     for c in cids_to_sell: del active_portfolio[c]
