@@ -401,21 +401,22 @@ def main():
                                 payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
-
-                                is_yes_win = 1 if outcome > 0.5 else 0
-                                is_no_win = 1 if outcome <= 0.5 else 0
                                 
-                                for partial in pos.pending_yes:
-                                    final_packed = partial | is_yes_win
-                                    bisect.insort(user_history[u].trade_history_yes, final_packed)
-                                    exact_price = (partial >> 22) / 1000.0
-                                    daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                                if outcome != 0.5:
+                                    is_yes_win = 1 if outcome > 0.5 else 0
+                                    is_no_win = 1 if outcome <= 0.5 else 0
                                     
-                                for partial in pos.pending_no:
-                                    final_packed = partial | is_no_win
-                                    bisect.insort(user_history[u].trade_history_no, final_packed)
-                                    exact_price = (partial >> 22) / 1000.0
-                                    daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
+                                    for partial in pos.pending_yes:
+                                        final_packed = partial | is_yes_win
+                                        bisect.insort(user_history[u].trade_history_yes, final_packed)
+                                        exact_price = (partial >> 22) / 1000.0
+                                        daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                                        
+                                    for partial in pos.pending_no:
+                                        final_packed = partial | is_no_win
+                                        bisect.insort(user_history[u].trade_history_no, final_packed)
+                                        exact_price = (partial >> 22) / 1000.0
+                                        daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
                                     
                                 # 1. Calculate ROI and Time Held
                                 position_roi = pnl / invested if invested > 0 else 0.0
