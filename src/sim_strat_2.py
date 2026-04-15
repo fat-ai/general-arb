@@ -107,7 +107,6 @@ poly_coeffs_no = [-1.0, 1.0, 0.0]
 
 def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
-        current_price_int = max(0, min(1000, int(price * 1000)))
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
 
         if is_buying:
@@ -117,56 +116,67 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
         
         is_yes = (direction > 0)
         
-        # 2. Select Directional Bias Arrays and Coefficients
+        # 2. Setup Directional Centers and Arrays
+        primary_price_int = max(0, min(1000, int(expected_p * 1000)))
+        opposing_price_int = max(0, min(1000, int((1.0 - expected_p) * 1000)))
+        
         if is_yes:
-            history_array = user_metrics.trade_history_yes
+            primary_array = user_metrics.trade_history_yes
+            opposing_array = user_metrics.trade_history_no
             coeffs = poly_yes
         else:
-            history_array = user_metrics.trade_history_no
+            primary_array = user_metrics.trade_history_no
+            opposing_array = user_metrics.trade_history_yes
             coeffs = poly_no
 
-        # 3. Fast Bounded Slice (± 50 cents)
-        # We only search within 500 integer units. The exponential LUT crushes anything further to zero anyway.
-        min_p = max(0, current_price_int - 500)
-        max_p = min(1000, current_price_int + 500)
-        
-        # Shift to the top 10 bits to match the array packing architecture
-        left_bound = min_p << 22
-        right_bound = ((max_p + 1) << 22) - 1
-        
-        start_idx = bisect.bisect_left(history_array, left_bound)
-        end_idx = bisect.bisect_right(history_array, right_bound)
-
-        # 4. The Global Trust Multiplier
-        # Extract the user's global skill score, bounded safely so noise doesn't overwhelm math
+        # 3. The Global Trust Multiplier
         raw_score = scorer.wallet_scores.get(wallet, 1.0)
         trust_multiplier = max(0.1, min(3.0, raw_score))
 
-        N_eff = 0.0
-        W_eff = 0.0
-
-        # 5. Tally the Effective Evidence (2D Kernel)
-        for i in range(start_idx, end_idx):
-            packed = history_array[i]
+        # 4. The 2D Kernel Scanner (Nested for DRY execution)
+        def scan_array(history_array, center_p_int, target_outcome):
+            n = 0.0
+            w = 0.0
             
-            # Bitwise Unpacking
-            hist_price_int = packed >> 22
-            hist_log_ttr = (packed >> 1) & 0x1FFFFF  # Bitmask for the middle 21 bits
-            hist_outcome = packed & 1
-
-            price_dist = abs(hist_price_int - current_price_int)
-            time_dist = abs(hist_log_ttr - current_log_ttr)
-
-            # Ignore outliers that slipped through or exceed LUT bounds
-            if price_dist > 1000 or time_dist >= len(time_lut):
-                continue
-
-            # Constant O(1) Look-up and combined damping
-            combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
+            min_p = max(0, center_p_int - 500)
+            max_p = min(1000, center_p_int + 500)
+            left_bound = min_p << 22
+            right_bound = ((max_p + 1) << 22) - 1
             
-            N_eff += combined_weight
-            if hist_outcome == 1:
-                W_eff += combined_weight
+            start_idx = bisect.bisect_left(history_array, left_bound)
+            end_idx = bisect.bisect_right(history_array, right_bound)
+            
+            for i in range(start_idx, end_idx):
+                packed = history_array[i]
+                
+                hist_price_int = packed >> 22
+                hist_log_ttr = (packed >> 1) & 0x1FFFFF 
+                hist_outcome = packed & 1
+
+                price_dist = abs(hist_price_int - center_p_int)
+                time_dist = abs(hist_log_ttr - current_log_ttr)
+
+                if price_dist > 1000 or time_dist >= len(time_lut):
+                    continue
+
+                combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
+                
+                n += combined_weight
+                # If they hit the target outcome (1 for primary, 0 for opposing), it supports the event
+                if hist_outcome == target_outcome:
+                    w += combined_weight
+                    
+            return n, w
+
+        # 5. Tally the Evidence from Both Arrays
+        # For the primary array, a Win (1) means the event occurred.
+        n1, w1 = scan_array(primary_array, primary_price_int, target_outcome=1)
+        
+        # For the opposing array, a Loss (0) means our event occurred.
+        n2, w2 = scan_array(opposing_array, opposing_price_int, target_outcome=0)
+        
+        N_eff = n1 + n2
+        W_eff = w1 + w2
 
         # 6. Empirical Bayes Population Priors (Polynomial Smoothing)
         a, b, c = coeffs
@@ -174,11 +184,9 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
         
         theoretical_v = expected_p * (1.0 - expected_p)
         
-        # Safety clamp: If the OLS regression bows out of physical probability bounds, snap to theoretical math
         if V <= 0.0001 or V > 0.25:
             V = max(0.0001, theoretical_v)
             
-        # Calculate Prior Weight (M)
         M = max(1.0, (theoretical_v / V) - 1.0)
         
         alpha = M * expected_p
@@ -188,7 +196,6 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
         smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
 
         margin = smoothed_win_rate - expected_p
-        # Expected Margin: (Expected Accuracy - Price) / Price
         perc_margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
         
         return margin, perc_margin
