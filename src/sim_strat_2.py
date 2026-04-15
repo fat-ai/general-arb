@@ -186,11 +186,12 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
 
         # 7. Final Bayesian Calculation
         smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
-        
+
+        margin = smoothed_win_rate - expected_p
         # Expected Margin: (Expected Accuracy - Price) / Price
-        margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
+        perc_margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
         
-        return margin
+        return margin, perc_margin
 
 def main():
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
@@ -600,7 +601,7 @@ def main():
                 
                 ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
                 
-                sig = process_trade(
+                marg, perc_marg = process_trade(
                     wallet=user, 
                     price=price, 
                     direction=direction,
@@ -614,7 +615,7 @@ def main():
                     scorer=scorer
                 )
                 
-                m['margin'] = sig
+                m['margin'] = (marg, perc_marg)
                 
                 current_event_id = m.get('event_id')
                 
