@@ -301,6 +301,12 @@ def main():
                                 invested = pos.cost_long + pos.cost_short
                                 pnl = payout - invested
 
+                                ttr_hours = max(1.0, (resolution_timestamp - trade_timestamp).total_seconds() / 3600.0)
+                                log_ttr_int = int(math.log(ttr_hours) * 1000)
+                                log_ttr_int = min(log_ttr_int, 2097151) 
+                                packed_trade = (price_int << 22) | (log_ttr_int << 1) | outcome_int
+                                squared_error = (outcome_int - trade_price) ** 2
+
                                 # Check if they had a long position ("Yes")
                                 if pos.qty_long > 0:
                                     avg_entry_long = pos.cost_long / pos.qty_long
