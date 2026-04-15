@@ -615,7 +615,7 @@ def main():
                     scorer=scorer
                 )
                 
-                m['margin'] = (marg, perc_marg)
+                m['margin'] = [marg, perc_marg]
                 
                 current_event_id = m.get('event_id')
                 
