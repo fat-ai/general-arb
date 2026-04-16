@@ -712,12 +712,7 @@ def main():
                             mid = pm['id']
                             actual_outcome = result_map[mid]['outcome']
                             
-                            # Multiply directly by the outcome float. 
-                            # If outcome is 0.5 (void), the bot gets back exactly 50 cents per token.
-                            if p_data['direction'] == "yes":
-                                payout = p_data['contracts'] * actual_outcome
-                            else:
-                                payout = p_data['contracts'] * (1.0 - actual_outcome)
+                            payout = p_data['contracts'] * pm['outcome']
                                 
                             profit = payout - p_data['bet_size']
                             
@@ -774,7 +769,8 @@ def main():
                     for p_cid, p_data in active_portfolio.items():
                         if p_cid not in target_cids:
                             smkt = market_map[p_cid]
-                            sell_price = smkt['last_price'] * (1.0 - MAX_SLIPPAGE)
+                            slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
+                            sell_price = smkt['last_price'] * (1.0 - slippage)
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
@@ -803,7 +799,8 @@ def main():
                             continue 
                         
                         if t_cid not in active_portfolio:
-                            buy_price = max(0.001, min(0.99, target['price'] * (1.0 + MAX_SLIPPAGE)))
+                            slippage = MAX_SLIPPAGE * (target_slot_size / MAX_BET) 
+                            buy_price = max(0.001, min(0.99, target['price'] * (1.0 + slippage)))
                             actual_bet = min(target_slot_size, result_map['performance']['cash'])
                             
                             if actual_bet > 1.0: 
