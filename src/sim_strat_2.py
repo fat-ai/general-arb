@@ -356,12 +356,15 @@ def main():
                 t.tradeAmount, 
                 t.outcomeTokensAmount, 
                 t.price, 
-                to_timestamp(CAST(t.timestamp AS BIGINT)) AS ts
+                COALESCE(
+                    to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
+                    TRY_CAST(t.timestamp AS TIMESTAMP)
+                ) AS ts
             FROM source_db.trades t
             JOIN valid_markets v ON t.contract_id = v.clean_cid
             WHERE t.timestamp IS NOT NULL
               AND t.price >= 0.0 AND t.price <= 1.0
-            ORDER BY t.timestamp ASC
+            ORDER BY ts ASC
         """
         cursor = con.execute(query)
     
