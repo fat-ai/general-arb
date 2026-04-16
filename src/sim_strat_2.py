@@ -509,7 +509,7 @@ def main():
                         is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff
                         
                         # Condition 2: No end date, but mathematically dead (no trades for 10 days)
-                        is_dead = m['end'] is None and m.get('last_update_ts', pd.Timestamp(current_sim_day)) < orphan_cutoff_ts
+                        is_dead = m['end'] is None and m.get('last_update_ts', pd.Timestamp(current_sim_day)) < orphan_cutoff
                         
                         if is_past_end or is_dead:
                             orphan_cids.append(c)
