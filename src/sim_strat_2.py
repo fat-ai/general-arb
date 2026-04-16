@@ -833,6 +833,35 @@ def main():
                         with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
                             csv.writer(f).writerows(executions_buffer)
                         executions_buffer.clear()
+
+                    # ---------------------------------------------------------
+                    # 6. LIVE DASHBOARD LOGGING
+                    # ---------------------------------------------------------
+                    perf = result_map['performance']
+                    open_pos_count = len(active_portfolio)
+                    total_closed_trades = perf['wins'] + perf['losses']
+                    
+                    # Calculate win rate safely
+                    if total_closed_trades > 0:
+                        win_rate = (perf['wins'] / total_closed_trades) * 100.0
+                    else:
+                        win_rate = 0.0
+                        
+                    # Calculate average entry price of currently open positions
+                    if open_pos_count > 0:
+                        avg_price = sum(p_data['entry_price'] for p_data in active_portfolio.values()) / open_pos_count
+                    else:
+                        avg_price = 0.0
+
+                    # Print a clean, single-line summary to the console
+                    log.info(
+                        f"🕒 [{ts.strftime('%Y-%m-%d %H:%M')}] "
+                        f"Eq: ${perf['equity']:,.2f} | "
+                        f"Cash: ${perf['cash']:,.2f} | "
+                        f"Pos: {open_pos_count} (Avg Px: {avg_price:.3f}) | "
+                        f"Trades: {total_closed_trades} (WR: {win_rate:.1f}%) | "
+                        f"Max DD: {perf['max_drawdown'][1]:.1f}%"
+                    )
                         
         if results_buffer:
             with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
