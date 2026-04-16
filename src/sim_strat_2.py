@@ -350,20 +350,25 @@ def main():
         # OPTIMIZATION: Use an INNER JOIN to filter the SQLite data BEFORE sorting.
         # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
         query = """
-            SELECT 
-                t.contract_id, 
-                t.user, 
-                t.tradeAmount, 
-                t.outcomeTokensAmount, 
-                t.price, 
-                COALESCE(
-                    to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
-                    TRY_CAST(t.timestamp AS TIMESTAMP)
-                ) AS ts
-            FROM source_db.trades t
-            JOIN valid_markets v ON t.contract_id = v.clean_cid
-            WHERE t.timestamp IS NOT NULL
-              AND t.price >= 0.0 AND t.price <= 1.0
+            WITH parsed_trades AS (
+                SELECT 
+                    t.contract_id, 
+                    t.user, 
+                    t.tradeAmount, 
+                    t.outcomeTokensAmount, 
+                    t.price, 
+                    COALESCE(
+                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
+                        TRY_CAST(t.timestamp AS TIMESTAMP)
+                    ) AS ts
+                FROM source_db.trades t
+                JOIN valid_markets v ON t.contract_id = v.clean_cid
+                WHERE t.timestamp IS NOT NULL
+                  AND t.price >= 0.0 
+                  AND t.price <= 1.0
+            )
+            SELECT * FROM parsed_trades
+            WHERE ts IS NOT NULL
             ORDER BY ts ASC
         """
         cursor = con.execute(query)
