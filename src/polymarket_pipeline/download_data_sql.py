@@ -471,23 +471,19 @@ class DataFetcher:
             existing_low_ts = None
             
             print(f"📂 Checking existing SQLite database bounds...")
-            db_cursor.execute("SELECT MAX(timestamp), MIN(timestamp) FROM trades")
+            
+            # Let SQLite unify text strings and integers into pure integers using COALESCE
+            db_cursor.execute('''
+                SELECT 
+                    MAX(CAST(COALESCE(strftime('%s', timestamp), timestamp) AS INTEGER)),
+                    MIN(CAST(COALESCE(strftime('%s', timestamp), timestamp) AS INTEGER))
+                FROM trades
+            ''')
             max_val, min_val = db_cursor.fetchone()
             
             if max_val is not None and min_val is not None:
-                
-                # Bilingual helper function
-                def parse_mixed_ts(val):
-                    val_str = str(val)
-                    if val_str.replace('.', '', 1).isdigit(): # It's a Unix number
-                        return int(float(val_str))
-                    else: # It's an old ISO string
-                        if not val_str.endswith('Z') and '+' not in val_str:
-                            val_str += '+00:00'
-                        return int(pd.to_datetime(val_str).timestamp())
-
-                existing_high_ts = parse_mixed_ts(max_val)
-                existing_low_ts = parse_mixed_ts(min_val)
+                existing_high_ts = max_val
+                existing_low_ts = min_val
                 
                 print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
             else:
