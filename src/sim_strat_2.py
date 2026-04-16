@@ -393,6 +393,9 @@ def main():
                 cid, user, amount, tokens, price, ts = row
                 
                 if ts is None: continue
+
+                if getattr(ts, 'tzinfo', None) is not None:
+                    ts = ts.replace(tzinfo=None)
                 
                 trade_date = ts.date()
                 
