@@ -163,7 +163,18 @@ def fetch_and_save_trades():
                         last_id = ""
                     else:
                         current_ts, last_id = new_ts, new_id
-
+                        
+                    new_ts = int(data[-1]['timestamp'])
+                    
+                    if new_ts >= current_ts and len(data) >= 1000:
+                        logger.warning(
+                            f"Timestamp not advancing (stuck at {current_ts}). "
+                            f"Possible data gap — breaking to avoid infinite loop."
+                        )
+                        break
+                        
+                    current_ts = new_ts
+                    
                     if len(data) < 1000: break
                     time.sleep(0.1)
 
