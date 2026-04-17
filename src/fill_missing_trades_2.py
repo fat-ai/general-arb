@@ -71,7 +71,6 @@ def fetch_and_save_trades():
     TOKEN_BATCH_SIZE = 50 
     MAX_RETRIES = 5
     
-    # Ensure directory exists
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
     with contextlib.closing(sqlite3.connect(DB_PATH)) as conn:
@@ -132,11 +131,7 @@ def fetch_and_save_trades():
 
                     out_rows = []
                     for r in data:
-                        # Skip if we are at the same timestamp boundary and already processed this ID
-                        if int(r['timestamp']) == current_ts and r['id'] >= last_id and last_id != "":
-                            continue
-
-                        # Standardize ID
+                        # Parse IDs
                         m_raw, t_raw = str(r['makerAssetId']), str(r['takerAssetId'])
                         m_int = str(int(m_raw, 16) if m_raw.startswith("0x") else int(Decimal(m_raw)))
                         t_int = str(int(t_raw, 16) if t_raw.startswith("0x") else int(Decimal(t_raw)))
@@ -153,28 +148,21 @@ def fetch_and_save_trades():
                             out_rows.append((r['id'], int(r['timestamp']), v_usdc, v_size * mult, r['taker'], tid, v_usdc/v_size, mult))
 
                     if out_rows:
+                        # Rely on DB Primary Key for all deduplication
                         conn.executemany("INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?)", out_rows)
                         conn.commit()
 
-                    # Advance cursor
+                    # Pagination Cursor Logic
                     new_ts, new_id = int(data[-1]['timestamp']), data[-1]['id']
-                    if new_ts == current_ts and new_id == last_id:
+                    
+                    # Stall Detection: If the last record of the page is exactly what we started with
+                    if new_ts == current_ts and new_id == last_id and len(data) >= 1000:
+                        logger.warning(f"⚠️ Cursor stalled at ts={current_ts}. Nudging to avoid infinite loop.")
                         current_ts -= 1
                         last_id = ""
                     else:
                         current_ts, last_id = new_ts, new_id
-                        
-                    new_ts = int(data[-1]['timestamp'])
-                    
-                    if new_ts >= current_ts and len(data) >= 1000:
-                        logger.warning(
-                            f"Timestamp not advancing (stuck at {current_ts}). "
-                            f"Possible data gap — breaking to avoid infinite loop."
-                        )
-                        break
-                        
-                    current_ts = new_ts
-                    
+
                     if len(data) < 1000: break
                     time.sleep(0.1)
 
