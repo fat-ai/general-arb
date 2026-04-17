@@ -11,13 +11,17 @@ def update_market_cache_efficiently():
     
     print("1. Extracting existing market IDs...")
     cache_ids_table = pq.read_table(cache_file, columns=['market_id'])
-    existing_ids = set(cache_ids_table['market_id'].to_pylist())
+    
+    # Per your instruction, format the IDs as integers for perfectly safe matching.
+    # String -> Float -> Int handles variations like "123" and "123.0" safely
+    cache_float = pc.cast(cache_ids_table['market_id'], pa.float64(), safe=False)
+    cache_int = pc.cast(cache_float, pa.int64(), safe=False)
+    
+    # Drop any nulls from failed casts and build our set
+    existing_ids = set(pc.drop_null(cache_int).to_pylist())
     print(f"Found {len(existing_ids)} existing markets in cache.")
     
-    # Build the initial PyArrow array outside the loop for maximum performance
     id_array = pa.array(list(existing_ids))
-    
-    # Initialize outside the try block to avoid NameError on early failure
     new_markets_added = 0
     
     try:
@@ -25,7 +29,6 @@ def update_market_cache_efficiently():
             schema = cache_pf.schema_arrow
             
             with pq.ParquetWriter(temp_file, schema) as writer:
-                
                 print("2. Copying existing cache to temporary file in chunks...")
                 for batch in cache_pf.iter_batches(batch_size=50000):
                     writer.write_batch(batch)
@@ -33,14 +36,15 @@ def update_market_cache_efficiently():
                 print("3. Scanning main file for new markets...")
                 with pq.ParquetFile(main_file) as main_pf:
                     for i, batch in enumerate(main_pf.iter_batches(batch_size=50000)):
-                        if i % 10 == 0:
-                            print(f"  Scanning chunk {i}...")
+                        
+                        # Cast main file IDs to integer to ensure a 1:1 match
+                        batch_ids_float = pc.cast(batch['market_id'], pa.float64(), safe=False)
+                        batch_ids_int = pc.cast(batch_ids_float, pa.int64(), safe=False)
                         
                         # Filter A: Is this market_id completely new?
-                        mask_new = pc.invert(pc.is_in(batch['market_id'], value_set=id_array))
+                        mask_new = pc.invert(pc.is_in(batch_ids_int, value_set=id_array))
                         
-                        # Filter B: Handle volume safely and completely natively
-                        # safe=False forces PyArrow to gracefully turn invalid strings into nulls
+                        # Filter B: Volume > 0 (Reverted to the simple, clean logic)
                         numeric_vol = pc.cast(batch['volume'], pa.float64(), safe=False)
                         clean_vol = pc.fill_null(numeric_vol, 0.0)
                         mask_volume = pc.greater(clean_vol, 0.0)
@@ -48,19 +52,26 @@ def update_market_cache_efficiently():
                         # Combine masks
                         combined_mask = pc.and_(mask_new, mask_volume)
                         
+                        # --- DIAGNOSTICS ---
+                        if i % 10 == 0:
+                            # Count how many rows evaluate to True for each mask
+                            new_ids_count = pc.sum(pc.cast(mask_new, pa.int64())).as_py()
+                            valid_vol_count = pc.sum(pc.cast(mask_volume, pa.int64())).as_py()
+                            print(f"  Chunk {i} Stats -> New IDs: {new_ids_count} | IDs with Vol > 0: {valid_vol_count}")
+                        
                         # Filter the batch natively
                         new_markets_batch = batch.filter(combined_mask)
                         
-                        # 4. Write new markets, update tracking set, and conditionally rebuild id_array
+                        # 4. Write new markets, update tracking set
                         if new_markets_batch.num_rows > 0:
                             writer.write_batch(new_markets_batch)
                             new_markets_added += new_markets_batch.num_rows
                             
-                            # Update the Python set with new IDs to prevent duplicates
-                            new_ids = new_markets_batch['market_id'].to_pylist()
-                            existing_ids.update(new_ids)
+                            # Extract the new integer IDs to update our tracking set
+                            new_ids_float = pc.cast(new_markets_batch['market_id'], pa.float64(), safe=False)
+                            new_ids_int = pc.cast(new_ids_float, pa.int64(), safe=False)
+                            existing_ids.update(pc.drop_null(new_ids_int).to_pylist())
                             
-                            # Rebuild the id_array ONLY when we actually add new markets
                             id_array = pa.array(list(existing_ids))
 
     except Exception as e:
