@@ -149,7 +149,11 @@ def fetch_and_save_trades():
 
                     if out_rows:
                         # Rely on DB Primary Key for all deduplication
-                        conn.executemany("INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?)", out_rows)
+                        conn.executemany("""
+                            INSERT OR IGNORE INTO trades 
+                            (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, side_mult) 
+                            VALUES (?,?,?,?,?,?,?,?)
+                        """, out_rows)
                         conn.commit()
 
                     # Pagination Cursor Logic
