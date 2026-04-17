@@ -71,6 +71,9 @@ def fetch_and_save_trades():
     TOKEN_BATCH_SIZE = 50 
     MAX_RETRIES = 5
     
+    # Ensure directory exists
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+
     with contextlib.closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -96,20 +99,15 @@ def fetch_and_save_trades():
             logger.info(f"🚀 Batch {i//TOKEN_BATCH_SIZE + 1}/{math.ceil(len(target_tokens)/TOKEN_BATCH_SIZE)}")
 
             for side_filter in ["makerAssetId_in", "takerAssetId_in"]:
-                current_ts = 2147483647  # Max Int (far in the future)
-                last_id = "" # Tie-breaker for identical timestamps
+                current_ts = 2147483647 
+                last_id = "" 
                 
                 while True:
-                    # Logic: Get records older than current_ts, 
-                    # OR records at current_ts with an ID smaller than last_id (lexicographical)
                     query = f"""
                     query {{
                         orderFilledEvents(
                             first: 1000, orderBy: timestamp, orderDirection: desc, 
-                            where: {{ 
-                                timestamp_lte: {current_ts}, 
-                                {side_filter}: {tokens_list_str}
-                            }}
+                            where: {{ timestamp_lte: {current_ts}, {side_filter}: {tokens_list_str} }}
                         ) {{
                             id timestamp maker taker makerAssetId takerAssetId makerAmountFilled takerAmountFilled
                         }}
@@ -122,56 +120,49 @@ def fetch_and_save_trades():
                             resp = fetcher.session.post(GRAPH_URL, json={'query': query}, timeout=20)
                             resp.raise_for_status()
                             res_json = resp.json()
-                            
-                            if 'errors' in res_json:
-                                raise ValueError(f"GraphQL Errors: {res_json['errors']}")
-                                
+                            if 'errors' in res_json: raise ValueError(f"GraphQL Error: {res_json['errors']}")
                             data = res_json.get('data', {}).get('orderFilledEvents', [])
                             break
                         except Exception as e:
-                            logger.warning(f"Attempt {attempt+1} failed: {e}")
+                            logger.warning(f"Retry {attempt+1}: {e}")
                             time.sleep(2 ** attempt)
-                            if attempt == MAX_RETRIES - 2:
-                                fetcher = DataFetcher() # Refresh session
+                            if attempt == MAX_RETRIES - 2: fetcher = DataFetcher()
 
                     if not data: break
 
                     out_rows = []
                     for r in data:
+                        # Skip if we are at the same timestamp boundary and already processed this ID
+                        if int(r['timestamp']) == current_ts and r['id'] >= last_id and last_id != "":
+                            continue
 
-                        # Standardize ID parsing
+                        # Standardize ID
                         m_raw, t_raw = str(r['makerAssetId']), str(r['takerAssetId'])
                         m_int = str(int(m_raw, 16) if m_raw.startswith("0x") else int(Decimal(m_raw)))
                         t_int = str(int(t_raw, 16) if t_raw.startswith("0x") else int(Decimal(t_raw)))
 
                         if m_int in batch_tokens_set:
                             tid, mult = m_int, 1
-                            val_usdc = float(r['takerAmountFilled']) / 1e6
-                            val_size = float(r['makerAmountFilled']) / 1e6
+                            v_usdc, v_size = float(r['takerAmountFilled'])/1e6, float(r['makerAmountFilled'])/1e6
                         elif t_int in batch_tokens_set:
                             tid, mult = t_int, -1
-                            val_usdc = float(r['makerAmountFilled']) / 1e6
-                            val_size = float(r['takerAmountFilled']) / 1e6
+                            v_usdc, v_size = float(r['makerAmountFilled'])/1e6, float(r['takerAmountFilled'])/1e6
                         else: continue
 
-                        if val_size > 0:
-                            price = val_usdc / val_size
-                            out_rows.append((
-                                r['id'], int(r['timestamp']), val_usdc, val_size * mult,
-                                r['taker'], tid, price, mult
-                            ))
+                        if v_size > 0:
+                            out_rows.append((r['id'], int(r['timestamp']), v_usdc, v_size * mult, r['taker'], tid, v_usdc/v_size, mult))
 
                     if out_rows:
-                        conn.executemany("""
-                            INSERT OR IGNORE INTO trades 
-                            (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, side_mult)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, out_rows)
+                        conn.executemany("INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?)", out_rows)
                         conn.commit()
 
-                    # Set cursor for next page
-                    current_ts = int(data[-1]['timestamp'])
-                    last_id = data[-1]['id']
+                    # Advance cursor
+                    new_ts, new_id = int(data[-1]['timestamp']), data[-1]['id']
+                    if new_ts == current_ts and new_id == last_id:
+                        current_ts -= 1
+                        last_id = ""
+                    else:
+                        current_ts, last_id = new_ts, new_id
 
                     if len(data) < 1000: break
                     time.sleep(0.1)
