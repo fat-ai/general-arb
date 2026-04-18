@@ -497,6 +497,9 @@ def main():
     calib_dates = deque()
     calib_X = deque() 
     calib_y = deque()
+
+    global_total_peak = 0.0
+    global_user_count = 0
     
     scorer = WalletScorer()
 
@@ -784,7 +787,19 @@ def main():
                     else: pos.pending_yes.append(partial_packed)
                 
                 # 1. Update rolling bankroll proxy and get wager fraction
-                wager_fraction = get_wager_fraction(user_history[user], invested_this_trade)
+                if user not in known_users:
+                    global_user_count += 1
+                else:
+                    # Subtract their old peak before we potentially update it
+                    global_total_peak -= user_history[user].peak_exposure
+
+                current_global_avg = (global_total_peak / global_user_count) if global_user_count > 0 else 100.0
+                
+                # 1. Update rolling bankroll proxy and get wager fraction
+                wager_fraction = get_wager_fraction(user_history[user], invested_this_trade, current_global_avg)
+                
+                # Add back their (potentially new) peak exposure
+                global_total_peak += user_history[user].peak_exposure
                 
                 # 2. Extract latent conviction
                 p_true = extract_true_probability(price, wager_fraction, is_buying)
