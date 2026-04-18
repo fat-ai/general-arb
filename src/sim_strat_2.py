@@ -522,7 +522,7 @@ def main():
         con.execute(f"SET temp_directory='{duck_tmp}';")
         
         con.execute("INSTALL sqlite; LOAD sqlite;")
-        con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE);")
+        con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
     
         log.info("⏳ DuckDB is now working ... Please wait")
         
