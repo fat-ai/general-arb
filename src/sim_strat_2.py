@@ -689,7 +689,8 @@ def main():
                     # Silently clear their tracked data to free RAM
                     for o_cid in orphan_cids:
                         market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
-                        
+                        contract_positions.pop(o_cid, None)
+                        first_bets_pending.pop(o_cid, None)
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
                     
@@ -801,8 +802,17 @@ def main():
                 # Add back their (potentially new) peak exposure
                 global_total_peak += user_history[user].peak_exposure
                 
-                # 2. Extract latent conviction
-                p_true = extract_true_probability(price, wager_fraction, is_buying)
+                # 2. Standardize trade to the YES perspective for accurate Brier scoring
+                yes_price = price if bet_on == "yes" else 1.0 - price
+                
+                effective_direction = 1.0 if is_buying else -1.0
+                if bet_on != "yes": 
+                    effective_direction *= -1.0
+                    
+                is_effective_yes_bet = (effective_direction > 0)
+                
+                # Extract latent conviction (p_true is now strictly P(YES))
+                p_true = extract_true_probability(yes_price, wager_fraction, is_effective_yes_bet)
                 
                 # 3. Store for Brier calculation at resolution
                 pos.pending_brier_data.append((user, p_true, invested_this_trade))
@@ -921,7 +931,6 @@ def main():
                         
                         # Require > 500% AER AND a raw absolute edge of at least 2% to cover slippage
                         if aer > 5.0 and p_marg > 0.02:
-                            if aer > 5.0:
                                 candidates.append({
                                     'cid': scan_cid, 
                                     'dir': scan_m['outcome_label'], 
