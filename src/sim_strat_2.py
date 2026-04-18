@@ -36,10 +36,6 @@ executions_buffer = []
 
 @dataclass(slots=True)
 class PositionMetrics:
-    qty_long: float = 0.0
-    cost_long: float = 0.0
-    qty_short: float = 0.0
-    cost_short: float = 0.0
     duration_weight_sum: float = 0.0
     pending_yes: array.array = field(default_factory=lambda: array.array('I'))
     pending_no: array.array = field(default_factory=lambda: array.array('I'))
@@ -616,10 +612,6 @@ def main():
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
                         outcome_label = market_map[r_cid]['outcome_label']
-                        is_yes = True
-                        if outcome_label.lower() == "no":
-                            is_yes = False
-                        end_date = market_map[r_cid]['end']
                         market_map[r_cid]['resolved'] = True
                 
                         # Update Standard User History
@@ -627,9 +619,6 @@ def main():
                             users_in_market = contract_positions.pop(r_cid)
                             
                             for u, pos in users_in_market.items():
-                                payout = (pos.qty_long * outcome) + (pos.qty_short * (1.0 - outcome))
-                                invested = pos.cost_long + pos.cost_short
-                                pnl = payout - invested
                                 
                                 if outcome != 0.5:
                                     is_yes_win = 1 if outcome > 0.5 else 0
@@ -653,7 +642,8 @@ def main():
                                     release_exposure(user_history[brier_user], initial_stake)
                                     
                                     # 2. Calculate Latent Brier Score
-                                    squared_error = (p_true - outcome)**2
+                                    yes_outcome = outcome if market_map[r_cid]['outcome_label'] == 'yes' else 1.0 - outcome
+                                    squared_error = (p_true - yes_outcome)**2
                                     user_history[brier_user].brier_sum += squared_error
                                     user_history[brier_user].brier_count += 1
                                   
