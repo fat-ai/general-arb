@@ -588,10 +588,7 @@ def main():
                             is_yes = False
                         end_date = market_map[r_cid]['end']
                         market_map[r_cid]['resolved'] = True
-                        last_recorded_signal.pop(r_cid, None)
-                        resolved_event_id = market_map[r_cid].get('event_id')
-                        if resolved_event_id:
-                            traded_events.discard(resolved_event_id)
+                
                         # Update Standard User History
                         if r_cid in contract_positions:
                             users_in_market = contract_positions.pop(r_cid)
@@ -639,16 +636,19 @@ def main():
                                 calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
                                 calib_y.append(is_win)
                                 
-                    orphan_cutoff = current_sim_day - timedelta(days=10)
+                    orphan_cutoff_date = current_sim_day - timedelta(days=10)
+                    orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
+                    
                     orphan_cids = []
                     for c, m in market_map.items():
                         if m['resolved']: continue
                         
-                        # Condition 1: Past official end date by 10 days
-                        is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff
+                        # Condition 1: Past official end date by 10 days (Uses .date())
+                        is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff_date
                         
-                        # Condition 2: No end date, but mathematically dead (no trades for 10 days)
-                        is_dead = m['end'] is None and m.get('last_update_ts', pd.Timestamp(current_sim_day)) < orphan_cutoff
+                        # Condition 2: No end date, mathematically dead (Uses Timestamp)
+                        last_ts = m.get('last_update_ts', pd.Timestamp(current_sim_day))
+                        is_dead = m['end'] is None and last_ts < orphan_cutoff_ts
                         
                         if is_past_end or is_dead:
                             orphan_cids.append(c)
@@ -656,12 +656,6 @@ def main():
                     # Silently clear their tracked data to free RAM
                     for o_cid in orphan_cids:
                         market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
-                        orphan_event_id = market_map[o_cid].get('event_id')
-                        if orphan_event_id:
-                            traded_events.discard(orphan_event_id)
-                        contract_positions.pop(o_cid, None)
-                        first_bets_pending.pop(o_cid, None)
-                        last_recorded_signal.pop(o_cid, None)
                         
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
@@ -829,7 +823,10 @@ def main():
                             mid = pm['id']
                             actual_outcome = result_map[mid]['outcome']
                             
-                            payout = p_data['contracts'] * pm['outcome']
+                            if p_data['direction'] == "yes":
+                                payout = p_data['contracts'] * pm['outcome']
+                            else:
+                                payout = p_data['contracts'] * (1.0 - pm['outcome'])
                                 
                             profit = payout - p_data['bet_size']
                             
@@ -850,8 +847,11 @@ def main():
                         if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
                         if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
                         
-                        # --- STALENESS FILTER ---
-                        # If the last trade was more than 24 hours ago, the edge is stale. Ignore it.
+                        # --- STALENESS & PATH-DEPENDENCY FILTER ---
+                        # Note: 'last_perc_marg' is snapshotted from the last user to trade. 
+                        # Between heartbeats, the fund's view of edge is path-dependent on 
+                        # this final trader's Bayesian signal. 
+                        # We drop any edge older than 24 hours to prevent trading on dead signals.
                         hours_since_trade = (ts - scan_m['last_update_ts']).total_seconds() / 3600.0
                         if hours_since_trade > 24.0: 
                             continue
@@ -993,10 +993,11 @@ def main():
         # ==========================================
         log.info("🧹 Cleaning up DuckDB and temporary files...")
         
-        try:
-            con.close()
-        except Exception as e:
-            log.warning(f"Could not close DuckDB connection: {e}")
+        if con:
+            try:
+                con.close()
+            except Exception as e:
+                log.warning(f"Could not close DuckDB connection: {e}")
             
         if duck_tmp.exists():
             shutil.rmtree(duck_tmp, ignore_errors=True)
