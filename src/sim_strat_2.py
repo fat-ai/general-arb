@@ -280,7 +280,7 @@ def get_cold_start_trust(model_params: np.ndarray, price: float, stake: float, t
     
     return min(5.0, weight)
 
-def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
+def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
 
@@ -645,12 +645,11 @@ def main():
                             first_bets = first_bets_pending.pop(r_cid)
                             for u, bet in first_bets.items():
                                 vwap = bet['vwap']
-                                roi = (outcome - vwap) / vwap if bet['is_long'] else (vwap - outcome) / (1.0 - vwap)
-                                
-                                # Append to parallel deques to avoid dictionary memory bloat
+        
+                                is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
                                 calib_dates.append(pd.Timestamp(current_sim_day))
-                                calib_X.append([bet['log_vol'], vwap])
-                                calib_y.append(roi)
+                                calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
+                                calib_y.append(is_win)
                                 
                     orphan_cutoff = current_sim_day - timedelta(days=10)
                     orphan_cids = []
@@ -782,7 +781,8 @@ def main():
                         first_bets_pending[cid][user] = {
                             'log_vol': math.log1p(risk_vol),
                             'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                            'is_long': is_buying
+                            'is_long': is_buying,
+                            'log_ttr': math.log1p(ttr_hours)
                         }
     
                 # ---------------------------------------------------------
@@ -799,7 +799,7 @@ def main():
                 if bet_on != "yes": direction *= -1.0
                 
                 smooth_prob, marg, perc_marg = process_trade(
-                    wallet=user, price=price, direction=direction, is_buying=is_buying,
+                    wallet=user, price=price, stake=amount, direction=direction, is_buying=is_buying,
                     ttr_hours=ttr_hours, user_metrics=user_history[user],
                     poly_yes=poly_coeffs_yes, poly_no=poly_coeffs_no,
                     price_lut=PRICE_LUT, time_lut=TIME_LUT, scorer=scorer
