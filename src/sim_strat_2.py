@@ -49,6 +49,7 @@ class PositionMetrics:
 class UserMetrics:
     current_active_exposure: float = 0.0
     peak_exposure: float = 0.0
+    total_trades: int = 0
     brier_sum: float = 0.0
     brier_count: int = 0
     trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
@@ -139,32 +140,39 @@ def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
     
     return weight
 
-def get_wager_fraction(user_metrics: UserMetrics, stake: float) -> float:
+def get_wager_fraction(user_metrics: UserMetrics, stake: float, global_avg_peak: float = 100.0) -> float:
     """
-    Updates the rolling active exposure and calculates the fraction of the proxy bankroll risked.
-    
-    Args:
-        user_metrics (UserMetrics): The state dataclass for the specific wallet.
-        stake (float): The absolute dollar amount put at risk in the current trade.
-        
-    Returns:
-        float: The wager fraction (f_hat), bounded between 0.0 and 1.0.
+    Updates rolling exposure and calculates wager fraction using a Bayesian bankroll estimator.
     """
-    # 1. Lock up the capital
+    # 1. Lock up the capital and increment trade count
     user_metrics.current_active_exposure += stake
+    user_metrics.total_trades += 1
     
-    # 2. Update the rolling peak proxy (W_hat) if a new high is reached
+    # 2. Update the empirical peak exposure
     if user_metrics.current_active_exposure > user_metrics.peak_exposure:
         user_metrics.peak_exposure = user_metrics.current_active_exposure
         
-    # Prevent division by zero for edge cases
-    if user_metrics.peak_exposure <= 0.0:
+    # 3. Bayesian Shrinkage applied to Bankroll Estimation
+    N = user_metrics.total_trades
+    K = 5.0 # It takes 5 trades for empirical behavior to equal the global prior
+    
+    w_empirical = user_metrics.peak_exposure
+    w_prior = global_avg_peak
+    
+    w_shrunk = ((N * w_empirical) + (K * w_prior)) / (N + K)
+    
+    # 4. The Whale Exemption: 
+    # Effective bankroll cannot be less than what they physically just risked,
+    # nor less than their absolute observed peak.
+    w_effective = max(stake, w_empirical, w_shrunk)
+    
+    # Prevent edge-case division by zero
+    if w_effective <= 0.0:
         return 0.0
         
-    # 3. Calculate fraction
-    fraction = stake / user_metrics.peak_exposure
+    # 5. Calculate final fraction
+    fraction = stake / w_effective
     
-    # Return safely bounded fraction (protects against floating point artifacts)
     return min(1.0, fraction)
 
 
@@ -257,6 +265,30 @@ def get_cold_start_trust(model_params: np.ndarray, price: float, stake: float, t
     weight = 1.0 + (edge * 20.0) 
     
     return min(5.0, weight)
+
+def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
+    """
+    Validates if an OLS polynomial fit for variance is mathematically sane.
+    Checks the tails (P=0, P=1), the peak (P=0.5), and the concavity.
+    """
+    v_0 = c
+    v_05 = (a * 0.25) + (b * 0.5) + c
+    v_1 = a + b + c
+    
+    # 1. The parabola must be concave down (variance peaks in the middle)
+    if a > 0.0: 
+        return False
+        
+    # 2. Allow a tiny bit of OLS noise at the absolute tails (-0.02), 
+    # but reject deeply negative predictions.
+    if v_0 < -0.02 or v_1 < -0.02: 
+        return False
+        
+    # 3. The center variance must be positive, but not wildly above the 0.25 mathematical maximum
+    if v_05 <= 0.001 or v_05 > 0.35: 
+        return False
+        
+    return True
 
 def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
@@ -677,12 +709,15 @@ def main():
                             prices_yes = v_data_yes[:, 0]
                             y_var_yes = v_data_yes[:, 1] # Target: The Individual Squared Errors
                             
-                            # Features: [Price^2, Price, 1 (Constant)]
                             X_var_yes = np.column_stack((prices_yes**2, prices_yes, np.ones_like(prices_yes)))
-                            
                             model_yes = sm.OLS(y_var_yes, X_var_yes).fit()
-                            # Slice assignment [:] mutates our global list directly without needing 'global' keyword
-                            poly_coeffs_yes[:] = model_yes.params 
+                            
+                            a, b, c = model_yes.params
+                            if is_valid_variance_fit(a, b, c):
+                                poly_coeffs_yes[:] = [a, b, c] 
+                            else:
+                                log.debug("Variance YES OLS yielded unbounded polynomial; rejecting fit.")
+                            # -------------------------------------
                         except Exception as e:
                             log.warning(f"Variance YES OLS failed: {e}")
                             
@@ -693,9 +728,14 @@ def main():
                             y_var_no = v_data_no[:, 1]
                             
                             X_var_no = np.column_stack((prices_no**2, prices_no, np.ones_like(prices_no)))
-                            
                             model_no = sm.OLS(y_var_no, X_var_no).fit()
-                            poly_coeffs_no[:] = model_no.params
+                            
+                            a, b, c = model_no.params
+                            if is_valid_variance_fit(a, b, c):
+                                poly_coeffs_no[:] = [a, b, c]
+                            else:
+                                log.debug("Variance NO OLS yielded unbounded polynomial; rejecting fit.")
+                            # -------------------------------------
                         except Exception as e:
                             log.warning(f"Variance NO OLS failed: {e}")
                             
