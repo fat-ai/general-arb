@@ -787,7 +787,7 @@ def main():
                     else: pos.pending_yes.append(partial_packed)
                 
                 # 1. Update rolling bankroll proxy and get wager fraction
-                if user not in known_users:
+                if user_history[user].total_trades == 0: 
                     global_user_count += 1
                 else:
                     # Subtract their old peak before we potentially update it
