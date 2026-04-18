@@ -63,17 +63,14 @@ class PositionMetrics:
     duration_weight_sum: float = 0.0
     pending_yes: array.array = field(default_factory=lambda: array.array('I'))
     pending_no: array.array = field(default_factory=lambda: array.array('I'))
+    pending_brier_data: list = field(default_factory=list) 
 
 @dataclass(slots=True)
 class UserMetrics:
-    invested: float = 0.0
-    pnl: float = 0.0
-    peak: float = 0.0
-    max_dd: float = 0.0
-    max_dd_percent: float = 0.0
-    trades: int = 0
-    downside_sq_sum: float = 0.0
-    weighted_irr_sum: float = 0.0
+    current_active_exposure: float = 0.0
+    peak_exposure: float = 0.0
+    brier_sum: float = 0.0
+    brier_count: int = 0
     trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
     trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
 
@@ -109,6 +106,180 @@ poly_coeffs_yes = [-1.0, 1.0, 0.0]
 poly_coeffs_no = [-1.0, 1.0, 0.0] 
 # ==========================================
 
+def extract_true_probability(price: float, wager_fraction: float, is_yes_bet: bool) -> float:
+    """
+    Reverse-engineers the trader's latent subjective probability using the reverse-Kelly formula.
+    
+    Args:
+        price (float): The execution price of the token (0.0 to 1.0).
+        wager_fraction (float): The fraction of the user's peak bankroll risked on this trade.
+        is_yes_bet (bool): True if they bought YES (or sold NO), False if they bought NO (or sold YES).
+        
+    Returns:
+        float: The trader's true implied conviction (bounded strictly between 0.001 and 0.999).
+    """
+    # Reverse-Kelly Math
+    if is_yes_bet:
+        p_true = price + (wager_fraction * (1.0 - price))
+    else:
+        p_true = price - (wager_fraction * price)
+        
+    return max(0.001, min(0.999, p_true))
+
+
+def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
+    """
+    Calculates the Trust Weight using Precision Weighting (Inverse Brier Score) 
+    applied to the Pessimistic Bound (Upper Confidence Bound).
+    
+    Args:
+        brier_sum (float): The running sum of the user's squared errors.
+        brier_count (int): The total number of resolved trades (N).
+        
+    Returns:
+        float: The final Bayesian trust multiplier / weight.
+    """
+    if brier_count == 0:
+        return 0.0 # No data, no trust
+        
+    # 1. Calculate Mean Brier
+    mean_brier = brier_sum / brier_count
+    
+    # 2. Calculate the Pessimistic Bound (95% UCB using max variance assumption)
+    # Penalty decays proportional to the square root of N
+    confidence_penalty = 0.5 / math.sqrt(brier_count)
+    
+    bs_ucb = min(1.0, mean_brier + confidence_penalty)
+    
+    # 3. Precision Weighting (Inverse Variance)
+    # We add a tiny epsilon (0.01) to the denominator to prevent division-by-zero 
+    # and to cap the maximum possible weight of a "perfect" infinite-N trader at 100.
+    epsilon = 0.01
+    weight = 1.0 / (bs_ucb + epsilon)
+    
+    return weight
+
+def get_wager_fraction(user_metrics: UserMetrics, stake: float) -> float:
+    """
+    Updates the rolling active exposure and calculates the fraction of the proxy bankroll risked.
+    
+    Args:
+        user_metrics (UserMetrics): The state dataclass for the specific wallet.
+        stake (float): The absolute dollar amount put at risk in the current trade.
+        
+    Returns:
+        float: The wager fraction (f_hat), bounded between 0.0 and 1.0.
+    """
+    # 1. Lock up the capital
+    user_metrics.current_active_exposure += stake
+    
+    # 2. Update the rolling peak proxy (W_hat) if a new high is reached
+    if user_metrics.current_active_exposure > user_metrics.peak_exposure:
+        user_metrics.peak_exposure = user_metrics.current_active_exposure
+        
+    # Prevent division by zero for edge cases
+    if user_metrics.peak_exposure <= 0.0:
+        return 0.0
+        
+    # 3. Calculate fraction
+    fraction = stake / user_metrics.peak_exposure
+    
+    # Return safely bounded fraction (protects against floating point artifacts)
+    return min(1.0, fraction)
+
+
+def release_exposure(user_metrics: UserMetrics, initial_stake: float) -> None:
+    """
+    Frees up locked capital when a market resolves or a position is sold.
+    
+    Args:
+        user_metrics (UserMetrics): The state dataclass for the specific wallet.
+        initial_stake (float): The ORIGINAL dollar amount risked, NOT the payout.
+    """
+    user_metrics.current_active_exposure -= initial_stake
+    
+    # Floating point math can sometimes result in something like -0.000000001
+    # We enforce a hard floor at 0.0 to prevent cumulative drift over millions of trades.
+    if user_metrics.current_active_exposure < 0.0:
+        user_metrics.current_active_exposure = 0.0
+
+log = logging.getLogger("Sim")
+
+def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
+    """
+    Trains a Logistic Regression model to predict the probability of a first-trade win.
+    
+    Args:
+        calib_X (list): A list of feature arrays [log_vol, price, log_ttr_hours]
+        calib_y (list): A list of binary outcomes (1.0 for win, 0.0 for loss)
+        
+    Returns:
+        np.ndarray: The fitted coefficients [intercept, log_vol_coef, price_coef, ttr_coef].
+                    Returns None if the calibration fails.
+    """
+    if len(calib_y) < 50:
+        return None # Not enough data to fit a stable model
+        
+    try:
+        y_data = np.array(calib_y)
+        X_features = np.array(calib_X)
+        
+        # statsmodels requires us to explicitly add the constant (intercept) column
+        X_data = sm.add_constant(X_features)
+        
+        # Fit the Logistic Regression model (disp=0 suppresses console output)
+        model = sm.Logit(y_data, X_data).fit(disp=0)
+        
+        return model.params
+        
+    except Exception as e:
+        log.warning(f"Logit calibration failed: {e}")
+        return None
+
+
+def get_cold_start_trust(model_params: np.ndarray, price: float, stake: float, ttr_hours: float) -> float:
+    """
+    Calculates the temporary Trust Weight for a user's first trade based on the global Logit prior.
+    
+    Args:
+        model_params (np.ndarray): The fitted Logit coefficients.
+        price (float): Execution price of the trade.
+        stake (float): The dollar amount risked.
+        ttr_hours (float): Time to resolution in hours.
+        
+    Returns:
+        float: A temporary Bayesian trust weight to use for this specific trade.
+    """
+    # 1. Fallback if the daily model failed to train
+    # We assign a baseline weight of 1.33 (Equivalent to a UCB Brier of 0.75, which is typical for N=1)
+    if model_params is None or len(model_params) != 4:
+        return 1.33
+        
+    # 2. Prepare the features
+    log_vol = math.log1p(stake)
+    log_ttr = math.log1p(ttr_hours)
+    
+    intercept, coef_vol, coef_price, coef_ttr = model_params
+    
+    # 3. Calculate Log-Odds (Linear combination)
+    log_odds = intercept + (coef_vol * log_vol) + (coef_price * price) + (coef_ttr * log_ttr)
+    
+    # 4. Convert Log-Odds to Probability using the Sigmoid function
+    p_model = 1.0 / (1.0 + math.exp(-log_odds))
+    
+    # 5. Calculate the Implied Edge
+    # How much does our model disagree with the current market price?
+    edge = abs(p_model - price)
+    
+    # 6. Map Edge to a Temporary Precision Weight
+    # A base weight of 1.0 implies no edge. 
+    # For every 1% of edge, we add to the weight, capping at a maximum weight of 5.0.
+    # This ensures a brand new user can't have a higher weight than a proven sharp, 
+    # but still allows strong first-trade signals to carry influence.
+    weight = 1.0 + (edge * 20.0) 
+    
+    return min(5.0, weight)
+
 def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, poly_yes, poly_no, price_lut, time_lut, scorer):
         # 1. Format Current Market State
         current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
@@ -133,15 +304,14 @@ def process_trade(wallet, price, direction, is_buying, ttr_hours, user_metrics, 
             opposing_array = user_metrics.trade_history_yes
             coeffs = poly_no
 
-        # 3. The Global Trust Multiplier
-        raw_score = scorer.wallet_scores.get(wallet, 0.0) 
-        
-        # Clamp raw score to prevent math.exp() overflow errors on wild outliers
-        safe_score = max(-10.0, min(10.0, raw_score))
-        
-        # Shifted logistic curve: Asymptotes at 0.0 and 3.0, passes exactly through (0, 1.0)
-        k = 2.0 # The steepness of the curve. 2.0 provides a smooth ramp.
-        trust_multiplier = 3.0 / (1.0 + 2.0 * math.exp(-k * safe_score))
+        # 3. The Global Trust Multiplier (Precision Weighting & Cold Start)
+        if user_metrics.brier_count > 0:
+            # Proven User: Use Pessimistic Brier Precision Weighting
+            trust_multiplier = calculate_precision_weight(user_metrics.brier_sum, user_metrics.brier_count)
+        else:
+            # Brand New User: Use the Global Logit Prior
+            logit_params = scorer.logit_model_params if hasattr(scorer, 'logit_model_params') else None
+            trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
         # 4. The 2D Kernel Scanner (Nested for DRY execution)
         def scan_array(history_array, center_p_int, target_outcome):
@@ -460,43 +630,14 @@ def main():
                                         daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
                                     
                                 # 1. Calculate ROI and Time Held
-                                position_roi = pnl / invested if invested > 0 else 0.0
-                                avg_days_held = pos.duration_weight_sum / invested if invested > 0 else 1.0
-                                avg_days_held = max(avg_days_held, 1.0) # Apply our 1-day safety floor
-                                
-                                # 2. Calculate Annualized IRR (Compound)
-                                clamped_roi = max(position_roi, -0.999999) # Prevent exact -1.0 bounds errors
-                                
-                                safe_days_held = max(avg_days_held, 1.0) 
-                                annualized_irr = clamped_roi * (365.0 / safe_days_held)
-                                
-                                hist = user_history[u]
-                                hist.invested += invested
-                                hist.pnl += pnl
-                                hist.trades += 1
-                                hist.weighted_irr_sum += (annualized_irr * invested)
-                                
-                                # 3. Update Drawdowns (Absolute and Percentage)
-                                hist.peak = max(hist.peak, hist.pnl)
-                                current_dd = hist.peak - hist.pnl
-                                hist.max_dd = max(hist.max_dd, current_dd)
-                                
-                                # Use max(peak, invested) as the denominator to handle users who only lose from day 1
-                                equity_basis = max(hist.peak, hist.invested, 1e-6)
-                                current_dd_percent = current_dd / equity_basis
-                                hist.max_dd_percent = max(hist.max_dd_percent, current_dd_percent)
-                                
-                                # 4. Update Sortino Downside Tracker
-                                if position_roi < 0.0:
-                                    hist.downside_sq_sum += (position_roi ** 2)
-                                
-                                if hist.trades >= 1 and hist.invested > 100.0:
-                                    dw_avg_irr = hist.weighted_irr_sum / hist.invested
-                                    downside_dev = math.sqrt(hist.downside_sq_sum / hist.trades)
-                                    custom_score = dw_avg_irr / (((1.0 + hist.max_dd_percent) + (1.0 + downside_dev)) / 2 )
-                                    if hist.trades < 6:
-                                        custom_score = custom_score / ( 6 - hist.trades )
-                                    scorer.wallet_scores[u] = custom_score
+                                for brier_user, p_true, initial_stake in pos.pending_brier_data:
+                                    # 1. Free the capital
+                                    release_exposure(user_history[brier_user], initial_stake)
+                                    
+                                    # 2. Calculate Latent Brier Score
+                                    squared_error = (p_true - outcome)**2
+                                    user_history[brier_user].brier_sum += squared_error
+                                    user_history[brier_user].brier_count += 1
                                   
                         
                         # Update Fresh Wallet Calibration Buffer
@@ -547,23 +688,9 @@ def main():
                     if len(calib_dates) >= 50:
                         # Convert flat deques directly to arrays for fast processing
                         raw_y = np.array(calib_y)
-                        # --- THE WINSORIZATION FIX ---
-                        # Clamp the ROI between -1.0 (100% loss) and +3.0 (300% profit).
-                        # This mathematically neuters the extreme leverage of 1-cent longshots
-                        # while maintaining the linear relationship for realistic trading edges.
-                        y_recent = np.clip(raw_y, -1.0, 3.0)
-                        X_features = np.array(calib_X)
-                        X_recent = sm.add_constant(X_features)
-                        
-                        try:
-                           # Run the full regression on 100% of the active data
-                            model = sm.OLS(y_recent, X_recent).fit()
-                            scorer.intercept = model.params[0]
-                            scorer.slope_vol = model.params[1]
-                            scorer.slope_price = model.params[2]
-                        except Exception as e:
-                            log.warning(f"OLS calibration failed: {e}")
-                            pass
+                        new_params = train_cold_start_logit(list(calib_X), list(calib_y))
+                        if new_params is not None:
+                            scorer.logit_model_params = new_params
                             
                     if len(daily_variance_yes) >= 1000:
                         try:
@@ -637,12 +764,15 @@ def main():
                     if bet_on == "yes": pos.pending_no.append(partial_packed)
                     else: pos.pending_yes.append(partial_packed)
                 
-                if is_buying:
-                    pos.qty_long += qty           
-                    pos.cost_long += price * qty
-                else:
-                    pos.qty_short += qty
-                    pos.cost_short += (1.0 - price) * qty
+                # 1. Update rolling bankroll proxy and get wager fraction
+                wager_fraction = get_wager_fraction(user_history[user], invested_this_trade)
+                
+                # 2. Extract latent conviction
+                p_true = extract_true_probability(price, wager_fraction, is_buying)
+                
+                # 3. Store for Brier calculation at resolution
+                pos.pending_brier_data.append((user, p_true, invested_this_trade))
+                # ----------------------------------------
                     
                 # Fresh Wallet Check
                 if user not in known_users:
