@@ -702,7 +702,7 @@ def main():
                         
                     if len(calib_dates) >= 50:
                         # Convert flat deques directly to arrays for fast processing
-                        raw_y = np.array(calib_y)
+                   
                         new_params = train_cold_start_logit(list(calib_X), list(calib_y))
                         if new_params is not None:
                             scorer.logit_model_params = new_params
