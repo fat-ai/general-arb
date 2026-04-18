@@ -183,8 +183,6 @@ def release_exposure(user_metrics: UserMetrics, initial_stake: float) -> None:
     if user_metrics.current_active_exposure < 0.0:
         user_metrics.current_active_exposure = 0.0
 
-log = logging.getLogger("Sim")
-
 def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
     """
     Trains a Logistic Regression model to predict the probability of a first-trade win.
