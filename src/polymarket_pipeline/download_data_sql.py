@@ -448,8 +448,9 @@ class DataFetcher:
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
 
-        with contextlib.closing(sqlite3.connect(db_file)) as conn:
+        with contextlib.closing(sqlite3.connect(db_file, timeout=30.0)) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             db_cursor = conn.cursor()
             
