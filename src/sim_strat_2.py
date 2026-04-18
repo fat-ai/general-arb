@@ -637,12 +637,12 @@ def main():
                                         daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
                                     
                                 # 1. Calculate ROI and Time Held
+                                yes_outcome = outcome if market_map[r_cid]['outcome_label'] == 'yes' else 1.0 - outcome
                                 for brier_user, p_true, initial_stake in pos.pending_brier_data:
                                     # 1. Free the capital
                                     release_exposure(user_history[brier_user], initial_stake)
                                     
                                     # 2. Calculate Latent Brier Score
-                                    yes_outcome = outcome if market_map[r_cid]['outcome_label'] == 'yes' else 1.0 - outcome
                                     squared_error = (p_true - yes_outcome)**2
                                     user_history[brier_user].brier_sum += squared_error
                                     user_history[brier_user].brier_count += 1
@@ -884,14 +884,14 @@ def main():
                             profit = payout - p_data['bet_size']
 
                             # Only sell early for a profit
-                            if profit > 0:
-                                    result_map['performance']['cash'] += payout
-                                    result_map['performance']['equity'] += profit
-                                    if profit > 0: result_map['performance']['wins'] += 1
-                                    elif profit < 0: result_map['performance']['losses'] += 1
+                   
+                            result_map['performance']['cash'] += payout
+                            result_map['performance']['equity'] += profit
+                            if profit > 0: result_map['performance']['wins'] += 1
+                            elif profit < 0: result_map['performance']['losses'] += 1
                                     
-                                    executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
-                                    cids_to_remove.append(p_cid)
+                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                            cids_to_remove.append(p_cid)
                             
                     for c in cids_to_remove: del active_portfolio[c]
 
@@ -945,14 +945,16 @@ def main():
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
-                            
-                            result_map['performance']['cash'] += payout
-                            result_map['performance']['equity'] += profit
-                            if profit > 0: result_map['performance']['wins'] += 1
-                            else: result_map['performance']['losses'] += 1
-                            
-                            executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
-                            cids_to_sell.append(p_cid)
+
+                            #Only sell ealy if profitable
+                            if profit > 0:
+                                    result_map['performance']['cash'] += payout
+                                    result_map['performance']['equity'] += profit
+                                    if profit > 0: result_map['performance']['wins'] += 1
+                                    else: result_map['performance']['losses'] += 1
+                                    
+                                    executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                                    cids_to_sell.append(p_cid)
                             
                     for c in cids_to_sell: del active_portfolio[c]
 
