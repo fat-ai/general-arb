@@ -932,7 +932,7 @@ def main():
                             
                     # Rank and slice the Top 100
                     candidates.sort(key=lambda x: x['aer'], reverse=True)
-                    target_portfolio = candidates[:100]
+                    target_portfolio = candidates[:500]
                     target_cids = {c['cid']: c for c in target_portfolio}
 
                     # 3. SELL DECAYED POSITIONS 
@@ -945,9 +945,9 @@ def main():
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
-
+                            perc_profit = profit / p_date['size']
                             #Only sell ealy if profitable
-                            if profit > 0:
+                            if perc_profit > MAX_SLIPPAGE * 1.1:
                                     result_map['performance']['cash'] += payout
                                     result_map['performance']['equity'] += profit
                                     if profit > 0: result_map['performance']['wins'] += 1
@@ -959,10 +959,10 @@ def main():
                     for c in cids_to_sell: del active_portfolio[c]
 
                     # 4. BUY NEW POSITIONS (Fill the 1% Slots)
-                    target_slot_size = result_map['performance']['equity'] * 0.01
+                    target_slot_size = result_map['performance']['equity'] * 0.002
                     
                     for target in target_portfolio:
-                        if len(active_portfolio) >= 100: break
+                        if len(active_portfolio) >= 500: break
                         t_cid = target['cid']
                         
                         # Prevent Directional Flipping Collision
