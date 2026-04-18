@@ -374,7 +374,7 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
         
         theoretical_v = expected_p * (1.0 - expected_p)
         
-        if V <= 0.0001 or V > 0.25:
+        if V <= 0.0001 or V > 0.35:
             V = max(0.0001, theoretical_v)
             
         M = max(1.0, (theoretical_v / V) - 1.0)
