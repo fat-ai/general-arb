@@ -780,7 +780,7 @@ def main():
                 if bet_on != "yes": direction *= -1.0
                 
                 smooth_prob, marg, perc_marg = process_trade(
-                    wallet=user, price=price, stake=amount, direction=direction, is_buying=is_buying,
+                    wallet=user, price=price, stake=invested_this_trade, direction=direction, is_buying=is_buying,
                     ttr_hours=ttr_hours, user_metrics=user_history[user],
                     poly_yes=poly_coeffs_yes, poly_no=poly_coeffs_no,
                     price_lut=PRICE_LUT, time_lut=TIME_LUT, scorer=scorer
