@@ -882,14 +882,16 @@ def main():
                                 payout = p_data['contracts'] * (1.0 - pm['outcome'])
                                 
                             profit = payout - p_data['bet_size']
-                            
-                            result_map['performance']['cash'] += payout
-                            result_map['performance']['equity'] += profit
-                            if profit > 0: result_map['performance']['wins'] += 1
-                            elif profit < 0: result_map['performance']['losses'] += 1
-                            
-                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
-                            cids_to_remove.append(p_cid)
+
+                            # Only sell early for a profit
+                            if profit > 0:
+                                    result_map['performance']['cash'] += payout
+                                    result_map['performance']['equity'] += profit
+                                    if profit > 0: result_map['performance']['wins'] += 1
+                                    elif profit < 0: result_map['performance']['losses'] += 1
+                                    
+                                    executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                                    cids_to_remove.append(p_cid)
                             
                     for c in cids_to_remove: del active_portfolio[c]
 
