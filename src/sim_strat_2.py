@@ -920,7 +920,7 @@ def main():
                         aer = p_marg * annualization_factor
                         
                         # Require > 500% AER AND a raw absolute edge of at least 2% to cover slippage
-                        if aer > 5.0 and p_marg > 0.02:
+                        if aer > 5.0 and p_marg > MAX_SLIPPAGE * 1.5:
                                 candidates.append({
                                     'cid': scan_cid, 
                                     'dir': scan_m['outcome_label'], 
