@@ -1,6 +1,4 @@
-import os
 import csv
-import json
 import duckdb
 import polars as pl
 import pandas as pd
@@ -10,11 +8,10 @@ import logging
 import gc
 from pathlib import Path
 from datetime import datetime, timedelta
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 from strategy import SignalEngine, WalletScorer
-import sqlite3
 import shutil
 from dataclasses import dataclass, field
 import array
@@ -33,24 +30,7 @@ log = logging.getLogger("Sim")
 TRADES_PATH = CACHE_DIR / "gamma_trades.db" 
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 OUTPUT_PATH = CACHE_DIR / SIGNAL_FILE
-
-if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
-    
-headers = [
-    "timestamp", "market_id", "cid", "bet_on", 
-    "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
-    "end_timestamp", "actual_outcome"
-]
-with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
-    csv.writer(f).writerow(headers)
-        
-
 EXECUTIONS_PATH = CACHE_DIR / "strategy_executions.csv"
-if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
-    
-exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
-with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
-    csv.writer(f).writerow(exec_headers)
         
 executions_buffer = []
 
@@ -381,13 +361,24 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
         return smoothed_win_rate, margin, perc_margin
 
 def main():
+    
     if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
 
-    headers = ["timestamp", "id", "cid", "question", "bet_on", "outcome", "trade_price", "trade_volume", "signal_strength"]
+    headers = [
+        "timestamp", "market_id", "cid", "bet_on", 
+        "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
+        "end_timestamp", "actual_outcome"
+    ]
     with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(headers)
     log.info(f"Output file created successfully at {OUTPUT_PATH}")
+
+    if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
+        
+    exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
+    with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
+        csv.writer(f).writerow(exec_headers)
     
     # ==========================================
     # 1. LOAD MARKETS (Polars Pushdown)
@@ -468,19 +459,16 @@ def main():
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
     contract_positions = defaultdict(lambda: defaultdict(PositionMetrics))
     user_history = defaultdict(UserMetrics)
-    traded_events = set()
     active_portfolio = {}
     
     # Fresh wallet tracking
     known_users = set()
     first_bets_pending = defaultdict(dict) # Dict[cid] -> Dict[user] -> {log_vol, vwap, is_long}
-    last_recorded_signal = {}
     calib_dates = deque()
     calib_X = deque() 
     calib_y = deque()
     
     scorer = WalletScorer()
-    engine = SignalEngine()
 
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
@@ -791,7 +779,6 @@ def main():
                 if m['start'] is None or m['start'] < simulation_start_date: continue
                 if ts < simulation_start_date: continue
 
-                usdc_vol = amount * price
                 m['volume'] += amount
                 
                 ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
