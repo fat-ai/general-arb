@@ -20,7 +20,7 @@ import bisect
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-WARMUP_DAYS = 30
+WARMUP_DAYS = 547
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
 
@@ -55,8 +55,8 @@ class UserMetrics:
 # BAYESIAN ESTIMATOR GLOBALS & LUTS
 # ==========================================
 # 1. Look-Up Tables (LUTs) for Fast Exponential Dampening
-PRICE_HALF_LIFE = 50  # 5 cents (50 thousandths)
-TIME_HALF_LIFE = 182  # ~20% time distance in scaled log space (ln(1.2) * 1000)
+PRICE_HALF_LIFE = 25  # 2.5 cents (25 thousandths)
+TIME_HALF_LIFE = 91  # ~10% time distance in scaled log space (ln(1.1) * 1000)
 
 PRICE_LUT = [0.0] * 1001
 _lambda_p = -math.log(0.5) / PRICE_HALF_LIFE
