@@ -324,8 +324,8 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
             n = 0.0
             w = 0.0
             
-            min_p = max(0, center_p_int - 500)
-            max_p = min(1000, center_p_int + 500)
+            min_p = max(0, center_p_int - 100)
+            max_p = min(1000, center_p_int + 100)
             left_bound = min_p << 22
             right_bound = ((max_p + 1) << 22) - 1
             
@@ -342,7 +342,7 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
                 price_dist = abs(hist_price_int - center_p_int)
                 time_dist = abs(hist_log_ttr - current_log_ttr)
 
-                if price_dist > 1000 or time_dist >= len(time_lut):
+                if price_dist > 100 or time_dist >= len(time_lut):
                     continue
 
                 combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
