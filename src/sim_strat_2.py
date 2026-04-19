@@ -945,7 +945,7 @@ def main():
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
-                            perc_profit = profit / p_date['size']
+                            perc_profit = profit / p_data['bet_size']
                             #Only sell ealy if profitable
                             if perc_profit > MAX_SLIPPAGE * 1.1:
                                     result_map['performance']['cash'] += payout
