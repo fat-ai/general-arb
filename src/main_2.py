@@ -119,8 +119,7 @@ class LiveTrader:
             self._dashboard_loop(),
             self._resolution_monitor_loop(),
         )
-
-            
+    
     async def shutdown(self):
         log.info("🛑 Shutting down...")
         self.running = False
@@ -481,7 +480,7 @@ class LiveTrader:
                 if asset_b_str == usdc_decimal or asset_b_str == "0":
                     asset_b_str = "0"
 
-                # --- CRITICAL FIX: VOLUME NORMALIZATION ---
+                # --- VOLUME NORMALIZATION ---
                 # The logs show a 1000x difference between Amt A and Amt B.
                 # We interpret the LARGER value as the true micro-USDC amount 
                 # to capture the real economic size (e.g. $8.00 vs $0.008).
@@ -515,9 +514,6 @@ class LiveTrader:
             log.error(f"Parse Fail: {e}")
             return "ERROR"
             
-    
-    
-    
     async def _ensure_session(self):
         """Creates a shared aiohttp session if one doesn't exist or has been closed."""
         if not hasattr(self, "http_session") or self.http_session.closed:
