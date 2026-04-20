@@ -23,6 +23,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 WARMUP_DAYS = 547
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
+P_RANGE = 100
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger("Sim")
@@ -324,8 +325,8 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
             n = 0.0
             w = 0.0
             
-            min_p = max(0, center_p_int - 100)
-            max_p = min(1000, center_p_int + 100)
+            min_p = max(0, center_p_int - P_RANGE)
+            max_p = min(1000, center_p_int + P_RANGE)
             left_bound = min_p << 22
             right_bound = ((max_p + 1) << 22) - 1
             
@@ -342,7 +343,7 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
                 price_dist = abs(hist_price_int - center_p_int)
                 time_dist = abs(hist_log_ttr - current_log_ttr)
 
-                if price_dist > 100 or time_dist >= len(time_lut):
+                if price_dist > P_RANGE or time_dist >= len(time_lut):
                     continue
 
                 combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
@@ -382,7 +383,8 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
         smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
 
         margin = smoothed_win_rate - expected_p
-        perc_margin = (smoothed_win_rate - expected_p) / expected_p if expected_p > 0 else 0.0
+        
+        perc_margin = margin / expected_p if expected_p > 0 else 0.0
         
         return smoothed_win_rate, margin, perc_margin
 
@@ -922,7 +924,7 @@ def main():
                         aer = p_marg * annualization_factor
                         
                         # Require > 500% AER AND a raw absolute edge of at least 2% to cover slippage
-                        if aer > 5.0 and p_marg > MAX_SLIPPAGE * 1.5:
+                        if aer > 5.0 and p_marg > (P_RANGE / 1000) + ( MAX_SLIPPAGE * 1.5 ):
                                 candidates.append({
                                     'cid': scan_cid, 
                                     'dir': scan_m['outcome_label'], 
