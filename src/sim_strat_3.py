@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
-from strategy import SignalEngine
 import shutil
 from dataclasses import dataclass, field
 import array
@@ -702,15 +701,14 @@ def main():
                         resolve_market(r_cid, outcome, outcome_label, current_sim_day, state)
                                   
                         # Update Fresh Wallet Calibration Buffer
-                        if r_cid in first_bets_pending:
-                            first_bets = first_bets_pending.pop(r_cid)
+                        if r_cid in state.first_bets_pending:
+                            first_bets = state.first_bets_pending.pop(r_cid)
                             for u, bet in first_bets.items():
                                 vwap = bet['vwap']
-        
                                 is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
-                                calib_dates.append(pd.Timestamp(current_sim_day))
-                                calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
-                                calib_y.append(is_win)
+                                state.calib_dates.append(pd.Timestamp(current_sim_day))
+                                state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
+                                state.calib_y.append(is_win)
                                 
                     orphan_cutoff_date = current_sim_day - timedelta(days=10)
                     orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
