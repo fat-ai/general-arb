@@ -336,6 +336,15 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 state.user_history[brier_user].brier_sum += squared_error
                 state.user_history[brier_user].brier_count += 1
 
+        if r_cid in state.first_bets_pending:
+                first_bets = state.first_bets_pending.pop(r_cid)
+                for u, bet in first_bets.items():
+                    vwap = bet['vwap']
+                    is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
+                    state.calib_dates.append(pd.Timestamp(current_sim_day))
+                    state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
+                    state.calib_y.append(is_win)   
+
 def calibrate_models(current_sim_day, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
@@ -749,17 +758,7 @@ def main():
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
                         resolve_market(r_cid, outcome, outcome_label, current_sim_day, state)
-                                  
-                        # Update Fresh Wallet Calibration Buffer
-                        if r_cid in state.first_bets_pending:
-                            first_bets = state.first_bets_pending.pop(r_cid)
-                            for u, bet in first_bets.items():
-                                vwap = bet['vwap']
-                                is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
-                                state.calib_dates.append(pd.Timestamp(current_sim_day))
-                                state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
-                                state.calib_y.append(is_win)
-                                
+                                      
                     orphan_cutoff_date = current_sim_day - timedelta(days=10)
                     orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
                     
