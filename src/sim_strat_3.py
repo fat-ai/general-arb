@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict, deque
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
-from strategy import SignalEngine, WalletScorer
+from strategy import SignalEngine
 import shutil
 from dataclasses import dataclass, field
 import array
@@ -337,17 +337,6 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 state.user_history[brier_user].brier_sum += squared_error
                 state.user_history[brier_user].brier_count += 1
 
-    # Update Fresh Wallet Calibration Buffer
-    if r_cid in state.first_bets_pending:
-        first_bets = state.first_bets_pending.pop(r_cid)
-        for u, bet in first_bets.items():
-            vwap = bet['vwap']
-            is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
-            state.calib_dates.append(pd.Timestamp(current_sim_day))
-            state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
-            state.calib_y.append(is_win)
-
-
 def calibrate_models(current_sim_day, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
     cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
@@ -392,7 +381,7 @@ def calibrate_models(current_sim_day, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO OLS failed: {e}")
 
-def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState):
+def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
         
         user_metrics = state.user_history[wallet]
         
@@ -454,7 +443,7 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
                 if price_dist > P_RANGE or time_dist >= len(time_lut):
                     continue
 
-                combined_weight = PRICE_LUT[price_dist] * TIME_LUT[time_dist] * trust_multiplier
+                combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
                 
                 n += combined_weight
                 # If they hit the target outcome (1 for primary, 0 for opposing), it supports the event
@@ -595,8 +584,6 @@ def main():
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
     state = BayesianState()
     active_portfolio = {}
-
-    scorer = WalletScorer()
 
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
@@ -851,7 +838,8 @@ def main():
                 smooth_prob, marg, perc_marg = process_trade(
                     wallet=user, price=price, stake=invested_this_trade, 
                     direction=direction, is_buying=is_buying,
-                    ttr_hours=ttr_hours, state=state
+                    ttr_hours=ttr_hours, state=state, 
+                    price_lut=PRICE_LUT, time_lut=TIME_LUT
                 )
                 
                 m['last_perc_marg'] = perc_marg
