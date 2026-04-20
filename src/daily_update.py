@@ -145,6 +145,7 @@ def main():
     last_ts_str = state.last_processed_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
     
     con = duckdb.connect(database=':memory:')
+    con.execute("INSTALL sqlite; LOAD sqlite;")
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
     
     valid_cids_df = pd.DataFrame({'clean_cid': list(market_map.keys())})
