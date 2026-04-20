@@ -79,6 +79,8 @@ class BayesianState:
     global_total_peak: float = 0.0
     global_user_count: int = 0
 
+    known_users: set = field(default_factory=set)
+
 # ==========================================
 # BAYESIAN ESTIMATOR GLOBALS & LUTS
 # ==========================================
@@ -593,7 +595,6 @@ def main():
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
     state = BayesianState()
     active_portfolio = {}
-    known_users = set()
 
     scorer = WalletScorer()
 
@@ -824,10 +825,10 @@ def main():
                 # ----------------------------------------
                     
                 # Fresh Wallet Check
-                if user not in known_users:
+                if user not in state.known_users:
                     risk_vol = amount if is_buying else qty * (1.0 - price)
                     if risk_vol >= 1.0: # Ignore noise
-                        known_users.add(user)
+                        state.known_users.add(user)
                         state.first_bets_pending[cid][user] = {
                             'log_vol': math.log1p(risk_vol),
                             'vwap': max(1e-6, min(1.0 - 1e-6, price)),
