@@ -380,6 +380,54 @@ def calibrate_models(current_sim_day, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO OLS failed: {e}")
 
+def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float, qty: float, price: float, ts: datetime, market_end: datetime, bet_on: str, is_buying: bool):
+    """Mutates the BayesianState by processing a raw historical trade."""
+    pos = state.contract_positions[cid][user]
+    invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
+    days_to_expiry = (market_end - ts).total_seconds() / 86400.0 if market_end is not None else 1.0
+    pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
+
+    price_int = max(0, min(1000, int(price * 1000)))
+    ttr_hours = max(1.0, days_to_expiry * 24.0)
+    log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+    
+    partial_packed = (price_int << 22) | (log_ttr_int << 1)
+    
+    if is_buying: 
+        if bet_on == "yes": pos.pending_yes.append(partial_packed)
+        else: pos.pending_no.append(partial_packed)
+    else: 
+        if bet_on == "yes": pos.pending_no.append(partial_packed)
+        else: pos.pending_yes.append(partial_packed)
+    
+    if state.user_history[user].total_trades == 0:
+        state.global_user_count += 1
+    else:
+        state.global_total_peak -= state.user_history[user].peak_exposure
+
+    current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
+    wager_fraction = get_wager_fraction(state.user_history[user], invested_this_trade, current_global_avg)
+    state.global_total_peak += state.user_history[user].peak_exposure
+    
+    yes_price = price if bet_on == "yes" else 1.0 - price
+    effective_direction = 1.0 if is_buying else -1.0
+    if bet_on != "yes": effective_direction *= -1.0
+    is_effective_yes_bet = (effective_direction > 0)
+    
+    p_true = extract_true_probability(yes_price, wager_fraction, is_effective_yes_bet)
+    pos.pending_brier_data.append((user, p_true, invested_this_trade))
+        
+    if user not in state.known_users:
+        risk_vol = amount if is_buying else qty * (1.0 - price)
+        if risk_vol >= 1.0: 
+            state.known_users.add(user)
+            state.first_bets_pending[cid][user] = {
+                'log_vol': math.log1p(risk_vol),
+                'vwap': max(1e-6, min(1.0 - 1e-6, price)),
+                'is_long': is_buying,
+                'log_ttr': math.log1p(ttr_hours)
+            }
+
 def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
         
         user_metrics = state.user_history[wallet]
@@ -760,66 +808,7 @@ def main():
                     market_map[sibling_cid]['last_update_ts'] = ts
                     
                 # Accumulate internal tracking state
-                pos = state.contract_positions[cid][user]
-                invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
-                days_to_expiry = (m['end'] - ts).total_seconds() / 86400.0 if m['end'] is not None else 1.0
-                pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
-
-                price_int = max(0, min(1000, int(price * 1000)))
-                ttr_hours = max(1.0, days_to_expiry * 24.0)
-                log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
-                
-                partial_packed = (price_int << 22) | (log_ttr_int << 1)
-                
-                if is_buying: # They bought the token
-                    if bet_on == "yes": pos.pending_yes.append(partial_packed)
-                    else: pos.pending_no.append(partial_packed)
-                else: # They shorted/sold the token
-                    if bet_on == "yes": pos.pending_no.append(partial_packed)
-                    else: pos.pending_yes.append(partial_packed)
-                
-                # 1. Update rolling bankroll proxy and get wager fraction
-                if state.user_history[user].total_trades == 0:
-                    state.global_user_count += 1
-                else:
-                    # Subtract their old peak before we potentially update it
-                    state.global_total_peak -= state.user_history[user].peak_exposure
-
-                current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
-                
-                # 1. Update rolling bankroll proxy and get wager fraction
-                wager_fraction = get_wager_fraction(state.user_history[user], invested_this_trade, current_global_avg)
-                
-                # Add back their (potentially new) peak exposure
-                state.global_total_peak += state.user_history[user].peak_exposure
-                
-                # 2. Standardize trade to the YES perspective for accurate Brier scoring
-                yes_price = price if bet_on == "yes" else 1.0 - price
-                
-                effective_direction = 1.0 if is_buying else -1.0
-                if bet_on != "yes": 
-                    effective_direction *= -1.0
-                    
-                is_effective_yes_bet = (effective_direction > 0)
-                
-                # Extract latent conviction (p_true is now strictly P(YES))
-                p_true = extract_true_probability(yes_price, wager_fraction, is_effective_yes_bet)
-                
-                # 3. Store for Brier calculation at resolution
-                pos.pending_brier_data.append((user, p_true, invested_this_trade))
-                # ----------------------------------------
-                    
-                # Fresh Wallet Check
-                if user not in state.known_users:
-                    risk_vol = amount if is_buying else qty * (1.0 - price)
-                    if risk_vol >= 1.0: # Ignore noise
-                        state.known_users.add(user)
-                        state.first_bets_pending[cid][user] = {
-                            'log_vol': math.log1p(risk_vol),
-                            'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                            'is_long': is_buying,
-                            'log_ttr': math.log1p(ttr_hours)
-                        }
+                ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
     
                 # ---------------------------------------------------------
                 # C. SIMULATE SIGNALS (Signal Logging Only)
