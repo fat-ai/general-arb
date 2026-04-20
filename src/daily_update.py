@@ -13,8 +13,6 @@ from sim_strat_3 import (
     BayesianState, 
     resolve_market, 
     calibrate_models, 
-    get_wager_fraction, 
-    extract_true_probability,
     ingest_trade_state,
     CACHE_DIR, 
     MARKETS_FILE, 
@@ -144,7 +142,7 @@ def main():
     log.info(f"🔍 Fetching delta trades since {state.last_processed_timestamp}...")
     
     # Extract timestamp string for DuckDB query
-    last_ts_str = state.last_processed_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    last_ts_str = state.last_processed_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
     
     con = duckdb.connect(database=':memory:')
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
