@@ -428,6 +428,8 @@ def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float,
                 'log_ttr': math.log1p(ttr_hours)
             }
 
+    return invested_this_trade
+
 def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
         
         user_metrics = state.user_history[wallet]
@@ -808,7 +810,7 @@ def main():
                     market_map[sibling_cid]['last_update_ts'] = ts
                     
                 # Accumulate internal tracking state
-                ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
+                invested_this_trade = ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
     
                 # ---------------------------------------------------------
                 # C. SIMULATE SIGNALS (Signal Logging Only)
