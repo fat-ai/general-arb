@@ -302,8 +302,11 @@ class DataFetcher:
             print(f" Done.")
 
         if current_raw_rows:
+            process_and_save_chunk(current_raw_rows, chunk_idx)
+            current_raw_rows = []
+            chunk_idx += 1        
             
-            if cache_file.exists():
+        if cache_file.exists():
                 if temp_files: # ✅ Only run if we actually downloaded new chunks this session
                     print(f"   🕵️ Checking for missing market IDs (Gaps in current session)...")
                     try:
@@ -348,10 +351,9 @@ class DataFetcher:
                                 process_and_save_chunk(gap_raw_rows, "gap_fill_final")
                                 print("\n   ✅ Gap updates saved to temp chunks.")
                     except Exception as e:
-                        print(f"\n   ⚠️ Could not process gap updates: {e}")
-
+                        print(f"\n   ⚠️ Could not process gap updates: {e}")    
             
-            if cache_file.exists():
+        if cache_file.exists():
                 print(f"   🔄 Checking for unresolved market updates...")
                 try:
                     df_ext = pd.read_parquet(cache_file, columns=['market_id', 'closed'])
@@ -387,11 +389,7 @@ class DataFetcher:
                             print("\n   ✅ Unresolved updates saved to temp chunk.")
                 except Exception as e:
                     print(f"\n   ⚠️ Could not process unresolved updates: {e}")
-
-                                    
-        chunk_idx += 1            
-        process_and_save_chunk(current_raw_rows, chunk_idx)
-
+    
         if not temp_files:
             print("   ℹ️  No new market data to save.")
             return
