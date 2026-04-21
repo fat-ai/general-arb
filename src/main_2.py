@@ -23,6 +23,7 @@ from sim_strat_3 import (
     BayesianState,
     process_trade,
     ingest_trade_state,
+    fast_numba_scan,
     PRICE_LUT,
     TIME_LUT,
     CACHE_DIR
@@ -75,7 +76,18 @@ class LiveTrader:
         self.ws_client = None
 
     async def start(self):
-        print("\n🚀 STARTING LIVE PAPER TRADER (FULL MARKET MODE)")
+        print("\n🚀 STARTING LIVE TRADER")
+        
+        # Offload Numba JIT compilation to a separate thread to keep the event loop responsive
+        log.info("Warming up Numba JIT compiler...")
+        _dummy = np.empty(0, dtype=np.uint32)
+        
+        await asyncio.to_thread(
+            fast_numba_scan, 
+            _dummy, 500, 1, 1000, PRICE_LUT, TIME_LUT, P_RANGE
+        )
+        
+        log.info("✅ Numba JIT compilation complete.")
         self.start_time = time.time()
         if self.trade_queue is None:
             self.trade_queue = asyncio.Queue()
