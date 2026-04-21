@@ -340,20 +340,22 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
                 hist_log_ttr = (packed >> 1) & 0x1FFFFF 
                 hist_outcome = packed & 1
 
-                price_dist = abs(hist_price_int - center_p_int)
                 time_dist = abs(hist_log_ttr - current_log_ttr)
 
-                if price_dist > P_RANGE or time_dist >= len(time_lut):
+                if time_dist >= len(time_lut):
                     continue
 
-                combined_weight = price_lut[price_dist] * time_lut[time_dist] * trust_multiplier
+                price_dist = abs(hist_price_int - center_p_int)
+                
+                # Removed trust_multiplier from the inner loop
+                combined_weight = price_lut[price_dist] * time_lut[time_dist]
                 
                 n += combined_weight
-                # If they hit the target outcome (1 for primary, 0 for opposing), it supports the event
                 if hist_outcome == target_outcome:
                     w += combined_weight
                     
-            return n, w
+            # Apply the trust multiplier ONCE at the end
+            return n * trust_multiplier, w * trust_multiplier
 
         # 5. Tally the Evidence from Both Arrays
         # For the primary array, a Win (1) means the event occurred.
