@@ -3,6 +3,7 @@ import duckdb
 import polars as pl
 import pandas as pd
 import numpy as np
+from numba import njit
 import statsmodels.api as sm
 import logging
 import gc
@@ -48,8 +49,8 @@ class UserMetrics:
     total_trades: int = 0
     brier_sum: float = 0.0
     brier_count: int = 0
-    trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
-    trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
+    trade_history_yes: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint32))
+    trade_history_no: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint32))
 
 # ==========================================
 # BAYESIAN STATE ENCAPSULATION
@@ -87,21 +88,68 @@ class BayesianState:
 PRICE_HALF_LIFE = 25  # 2.5 cents (25 thousandths)
 TIME_HALF_LIFE = 91  # ~10% time distance in scaled log space (ln(1.1) * 1000)
 
-PRICE_LUT = [0.0] * 1001
+# Defensive assertion to ensure our bit-packing scheme never silently overflows uint32
+assert (np.int64(1001) << 22) - 1 <= np.iinfo(np.uint32).max, \
+    "Packed value scheme exceeds uint32 max limit"
+
+# Numba-compatible LUTs
+PRICE_LUT = np.zeros(1001, dtype=np.float64)
 _lambda_p = -math.log(0.5) / PRICE_HALF_LIFE
 for i in range(1001):
     w = math.exp(-_lambda_p * i)
-    # Snap microscopically small weights to 0.0 to save CPU calculations later
     PRICE_LUT[i] = w if w >= 0.01 else 0.0
 
-TIME_LUT_SIZE = 20000  # Safely covers massive time differences
-TIME_LUT = [0.0] * TIME_LUT_SIZE
+TIME_LUT_SIZE = 20000 
+TIME_LUT = np.zeros(TIME_LUT_SIZE, dtype=np.float64)
 _lambda_t = -math.log(0.5) / TIME_HALF_LIFE
 for i in range(TIME_LUT_SIZE):
     w = math.exp(-_lambda_t * i)
     TIME_LUT[i] = w if w >= 0.01 else 0.0
 
+@njit(cache=True)
+def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
+    """
+    Compiled to machine code via Numba. Executes the bitwise unpacking and 
+    LUT lookups at C-speeds without Python interpreter overhead.
+    """
+    n = 0.0
+    w = 0.0
+    
+    # Use int64 for safe arithmetic before casting bounds
+    min_p = max(0, center_p_int - p_range)
+    max_p = min(1000, center_p_int + p_range)
+    
+    left_bound = np.uint32(np.int64(min_p) << 22)
+    right_bound = np.uint32((np.int64(max_p + 1) << 22) - 1)
+    
+    start_idx = np.searchsorted(history_array, left_bound, side='left')
+    end_idx = np.searchsorted(history_array, right_bound, side='right')
+    
+    for i in range(start_idx, end_idx):
+        packed = history_array[i]
+        
+        hist_price_int = packed >> 22
+        hist_log_ttr = (packed >> 1) & 0x1FFFFF 
+        hist_outcome = packed & 1
 
+        # Cast to int64 to prevent unsigned wrap-around underflow
+        time_dist = np.int64(abs(np.int64(hist_log_ttr) - np.int64(current_log_ttr)))
+        
+        # time_dist has no guarantee from searchsorted, so we must guard it
+        if time_dist >= len(time_lut):
+            continue
+
+        # bisect bounds already guarantee price_dist <= p_range, so no guard needed
+        price_dist = np.int64(abs(np.int64(hist_price_int) - np.int64(center_p_int)))
+        
+        combined_weight = price_lut[price_dist] * time_lut[time_dist]
+        
+        n += combined_weight
+        if hist_outcome == target_outcome:
+            w += combined_weight
+            
+    return n, w
+        
 def extract_true_probability(price: float, wager_fraction: float, is_yes_bet: bool) -> float:
     """
     Reverse-engineers the trader's latent subjective probability using the reverse-Kelly formula.
@@ -314,19 +362,27 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 is_yes_win = 1 if outcome > 0.5 else 0
                 is_no_win = 1 if outcome <= 0.5 else 0
                 
-                # Update YES history
-                for partial in pos.pending_yes:
-                    final_packed = partial | is_yes_win
-                    bisect.insort(state.user_history[u].trade_history_yes, final_packed)
-                    exact_price = (partial >> 22) / 1000.0
-                    state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                # Update YES history (Bulk Operation)
+                if pos.pending_yes:
+                    new_yes = np.array([p | is_yes_win for p in pos.pending_yes], dtype=np.uint32)
+                    state.user_history[u].trade_history_yes = np.sort(
+                        np.concatenate((state.user_history[u].trade_history_yes, new_yes))
+                    )
                     
-                # Update NO history
-                for partial in pos.pending_no:
-                    final_packed = partial | is_no_win
-                    bisect.insort(state.user_history[u].trade_history_no, final_packed)
-                    exact_price = (partial >> 22) / 1000.0
-                    state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
+                    for partial in pos.pending_yes:
+                        exact_price = (partial >> 22) / 1000.0
+                        state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                        
+                # Update NO history (Bulk Operation)
+                if pos.pending_no:
+                    new_no = np.array([p | is_no_win for p in pos.pending_no], dtype=np.uint32)
+                    state.user_history[u].trade_history_no = np.sort(
+                        np.concatenate((state.user_history[u].trade_history_no, new_no))
+                    )
+                    
+                    for partial in pos.pending_no:
+                        exact_price = (partial >> 22) / 1000.0
+                        state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
                 
             # Calculate Brier and release capital
             yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
@@ -511,14 +567,12 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             return n * trust_multiplier, w * trust_multiplier
 
         # 5. Tally the Evidence from Both Arrays
-        # For the primary array, a Win (1) means the event occurred.
-        n1, w1 = scan_array(primary_array, primary_price_int, target_outcome=1)
+        n1_raw, w1_raw = fast_numba_scan(primary_array, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+        n2_raw, w2_raw = fast_numba_scan(opposing_array, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
         
-        # For the opposing array, a Loss (0) means our event occurred.
-        n2, w2 = scan_array(opposing_array, opposing_price_int, target_outcome=0)
-        
-        N_eff = n1 + n2
-        W_eff = w1 + w2
+        # Apply the Global Trust Multiplier outside the loop!
+        N_eff = (n1_raw + n2_raw) * trust_multiplier
+        W_eff = (w1_raw + w2_raw) * trust_multiplier
 
         # 6. Empirical Bayes Population Priors (Polynomial Smoothing)
         a, b, c = coeffs
@@ -642,6 +696,12 @@ def main():
     # contract_positions: Dict[cid] -> Dict[user] -> metrics
     state = BayesianState()
     active_portfolio = {}
+
+    # Force Numba compilation before starting the tight simulation loop
+    log.info("Warming up Numba JIT compiler...")
+    _dummy = np.empty(0, dtype=np.uint32)
+    fast_numba_scan(_dummy, 500, 1, 1000, PRICE_LUT, TIME_LUT, P_RANGE)
+    log.info("✅ Numba JIT compilation complete.")
 
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
