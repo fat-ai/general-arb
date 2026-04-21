@@ -531,41 +531,6 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             logit_params = state.logit_model_params
             trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
-        # 4. The 2D Kernel Scanner (Nested for DRY execution)
-        def scan_array(history_array, center_p_int, target_outcome):
-            n = 0.0
-            w = 0.0
-            
-            min_p = max(0, center_p_int - P_RANGE)
-            max_p = min(1000, center_p_int + P_RANGE)
-            left_bound = min_p << 22
-            right_bound = ((max_p + 1) << 22) - 1
-            
-            start_idx = bisect.bisect_left(history_array, left_bound)
-            end_idx = bisect.bisect_right(history_array, right_bound)
-            
-            for i in range(start_idx, end_idx):
-                packed = history_array[i]
-                
-                hist_price_int = packed >> 22
-                hist_log_ttr = (packed >> 1) & 0x1FFFFF 
-                hist_outcome = packed & 1
-
-                time_dist = abs(hist_log_ttr - current_log_ttr)
-
-                if time_dist >= len(time_lut):
-                    continue
-
-                price_dist = abs(hist_price_int - center_p_int)
-                
-                combined_weight = price_lut[price_dist] * time_lut[time_dist]
-                
-                n += combined_weight
-                if hist_outcome == target_outcome:
-                    w += combined_weight
-                    
-            return n * trust_multiplier, w * trust_multiplier
-
         # 5. Tally the Evidence from Both Arrays
         n1_raw, w1_raw = fast_numba_scan(primary_array, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
         n2_raw, w2_raw = fast_numba_scan(opposing_array, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
