@@ -15,7 +15,6 @@ from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 import shutil
 from dataclasses import dataclass, field
 import array
-import bisect
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
