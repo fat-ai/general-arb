@@ -347,14 +347,12 @@ def process_trade(wallet, price, stake, direction, is_buying, ttr_hours, user_me
 
                 price_dist = abs(hist_price_int - center_p_int)
                 
-                # Removed trust_multiplier from the inner loop
                 combined_weight = price_lut[price_dist] * time_lut[time_dist]
                 
                 n += combined_weight
                 if hist_outcome == target_outcome:
                     w += combined_weight
                     
-            # Apply the trust multiplier ONCE at the end
             return n * trust_multiplier, w * trust_multiplier
 
         # 5. Tally the Evidence from Both Arrays
