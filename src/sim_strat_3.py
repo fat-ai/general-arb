@@ -615,7 +615,7 @@ def main():
         market_map[cid] = {
             'id': market['id'], 'start': s_date, 'end': e_date,
             'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 
-            'volume': market['volume'] = 0, 'resolved': False
+            'volume': 0, 'resolved': False
         }
 
         mid = market['id']
