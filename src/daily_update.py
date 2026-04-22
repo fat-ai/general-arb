@@ -207,36 +207,39 @@ def main():
         WHERE ts > '{last_ts_str}'
         ORDER BY ts ASC
     """
-    
-    cursor = con.execute(query)
-    
-    trade_count = 0
-    max_ts = state.last_processed_timestamp
-    
-    while True:
-        rows = cursor.fetchmany(10000)
-        if not rows: break
-        
-        for row in rows:
-            cid, user, amount, tokens, price, ts = row
-            if ts is None: continue
-            if getattr(ts, 'tzinfo', None) is not None:
-                ts = ts.replace(tzinfo=None)
-                
-            m = market_map[cid]
-            if m['start'] is not None and ts < m['start']: continue
-            if m['end'] is not None and ts > m['end']: continue
-            
-            qty = abs(tokens)
-            is_buying = (tokens > 0)
-            bet_on = m['outcome_label']
-            
-            ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
-            
-            if ts > max_ts: max_ts = ts
-            trade_count += 1
 
-    con.close()
+    try:
+        cursor = con.execute(query)
+        
+        trade_count = 0
+        max_ts = state.last_processed_timestamp
+        
+        while True:
+            rows = cursor.fetchmany(10000)
+            if not rows: break
+            
+            for row in rows:
+                cid, user, amount, tokens, price, ts = row
+                if ts is None: continue
+                if getattr(ts, 'tzinfo', None) is not None:
+                    ts = ts.replace(tzinfo=None)
+                    
+                m = market_map[cid]
+                if m['start'] is not None and ts < m['start']: continue
+                if m['end'] is not None and ts > m['end']: continue
+                
+                qty = abs(tokens)
+                is_buying = (tokens > 0)
+                bet_on = m['outcome_label']
+                
+                ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
+                
+                if ts > max_ts: max_ts = ts
+                trade_count += 1
+
+    finally:
+        con.close()
+        
     if duck_tmp.exists():
         shutil.rmtree(duck_tmp, ignore_errors=True)
         
