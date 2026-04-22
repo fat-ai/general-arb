@@ -670,20 +670,18 @@ def main():
     # ==========================================
     log.info("Spinning up DuckDB")
     duck_tmp = CACHE_DIR / "duckdb_sim_tmp"
-    sim_db_path = CACHE_DIR / "sim_working.duckdb"
     duck_tmp.mkdir(parents=True, exist_ok=True)
-
-    for leftover in [sim_db_path, Path(str(sim_db_path) + ".wal")]:
-        if leftover.exists():
-            leftover.unlink()
             
     con = None
     
     try:
-        con = duckdb.connect(database=str(sim_db_path))
+        # Switch to :memory: to avoid WAL overhead
+        con = duckdb.connect(database=':memory:')
+        
+        # The OOM Shield: Strict memory cap, reduced threads, and explicit disk spillover
         con.execute("SET memory_limit='4GB';")
         con.execute("SET max_temp_directory_size = '200GB';")
-        con.execute("SET threads=4;")
+        con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=false;")
         con.execute(f"SET temp_directory='{duck_tmp}';")
         
@@ -692,17 +690,7 @@ def main():
     
         log.info("⏳ DuckDB is now working ... Please wait")
         
-        # OPTIMIZATION: Create a tiny DataFrame of only the contracts we care about
-        valid_cids_df = pd.DataFrame({
-            'clean_cid': list(market_map.keys())
-        })
-        
-        # Register it virtually inside DuckDB (takes almost zero memory)
-        con.register('valid_markets', valid_cids_df)
-        
-        # OPTIMIZATION: Use an INNER JOIN to filter the SQLite data BEFORE sorting.
-        # We also add 'WHERE t.timestamp IS NOT NULL' so DuckDB doesn't waste space sorting nulls.
-        query = """
+        query = f"""
             WITH parsed_trades AS (
                 SELECT 
                     t.contract_id, 
@@ -715,7 +703,10 @@ def main():
                         TRY_CAST(t.timestamp AS TIMESTAMP)
                     ) AS ts
                 FROM source_db.trades t
-                JOIN valid_markets v ON t.contract_id = v.clean_cid
+                INNER JOIN (
+                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
+                    FROM read_parquet('{MARKETS_PATH}')
+                ) m ON t.contract_id = m.clean_cid
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0 
                   AND t.price <= 1.0
@@ -780,6 +771,8 @@ def main():
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
                         resolve_market(r_cid, outcome, outcome_label, current_sim_day, state)
+                        mid = market_map[r_cid]['id']
+                        result_map.pop(mid, None)
                                       
                     orphan_cutoff_date = current_sim_day - timedelta(days=10)
                     orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
@@ -803,6 +796,8 @@ def main():
                         market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
                         state.contract_positions.pop(o_cid, None)
                         state.first_bets_pending.pop(o_cid, None)
+                        mid = m_data['id']
+                        result_map.pop(mid, None)
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     calibrate_models(current_sim_day, state)     
                     current_sim_day = trade_date
@@ -1072,10 +1067,6 @@ def main():
             shutil.rmtree(duck_tmp, ignore_errors=True)
             log.info(f"🗑️ Temporary directory {duck_tmp} successfully wiped from disk.")
             
-        for scratch in [sim_db_path, Path(str(sim_db_path) + ".wal")]:
-            if scratch.exists():
-                scratch.unlink()
-        log.info("🗑️ Scratch DuckDB files successfully wiped from disk.")
 
 if __name__ == "__main__":
     main()
