@@ -767,8 +767,7 @@ def main():
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
                         resolve_market(r_cid, outcome, outcome_label, current_sim_day, state)
-                        mid = market_map[r_cid]['id']
-                        result_map.pop(mid, None)
+                        
                                       
                     # Sweeping for ALL dead markets (Resolved or Orphaned) past the 10-day buffer
                     orphan_cutoff_date = current_sim_day - timedelta(days=10)
@@ -880,7 +879,6 @@ def main():
                         pm = market_map[p_cid]
                         if pm['end'] is not None and ts >= pm['end']:
                             mid = pm['id']
-                            actual_outcome = result_map[mid]['outcome']
                             
                             if p_data['direction'] == "yes":
                                 payout = p_data['contracts'] * pm['outcome']
