@@ -588,8 +588,6 @@ def main():
     markets_pl = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('market_id').alias('id'),
-        pl.col('events').str.json_path_match(r"$[0].id").alias('event_id'),
-        pl.col('question'),
         pl.col('start_date').cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
         pl.col('outcome').cast(pl.Float32),
@@ -615,16 +613,15 @@ def main():
             e_date = e_date.replace(tzinfo=None)
             
         market_map[cid] = {
-            'id': market['id'], 'event_id': market['event_id'], 'question': market['question'], 'start': s_date, 'end': e_date,
-            'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 'volume': 0,
+            'id': market['id'], 'start': s_date, 'end': e_date,
+            'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'],
             'resolved': False
         }
 
         mid = market['id']
         if mid not in result_map:
             result_map[mid] = {
-                'question': market['question'], 'start': s_date, 'end': e_date, 'outcome': market['outcome'],
-                'yes_cid': None, 'no_cid': None
+                'outcome': market['outcome'], 'yes_cid': None, 'no_cid': None
             }
 
         # Slot the CID into the parent market tracker
@@ -633,7 +630,6 @@ def main():
         else:
             result_map[mid]['no_cid'] = cid
             
-        # The moment we have both siblings, link them natively in the market_map!
         yes_cid = result_map[mid]['yes_cid']
         no_cid = result_map[mid]['no_cid']
         
@@ -774,30 +770,32 @@ def main():
                         mid = market_map[r_cid]['id']
                         result_map.pop(mid, None)
                                       
+                    # Sweeping for ALL dead markets (Resolved or Orphaned) past the 10-day buffer
                     orphan_cutoff_date = current_sim_day - timedelta(days=10)
                     orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
                     
-                    orphan_cids = []
+                    purge_cids = []
                     for c, m in market_map.items():
-                        if m['resolved']: continue
-                        
-                        # Condition 1: Past official end date by 10 days (Uses .date())
+                        # Condition 1: Past official end date by 10 days
                         is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff_date
                         
-                        # Condition 2: No end date, mathematically dead (Uses Timestamp)
+                        # Condition 2: No end date, mathematically dead
                         last_ts = m.get('last_update_ts', pd.Timestamp(current_sim_day))
                         is_dead = m['end'] is None and last_ts < orphan_cutoff_ts
                         
                         if is_past_end or is_dead:
-                            orphan_cids.append(c)
+                            purge_cids.append(c)
                     
-                    # Silently clear their tracked data to free RAM
-                    for o_cid in orphan_cids:
-                        market_map[o_cid]['resolved'] = True # Mark as resolved to ignore in the future
-                        state.contract_positions.pop(o_cid, None)
-                        state.first_bets_pending.pop(o_cid, None)
-                        mid = m_data['id']
-                        result_map.pop(mid, None)
+                    # Mass Garbarge Collection to free RAM
+                    for p_cid in purge_cids:
+                        # Pop entirely out of memory
+                        m_data = market_map.pop(p_cid, None) 
+                        state.contract_positions.pop(p_cid, None)
+                        state.first_bets_pending.pop(p_cid, None)
+                        
+                        if m_data:
+                            result_map.pop(m_data['id'], None)
+                                
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     calibrate_models(current_sim_day, state)     
                     current_sim_day = trade_date
