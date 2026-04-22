@@ -365,7 +365,7 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 if pos.pending_yes:
                     new_yes = np.array([p | is_yes_win for p in pos.pending_yes], dtype=np.uint32)
                     combined_yes = np.concatenate((state.user_history[u].trade_history_yes, new_yes))
-                    state.user_history[u].trade_history_yes = np.sort(combined_yes, kind='stable')
+                    state.user_history[u].trade_history_yes = np.sort(combined_yes)
                     
                     for partial in pos.pending_yes:
                         exact_price = (partial >> 22) / 1000.0
@@ -375,7 +375,7 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 if pos.pending_no:
                     new_no = np.array([p | is_no_win for p in pos.pending_no], dtype=np.uint32)
                     combined_no = np.concatenate((state.user_history[u].trade_history_no, new_no))
-                    state.user_history[u].trade_history_yes = np.sort(combined_no, kind='stable')
+                    state.user_history[u].trade_history_yes = np.sort(combined_no)
                     
                     for partial in pos.pending_no:
                         exact_price = (partial >> 22) / 1000.0
