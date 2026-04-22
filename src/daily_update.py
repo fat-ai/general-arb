@@ -7,6 +7,7 @@ import polars as pl
 import pandas as pd
 from datetime import datetime, timezone
 import csv
+import shutil
 
 # Import the core math and state definitions from our refactored backtester
 from sim_strat_3 import (
@@ -135,7 +136,30 @@ def main():
         
     if cids_to_resolve:
         log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
-
+    log.info("🧹 Sweeping for orphaned/dead markets to prevent memory leaks...")
+    orphan_cutoff_date = current_day - timedelta(days=10)
+    orphan_cids = []
+    
+    # Check all actively tracked CIDs
+    tracked_cids = set(state.contract_positions.keys()).union(set(state.first_bets_pending.keys()))
+    
+    for c in tracked_cids:
+        if c in market_map:
+            m = market_map[c]
+            # If past official end date by 10 days
+            if m['end'] is not None and m['end'].date() < orphan_cutoff_date:
+                orphan_cids.append(c)
+        else:
+            # If a CID is tracked but missing from the current markets file entirely
+            orphan_cids.append(c)
+            
+    for o_cid in orphan_cids:
+        state.contract_positions.pop(o_cid, None)
+        state.first_bets_pending.pop(o_cid, None)
+        
+    if orphan_cids:
+        log.info(f"🗑️ Purged {len(orphan_cids)} orphaned markets from the Bayesian State.")
+        
     # ==========================================
     # 2. INGEST NEW TRADES (DELTA)
     # ==========================================
@@ -144,13 +168,20 @@ def main():
     # Extract timestamp string for DuckDB query
     last_ts_str = state.last_processed_timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')
     
+    duck_tmp = CACHE_DIR / "duckdb_update_tmp"
+    duck_tmp.mkdir(parents=True, exist_ok=True)
+    
     con = duckdb.connect(database=':memory:')
+    con.execute("SET memory_limit='4GB';")
+    con.execute("SET max_temp_directory_size = '200GB';")
+    con.execute("SET threads=2;")
+    con.execute("SET preserve_insertion_order=false;")
+    con.execute(f"SET temp_directory='{duck_tmp}';")
+    
     con.execute("INSTALL sqlite; LOAD sqlite;")
     con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
     
-    valid_cids_df = pd.DataFrame({'clean_cid': list(market_map.keys())})
-    con.register('valid_markets', valid_cids_df)
-    
+    # The native Parquet INNER JOIN replaces the Pandas DataFrame
     query = f"""
         WITH parsed_trades AS (
             SELECT 
@@ -164,7 +195,10 @@ def main():
                     TRY_CAST(t.timestamp AS TIMESTAMP)
                 ) AS ts
             FROM source_db.trades t
-            JOIN valid_markets v ON t.contract_id = v.clean_cid
+            INNER JOIN (
+                SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
+                FROM read_parquet('{MARKETS_PATH}')
+            ) m ON t.contract_id = m.clean_cid
             WHERE t.timestamp IS NOT NULL
               AND t.price >= 0.0 
               AND t.price <= 1.0
@@ -175,6 +209,7 @@ def main():
     """
     
     cursor = con.execute(query)
+    
     trade_count = 0
     max_ts = state.last_processed_timestamp
     
@@ -202,7 +237,9 @@ def main():
             trade_count += 1
 
     con.close()
-    
+    if duck_tmp.exists():
+        shutil.rmtree(duck_tmp, ignore_errors=True)
+        
     if trade_count > 0:
         state.last_processed_timestamp = max_ts
         log.info(f"✅ Successfully ingested {trade_count} new trades into the Bayesian state.")
