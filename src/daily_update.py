@@ -5,7 +5,7 @@ import math
 import duckdb
 import polars as pl
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import csv
 import shutil
 
@@ -207,12 +207,12 @@ def main():
         WHERE ts > '{last_ts_str}'
         ORDER BY ts ASC
     """
-
+    
+    trade_count = 0
+    max_ts = state.last_processed_timestamp
+    
     try:
         cursor = con.execute(query)
-        
-        trade_count = 0
-        max_ts = state.last_processed_timestamp
         
         while True:
             rows = cursor.fetchmany(10000)
