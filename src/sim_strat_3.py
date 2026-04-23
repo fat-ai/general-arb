@@ -908,7 +908,7 @@ def main():
                     # 1. SETTLE EXPIRED POSITIONS 
                     cids_to_remove = []
                     for p_cid, p_data in active_portfolio.items():
-                        pm = market_map[p_cid]
+                        pm = market_map.get(p_cid)
                             
                         if pm is None:
                             cids_to_remove.append(p_cid)
@@ -980,7 +980,7 @@ def main():
                     cids_to_sell = []
                     for p_cid, p_data in active_portfolio.items():
                         if p_cid not in target_cids:
-                            smkt = market_map[p_cid]
+                            smkt = market_map.get(p_cid)
                             if smkt is None:
                                 cids_to_sell.append(p_cid)
                                 continue
