@@ -837,7 +837,7 @@ def main():
                 # B. PROCESS TRADE INTO STATE TRACKERS
                 # ---------------------------------------------------------
                 if cid not in market_map: continue
-                pm = market_map.get(p_cid)
+                m = market_map.get(cid)
                 
                 # Start/End filtering
                 if m['start'] is not None and ts < m['start']: continue
