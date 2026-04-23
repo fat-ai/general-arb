@@ -8,6 +8,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Set the working directory inside the container
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y libjemalloc2 && rm -rf /var/lib/apt/lists/*
+
+# Force the container to use jemalloc for all memory allocations instead of glibc
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
 # 1. Install dependencies
 # We copy requirements first to leverage Docker layer caching
 COPY requirements.txt .
