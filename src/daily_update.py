@@ -9,6 +9,10 @@ from datetime import datetime, timezone, timedelta
 import csv
 import shutil
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 # Import the core math and state definitions from our refactored backtester
 from sim_strat_3 import (
     BayesianState, 
