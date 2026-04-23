@@ -48,8 +48,8 @@ class UserMetrics:
     total_trades: int = 0
     brier_sum: float = 0.0
     brier_count: int = 0
-    trade_history_yes: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint32))
-    trade_history_no: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.uint32))
+    trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
+    trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
 
 # ==========================================
 # BAYESIAN STATE ENCAPSULATION
@@ -360,22 +360,22 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
             if outcome != 0.5:
                 is_yes_win = 1 if outcome > 0.5 else 0
                 is_no_win = 1 if outcome <= 0.5 else 0
-                
-                # Update YES history (Bulk Operation)
+
+                # Update YES history (Zero-copy in-place sort)
                 if pos.pending_yes:
-                    new_yes = np.array([p | is_yes_win for p in pos.pending_yes], dtype=np.uint32)
-                    combined_yes = np.concatenate((state.user_history[u].trade_history_yes, new_yes))
-                    state.user_history[u].trade_history_yes = np.sort(combined_yes)
+                    arr_yes = state.user_history[u].trade_history_yes
+                    arr_yes.extend((p | is_yes_win) for p in pos.pending_yes)
+                    np.asarray(arr_yes).sort() # Sorts the memory buffer instantly
                     
                     for partial in pos.pending_yes:
                         exact_price = (partial >> 22) / 1000.0
                         state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
                         
-                # Update NO history (Bulk Operation)
+                # Update NO history (Zero-copy in-place sort)
                 if pos.pending_no:
-                    new_no = np.array([p | is_no_win for p in pos.pending_no], dtype=np.uint32)
-                    combined_no = np.concatenate((state.user_history[u].trade_history_no, new_no))
-                    state.user_history[u].trade_history_yes = np.sort(combined_no)
+                    arr_no = state.user_history[u].trade_history_no
+                    arr_no.extend((p | is_no_win) for p in pos.pending_no)
+                    np.asarray(arr_no).sort() # Sorts the memory buffer instantly
                     
                     for partial in pos.pending_no:
                         exact_price = (partial >> 22) / 1000.0
@@ -529,8 +529,8 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
         # 5. Tally the Evidence from Both Arrays
-        n1_raw, w1_raw = fast_numba_scan(primary_array, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        n2_raw, w2_raw = fast_numba_scan(opposing_array, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+        n1_raw, w1_raw = fast_numba_scan(np.asarray(primary_array), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+        n2_raw, w2_raw = fast_numba_scan(np.asarray(opposing_array), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
         
         # Apply the Global Trust Multiplier outside the loop!
         N_eff = (n1_raw + n2_raw) * trust_multiplier
