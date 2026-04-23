@@ -748,9 +748,9 @@ def main():
 
                 if getattr(ts, 'tzinfo', None) is not None:
                     ts = ts.replace(tzinfo=None)
-                    trade_date = ts.date()
+                        
+                trade_date = ts.date()
                     
-                
                 if data_start_date is None:
                     data_start_date = trade_date
                     simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
@@ -837,7 +837,7 @@ def main():
                 # B. PROCESS TRADE INTO STATE TRACKERS
                 # ---------------------------------------------------------
                 if cid not in market_map: continue
-                m = market_map[cid]
+                pm = market_map.get(p_cid)
                 
                 # Start/End filtering
                 if m['start'] is not None and ts < m['start']: continue
