@@ -909,11 +909,11 @@ def main():
                     cids_to_remove = []
                     for p_cid, p_data in active_portfolio.items():
                         pm = market_map.get(p_cid)
-                            
+                        
                         if pm is None:
                             cids_to_remove.append(p_cid)
                             continue
-                                
+                            
                         if pm['end'] is not None and ts >= pm['end']:
                             mid = pm['id']
                             
@@ -925,7 +925,6 @@ def main():
                             profit = payout - p_data['bet_size']
 
                             # Only sell early for a profit
-                   
                             result_map['performance']['cash'] += payout
                             result_map['performance']['equity'] += profit
                             if profit > 0: result_map['performance']['wins'] += 1
@@ -935,6 +934,64 @@ def main():
                             cids_to_remove.append(p_cid)
                             
                     for c in cids_to_remove: del active_portfolio[c]
+
+                    # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
+                    candidates = []
+                    
+                    for scan_cid, scan_m in market_map.items():
+                        if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
+                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
+                        
+                        # --- STALENESS & PATH-DEPENDENCY FILTER ---
+                        hours_since_trade = (ts - scan_m['last_update_ts']).total_seconds() / 3600.0
+                        if hours_since_trade > 24.0: 
+                            continue
+                        
+                        scan_ttr = max(1.0, (scan_m['end'] - ts).total_seconds() / 3600.0)
+                        annualization_ttr = max(24.0, scan_ttr) 
+                        annualization_factor = 8760.0 / annualization_ttr
+                        
+                        p_marg = scan_m.get('last_perc_marg', 0.0)
+                        aer = p_marg * annualization_factor
+                        
+                        if aer > 5.0 and p_marg > (P_RANGE / 1000) + ( MAX_SLIPPAGE * 1.5 ):
+                            candidates.append({
+                                'cid': scan_cid, 
+                                'dir': scan_m['outcome_label'], 
+                                'aer': aer, 
+                                'price': scan_m['last_price']
+                            })
+                            
+                    candidates.sort(key=lambda x: x['aer'], reverse=True)
+                    target_portfolio = candidates[:500]
+                    target_cids = {c['cid']: c for c in target_portfolio}
+
+                    # 3. SELL DECAYED POSITIONS 
+                    cids_to_sell = []
+                    for p_cid, p_data in active_portfolio.items():
+                        if p_cid not in target_cids:
+                            smkt = market_map.get(p_cid)
+                            if smkt is None:
+                                cids_to_sell.append(p_cid)
+                                continue
+                            
+                            slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
+                            sell_price = smkt['last_price'] * (1.0 - slippage)
+                            
+                            payout = p_data['contracts'] * sell_price
+                            profit = payout - p_data['bet_size']
+                            perc_profit = profit / p_data['bet_size']
+                            
+                            if perc_profit > MAX_SLIPPAGE * 1.1:
+                                result_map['performance']['cash'] += payout
+                                result_map['performance']['equity'] += profit
+                                if profit > 0: result_map['performance']['wins'] += 1
+                                else: result_map['performance']['losses'] += 1
+                                
+                                executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                                cids_to_sell.append(p_cid)
+                            
+                    for c in cids_to_sell: del active_portfolio[c]
 
                     # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
                     candidates = []
