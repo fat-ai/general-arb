@@ -57,13 +57,20 @@ class UserMetrics:
 # ==========================================
 # BAYESIAN STATE ENCAPSULATION
 # ==========================================
+def _inner_position_dict():
+    """Named helper function so pickle doesn't choke on a lambda."""
+    return defaultdict(PositionMetrics)
+
+# ==========================================
+# BAYESIAN STATE ENCAPSULATION
+# ==========================================
 @dataclass(slots=True)
 class BayesianState:
     """Encapsulates the entire memory of the trading system for easy serialization."""
     last_processed_timestamp: datetime = datetime.min
     days_simulated: int = 0
     user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
-    contract_positions: dict = field(default_factory=lambda: defaultdict(lambda: defaultdict(PositionMetrics)))
+    contract_positions: dict = field(default_factory=lambda: defaultdict(_inner_position_dict))
     first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
     
     # Rolling Variances & Calibration
