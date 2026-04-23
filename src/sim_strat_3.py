@@ -16,6 +16,7 @@ import shutil
 from dataclasses import dataclass, field
 import array
 import pickle
+import sys
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,6 +61,7 @@ class UserMetrics:
 class BayesianState:
     """Encapsulates the entire memory of the trading system for easy serialization."""
     last_processed_timestamp: datetime = datetime.min
+    days_simulated: int = 0
     user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
     contract_positions: dict = field(default_factory=lambda: defaultdict(lambda: defaultdict(PositionMetrics)))
     first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
@@ -736,7 +738,7 @@ def main():
                 break
                 
             for row in rows:
-                for row in rows:
+       
                 raw_cid, raw_user, amount, tokens, price, ts = row
                 
                 if ts is None: continue
@@ -746,6 +748,8 @@ def main():
 
                 if getattr(ts, 'tzinfo', None) is not None:
                     ts = ts.replace(tzinfo=None)
+                    trade_date = ts.date()
+                    
                 
                 if data_start_date is None:
                     data_start_date = trade_date
@@ -811,8 +815,6 @@ def main():
                     # ---------------------------------------------------------
                     # E. PROGRESS CHECKPOINTING (Every 90 Simulated Days)
                     # ---------------------------------------------------------
-                    if not hasattr(state, 'days_simulated'):
-                        state.days_simulated = 0
                     
                     state.days_simulated += 1
                     
@@ -907,6 +909,11 @@ def main():
                     cids_to_remove = []
                     for p_cid, p_data in active_portfolio.items():
                         pm = market_map[p_cid]
+                            
+                        if pm is None:
+                            cids_to_remove.append(p_cid)
+                            continue
+                                
                         if pm['end'] is not None and ts >= pm['end']:
                             mid = pm['id']
                             
@@ -974,6 +981,9 @@ def main():
                     for p_cid, p_data in active_portfolio.items():
                         if p_cid not in target_cids:
                             smkt = market_map[p_cid]
+                            if smkt is None:
+                                cids_to_sell.append(p_cid)
+                                continue
                             slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
                             sell_price = smkt['last_price'] * (1.0 - slippage)
                             
