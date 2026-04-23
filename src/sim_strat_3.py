@@ -15,6 +15,7 @@ from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
 import shutil
 from dataclasses import dataclass, field
 import array
+import pickle
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,7 +40,8 @@ class PositionMetrics:
     duration_weight_sum: float = 0.0
     pending_yes: array.array = field(default_factory=lambda: array.array('I'))
     pending_no: array.array = field(default_factory=lambda: array.array('I'))
-    pending_brier_data: list = field(default_factory=list) 
+    brier_p_true: array.array = field(default_factory=lambda: array.array('d'))
+    brier_stake: array.array = field(default_factory=lambda: array.array('d'))
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -383,11 +385,14 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 
             # Calculate Brier and release capital
             yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
-            for brier_user, p_true, initial_stake in pos.pending_brier_data:
-                release_exposure(state.user_history[brier_user], initial_stake)
+            
+            for i in range(len(pos.brier_p_true)):
+                p_true = pos.brier_p_true[i]
+                initial_stake = pos.brier_stake[i]
+                release_exposure(state.user_history[u], initial_stake)
                 squared_error = (p_true - yes_outcome)**2
-                state.user_history[brier_user].brier_sum += squared_error
-                state.user_history[brier_user].brier_count += 1
+                state.user_history[u].brier_sum += squared_error
+                state.user_history[u].brier_count += 1
 
         if r_cid in state.first_bets_pending:
                 first_bets = state.first_bets_pending.pop(r_cid)
@@ -477,7 +482,8 @@ def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float,
     is_effective_yes_bet = (effective_direction > 0)
     
     p_true = extract_true_probability(yes_price, wager_fraction, is_effective_yes_bet)
-    pos.pending_brier_data.append((user, p_true, invested_this_trade))
+    pos.brier_p_true.append(p_true)
+    pos.brier_stake.append(invested_this_trade)
         
     if user not in state.known_users:
         risk_vol = amount if is_buying else qty * (1.0 - price)
@@ -730,16 +736,17 @@ def main():
                 break
                 
             for row in rows:
-                cid, user, amount, tokens, price, ts = row
+                for row in rows:
+                raw_cid, raw_user, amount, tokens, price, ts = row
                 
                 if ts is None: continue
+
+                cid = sys.intern(str(raw_cid))
+                user = sys.intern(str(raw_user))
 
                 if getattr(ts, 'tzinfo', None) is not None:
                     ts = ts.replace(tzinfo=None)
                 
-                trade_date = ts.date()
-                
-                # Initialization of Warmup Anchor
                 if data_start_date is None:
                     data_start_date = trade_date
                     simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
@@ -800,6 +807,29 @@ def main():
                     current_sim_day = trade_date
 
                     gc.collect()
+
+                    # ---------------------------------------------------------
+                    # E. PROGRESS CHECKPOINTING (Every 90 Simulated Days)
+                    # ---------------------------------------------------------
+                    if not hasattr(state, 'days_simulated'):
+                        state.days_simulated = 0
+                    
+                    state.days_simulated += 1
+                    
+                    if state.days_simulated % 90 == 0:
+                        log.info(f"💾 Checkpointing state at simulated day {state.days_simulated}...")
+                        
+                        # Update the timestamp so it knows where to resume
+                        state.last_processed_timestamp = ts 
+                        
+                        tmp_ckpt = CACHE_DIR / "sim_checkpoint.pkl.tmp"
+                        final_ckpt = CACHE_DIR / "sim_checkpoint.pkl"
+                        
+                        with open(tmp_ckpt, 'wb') as f:
+                            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                        tmp_ckpt.replace(final_ckpt) # Atomic overwrite prevents corruption
+                        
+                        log.info("✅ Checkpoint securely saved to disk.")
     
                 # ---------------------------------------------------------
                 # B. PROCESS TRADE INTO STATE TRACKERS
