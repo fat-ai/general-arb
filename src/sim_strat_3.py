@@ -9,7 +9,7 @@ import statsmodels.api as sm
 import logging
 import gc
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
@@ -492,7 +492,7 @@ def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float,
     pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
 
     price_int = max(0, min(1000, int(price * 1000)))
-    ttr_hours = max(1.0, (m['end'] - ts) / 3600.0) if m['end'] is not None else 24.0
+    ttr_hours = max(1.0, (market_end - ts) / 3600.0) if market_end is not None else 24.0
     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
     
     partial_packed = (price_int << 22) | (log_ttr_int << 1)
@@ -710,11 +710,42 @@ def main():
     gc.collect()
 
     # ==========================================
-    # 2. STATE MACHINE INITIALIZATION
+    # 2. STATE MACHINE INITIALIZATION & RESUME
     # ==========================================
-    # contract_positions: Dict[cid] -> Dict[user] -> metrics
-    state = BayesianState()
-    active_portfolio = {}
+    ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
+    is_resuming = ckpt_file.exists()
+
+    if not is_resuming:
+        if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
+        headers = ["timestamp", "market_id", "cid", "bet_on", "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", "end_timestamp", "actual_outcome"]
+        with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(headers)
+            
+        if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
+        exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
+        with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(exec_headers)
+            
+        state = BayesianState()
+        active_portfolio = {}
+        resume_data_start = None
+        resume_sim_start = None
+        resume_sim_day = None
+        resume_heartbeat = None
+    else:
+        log.info(f"🔄 Found checkpoint! Resuming state from {ckpt_file}...")
+        with open(ckpt_file, 'rb') as f:
+            checkpoint_data = pickle.load(f)
+            
+        state = checkpoint_data['state']
+        active_portfolio = checkpoint_data['active_portfolio']
+        result_map['performance'] = checkpoint_data['performance']
+        
+        resume_data_start = checkpoint_data['data_start_date']
+        resume_sim_start = checkpoint_data['simulation_start_date']
+        resume_sim_day = checkpoint_data['current_sim_day']
+        resume_heartbeat = checkpoint_data['heartbeat']
+        log.info(f"✅ Resuming from day {state.days_simulated} (Timestamp: {state.last_processed_timestamp})")
 
     # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
