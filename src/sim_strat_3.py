@@ -561,7 +561,7 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
         
         perc_margin = margin / expected_p if expected_p > 0 else 0.0
         
-        return smoothed_win_rate, margin, perc_margin, V
+        return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
 
 def main():
 
@@ -574,7 +574,7 @@ def main():
         headers = [
             "timestamp", "market_id", "cid", "bet_on", 
             "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
-            "variance_v", "volume", 
+            "variance_v", "volume", "wallet_id", "brier_count", "trust_weight",
             "end_timestamp", "actual_outcome"
         ]
         with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
@@ -914,7 +914,7 @@ def main():
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
-                smooth_prob, marg, perc_marg = process_trade(
+                smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
                     wallet=user, price=price, stake=invested_this_trade, 
                     direction=direction, is_buying=is_buying,
                     ttr_hours=ttr_hours, state=state, 
@@ -926,6 +926,9 @@ def main():
                 last_logged_price = m.get('log_price', 0.0)
                 last_logged_ts = m.get('log_ts', 0.0)
                 
+                # Extract the current Brier count for this specific wallet
+                current_brier_count = state.user_history[user].brier_count
+
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
                 if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
                     m['log_price'] = price
@@ -933,7 +936,9 @@ def main():
                     
                     results_buffer.append([
                         ts, m['id'], cid, bet_on, price, ttr_hours, 
-                        smooth_prob, marg, perc_marg, variance_v, m['volume'], m['end'], m['outcome']
+                        smooth_prob, marg, perc_marg, variance_v, m['volume'], 
+                        user, current_brier_count, trust_weight,
+                        m['end'], m['outcome']
                     ])
                     
                     if len(results_buffer) >= 10000:
