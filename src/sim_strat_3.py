@@ -715,17 +715,7 @@ def main():
     ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
     is_resuming = ckpt_file.exists()
 
-    if not is_resuming:
-        if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
-        headers = ["timestamp", "market_id", "cid", "bet_on", "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", "end_timestamp", "actual_outcome"]
-        with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(headers)
-            
-        if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
-        exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
-        with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(exec_headers)
-            
+    if not is_resuming:            
         state = BayesianState()
         active_portfolio = {}
         resume_data_start = None
@@ -900,8 +890,8 @@ def main():
                         if m_data: result_map.pop(m_data['id'], None)
                                 
                     # 2. Daily OLS Calibration (Rolling 365 Days)
-                    calibrate_models(current_sim_day, state)     
-                    current_sim_day = trade_date
+                    calibrate_models(current_day_ts, state)
+                    current_sim_day = trade_day_int
 
                     gc.collect()
 
@@ -921,7 +911,15 @@ def main():
                         final_ckpt = CACHE_DIR / "sim_checkpoint.pkl"
                         
                         with open(tmp_ckpt, 'wb') as f:
-                            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                            pickle.dump({
+                                    'state': state,
+                                    'active_portfolio': active_portfolio,
+                                    'performance': result_map['performance'],
+                                    'data_start_date': data_start_date,
+                                    'simulation_start_date': simulation_start_date,
+                                    'current_sim_day': current_sim_day,
+                                    'heartbeat': heartbeat
+                                }, f, protocol=pickle.HIGHEST_PROTOCOL)
                         tmp_ckpt.replace(final_ckpt) # Atomic overwrite prevents corruption
                         
                         log.info("✅ Checkpoint securely saved to disk.")
@@ -958,7 +956,7 @@ def main():
 
                 m['volume'] += amount
                 
-                ttr_hours = max(1.0, (m['end'] - ts).total_seconds() / 3600.0) if m['end'] is not None else 24.0
+                ttr_hours = max(1.0, (m['end'] - ts) / 3600.0) if m['end'] is not None else 24.0
                 direction = 1.0 if is_buying else -1.0
                 if bet_on != "yes": direction *= -1.0
                 
@@ -972,7 +970,7 @@ def main():
                 m['last_perc_marg'] = perc_marg
 
                 last_logged_price = m.get('log_price', 0.0)
-                last_logged_ts = m.get('log_ts', datetime.min)
+                last_logged_ts = m.get('log_ts', 0.0)
                 
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
                 if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
@@ -1087,73 +1085,7 @@ def main():
                             
                     for c in cids_to_sell: del active_portfolio[c]
 
-                    # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
-                    candidates = []
-                    
-                    for scan_cid, scan_m in market_map.items():
-                        if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
-                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
-                        
-                        # --- STALENESS & PATH-DEPENDENCY FILTER ---
-                        # Note: 'last_perc_marg' is snapshotted from the last user to trade. 
-                        # Between heartbeats, the fund's view of edge is path-dependent on 
-                        # this final trader's Bayesian signal. 
-                        # We drop any edge older than 24 hours to prevent trading on dead signals.
-                        hours_since_trade = (ts - scan_m['last_update_ts']).total_seconds() / 3600.0
-                        if hours_since_trade > 24.0: 
-                            continue
-                        # ------------------------
-                        
-                        scan_ttr = max(1.0, (scan_m['end'] - ts).total_seconds() / 3600.0)
-                        annualization_ttr = max(24.0, scan_ttr) 
-                        annualization_factor = 8760.0 / annualization_ttr
-                        
-                        # Grab the edge generated by the last actual user who traded this token!
-                        p_marg = scan_m.get('last_perc_marg', 0.0)
-                        
-                        aer = p_marg * annualization_factor
-                        
-                        # Require > 500% AER AND a raw absolute edge of at least 2% to cover slippage
-                        if aer > 5.0 and p_marg > (P_RANGE / 1000) + ( MAX_SLIPPAGE * 1.5 ):
-                                candidates.append({
-                                    'cid': scan_cid, 
-                                    'dir': scan_m['outcome_label'], 
-                                    'aer': aer, 
-                                    'price': scan_m['last_price']
-                                })
-                            
-                    # Rank and slice the Top 100
-                    candidates.sort(key=lambda x: x['aer'], reverse=True)
-                    target_portfolio = candidates[:500]
-                    target_cids = {c['cid']: c for c in target_portfolio}
-
-                    # 3. SELL DECAYED POSITIONS 
-                    cids_to_sell = []
-                    for p_cid, p_data in active_portfolio.items():
-                        if p_cid not in target_cids:
-                            smkt = market_map.get(p_cid)
-                            if smkt is None:
-                                cids_to_sell.append(p_cid)
-                                continue
-                            slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
-                            sell_price = smkt['last_price'] * (1.0 - slippage)
-                            
-                            payout = p_data['contracts'] * sell_price
-                            profit = payout - p_data['bet_size']
-                            perc_profit = profit / p_data['bet_size']
-                            #Only sell ealy if profitable
-                            if perc_profit > MAX_SLIPPAGE * 1.1:
-                                    result_map['performance']['cash'] += payout
-                                    result_map['performance']['equity'] += profit
-                                    if profit > 0: result_map['performance']['wins'] += 1
-                                    else: result_map['performance']['losses'] += 1
-                                    
-                                    executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
-                                    cids_to_sell.append(p_cid)
-                            
-                    for c in cids_to_sell: del active_portfolio[c]
-
-                    # 4. BUY NEW POSITIONS (Fill the 1% Slots)
+                    # 4. BUY NEW POSITIONS (Fill the Slots)
                     target_slot_size = result_map['performance']['equity'] * 0.002
                     
                     for target in target_portfolio:
