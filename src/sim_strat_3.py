@@ -564,24 +564,30 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
         return smoothed_win_rate, margin, perc_margin
 
 def main():
+
+    ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
+    is_resuming = ckpt_file.exists()
+
+    # Safely guard the CSV wipes so we don't destroy our history
+    if not is_resuming:
+        if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
+        headers = [
+            "timestamp", "market_id", "cid", "bet_on", 
+            "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
+            "end_timestamp", "actual_outcome"
+        ]
+        with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        log.info(f"Output file created successfully at {OUTPUT_PATH}")
+
+        if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
+        exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
+        with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(exec_headers)
+    else:
+        log.info("🔄 Resuming simulation. Preserving existing CSV output files.")
     
-    if OUTPUT_PATH.exists(): OUTPUT_PATH.unlink()
-
-    headers = [
-        "timestamp", "market_id", "cid", "bet_on", 
-        "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
-        "end_timestamp", "actual_outcome"
-    ]
-    with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-    log.info(f"Output file created successfully at {OUTPUT_PATH}")
-
-    if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
-        
-    exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
-    with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
-        csv.writer(f).writerow(exec_headers)
     
     # ==========================================
     # 1. LOAD MARKETS (Polars Pushdown)
