@@ -435,7 +435,7 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                 for u, bet in first_bets.items():
                     vwap = bet['vwap']
                     is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
-                    state.calib_dates.append(pd.Timestamp(current_sim_day))
+                    state.calib_dates.append(current_sim_day)
                     state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
                     state.calib_y.append(is_win)   
 
@@ -456,33 +456,33 @@ def calibrate_models(current_day_ts, state: BayesianState):
         if new_params is not None:
             state.logit_model_params = new_params
             
-    # Variance YES OLS Calibration
+    # Variance YES Calibration (Using fast NumPy Polyfit)
     if len(state.daily_variance_yes) >= 1000:
         try:
             v_data_yes = np.array(state.daily_variance_yes)
             prices_yes = v_data_yes[:, 0]
             y_var_yes = v_data_yes[:, 1]
-            X_var_yes = np.column_stack((prices_yes**2, prices_yes, np.ones_like(prices_yes)))
-            model_yes = sm.OLS(y_var_yes, X_var_yes).fit()
-            a, b, c = model_yes.params
+            
+            coeffs = np.polyfit(prices_yes, y_var_yes, 2)
+            a, b, c = coeffs
             if is_valid_variance_fit(a, b, c):
                 state.poly_coeffs_yes[:] = [a, b, c] 
         except Exception as e:
-            log.warning(f"Variance YES OLS failed: {e}")
+            log.warning(f"Variance YES Polyfit failed: {e}")
             
-    # Variance NO OLS Calibration
+    # Variance NO Calibration (Using fast NumPy Polyfit)
     if len(state.daily_variance_no) >= 1000:
         try:
             v_data_no = np.array(state.daily_variance_no)
             prices_no = v_data_no[:, 0]
             y_var_no = v_data_no[:, 1]
-            X_var_no = np.column_stack((prices_no**2, prices_no, np.ones_like(prices_no)))
-            model_no = sm.OLS(y_var_no, X_var_no).fit()
-            a, b, c = model_no.params
+            
+            coeffs = np.polyfit(prices_no, y_var_no, 2)
+            a, b, c = coeffs
             if is_valid_variance_fit(a, b, c):
                 state.poly_coeffs_no[:] = [a, b, c]
         except Exception as e:
-            log.warning(f"Variance NO OLS failed: {e}")
+            log.warning(f"Variance NO Polyfit failed: {e}")
 
 def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float, qty: float, price: float, ts: float, market_end: float, bet_on: str, is_buying: bool):
     """Mutates the BayesianState by processing a raw historical trade."""
@@ -853,7 +853,7 @@ def main():
                 # Initialization of Warmup Anchor
                 if data_start_date is None:
                     data_start_date = trade_day_int
-                    simulation_start_date = data_start_date + WARMUP_DAYS
+                    simulation_start_date = (data_start_date + WARMUP_DAYS) * 86400.0
                     log.info(f"🔥 Warm-up Anchor Set. Sim starts trading on Day INT: {simulation_start_date}")
                 
                 # ---------------------------------------------------------
