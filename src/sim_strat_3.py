@@ -738,7 +738,7 @@ def main():
             ORDER BY ts ASC
         """
         cursor = con.execute(query)
-        record_batch_reader = cursor.fetch_record_batch(chunk_size=10000)
+        record_batch_reader = cursor.fetch_record_batch(rows_per_batch=10000)
     
         # ==========================================
         # 4. CHRONOLOGICAL SIMULATION LOOP
