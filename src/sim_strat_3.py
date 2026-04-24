@@ -800,10 +800,10 @@ def main():
         # ==========================================
         # 4. CHRONOLOGICAL SIMULATION LOOP
         # ==========================================
-        current_sim_day = None
-        simulation_start_date = None
-        data_start_date = None
-        heartbeat = None
+        current_sim_day = resume_sim_day
+        simulation_start_date = resume_sim_start
+        data_start_date = resume_data_start
+        heartbeat = resume_heartbeat
         results_buffer = []
     
         log.info("🔥 Streaming perfectly sorted columnar Arrow batches...")
