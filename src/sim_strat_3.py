@@ -561,7 +561,7 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
         
         perc_margin = margin / expected_p if expected_p > 0 else 0.0
         
-        return smoothed_win_rate, margin, perc_margin
+        return smoothed_win_rate, margin, perc_margin, V
 
 def main():
 
@@ -574,6 +574,7 @@ def main():
         headers = [
             "timestamp", "market_id", "cid", "bet_on", 
             "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
+            "variance_v", "volume", 
             "end_timestamp", "actual_outcome"
         ]
         with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
@@ -932,7 +933,7 @@ def main():
                     
                     results_buffer.append([
                         ts, m['id'], cid, bet_on, price, ttr_hours, 
-                        smooth_prob, marg, perc_marg, m['end'], m['outcome']
+                        smooth_prob, marg, perc_marg, variance_v, m['volume'], m['end'], m['outcome']
                     ])
                     
                     if len(results_buffer) >= 10000:
