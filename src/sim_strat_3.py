@@ -2,6 +2,7 @@ import csv
 import duckdb
 import polars as pl
 import pandas as pd
+import pyarrow as pa
 import numpy as np
 from numba import njit
 import statsmodels.api as sm
@@ -67,7 +68,7 @@ def _inner_position_dict():
 @dataclass(slots=True)
 class BayesianState:
     """Encapsulates the entire memory of the trading system for easy serialization."""
-    last_processed_timestamp: datetime = datetime.min
+    last_processed_timestamp: float = 0.0
     days_simulated: int = 0
     user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
     contract_positions: dict = field(default_factory=lambda: defaultdict(_inner_position_dict))
@@ -159,6 +160,32 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
             w += combined_weight
             
     return n, w
+
+@njit(cache=True)
+def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, total_trades, global_avg_peak, is_yes_bet):
+    # 1. Calculate new exposure and peak
+    new_exposure = current_exposure + invested
+    new_peak = peak_exposure if new_exposure <= peak_exposure else new_exposure
+    
+    # 2. Increment trades
+    N = total_trades + 1
+    
+    # 3. Shrinkage and Bankroll Math
+    K = 5.0
+    w_shrunk = ((N * new_peak) + (K * global_avg_peak)) / (N + K)
+    w_effective = max(invested, new_peak, w_shrunk)
+    fraction = min(1.0, invested / w_effective) if w_effective > 0.0 else 0.0
+    
+    # 4. Reverse Kelly
+    if is_yes_bet:
+        p_true = price + (fraction * (1.0 - price))
+    else:
+        p_true = price - (fraction * price)
+        
+    p_true = max(0.001, min(0.999, p_true))
+    
+    # Return the updated state variables PLUS the computed math
+    return new_exposure, new_peak, N, fraction, p_true
         
 def extract_true_probability(price: float, wager_fraction: float, is_yes_bet: bool) -> float:
     """
@@ -412,12 +439,13 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
                     state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
                     state.calib_y.append(is_win)   
 
-def calibrate_models(current_sim_day, state: BayesianState):
+def calibrate_models(current_day_ts, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
-    cutoff_date = pd.Timestamp(current_sim_day) - timedelta(days=365)
+    # 365 days = 31,536,000 seconds
+    cutoff_ts = current_day_ts - 31536000.0
     
     # Prune old records
-    while state.calib_dates and state.calib_dates[0] < cutoff_date:
+    while state.calib_dates and state.calib_dates[0] < cutoff_ts:
         state.calib_dates.popleft()
         state.calib_X.popleft()
         state.calib_y.popleft()
@@ -456,15 +484,15 @@ def calibrate_models(current_sim_day, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO OLS failed: {e}")
 
-def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float, qty: float, price: float, ts: datetime, market_end: datetime, bet_on: str, is_buying: bool):
+def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float, qty: float, price: float, ts: float, market_end: float, bet_on: str, is_buying: bool):
     """Mutates the BayesianState by processing a raw historical trade."""
     pos = state.contract_positions[cid][user]
     invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
-    days_to_expiry = (market_end - ts).total_seconds() / 86400.0 if market_end is not None else 1.0
+    days_to_expiry = (market_end - ts) / 86400.0 if market_end is not None else 1.0
     pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
 
     price_int = max(0, min(1000, int(price * 1000)))
-    ttr_hours = max(1.0, days_to_expiry * 24.0)
+    ttr_hours = max(1.0, (m['end'] - ts) / 3600.0) if m['end'] is not None else 24.0
     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
     
     partial_packed = (price_int << 22) | (log_ttr_int << 1)
@@ -482,15 +510,33 @@ def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float,
         state.global_total_peak -= state.user_history[user].peak_exposure
 
     current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
-    wager_fraction = get_wager_fraction(state.user_history[user], invested_this_trade, current_global_avg)
-    state.global_total_peak += state.user_history[user].peak_exposure
     
     yes_price = price if bet_on == "yes" else 1.0 - price
     effective_direction = 1.0 if is_buying else -1.0
     if bet_on != "yes": effective_direction *= -1.0
     is_effective_yes_bet = (effective_direction > 0)
     
-    p_true = extract_true_probability(yes_price, wager_fraction, is_effective_yes_bet)
+    # --- NEW FAST JIT CALL ---
+    user_metrics = state.user_history[user]
+    
+    new_exp, new_peak, new_n, wager_fraction, p_true = compute_wager_and_p_true(
+        yes_price, 
+        invested_this_trade, 
+        user_metrics.current_active_exposure, 
+        user_metrics.peak_exposure,
+        user_metrics.total_trades, 
+        current_global_avg, 
+        is_effective_yes_bet
+    )
+    
+    # Write the calculated state natively back into the Python dataclass
+    user_metrics.current_active_exposure = new_exp
+    user_metrics.peak_exposure = new_peak
+    user_metrics.total_trades = new_n
+    # -------------------------
+
+    state.global_total_peak += user_metrics.peak_exposure
+    
     pos.brier_p_true.append(p_true)
     pos.brier_stake.append(invested_this_trade)
         
@@ -617,15 +663,15 @@ def main():
         s_date = market['start_date']
         
         if isinstance(s_date, str):
-            try: s_date = pd.to_datetime(s_date, utc=True)
+            try: s_date = pd.to_datetime(s_date, utc=True).timestamp()
             except: s_date = None
+                    
+        elif hasattr(s_date, 'timestamp'):
+            s_date = s_date.timestamp()
                 
-        if s_date is not None and s_date.tzinfo is not None:
-            s_date = s_date.replace(tzinfo=None)
-            
         e_date = market['resolution_timestamp']
-        if e_date is not None and e_date.tzinfo is not None:
-            e_date = e_date.replace(tzinfo=None)
+        if hasattr(e_date, 'timestamp'):
+            e_date = e_date.timestamp()
             
         market_map[cid] = {
             'id': market['id'], 'start': s_date, 'end': e_date,
@@ -709,10 +755,10 @@ def main():
                     t.tradeAmount, 
                     t.outcomeTokensAmount, 
                     t.price, 
-                    COALESCE(
+                    EPOCH(COALESCE(
                         to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
                         TRY_CAST(t.timestamp AS TIMESTAMP)
-                    ) AS ts
+                    )) AS ts
                 FROM source_db.trades t
                 INNER JOIN (
                     SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
@@ -724,9 +770,11 @@ def main():
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
+              AND ts > {state.last_processed_timestamp}
             ORDER BY ts ASC
         """
         cursor = con.execute(query)
+        record_batch_reader = cursor.fetch_record_batch(chunk_size=10000)
     
         # ==========================================
         # 4. CHRONOLOGICAL SIMULATION LOOP
@@ -737,67 +785,77 @@ def main():
         heartbeat = None
         results_buffer = []
     
-        log.info("🔥 Streaming perfectly sorted native objects...")
+        log.info("🔥 Streaming perfectly sorted columnar Arrow batches...")
     
-        while True:
-            rows = cursor.fetchmany(10000)
-            if not rows:
-                break
+        # Iterate natively through the PyArrow RecordBatchReader
+        for batch in record_batch_reader:
+            
+            # Instantly convert C-memory blocks into Python lists using PyArrow's C++ backend
+            # Note: We assume 'ts' is the aliased epoch float from the DuckDB query we discussed
+            cids_col = batch['contract_id'].to_pylist()
+            users_col = batch['user'].to_pylist()
+            amounts_col = batch['tradeAmount'].to_pylist()
+            tokens_col = batch['outcomeTokensAmount'].to_pylist()
+            prices_col = batch['price'].to_pylist()
+            ts_col = batch['ts'].to_pylist()
+            
+            # Iterate through the lists using a fast integer index
+            for i in range(batch.num_rows):
                 
-            for row in rows:
-       
-                raw_cid, raw_user, amount, tokens, price, ts = row
+                # Extract the variables exactly as your loop expects them
+                raw_cid = cids_col[i]
+                raw_user = users_col[i]
+                amount = amounts_col[i]
+                tokens = tokens_col[i]
+                price = prices_col[i]
+                ts = ts_col[i]
                 
+                # --- YOUR LOOP CONTINUES EXACTLY THE SAME FROM HERE ---
                 if ts is None: continue
 
                 cid = sys.intern(str(raw_cid))
                 user = sys.intern(str(raw_user))
 
-                if getattr(ts, 'tzinfo', None) is not None:
-                    ts = ts.replace(tzinfo=None)
-                        
-                trade_date = ts.date()
-                    
+                # Fast integer division to find the current "Day"
+                trade_day_int = int(ts // 86400)
+                
+                # Initialization of Warmup Anchor
                 if data_start_date is None:
-                    data_start_date = trade_date
-                    simulation_start_date = pd.Timestamp(data_start_date) + timedelta(days=WARMUP_DAYS)
-                    log.info(f"🔥 Warm-up Anchor Set: {data_start_date} -> Start Trading: {simulation_start_date.date()}")
+                    data_start_date = trade_day_int
+                    simulation_start_date = data_start_date + WARMUP_DAYS
+                    log.info(f"🔥 Warm-up Anchor Set. Sim starts trading on Day INT: {simulation_start_date}")
                 
                 # ---------------------------------------------------------
                 # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
                 # ---------------------------------------------------------
     
                 if current_sim_day is None:
-                    current_sim_day = trade_date
+                    current_sim_day = trade_day_int
                     
-                elif trade_date > current_sim_day:
+                elif trade_day_int > current_sim_day:
                     
-                    log.info(f"📅 --- STARTING NEW SIMULATION DAY: {trade_date} ---")
+                    # Convert day integer back to float timestamp for accurate filtering
+                    current_day_ts = trade_day_int * 86400.0
                     
                     # 1. Resolve Markets that ended yesterday
                     resolved_cids = [
                         c for c, m in market_map.items() 
-                        if m['end'] is not None and m['end'].date() < current_sim_day and not m['resolved']
+                        if m['end'] is not None and m['end'] < current_day_ts and not m['resolved']
                     ]
                     
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
-                        resolve_market(r_cid, outcome, outcome_label, current_sim_day, state)
-                        
+                        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
                                       
-                    # Sweeping for ALL dead markets (Resolved or Orphaned) past the 10-day buffer
-                    orphan_cutoff_date = current_sim_day - timedelta(days=10)
-                    orphan_cutoff_ts = pd.Timestamp(current_sim_day) - timedelta(days=10)
+                    # Sweeping for dead markets (10 days = 864,000 seconds)
+                    orphan_cutoff_ts = current_day_ts - 864000.0
                     
                     purge_cids = []
                     for c, m in market_map.items():
-                        # Condition 1: Past official end date by 10 days
-                        is_past_end = m['end'] is not None and m['end'].date() < orphan_cutoff_date
-                        
-                        # Condition 2: No end date, mathematically dead
-                        last_ts = m.get('last_update_ts', pd.Timestamp(current_sim_day))
+                        is_past_end = m['end'] is not None and m['end'] < orphan_cutoff_ts
+                        last_ts = m.get('last_update_ts', current_day_ts)
                         is_dead = m['end'] is None and last_ts < orphan_cutoff_ts
                         
                         if is_past_end or is_dead:
@@ -805,13 +863,10 @@ def main():
                     
                     # Mass Garbarge Collection to free RAM
                     for p_cid in purge_cids:
-                        # Pop entirely out of memory
                         m_data = market_map.pop(p_cid, None) 
                         state.contract_positions.pop(p_cid, None)
                         state.first_bets_pending.pop(p_cid, None)
-                        
-                        if m_data:
-                            result_map.pop(m_data['id'], None)
+                        if m_data: result_map.pop(m_data['id'], None)
                                 
                     # 2. Daily OLS Calibration (Rolling 365 Days)
                     calibrate_models(current_sim_day, state)     
@@ -889,7 +944,7 @@ def main():
                 last_logged_ts = m.get('log_ts', datetime.min)
                 
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
-                if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts).total_seconds() >= 3600:
+                if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
                     m['log_price'] = price
                     m['log_ts'] = ts
                     
@@ -909,7 +964,8 @@ def main():
                 if heartbeat is None:
                     heartbeat = ts
     
-                if abs((ts - heartbeat).total_seconds()) >= 3600:
+                # 3600 seconds = 1 hour
+                if (ts - heartbeat) >= 3600.0:
                     heartbeat = ts
                     
                     # 1. SETTLE EXPIRED POSITIONS 
@@ -950,11 +1006,11 @@ def main():
                         if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
                         
                         # --- STALENESS & PATH-DEPENDENCY FILTER ---
-                        hours_since_trade = (ts - scan_m['last_update_ts']).total_seconds() / 3600.0
+                        hours_since_trade = (ts - scan_m['last_update_ts']) / 3600.0
                         if hours_since_trade > 24.0: 
                             continue
                         
-                        scan_ttr = max(1.0, (scan_m['end'] - ts).total_seconds() / 3600.0)
+                        scan_ttr = max(1.0, (scan_m['end'] - ts) / 3600.0)
                         annualization_ttr = max(24.0, scan_ttr) 
                         annualization_factor = 8760.0 / annualization_ttr
                         
@@ -1132,8 +1188,9 @@ def main():
                         avg_price = 0.0
 
                     # Print a clean, single-line summary to the console
+                    log_time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
                     log.info(
-                        f"🕒 [{ts.strftime('%Y-%m-%d %H:%M')}] "
+                        f"🕒 [{log_time_str}] "
                         f"Eq: ${perf['equity']:,.2f} | "
                         f"Cash: ${perf['cash']:,.2f} | "
                         f"Pos: {open_pos_count} (Avg Px: {avg_price:.3f}) | "
