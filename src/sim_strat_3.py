@@ -844,6 +844,16 @@ def main():
                         # Update the timestamp so it knows where to resume
                         state.last_processed_timestamp = ts 
                         
+                        if results_buffer:
+                            with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                                csv.writer(f).writerows(results_buffer)
+                            results_buffer.clear()
+                            
+                        if executions_buffer:
+                            with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
+                                csv.writer(f).writerows(executions_buffer)
+                            executions_buffer.clear()
+
                         tmp_ckpt = CACHE_DIR / "sim_checkpoint.pkl.tmp"
                         final_ckpt = CACHE_DIR / "sim_checkpoint.pkl"
                         
