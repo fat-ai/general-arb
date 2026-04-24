@@ -187,27 +187,6 @@ def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, t
     # Return the updated state variables PLUS the computed math
     return new_exposure, new_peak, N, fraction, p_true
         
-def extract_true_probability(price: float, wager_fraction: float, is_yes_bet: bool) -> float:
-    """
-    Reverse-engineers the trader's latent subjective probability using the reverse-Kelly formula.
-    
-    Args:
-        price (float): The execution price of the token (0.0 to 1.0).
-        wager_fraction (float): The fraction of the user's peak bankroll risked on this trade.
-        is_yes_bet (bool): True if they bought YES (or sold NO), False if they bought NO (or sold YES).
-        
-    Returns:
-        float: The trader's true implied conviction (bounded strictly between 0.001 and 0.999).
-    """
-    # Reverse-Kelly Math
-    if is_yes_bet:
-        p_true = price + (wager_fraction * (1.0 - price))
-    else:
-        p_true = price - (wager_fraction * price)
-        
-    return max(0.001, min(0.999, p_true))
-
-
 def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
     """
     Calculates the Trust Weight using Precision Weighting (Inverse Brier Score) 
@@ -239,42 +218,6 @@ def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
     weight = 1.0 / (bs_ucb + epsilon)
     
     return weight
-
-def get_wager_fraction(user_metrics: UserMetrics, stake: float, global_avg_peak: float = 100.0) -> float:
-    """
-    Updates rolling exposure and calculates wager fraction using a Bayesian bankroll estimator.
-    """
-    # 1. Lock up the capital and increment trade count
-    user_metrics.current_active_exposure += stake
-    user_metrics.total_trades += 1
-    
-    # 2. Update the empirical peak exposure
-    if user_metrics.current_active_exposure > user_metrics.peak_exposure:
-        user_metrics.peak_exposure = user_metrics.current_active_exposure
-        
-    # 3. Bayesian Shrinkage applied to Bankroll Estimation
-    N = user_metrics.total_trades
-    K = 5.0 # It takes 5 trades for empirical behavior to equal the global prior
-    
-    w_empirical = user_metrics.peak_exposure
-    w_prior = global_avg_peak
-    
-    w_shrunk = ((N * w_empirical) + (K * w_prior)) / (N + K)
-    
-    # 4. The Whale Exemption: 
-    # Effective bankroll cannot be less than what they physically just risked,
-    # nor less than their absolute observed peak.
-    w_effective = max(stake, w_empirical, w_shrunk)
-    
-    # Prevent edge-case division by zero
-    if w_effective <= 0.0:
-        return 0.0
-        
-    # 5. Calculate final fraction
-    fraction = stake / w_effective
-    
-    return min(1.0, fraction)
-
 
 def release_exposure(user_metrics: UserMetrics, initial_stake: float) -> None:
     """
@@ -712,9 +655,6 @@ def main():
     # ==========================================
     # 2. STATE MACHINE INITIALIZATION & RESUME
     # ==========================================
-    ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
-    is_resuming = ckpt_file.exists()
-
     if not is_resuming:            
         state = BayesianState()
         active_portfolio = {}
@@ -723,7 +663,7 @@ def main():
         resume_sim_day = None
         resume_heartbeat = None
     else:
-        log.info(f"🔄 Found checkpoint! Resuming state from {ckpt_file}...")
+        log.info(f"🔄 Found checkpoint! Loading state from {ckpt_file}...")
         with open(ckpt_file, 'rb') as f:
             checkpoint_data = pickle.load(f)
             
@@ -739,9 +679,6 @@ def main():
 
     # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
-    _dummy = np.empty(0, dtype=np.uint32)
-    fast_numba_scan(_dummy, 500, 1, 1000, PRICE_LUT, TIME_LUT, P_RANGE)
-    log.info("✅ Numba JIT compilation complete.")
 
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
