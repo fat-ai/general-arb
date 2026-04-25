@@ -715,25 +715,30 @@ def main():
         query = f"""
             WITH parsed_trades AS (
                 SELECT 
-                    contract_id, 
-                    user, 
-                    tradeAmount, 
-                    outcomeTokensAmount, 
-                    price, 
+                    t.contract_id, 
+                    t.user, 
+                    t.tradeAmount, 
+                    t.outcomeTokensAmount, 
+                    t.price, 
                     EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(timestamp AS DOUBLE)), 
-                        TRY_CAST(timestamp AS TIMESTAMP)
+                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
+                        TRY_CAST(t.timestamp AS TIMESTAMP)
                     )) AS ts
-                FROM source_db.trades
-                WHERE timestamp IS NOT NULL
-                  AND price >= 0.0 
-                  AND price <= 1.0
+                FROM source_db.trades t
+                INNER JOIN (
+                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
+                    FROM read_parquet('{MARKETS_PATH}')
+                ) m ON t.contract_id = m.clean_cid
+                WHERE t.timestamp IS NOT NULL
+                  AND t.price >= 0.0 
+                  AND t.price <= 1.0
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
               AND ts > {state.last_processed_timestamp}
             ORDER BY ts ASC
         """
+            
         cursor = con.execute(query)
         record_batch_reader = cursor.fetch_record_batch(rows_per_batch=10000)
     
