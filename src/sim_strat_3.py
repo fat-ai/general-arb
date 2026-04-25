@@ -923,14 +923,16 @@ def main():
 
                 last_logged_price = m.get('log_price', 0.0)
                 last_logged_ts = m.get('log_ts', 0.0)
+                last_logged_perc_marg = m.get('log_perc_marg', 0.0)
                 
                 # Extract the current Brier count for this specific wallet
                 current_brier_count = state.user_history[user].brier_count
 
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
-                if abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
+                if abs(price - last_logged_price) >= 0.01 or abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
                     m['log_price'] = price
                     m['log_ts'] = ts
+                    m['log_perc_marg'] = perc_marg
                     
                     results_buffer.append([
                         ts, m['id'], cid, bet_on, price, ttr_hours, 
