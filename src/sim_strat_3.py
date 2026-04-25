@@ -533,8 +533,8 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
         # 5. Tally the Evidence from Both Arrays
-        n1_raw, w1_raw = fast_numba_scan(np.asarray(primary_array), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        n2_raw, w2_raw = fast_numba_scan(np.asarray(opposing_array), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+        n1_raw, w1_raw = fast_numba_scan(np.frombuffer(primary_array, dtype=np.uint32), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+        n2_raw, w2_raw = fast_numba_scan(np.frombuffer(opposing_array, dtype=np.uint32), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
         
         # Apply the Global Trust Multiplier outside the loop!
         N_eff = (n1_raw + n2_raw) * trust_multiplier
@@ -715,23 +715,19 @@ def main():
         query = f"""
             WITH parsed_trades AS (
                 SELECT 
-                    t.contract_id, 
-                    t.user, 
-                    t.tradeAmount, 
-                    t.outcomeTokensAmount, 
-                    t.price, 
+                    contract_id, 
+                    user, 
+                    tradeAmount, 
+                    outcomeTokensAmount, 
+                    price, 
                     EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
-                        TRY_CAST(t.timestamp AS TIMESTAMP)
+                        to_timestamp(TRY_CAST(timestamp AS DOUBLE)), 
+                        TRY_CAST(timestamp AS TIMESTAMP)
                     )) AS ts
-                FROM source_db.trades t
-                INNER JOIN (
-                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
-                    FROM read_parquet('{MARKETS_PATH}')
-                ) m ON t.contract_id = m.clean_cid
-                WHERE t.timestamp IS NOT NULL
-                  AND t.price >= 0.0 
-                  AND t.price <= 1.0
+                FROM source_db.trades
+                WHERE timestamp IS NOT NULL
+                  AND price >= 0.0 
+                  AND price <= 1.0
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
@@ -749,6 +745,7 @@ def main():
         data_start_date = resume_data_start
         heartbeat = resume_heartbeat
         results_buffer = []
+        active_scan_cids = set()
     
         log.info("🔥 Streaming perfectly sorted columnar Arrow batches...")
     
@@ -780,6 +777,7 @@ def main():
 
                 cid = sys.intern(str(raw_cid))
                 user = sys.intern(str(raw_user))
+                active_scan_cids.add(cid)
 
                 # Fast integer division to find the current "Day"
                 trade_day_int = int(ts // 86400)
@@ -989,9 +987,15 @@ def main():
                     # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
                     candidates = []
                     
-                    for scan_cid, scan_m in market_map.items():
-                        if scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: continue
-                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: continue
+                    for scan_cid in list(active_scan_cids):
+                        scan_m = market_map.get(scan_cid)
+                        
+                        if scan_m is None or scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: 
+                            active_scan_cids.discard(scan_cid)
+                            continue
+                            
+                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: 
+                            continue
                         
                         # --- STALENESS & PATH-DEPENDENCY FILTER ---
                         hours_since_trade = (ts - scan_m['last_update_ts']) / 3600.0
