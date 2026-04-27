@@ -1038,7 +1038,8 @@ def main():
                                 continue
                             
                             slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
-                            sell_price = smkt['last_price'] * (1.0 - slippage)
+                            current_price = smkt.get('last_price', p_data['entry_price'])
+                            sell_price = current_price * (1.0 - slippage)
                             
                             payout = p_data['contracts'] * sell_price
                             profit = payout - p_data['bet_size']
