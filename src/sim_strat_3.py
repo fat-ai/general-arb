@@ -540,6 +540,131 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
         
         return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
 
+def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, result_map, data_start_date, simulation_start_date, current_sim_day, heartbeat):
+    log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
+    
+    # 1. Calculate required sizes for the flat arrays
+    num_users = len(state.user_history)
+    total_yes = sum(len(m.trade_history_yes) for m in state.user_history.values())
+    total_no = sum(len(m.trade_history_no) for m in state.user_history.values())
+    
+    yes_arr = np.zeros(total_yes, dtype=np.uint32)
+    no_arr = np.zeros(total_no, dtype=np.uint32)
+    yes_lens = np.zeros(num_users, dtype=np.uint32)
+    no_lens = np.zeros(num_users, dtype=np.uint32)
+    user_keys = []
+    
+    # We hold references to the original arrays to instantly restore them after pickling
+    restore_yes = []
+    restore_no = []
+    
+    y_idx, n_idx = 0, 0
+    
+    # 2. Extract User Histories into continuous memory
+    for i, (u, metrics) in enumerate(state.user_history.items()):
+        user_keys.append(u)
+        
+        y_len = len(metrics.trade_history_yes)
+        yes_lens[i] = y_len
+        if y_len > 0:
+            yes_arr[y_idx:y_idx+y_len] = metrics.trade_history_yes
+            y_idx += y_len
+        restore_yes.append(metrics.trade_history_yes)
+        metrics.trade_history_yes = array.array('I') # Replace with empty array for Pickle
+        
+        n_len = len(metrics.trade_history_no)
+        no_lens[i] = n_len
+        if n_len > 0:
+            no_arr[n_idx:n_idx+n_len] = metrics.trade_history_no
+            n_idx += n_len
+        restore_no.append(metrics.trade_history_no)
+        metrics.trade_history_no = array.array('I') # Replace with empty array for Pickle
+        
+    # 3. Extract Deques
+    var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
+    var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
+    restore_var_yes, restore_var_no = list(state.daily_variance_yes), list(state.daily_variance_no)
+    state.daily_variance_yes.clear()
+    state.daily_variance_no.clear()
+    
+    calib_X_arr = np.array(state.calib_X, dtype=np.float64) if state.calib_X else np.empty((0,3))
+    calib_y_arr = np.array(state.calib_y, dtype=np.float64) if state.calib_y else np.empty(0)
+    calib_dates_arr = np.array(state.calib_dates, dtype=np.float64) if state.calib_dates else np.empty(0)
+    restore_calib_X, restore_calib_y, restore_calib_dates = list(state.calib_X), list(state.calib_y), list(state.calib_dates)
+    state.calib_X.clear()
+    state.calib_y.clear()
+    state.calib_dates.clear()
+
+    # 4. Save massive data to compressed NPZ
+    npz_path = ckpt_path.with_suffix('.npz')
+    np.savez_compressed(
+        npz_path,
+        user_keys=np.array(user_keys, dtype=str),
+        yes_arr=yes_arr, yes_lens=yes_lens,
+        no_arr=no_arr, no_lens=no_lens,
+        var_yes=var_yes_arr, var_no=var_no_arr,
+        calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr
+    )
+    
+    # 5. Save the now-lightweight dictionaries via Pickle
+    tmp_ckpt = ckpt_path.with_suffix('.pkl.tmp')
+    with open(tmp_ckpt, 'wb') as f:
+        pickle.dump({
+            'state': state,
+            'active_portfolio': active_portfolio,
+            'performance': result_map['performance'],
+            'data_start_date': data_start_date,
+            'simulation_start_date': simulation_start_date,
+            'current_sim_day': current_sim_day,
+            'heartbeat': heartbeat
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp_ckpt.replace(ckpt_path)
+    
+    # 6. Re-attach the heavy arrays so the simulation continues without skipping a beat
+    for i, (u, metrics) in enumerate(state.user_history.items()):
+        metrics.trade_history_yes = restore_yes[i]
+        metrics.trade_history_no = restore_no[i]
+        
+    state.daily_variance_yes.extend(restore_var_yes)
+    state.daily_variance_no.extend(restore_var_no)
+    state.calib_X.extend(restore_calib_X)
+    state.calib_y.extend(restore_calib_y)
+    state.calib_dates.extend(restore_calib_dates)
+    
+    log.info("✅ Checkpoint securely saved to disk (Decoupled NPZ + PKL).")
+
+def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
+    """Blazing fast C-level byte restoring of the arrays upon resume."""
+    if not npz_path.exists():
+        return
+        
+    log.info(f"🔄 Restoring massive historical arrays from {npz_path}...")
+    with np.load(npz_path, allow_pickle=True) as data:
+        user_keys = data['user_keys']
+        yes_arr, yes_lens = data['yes_arr'], data['yes_lens']
+        no_arr, no_lens = data['no_arr'], data['no_lens']
+        
+        y_idx, n_idx = 0, 0
+        for i, u in enumerate(user_keys):
+            u_str = sys.intern(str(u))
+            metrics = state.user_history[u_str]
+            
+            y_len = yes_lens[i]
+            if y_len > 0:
+                metrics.trade_history_yes.frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
+                y_idx += y_len
+                
+            n_len = no_lens[i]
+            if n_len > 0:
+                metrics.trade_history_no.frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
+                n_idx += n_len
+                
+        state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
+        state.daily_variance_no.extend([tuple(x) for x in data['var_no']])
+        state.calib_X.extend([list(x) for x in data['calib_X']])
+        state.calib_y.extend(data['calib_y'])
+        state.calib_dates.extend(data['calib_dates'])
+
 def main():
 
     ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
@@ -647,7 +772,7 @@ def main():
         resume_sim_day = None
         resume_heartbeat = None
     else:
-        log.info(f"🔄 Found checkpoint! Loading state from {ckpt_file}...")
+        log.info(f"🔄 Found checkpoint! Loading lightweight state from {ckpt_file}...")
         with open(ckpt_file, 'rb') as f:
             checkpoint_data = pickle.load(f)
             
@@ -659,6 +784,10 @@ def main():
         resume_sim_start = checkpoint_data['simulation_start_date']
         resume_sim_day = checkpoint_data['current_sim_day']
         resume_heartbeat = checkpoint_data['heartbeat']
+        
+        # Restore the heavy arrays from the NPZ archive
+        restore_arrays_from_npz(state, ckpt_file.with_suffix('.npz'))
+        
         log.info(f"✅ Resuming from day {state.days_simulated} (Timestamp: {state.last_processed_timestamp})")
 
     # Force Numba compilation before starting the tight simulation loop
@@ -829,15 +958,13 @@ def main():
                     calibrate_models(current_day_ts, state)
                     current_sim_day = trade_day_int
 
-                    # (DELETED gc.collect() FROM HERE TO STOP CPU FREEZE)
-
                     # ---------------------------------------------------------
                     # E. PROGRESS CHECKPOINTING
                     # ---------------------------------------------------------
                     state.days_simulated += 1
                     
                     if state.days_simulated % 90 == 0:
-                        log.info(f"💾 Checkpointing state at simulated day {state.days_simulated}...")
+                        log.info(f"💾 Initiating 90-day checkpoint sequence at simulated day {state.days_simulated}...")
                         state.last_processed_timestamp = ts 
                         
                         if results_buffer:
@@ -850,21 +977,12 @@ def main():
                                 csv.writer(f).writerows(executions_buffer)
                             executions_buffer.clear()
 
-                        tmp_ckpt = CACHE_DIR / "sim_checkpoint.pkl.tmp"
-                        final_ckpt = CACHE_DIR / "sim_checkpoint.pkl"
-                        
-                        with open(tmp_ckpt, 'wb') as f:
-                            pickle.dump({
-                                    'state': state,
-                                    'active_portfolio': active_portfolio,
-                                    'performance': result_map['performance'],
-                                    'data_start_date': data_start_date,
-                                    'simulation_start_date': simulation_start_date,
-                                    'current_sim_day': current_sim_day,
-                                    'heartbeat': heartbeat
-                                }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                        tmp_ckpt.replace(final_ckpt)
-                        log.info("✅ Checkpoint securely saved to disk.")
+                        # Fire the new decoupled checkpointing function
+                        save_checkpoint(
+                            ckpt_file, state, active_portfolio, result_map, 
+                            data_start_date, simulation_start_date, 
+                            current_sim_day, heartbeat
+                        )
     
                 # ---------------------------------------------------------
                 # B. PROCESS TRADE INTO STATE TRACKERS (Vectorized & Flat)
