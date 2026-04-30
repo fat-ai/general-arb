@@ -42,8 +42,8 @@ class MarketPositions:
     users: list = field(default_factory=list)
     is_yes: array.array = field(default_factory=lambda: array.array('b'))
     packed_data: array.array = field(default_factory=lambda: array.array('I'))
-    p_trues: array.array = field(default_factory=lambda: array.array('f'))
-    stakes: array.array = field(default_factory=lambda: array.array('f'))
+    p_trues: array.array = field(default_factory=lambda: array.array('d'))
+    stakes: array.array = field(default_factory=lambda: array.array('d'))
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -893,7 +893,7 @@ def main():
                     valid_mask[i] = False
                     continue
                     
-                market_ends[i] = m['end'] if m['end'] is not None else (ts + 86400.0 * 30)
+                market_ends[i] = m['end'] if m['end'] is not None else (ts + 86400.0)
                 bet_on_is_yes[i] = (m['outcome_label'] == "yes")
                 
             # 5. Execute vectorized C-speed math for the entire batch
