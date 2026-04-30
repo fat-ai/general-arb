@@ -967,7 +967,7 @@ def main():
                 current_brier_count = state.user_history[user].brier_count
 
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
-                if abs(price - last_logged_price) >= 0.01 or abs(price - last_logged_price) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
+                if abs(price - last_logged_price) >= 0.01 or abs(perc_marg - last_logged_perc_marg) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
                     m['log_price'] = price
                     m['log_ts'] = ts
                     m['log_perc_marg'] = perc_marg
