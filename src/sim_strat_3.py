@@ -55,12 +55,6 @@ class UserMetrics:
     trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
     trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
 
-# ==========================================
-# BAYESIAN STATE ENCAPSULATION
-# ==========================================
-def _inner_position_dict():
-    """Named helper function so pickle doesn't choke on a lambda."""
-    return defaultdict(PositionMetrics)
 
 # ==========================================
 # BAYESIAN STATE ENCAPSULATION
@@ -71,9 +65,9 @@ class BayesianState:
     last_processed_timestamp: float = 0.0
     days_simulated: int = 0
     user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
-    contract_positions: dict = field(default_factory=lambda: defaultdict(_inner_position_dict))
-    first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
     contract_positions: dict = field(default_factory=lambda: defaultdict(MarketPositions))
+    first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
+    
     
     # Rolling Variances & Calibration
     daily_variance_yes: deque = field(default_factory=lambda: deque(maxlen=100000))
@@ -210,7 +204,7 @@ def compute_batch_stateless(tokens, prices, tss, market_ends, bet_on_is_yes, val
     return invested, partial_packed, is_effective_yes, yes_prices, is_buying_arr
 
 @njit(cache=True)
-def _and_p_true(price, invested, current_exposure, peak_exposure, total_trades, global_avg_peak, is_yes_bet):
+def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, total_trades, global_avg_peak, is_yes_bet):
     # 1. Calculate new exposure and peak
     new_exposure = current_exposure + invested
     new_peak = peak_exposure if new_exposure <= peak_exposure else new_exposure
@@ -478,74 +472,6 @@ def calibrate_models(current_day_ts, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO Polyfit failed: {e}")
 
-def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float, qty: float, price: float, ts: float, market_end: float, bet_on: str, is_buying: bool):
-    """Mutates the BayesianState by processing a raw historical trade."""
-    pos = state.contract_positions[cid][user]
-    invested_this_trade = (price * qty) if is_buying else ((1.0 - price) * qty)
-    days_to_expiry = (market_end - ts) / 86400.0 if market_end is not None else 1.0
-    pos.duration_weight_sum += invested_this_trade * max(days_to_expiry, 1.0)
-
-    price_int = max(0, min(1000, int(price * 1000)))
-    ttr_hours = max(1.0, (market_end - ts) / 3600.0) if market_end is not None else 24.0
-    log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
-    
-    partial_packed = (price_int << 22) | (log_ttr_int << 1)
-    
-    if is_buying: 
-        if bet_on == "yes": pos.pending_yes.append(partial_packed)
-        else: pos.pending_no.append(partial_packed)
-    else: 
-        if bet_on == "yes": pos.pending_no.append(partial_packed)
-        else: pos.pending_yes.append(partial_packed)
-    
-    if state.user_history[user].total_trades == 0:
-        state.global_user_count += 1
-    else:
-        state.global_total_peak -= state.user_history[user].peak_exposure
-
-    current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
-    
-    yes_price = price if bet_on == "yes" else 1.0 - price
-    effective_direction = 1.0 if is_buying else -1.0
-    if bet_on != "yes": effective_direction *= -1.0
-    is_effective_yes_bet = (effective_direction > 0)
-    
-    # --- NEW FAST JIT CALL ---
-    user_metrics = state.user_history[user]
-    
-    new_exp, new_peak, new_n, wager_fraction, p_true = _and_p_true(
-        yes_price, 
-        invested_this_trade, 
-        user_metrics.current_active_exposure, 
-        user_metrics.peak_exposure,
-        user_metrics.total_trades, 
-        current_global_avg, 
-        is_effective_yes_bet
-    )
-    
-    # Write the calculated state natively back into the Python dataclass
-    user_metrics.current_active_exposure = new_exp
-    user_metrics.peak_exposure = new_peak
-    user_metrics.total_trades = new_n
-    # -------------------------
-
-    state.global_total_peak += user_metrics.peak_exposure
-    
-    pos.brier_p_true.append(p_true)
-    pos.brier_stake.append(invested_this_trade)
-        
-    if user not in state.known_users:
-        risk_vol = amount if is_buying else qty * (1.0 - price)
-        if risk_vol >= 1.0: 
-            state.known_users.add(user)
-            state.first_bets_pending[cid][user] = {
-                'log_vol': math.log1p(risk_vol),
-                'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                'is_long': is_buying,
-                'log_ttr': math.log1p(ttr_hours)
-            }
-
-    return invested_this_trade
 
 def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
         
@@ -990,9 +916,9 @@ def main():
                 m_pos.p_trues.append(p_true)
                 m_pos.stakes.append(inv)
                 # -----------------------------------------------
-
+                    
+                amount = amounts_col[i]
                 if user not in state.known_users:
-                    amount = amounts_col[i]
                     qty = abs(tokens_col[i])
                     risk_vol = amount if is_buy else qty * (1.0 - price)
                     if risk_vol >= 1.0: 
