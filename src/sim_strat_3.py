@@ -38,12 +38,12 @@ EXECUTIONS_PATH = CACHE_DIR / "strategy_executions.csv"
 executions_buffer = []
 
 @dataclass(slots=True)
-class PositionMetrics:
-    duration_weight_sum: float = 0.0
-    pending_yes: array.array = field(default_factory=lambda: array.array('I'))
-    pending_no: array.array = field(default_factory=lambda: array.array('I'))
-    brier_p_true: array.array = field(default_factory=lambda: array.array('d'))
-    brier_stake: array.array = field(default_factory=lambda: array.array('d'))
+class MarketPositions:
+    users: list = field(default_factory=list)
+    is_yes: array.array = field(default_factory=lambda: array.array('b'))
+    packed_data: array.array = field(default_factory=lambda: array.array('I'))
+    p_trues: array.array = field(default_factory=lambda: array.array('f'))
+    stakes: array.array = field(default_factory=lambda: array.array('f'))
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -73,6 +73,7 @@ class BayesianState:
     user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
     contract_positions: dict = field(default_factory=lambda: defaultdict(_inner_position_dict))
     first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
+    contract_positions: dict = field(default_factory=lambda: defaultdict(MarketPositions))
     
     # Rolling Variances & Calibration
     daily_variance_yes: deque = field(default_factory=lambda: deque(maxlen=100000))
@@ -162,7 +163,54 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
     return n, w
 
 @njit(cache=True)
-def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, total_trades, global_avg_peak, is_yes_bet):
+def compute_batch_stateless(tokens, prices, tss, market_ends, bet_on_is_yes, valid_mask):
+    """
+    Processes a PyArrow batch at native C speeds, pre-computing all stateless 
+    mathematical operations and bit-packing before Python touches the state.
+    """
+    num_rows = len(tokens)
+    invested = np.zeros(num_rows, dtype=np.float64)
+    partial_packed = np.zeros(num_rows, dtype=np.uint32)
+    is_effective_yes = np.zeros(num_rows, dtype=np.bool_)
+    yes_prices = np.zeros(num_rows, dtype=np.float64)
+    is_buying_arr = np.zeros(num_rows, dtype=np.bool_)
+    
+    for i in range(num_rows):
+        if not valid_mask[i]:
+            continue
+            
+        qty = abs(tokens[i])
+        is_buying = tokens[i] > 0
+        is_buying_arr[i] = is_buying
+        price = prices[i]
+        ts = tss[i]
+        m_end = market_ends[i]
+        is_yes = bet_on_is_yes[i]
+        
+        # 1. Calculate Invested Amount
+        if is_buying:
+            inv = price * qty
+        else:
+            inv = (1.0 - price) * qty
+        invested[i] = inv
+        
+        # 2. Pack the Historical Integers
+        price_int = max(0, min(1000, int(price * 1000)))
+        ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+        log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+        partial_packed[i] = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+        
+        # 3. Setup Directionals
+        yes_prices[i] = price if is_yes else 1.0 - price
+        eff_dir = 1.0 if is_buying else -1.0
+        if not is_yes:
+            eff_dir *= -1.0
+        is_effective_yes[i] = (eff_dir > 0)
+        
+    return invested, partial_packed, is_effective_yes, yes_prices, is_buying_arr
+
+@njit(cache=True)
+def _and_p_true(price, invested, current_exposure, peak_exposure, total_trades, global_avg_peak, is_yes_bet):
     # 1. Calculate new exposure and peak
     new_exposure = current_exposure + invested
     new_peak = peak_exposure if new_exposure <= peak_exposure else new_exposure
@@ -333,54 +381,57 @@ def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
     return True
 
 def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState):
-    """Processes a market resolution, frees capital, and updates Brier/variance trackers."""
+    """Processes a market resolution using flat memory arrays."""
     if r_cid in state.contract_positions:
-        users_in_market = state.contract_positions.pop(r_cid)
+        m_pos = state.contract_positions.pop(r_cid)
         
-        for u, pos in users_in_market.items():
-            if outcome != 0.5:
-                is_yes_win = 1 if outcome > 0.5 else 0
-                is_no_win = 1 if outcome <= 0.5 else 0
-
-                # Update YES history (Zero-copy in-place sort)
-                if pos.pending_yes:
-                    arr_yes = state.user_history[u].trade_history_yes
-                    arr_yes.extend((p | is_yes_win) for p in pos.pending_yes)
-                    np.asarray(arr_yes).sort() # Sorts the memory buffer instantly
-                    
-                    for partial in pos.pending_yes:
-                        exact_price = (partial >> 22) / 1000.0
-                        state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
-                        
-                # Update NO history (Zero-copy in-place sort)
-                if pos.pending_no:
-                    arr_no = state.user_history[u].trade_history_no
-                    arr_no.extend((p | is_no_win) for p in pos.pending_no)
-                    np.asarray(arr_no).sort() # Sorts the memory buffer instantly
-                    
-                    for partial in pos.pending_no:
-                        exact_price = (partial >> 22) / 1000.0
-                        state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
-                
-            # Calculate Brier and release capital
-            yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
+        is_yes_win = 1 if outcome > 0.5 else 0
+        is_no_win = 1 if outcome <= 0.5 else 0
+        yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
+        
+        modified_users = set()
+        
+        # Iterate natively through the parallel arrays
+        for i in range(len(m_pos.users)):
+            u = m_pos.users[i]
+            is_yes_bet = m_pos.is_yes[i]
+            partial_packed = m_pos.packed_data[i]
+            p_true = m_pos.p_trues[i]
+            initial_stake = m_pos.stakes[i]
             
-            for i in range(len(pos.brier_p_true)):
-                p_true = pos.brier_p_true[i]
-                initial_stake = pos.brier_stake[i]
-                release_exposure(state.user_history[u], initial_stake)
-                squared_error = (p_true - yes_outcome)**2
-                state.user_history[u].brier_sum += squared_error
-                state.user_history[u].brier_count += 1
+            # History is only recorded for non-void markets
+            if outcome != 0.5:
+                if is_yes_bet:
+                    state.user_history[u].trade_history_yes.append(partial_packed | is_yes_win)
+                    exact_price = (partial_packed >> 22) / 1000.0
+                    state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                else:
+                    state.user_history[u].trade_history_no.append(partial_packed | is_no_win)
+                    exact_price = (partial_packed >> 22) / 1000.0
+                    state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
+                modified_users.add(u)
+                
+            # Capital release and Brier apply to all resolutions
+            release_exposure(state.user_history[u], initial_stake)
+            squared_error = (p_true - yes_outcome)**2
+            state.user_history[u].brier_sum += squared_error
+            state.user_history[u].brier_count += 1
+            
+        # Fast, zero-copy in-place memory sorts
+        for u in modified_users:
+            if state.user_history[u].trade_history_yes:
+                np.asarray(state.user_history[u].trade_history_yes).sort()
+            if state.user_history[u].trade_history_no:
+                np.asarray(state.user_history[u].trade_history_no).sort()
 
         if r_cid in state.first_bets_pending:
-                first_bets = state.first_bets_pending.pop(r_cid)
-                for u, bet in first_bets.items():
-                    vwap = bet['vwap']
-                    is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
-                    state.calib_dates.append(current_sim_day)
-                    state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
-                    state.calib_y.append(is_win)   
+            first_bets = state.first_bets_pending.pop(r_cid)
+            for u, bet in first_bets.items():
+                vwap = bet['vwap']
+                is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
+                state.calib_dates.append(current_sim_day)
+                state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
+                state.calib_y.append(is_win)  
 
 def calibrate_models(current_day_ts, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
@@ -462,7 +513,7 @@ def ingest_trade_state(state: BayesianState, cid: str, user: str, amount: float,
     # --- NEW FAST JIT CALL ---
     user_metrics = state.user_history[user]
     
-    new_exp, new_peak, new_n, wager_fraction, p_true = compute_wager_and_p_true(
+    new_exp, new_peak, new_n, wager_fraction, p_true = _and_p_true(
         yes_price, 
         invested_this_trade, 
         user_metrics.current_active_exposure, 
@@ -757,37 +808,57 @@ def main():
         # Iterate natively through the PyArrow RecordBatchReader
         for batch in record_batch_reader:
             
-            # Instantly convert C-memory blocks into Python lists using PyArrow's C++ backend
-            # Note: We assume 'ts' is the aliased epoch float from the DuckDB query we discussed
+            # 1. Extract zero-copy NumPy arrays for blazing fast math
+            tokens_col = batch['outcomeTokensAmount'].to_numpy()
+            prices_col = batch['price'].to_numpy()
+            ts_col = batch['ts'].to_numpy()
+            amounts_col = batch['tradeAmount'].to_numpy()
+            
+            # 2. Extract lists for string columns
             cids_col = batch['contract_id'].to_pylist()
             users_col = batch['user'].to_pylist()
-            amounts_col = batch['tradeAmount'].to_pylist()
-            tokens_col = batch['outcomeTokensAmount'].to_pylist()
-            prices_col = batch['price'].to_pylist()
-            ts_col = batch['ts'].to_pylist()
             
-            # Iterate through the lists using a fast integer index
-            for i in range(batch.num_rows):
+            num_rows = batch.num_rows
+            
+            # 3. Pre-allocate arrays for Numba
+            market_ends = np.zeros(num_rows, dtype=np.float64)
+            bet_on_is_yes = np.zeros(num_rows, dtype=np.bool_)
+            valid_mask = np.ones(num_rows, dtype=np.bool_)
+            
+            # 4. Fast Python pre-pass for dictionary lookups
+            for i in range(num_rows):
+                raw_cid = str(cids_col[i])
+                cid = sys.intern(raw_cid)
+                cids_col[i] = cid 
                 
-                # Extract the variables exactly as your loop expects them
-                raw_cid = cids_col[i]
-                raw_user = users_col[i]
-                amount = amounts_col[i]
-                tokens = tokens_col[i]
-                price = prices_col[i]
+                m = market_map.get(cid)
                 ts = ts_col[i]
                 
-                # --- YOUR LOOP CONTINUES EXACTLY THE SAME FROM HERE ---
-                if ts is None: continue
-
-                cid = sys.intern(str(raw_cid))
-                user = sys.intern(str(raw_user))
+                if m is None or (m['start'] is not None and ts < m['start']) or (m['end'] is not None and ts > m['end']):
+                    valid_mask[i] = False
+                    continue
+                    
+                market_ends[i] = m['end'] if m['end'] is not None else (ts + 86400.0 * 30)
+                bet_on_is_yes[i] = (m['outcome_label'] == "yes")
+                
+            # 5. Execute vectorized C-speed math for the entire batch
+            invested_arr, packed_arr, eff_yes_arr, yes_prices_arr, is_buying_arr = compute_batch_stateless(
+                tokens_col, prices_col, ts_col, market_ends, bet_on_is_yes, valid_mask
+            )
+            
+            # 6. Chronological State Machine Loop
+            for i in range(num_rows):
+                if not valid_mask[i]: continue
+                
+                ts = ts_col[i]
+                if np.isnan(ts): continue
+                
+                cid = cids_col[i]
+                user = sys.intern(str(users_col[i]))
                 active_scan_cids.add(cid)
 
-                # Fast integer division to find the current "Day"
                 trade_day_int = int(ts // 86400)
                 
-                # Initialization of Warmup Anchor
                 if data_start_date is None:
                     data_start_date = trade_day_int
                     simulation_start_date = (data_start_date + WARMUP_DAYS) * 86400.0
@@ -796,16 +867,12 @@ def main():
                 # ---------------------------------------------------------
                 # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
                 # ---------------------------------------------------------
-    
                 if current_sim_day is None:
                     current_sim_day = trade_day_int
                     
                 elif trade_day_int > current_sim_day:
-                    
-                    # Convert day integer back to float timestamp for accurate filtering
                     current_day_ts = trade_day_int * 86400.0
                     
-                    # 1. Resolve Markets that ended yesterday
                     resolved_cids = [
                         c for c, m in market_map.items() 
                         if m['end'] is not None and m['end'] < current_day_ts and not m['resolved']
@@ -817,9 +884,7 @@ def main():
                         market_map[r_cid]['resolved'] = True
                         resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
                                       
-                    # Sweeping for dead markets (10 days = 864,000 seconds)
                     orphan_cutoff_ts = current_day_ts - 864000.0
-                    
                     purge_cids = []
                     for c, m in market_map.items():
                         is_past_end = m['end'] is not None and m['end'] < orphan_cutoff_ts
@@ -829,29 +894,24 @@ def main():
                         if is_past_end or is_dead:
                             purge_cids.append(c)
                     
-                    # Mass Garbarge Collection to free RAM
                     for p_cid in purge_cids:
                         m_data = market_map.pop(p_cid, None) 
                         state.contract_positions.pop(p_cid, None)
                         state.first_bets_pending.pop(p_cid, None)
                         if m_data: result_map.pop(m_data['id'], None)
                                 
-                    # 2. Daily OLS Calibration (Rolling 365 Days)
                     calibrate_models(current_day_ts, state)
                     current_sim_day = trade_day_int
 
-                    gc.collect()
+                    # (DELETED gc.collect() FROM HERE TO STOP CPU FREEZE)
 
                     # ---------------------------------------------------------
-                    # E. PROGRESS CHECKPOINTING (Every 90 Simulated Days)
+                    # E. PROGRESS CHECKPOINTING
                     # ---------------------------------------------------------
-                    
                     state.days_simulated += 1
                     
                     if state.days_simulated % 90 == 0:
                         log.info(f"💾 Checkpointing state at simulated day {state.days_simulated}...")
-                        
-                        # Update the timestamp so it knows where to resume
                         state.last_processed_timestamp = ts 
                         
                         if results_buffer:
@@ -877,33 +937,80 @@ def main():
                                     'current_sim_day': current_sim_day,
                                     'heartbeat': heartbeat
                                 }, f, protocol=pickle.HIGHEST_PROTOCOL)
-                        tmp_ckpt.replace(final_ckpt) # Atomic overwrite prevents corruption
-                        
+                        tmp_ckpt.replace(final_ckpt)
                         log.info("✅ Checkpoint securely saved to disk.")
     
                 # ---------------------------------------------------------
-                # B. PROCESS TRADE INTO STATE TRACKERS
+                # B. PROCESS TRADE INTO STATE TRACKERS (Vectorized & Flat)
                 # ---------------------------------------------------------
-                if cid not in market_map: continue
-                m = market_map.get(cid)
-                
-                # Start/End filtering
-                if m['start'] is not None and ts < m['start']: continue
-                if m['end'] is not None and ts > m['end']: continue
-                
-                qty = abs(tokens)
-                is_buying = (tokens > 0)
-                bet_on = m['outcome_label']
-                
+                price = prices_col[i]
+                m = market_map[cid]
                 m['last_price'] = price
                 m['last_update_ts'] = ts
+                
                 sibling_cid = m.get('sibling_cid')
                 if sibling_cid and sibling_cid in market_map:
                     market_map[sibling_cid]['last_price'] = 1.0 - price
                     market_map[sibling_cid]['last_update_ts'] = ts
                     
-                # Accumulate internal tracking state
-                invested_this_trade = ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
+                # Assign pre-computed variables
+                inv = invested_arr[i]
+                packed = packed_arr[i]
+                is_buy = is_buying_arr[i]
+                
+                user_metrics = state.user_history[user]
+                if user_metrics.total_trades == 0:
+                    state.global_user_count += 1
+                else:
+                    state.global_total_peak -= user_metrics.peak_exposure
+                    
+                current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
+                
+                # JIT call for rolling mathematical state
+                new_exp, new_peak, new_n, wager_fraction, p_true = compute_wager_and_p_true(
+                    yes_prices_arr[i], 
+                    inv, 
+                    user_metrics.current_active_exposure, 
+                    user_metrics.peak_exposure,
+                    user_metrics.total_trades, 
+                    current_global_avg, 
+                    eff_yes_arr[i]
+                )
+                
+                user_metrics.current_active_exposure = new_exp
+                user_metrics.peak_exposure = new_peak
+                user_metrics.total_trades = new_n
+                state.global_total_peak += new_peak
+                
+                # --- THIS IS THE FLAT OOM-SAFE MEMORY APPEND ---
+                m_pos = state.contract_positions[cid]
+                m_pos.users.append(user)
+                m_pos.is_yes.append(1 if eff_yes_arr[i] else 0)
+                m_pos.packed_data.append(packed)
+                m_pos.p_trues.append(p_true)
+                m_pos.stakes.append(inv)
+                # -----------------------------------------------
+
+                if user not in state.known_users:
+                    amount = amounts_col[i]
+                    qty = abs(tokens_col[i])
+                    risk_vol = amount if is_buy else qty * (1.0 - price)
+                    if risk_vol >= 1.0: 
+                        state.known_users.add(user)
+                        m_end = market_ends[i]
+                        ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+                        state.first_bets_pending[cid][user] = {
+                            'log_vol': math.log1p(risk_vol),
+                            'vwap': max(1e-6, min(1.0 - 1e-6, price)),
+                            'is_long': is_buy,
+                            'log_ttr': math.log1p(ttr_hours)
+                        }
+                
+                # Variables required by the C. SIMULATE SIGNALS block below
+                invested_this_trade = inv
+                qty = abs(tokens_col[i])
+                is_buying = is_buy
+                bet_on = m['outcome_label']
     
                 # ---------------------------------------------------------
                 # C. SIMULATE SIGNALS (Signal Logging Only)
