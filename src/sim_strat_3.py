@@ -404,11 +404,13 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
+            token_won = True if (outcome_label == 'yes' and is_yes_win) or (outcome_label == 'no' and is_no_win) else False
+            
             for (uid, log_vol, vwap, is_long, log_ttr) in first_bets:
-                is_win = 1.0 if (is_long and outcome > 0.5) or (not is_long and outcome < 0.5) else 0.0
+                is_win = 1.0 if (is_long and token_won) or (not is_long and not token_won) else 0.0
                 state.calib_dates.append(current_sim_day)
                 state.calib_X.append([log_vol, vwap, log_ttr])
-                state.calib_y.append(is_win) 
+                state.calib_y.append(is_win)
 
 def calibrate_models(current_day_ts, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
@@ -563,15 +565,20 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
         user_brier_count=state.user_brier_count
     )
     
-    # 3. Strip the big numpy arrays to prevent memory spikes during Pickling
+    # 3. Strip the big numpy arrays AND the 5M-element lists to prevent memory spikes
     restore_exposure, restore_peak, restore_total_trades = state.user_exposure, state.user_peak, state.user_total_trades
     restore_brier_sum, restore_brier_count = state.user_brier_sum, state.user_brier_count
+    
+    full_yes_list = state.user_history_yes
+    full_no_list = state.user_history_no
     
     state.user_exposure = np.empty(0)
     state.user_peak = np.empty(0)
     state.user_total_trades = np.empty(0)
     state.user_brier_sum = np.empty(0)
     state.user_brier_count = np.empty(0)
+    state.user_history_yes = []
+    state.user_history_no = []
 
     # 4. Save the lightweight dictionary via Pickle
     tmp_ckpt = ckpt_path.with_suffix('.pkl.tmp')
@@ -588,9 +595,8 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     tmp_ckpt.replace(ckpt_path)
     
     # 5. Re-attach everything so the simulation continues natively
-    for i in range(active_uids):
-        state.user_history_yes[i] = restore_yes[i]
-        state.user_history_no[i] = restore_no[i]
+    state.user_history_yes = full_yes_list
+    state.user_history_no = full_no_list
         
     state.daily_variance_yes.extend(restore_var_yes)
     state.daily_variance_no.extend(restore_var_no)
@@ -641,6 +647,34 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         state.user_total_trades = data['user_total_trades']
         state.user_brier_sum = data['user_brier_sum']
         state.user_brier_count = data['user_brier_count']
+        state.user_history_yes = [array.array('I') for _ in range(MAX_USERS)]
+        state.user_history_no = [array.array('I') for _ in range(MAX_USERS)]
+        
+        active_uids = len(yes_lens)
+        y_idx, n_idx = 0, 0
+        
+        for i in range(active_uids):
+            y_len = yes_lens[i]
+            if y_len > 0:
+                state.user_history_yes[i].frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
+                y_idx += y_len
+                
+            n_len = no_lens[i]
+            if n_len > 0:
+                state.user_history_no[i].frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
+                n_idx += n_len
+                
+        state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
+        state.daily_variance_no.extend([tuple(x) for x in data['var_no']])
+        state.calib_X.extend([list(x) for x in data['calib_X']])
+        state.calib_y.extend(data['calib_y'])
+        state.calib_dates.extend(data['calib_dates'])
+
+        state.user_exposure = data['user_exposure'].copy()
+        state.user_peak = data['user_peak'].copy()
+        state.user_total_trades = data['user_total_trades'].copy()
+        state.user_brier_sum = data['user_brier_sum'].copy()
+        state.user_brier_count = data['user_brier_count'].copy()
             
 def main():
 
