@@ -414,9 +414,11 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
         # Fast, zero-copy in-place memory sorts
         for u in modified_users:
             if state.user_history[u].trade_history_yes:
-                np.asarray(state.user_history[u].trade_history_yes).sort()
+                with memoryview(state.user_history[u].trade_history_yes) as mv:
+                    np.asarray(mv).sort()
             if state.user_history[u].trade_history_no:
-                np.asarray(state.user_history[u].trade_history_no).sort()
+                with memoryview(state.user_history[u].trade_history_no) as mv:
+                    np.asarray(mv).sort()
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
@@ -510,8 +512,11 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
         # 5. Tally the Evidence from Both Arrays
-        n1_raw, w1_raw = fast_numba_scan(np.frombuffer(primary_array, dtype=np.uint32), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        n2_raw, w2_raw = fast_numba_scan(np.frombuffer(opposing_array, dtype=np.uint32), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+        with memoryview(primary_array) as mv1:
+            n1_raw, w1_raw = fast_numba_scan(np.frombuffer(mv1, dtype=np.uint32), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+            
+        with memoryview(opposing_array) as mv2:
+            n2_raw, w2_raw = fast_numba_scan(np.frombuffer(mv2, dtype=np.uint32), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
         
         # Apply the Global Trust Multiplier outside the loop!
         N_eff = (n1_raw + n2_raw) * trust_multiplier
