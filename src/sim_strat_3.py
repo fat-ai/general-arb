@@ -411,21 +411,19 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
             state.user_history[u].brier_sum += squared_error
             state.user_history[u].brier_count += 1
             
-        # Fast, zero-copy in-place memory sorts (Hard C-Lock Release)
+        # Fast, isolated memory sorts (100% Buffer-Safe Copy Approach)
         for u in modified_users:
-            if state.user_history[u].trade_history_yes:
-                mv_yes = memoryview(state.user_history[u].trade_history_yes)
-                arr_yes = np.asarray(mv_yes)
-                arr_yes.sort()
-                del arr_yes
-                mv_yes.release()
-                
-            if state.user_history[u].trade_history_no:
-                mv_no = memoryview(state.user_history[u].trade_history_no)
-                arr_no = np.asarray(mv_no)
-                arr_no.sort()
-                del arr_no
-                mv_no.release()
+            hist_yes = state.user_history[u].trade_history_yes
+            if hist_yes:
+                sorted_np = np.array(hist_yes, dtype=np.uint32)
+                sorted_np.sort()
+                hist_yes[:] = array.array('I', sorted_np)
+
+            hist_no = state.user_history[u].trade_history_no
+            if hist_no:
+                sorted_np = np.array(hist_no, dtype=np.uint32)
+                sorted_np.sort()
+                hist_no[:] = array.array('I', sorted_np)
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
@@ -518,18 +516,12 @@ def process_trade(wallet: str, price: float, stake: float, direction: float, is_
             logit_params = state.logit_model_params
             trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
 
-        # 5. Tally the Evidence from Both Arrays (Hard C-Lock Release)
-        mv_primary = memoryview(primary_array)
-        arr_primary = np.frombuffer(mv_primary, dtype=np.uint32)
+        # 5. Tally the Evidence from Both Arrays (100% Buffer-Safe Copy Approach)
+        arr_primary = np.array(primary_array, dtype=np.uint32)
         n1_raw, w1_raw = fast_numba_scan(arr_primary, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        del arr_primary
-        mv_primary.release()
         
-        mv_opposing = memoryview(opposing_array)
-        arr_opposing = np.frombuffer(mv_opposing, dtype=np.uint32)
+        arr_opposing = np.array(opposing_array, dtype=np.uint32)
         n2_raw, w2_raw = fast_numba_scan(arr_opposing, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
-        del arr_opposing
-        mv_opposing.release()
         
         # Apply the Global Trust Multiplier outside the loop!
         N_eff = (n1_raw + n2_raw) * trust_multiplier
