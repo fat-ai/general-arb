@@ -85,15 +85,6 @@ class BayesianState:
     global_total_peak: float = 0.0
     global_user_count: int = 0
 
-@dataclass(slots=True)
-class UserMetrics:
-    current_active_exposure: float = 0.0
-    peak_exposure: float = 0.0
-    total_trades: int = 0
-    brier_sum: float = 0.0
-    brier_count: int = 0
-    trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
-    trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
 
 # ==========================================
 # BAYESIAN ESTIMATOR GLOBALS & LUTS
@@ -268,21 +259,6 @@ def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
     weight = 1.0 / (bs_ucb + epsilon)
     
     return weight
-
-def release_exposure(user_metrics: UserMetrics, initial_stake: float) -> None:
-    """
-    Frees up locked capital when a market resolves or a position is sold.
-    
-    Args:
-        user_metrics (UserMetrics): The state dataclass for the specific wallet.
-        initial_stake (float): The ORIGINAL dollar amount risked, NOT the payout.
-    """
-    user_metrics.current_active_exposure -= initial_stake
-    
-    # Floating point math can sometimes result in something like -0.000000001
-    # We enforce a hard floor at 0.0 to prevent cumulative drift over millions of trades.
-    if user_metrics.current_active_exposure < 0.0:
-        user_metrics.current_active_exposure = 0.0
 
 def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
     """
@@ -528,44 +504,38 @@ def process_trade(uid: int, price: float, stake: float, direction: float, is_buy
 def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, result_map, data_start_date, simulation_start_date, current_sim_day, heartbeat):
     log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
     
-    # 1. Calculate required sizes for the flat arrays
-    num_users = len(state.user_history)
-    total_yes = sum(len(m.trade_history_yes) for m in state.user_history.values())
-    total_no = sum(len(m.trade_history_no) for m in state.user_history.values())
+    active_uids = state.next_user_id
+    total_yes = sum(len(state.user_history_yes[i]) for i in range(active_uids))
+    total_no = sum(len(state.user_history_no[i]) for i in range(active_uids))
     
     yes_arr = np.zeros(total_yes, dtype=np.uint32)
     no_arr = np.zeros(total_no, dtype=np.uint32)
-    yes_lens = np.zeros(num_users, dtype=np.uint32)
-    no_lens = np.zeros(num_users, dtype=np.uint32)
-    user_keys = []
+    yes_lens = np.zeros(active_uids, dtype=np.uint32)
+    no_lens = np.zeros(active_uids, dtype=np.uint32)
     
-    # We hold references to the original arrays to instantly restore them after pickling
     restore_yes = []
     restore_no = []
     
     y_idx, n_idx = 0, 0
     
-    # 2. Extract User Histories into continuous memory
-    for i, (u, metrics) in enumerate(state.user_history.items()):
-        user_keys.append(u)
-        
-        y_len = len(metrics.trade_history_yes)
+    # 1. Flatten the pre-allocated user history arrays
+    for i in range(active_uids):
+        y_len = len(state.user_history_yes[i])
         yes_lens[i] = y_len
         if y_len > 0:
-            yes_arr[y_idx:y_idx+y_len] = metrics.trade_history_yes
+            yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
             y_idx += y_len
-        restore_yes.append(metrics.trade_history_yes)
-        metrics.trade_history_yes = array.array('I') # Replace with empty array for Pickle
+        restore_yes.append(state.user_history_yes[i])
+        state.user_history_yes[i] = array.array('I') 
         
-        n_len = len(metrics.trade_history_no)
+        n_len = len(state.user_history_no[i])
         no_lens[i] = n_len
         if n_len > 0:
-            no_arr[n_idx:n_idx+n_len] = metrics.trade_history_no
+            no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
             n_idx += n_len
-        restore_no.append(metrics.trade_history_no)
-        metrics.trade_history_no = array.array('I') # Replace with empty array for Pickle
+        restore_no.append(state.user_history_no[i])
+        state.user_history_no[i] = array.array('I') 
         
-    # 3. Extract Deques
     var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
     var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
     restore_var_yes, restore_var_no = list(state.daily_variance_yes), list(state.daily_variance_no)
@@ -580,18 +550,30 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     state.calib_y.clear()
     state.calib_dates.clear()
 
-    # 4. Save massive data to compressed NPZ
+    # 2. Save ALL massive Numpy data to compressed NPZ to keep the Pickle empty
     npz_path = ckpt_path.with_suffix('.npz')
     np.savez_compressed(
         npz_path,
-        user_keys=np.array(user_keys, dtype=str),
         yes_arr=yes_arr, yes_lens=yes_lens,
         no_arr=no_arr, no_lens=no_lens,
         var_yes=var_yes_arr, var_no=var_no_arr,
-        calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr
+        calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr,
+        user_exposure=state.user_exposure, user_peak=state.user_peak,
+        user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
+        user_brier_count=state.user_brier_count
     )
     
-    # 5. Save the now-lightweight dictionaries via Pickle
+    # 3. Strip the big numpy arrays to prevent memory spikes during Pickling
+    restore_exposure, restore_peak, restore_total_trades = state.user_exposure, state.user_peak, state.user_total_trades
+    restore_brier_sum, restore_brier_count = state.user_brier_sum, state.user_brier_count
+    
+    state.user_exposure = np.empty(0)
+    state.user_peak = np.empty(0)
+    state.user_total_trades = np.empty(0)
+    state.user_brier_sum = np.empty(0)
+    state.user_brier_count = np.empty(0)
+
+    # 4. Save the lightweight dictionary via Pickle
     tmp_ckpt = ckpt_path.with_suffix('.pkl.tmp')
     with open(tmp_ckpt, 'wb') as f:
         pickle.dump({
@@ -605,16 +587,22 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
         }, f, protocol=pickle.HIGHEST_PROTOCOL)
     tmp_ckpt.replace(ckpt_path)
     
-    # 6. Re-attach the heavy arrays so the simulation continues without skipping a beat
-    for i, (u, metrics) in enumerate(state.user_history.items()):
-        metrics.trade_history_yes = restore_yes[i]
-        metrics.trade_history_no = restore_no[i]
+    # 5. Re-attach everything so the simulation continues natively
+    for i in range(active_uids):
+        state.user_history_yes[i] = restore_yes[i]
+        state.user_history_no[i] = restore_no[i]
         
     state.daily_variance_yes.extend(restore_var_yes)
     state.daily_variance_no.extend(restore_var_no)
     state.calib_X.extend(restore_calib_X)
     state.calib_y.extend(restore_calib_y)
     state.calib_dates.extend(restore_calib_dates)
+    
+    state.user_exposure = restore_exposure
+    state.user_peak = restore_peak
+    state.user_total_trades = restore_total_trades
+    state.user_brier_sum = restore_brier_sum
+    state.user_brier_count = restore_brier_count
     
     log.info("✅ Checkpoint securely saved to disk (Decoupled NPZ + PKL).")
 
@@ -625,23 +613,21 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         
     log.info(f"🔄 Restoring massive historical arrays from {npz_path}...")
     with np.load(npz_path, allow_pickle=True) as data:
-        user_keys = data['user_keys']
         yes_arr, yes_lens = data['yes_arr'], data['yes_lens']
         no_arr, no_lens = data['no_arr'], data['no_lens']
         
+        active_uids = len(yes_lens)
         y_idx, n_idx = 0, 0
-        for i, u in enumerate(user_keys):
-            u_str = sys.intern(str(u))
-            metrics = state.user_history[u_str]
-            
+        
+        for i in range(active_uids):
             y_len = yes_lens[i]
             if y_len > 0:
-                metrics.trade_history_yes.frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
+                state.user_history_yes[i].frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
                 y_idx += y_len
                 
             n_len = no_lens[i]
             if n_len > 0:
-                metrics.trade_history_no.frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
+                state.user_history_no[i].frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
                 n_idx += n_len
                 
         state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
@@ -649,7 +635,13 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         state.calib_X.extend([list(x) for x in data['calib_X']])
         state.calib_y.extend(data['calib_y'])
         state.calib_dates.extend(data['calib_dates'])
-
+        
+        state.user_exposure = data['user_exposure']
+        state.user_peak = data['user_peak']
+        state.user_total_trades = data['user_total_trades']
+        state.user_brier_sum = data['user_brier_sum']
+        state.user_brier_count = data['user_brier_count']
+            
 def main():
 
     ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
@@ -1051,7 +1043,7 @@ def main():
                 if bet_on != "yes": direction *= -1.0
                 
                 smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
-                    wallet=user, price=price, stake=invested_this_trade, 
+                    uid=uid, price=price, stake=invested_this_trade, 
                     direction=direction, is_buying=is_buying,
                     ttr_hours=ttr_hours, state=state, 
                     price_lut=PRICE_LUT, time_lut=TIME_LUT
@@ -1064,7 +1056,7 @@ def main():
                 last_logged_perc_marg = m.get('log_perc_marg', 0.0)
                 
                 # Extract the current Brier count for this specific wallet
-                current_brier_count = state.user_history[user].brier_count
+                current_brier_count = state.user_brier_count[uid]
 
                 # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
                 if abs(price - last_logged_price) >= 0.01 or abs(perc_marg - last_logged_perc_marg) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
