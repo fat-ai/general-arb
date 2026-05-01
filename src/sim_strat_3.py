@@ -622,37 +622,14 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         yes_arr, yes_lens = data['yes_arr'], data['yes_lens']
         no_arr, no_lens = data['no_arr'], data['no_lens']
         
-        active_uids = len(yes_lens)
-        y_idx, n_idx = 0, 0
-        
-        for i in range(active_uids):
-            y_len = yes_lens[i]
-            if y_len > 0:
-                state.user_history_yes[i].frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
-                y_idx += y_len
-                
-            n_len = no_lens[i]
-            if n_len > 0:
-                state.user_history_no[i].frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
-                n_idx += n_len
-                
-        state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
-        state.daily_variance_no.extend([tuple(x) for x in data['var_no']])
-        state.calib_X.extend([list(x) for x in data['calib_X']])
-        state.calib_y.extend(data['calib_y'])
-        state.calib_dates.extend(data['calib_dates'])
-        
-        state.user_exposure = data['user_exposure']
-        state.user_peak = data['user_peak']
-        state.user_total_trades = data['user_total_trades']
-        state.user_brier_sum = data['user_brier_sum']
-        state.user_brier_count = data['user_brier_count']
+        # 1. Re-initialize the lists (since they were empty in the Pickle)
         state.user_history_yes = [array.array('I') for _ in range(MAX_USERS)]
         state.user_history_no = [array.array('I') for _ in range(MAX_USERS)]
         
         active_uids = len(yes_lens)
         y_idx, n_idx = 0, 0
         
+        # 2. Re-populate the byte arrays
         for i in range(active_uids):
             y_len = yes_lens[i]
             if y_len > 0:
@@ -664,12 +641,14 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
                 state.user_history_no[i].frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
                 n_idx += n_len
                 
+        # 3. Restore the deques
         state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
         state.daily_variance_no.extend([tuple(x) for x in data['var_no']])
         state.calib_X.extend([list(x) for x in data['calib_X']])
         state.calib_y.extend(data['calib_y'])
         state.calib_dates.extend(data['calib_dates'])
-
+        
+        # 4. Restore the flat NumPy state arrays WITH .copy() for write access
         state.user_exposure = data['user_exposure'].copy()
         state.user_peak = data['user_peak'].copy()
         state.user_total_trades = data['user_total_trades'].copy()
