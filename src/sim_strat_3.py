@@ -760,8 +760,6 @@ def main():
         'peak_equity': CONFIG["initial_capital"], 'ins_cash': 0, 'max_drawdown': [0,0], 'pnl': 0,
         'wins': 0, 'losses': 0 
     }
-    
-    result_map['resolutions'] = []
 
     del markets_pl
     gc.collect()
