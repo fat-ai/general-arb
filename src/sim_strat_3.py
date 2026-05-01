@@ -37,13 +37,53 @@ EXECUTIONS_PATH = CACHE_DIR / "strategy_executions.csv"
         
 executions_buffer = []
 
+MAX_USERS = 5_000_000
+
 @dataclass(slots=True)
 class MarketPositions:
-    users: list = field(default_factory=list)
+    user_ids: array.array = field(default_factory=lambda: array.array('I')) # uint32 IDs
     is_yes: array.array = field(default_factory=lambda: array.array('b'))
     packed_data: array.array = field(default_factory=lambda: array.array('I'))
-    p_trues: array.array = field(default_factory=lambda: array.array('d'))
+    p_trues: array.array = field(default_factory=lambda: array.array('d')) # 64-bit float
     stakes: array.array = field(default_factory=lambda: array.array('d'))
+
+@dataclass(slots=True)
+class BayesianState:
+    last_processed_timestamp: float = 0.0
+    days_simulated: int = 0
+
+    # 1. FLAT USER METRICS (Zero Object Overhead)
+    user_exposure: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
+    user_peak: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
+    user_total_trades: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.uint32))
+    user_brier_sum: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
+    user_brier_count: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.uint32))
+
+    # 2. Pre-allocated arrays for user trade histories
+    user_history_yes: list = field(default_factory=lambda: [array.array('I') for _ in range(MAX_USERS)])
+    user_history_no: list = field(default_factory=lambda: [array.array('I') for _ in range(MAX_USERS)])
+
+    # 3. String-to-Int Mapping
+    user_map: dict = field(default_factory=dict) 
+    next_user_id: int = 0
+
+    contract_positions: dict = field(default_factory=lambda: defaultdict(MarketPositions))
+    
+    # Flattened pending bets (List of tuples instead of nested dicts)
+    first_bets_pending: dict = field(default_factory=lambda: defaultdict(list))
+
+    daily_variance_yes: deque = field(default_factory=lambda: deque(maxlen=100000))
+    daily_variance_no: deque = field(default_factory=lambda: deque(maxlen=100000))
+    calib_dates: deque = field(default_factory=deque)
+    calib_X: deque = field(default_factory=deque)
+    calib_y: deque = field(default_factory=deque)
+
+    poly_coeffs_yes: list = field(default_factory=lambda: [-1.0, 1.0, 0.0])
+    poly_coeffs_no: list = field(default_factory=lambda: [-1.0, 1.0, 0.0])
+    logit_model_params: np.ndarray = None
+
+    global_total_peak: float = 0.0
+    global_user_count: int = 0
 
 @dataclass(slots=True)
 class UserMetrics:
@@ -54,38 +94,6 @@ class UserMetrics:
     brier_count: int = 0
     trade_history_yes: array.array = field(default_factory=lambda: array.array('I'))
     trade_history_no: array.array = field(default_factory=lambda: array.array('I'))
-
-
-# ==========================================
-# BAYESIAN STATE ENCAPSULATION
-# ==========================================
-@dataclass(slots=True)
-class BayesianState:
-    """Encapsulates the entire memory of the trading system for easy serialization."""
-    last_processed_timestamp: float = 0.0
-    days_simulated: int = 0
-    user_history: dict = field(default_factory=lambda: defaultdict(UserMetrics))
-    contract_positions: dict = field(default_factory=lambda: defaultdict(MarketPositions))
-    first_bets_pending: dict = field(default_factory=lambda: defaultdict(dict))
-    
-    
-    # Rolling Variances & Calibration
-    daily_variance_yes: deque = field(default_factory=lambda: deque(maxlen=100000))
-    daily_variance_no: deque = field(default_factory=lambda: deque(maxlen=100000))
-    calib_dates: deque = field(default_factory=deque)
-    calib_X: deque = field(default_factory=deque)
-    calib_y: deque = field(default_factory=deque)
-    
-    # Mathematical Coefficients
-    poly_coeffs_yes: list = field(default_factory=lambda: [-1.0, 1.0, 0.0])
-    poly_coeffs_no: list = field(default_factory=lambda: [-1.0, 1.0, 0.0])
-    logit_model_params: np.ndarray = None
-    
-    # Global Bankroll Tracking
-    global_total_peak: float = 0.0
-    global_user_count: int = 0
-
-    known_users: set = field(default_factory=set)
 
 # ==========================================
 # BAYESIAN ESTIMATOR GLOBALS & LUTS
@@ -375,64 +383,56 @@ def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
     return True
 
 def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState):
-    """Processes a market resolution using flat memory arrays."""
     if r_cid in state.contract_positions:
         m_pos = state.contract_positions.pop(r_cid)
-        
+
         is_yes_win = 1 if outcome > 0.5 else 0
         is_no_win = 1 if outcome <= 0.5 else 0
         yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
-        
+
         modified_users = set()
-        
-        # Iterate natively through the parallel arrays
-        for i in range(len(m_pos.users)):
-            u = m_pos.users[i]
+
+        # Iterate through flat memory via index
+        for i in range(len(m_pos.user_ids)):
+            uid = m_pos.user_ids[i]
             is_yes_bet = m_pos.is_yes[i]
             partial_packed = m_pos.packed_data[i]
             p_true = m_pos.p_trues[i]
             initial_stake = m_pos.stakes[i]
-            
-            # History is only recorded for non-void markets
+
             if outcome != 0.5:
                 if is_yes_bet:
-                    state.user_history[u].trade_history_yes.append(partial_packed | is_yes_win)
+                    state.user_history_yes[uid].append(partial_packed | is_yes_win)
                     exact_price = (partial_packed >> 22) / 1000.0
                     state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
                 else:
-                    state.user_history[u].trade_history_no.append(partial_packed | is_no_win)
+                    state.user_history_no[uid].append(partial_packed | is_no_win)
                     exact_price = (partial_packed >> 22) / 1000.0
                     state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
-                modified_users.add(u)
-                
-            # Capital release and Brier apply to all resolutions
-            release_exposure(state.user_history[u], initial_stake)
-            squared_error = (p_true - yes_outcome)**2
-            state.user_history[u].brier_sum += squared_error
-            state.user_history[u].brier_count += 1
-            
-        # Fast, isolated memory sorts (100% Buffer-Safe Copy Approach)
-        for u in modified_users:
-            hist_yes = state.user_history[u].trade_history_yes
-            if hist_yes:
-                sorted_np = np.array(hist_yes, dtype=np.uint32)
-                sorted_np.sort()
-                hist_yes[:] = array.array('I', sorted_np)
+                modified_users.add(uid)
 
-            hist_no = state.user_history[u].trade_history_no
-            if hist_no:
-                sorted_np = np.array(hist_no, dtype=np.uint32)
-                sorted_np.sort()
-                hist_no[:] = array.array('I', sorted_np)
+            # Inlined exposure release (Removes function call overhead)
+            state.user_exposure[uid] -= initial_stake
+            if state.user_exposure[uid] < 0.0:
+                state.user_exposure[uid] = 0.0
+
+            squared_error = (p_true - yes_outcome)**2
+            state.user_brier_sum[uid] += squared_error
+            state.user_brier_count[uid] += 1
+
+        for uid in modified_users:
+            if state.user_history_yes[uid]:
+                with memoryview(state.user_history_yes[uid]) as mv: np.asarray(mv).sort()
+            if state.user_history_no[uid]:
+                with memoryview(state.user_history_no[uid]) as mv: np.asarray(mv).sort()
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
-            for u, bet in first_bets.items():
-                vwap = bet['vwap']
-                is_win = 1.0 if (bet['is_long'] and outcome > 0.5) or (not bet['is_long'] and outcome < 0.5) else 0.0
+            for (uid, log_vol, vwap, is_long, log_ttr) in first_bets:
+                is_win = 1.0 if (is_long and outcome > 0.5) or (not is_long and outcome < 0.5) else 0.0
                 state.calib_dates.append(current_sim_day)
-                state.calib_X.append([bet['log_vol'], vwap, bet['log_ttr']])
-                state.calib_y.append(is_win)  
+                state.calib_X.append([log_vol, vwap, log_ttr])
+                state.calib_y.append(is_win) 
 
 def calibrate_models(current_day_ts, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
@@ -480,75 +480,50 @@ def calibrate_models(current_day_ts, state: BayesianState):
             log.warning(f"Variance NO Polyfit failed: {e}")
 
 
-def process_trade(wallet: str, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
-        
-        user_metrics = state.user_history[wallet]
-        
-        # 1. Format Current Market State
-        current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
+def process_trade(uid: int, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
+    current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
+    expected_p = price if is_buying else 1.0 - price
+    is_yes = (direction > 0)
 
-        if is_buying:
-            expected_p = price
-        else:
-            expected_p = 1.0 - price
-        
-        is_yes = (direction > 0)
-        
-        # 2. Setup Directional Centers and Arrays
-        primary_price_int = max(0, min(1000, int(expected_p * 1000)))
-        opposing_price_int = max(0, min(1000, int((1.0 - expected_p) * 1000)))
-        
-        if is_yes:
-            primary_array = user_metrics.trade_history_yes
-            opposing_array = user_metrics.trade_history_no
-            coeffs = state.poly_coeffs_yes
-        else:
-            primary_array = user_metrics.trade_history_no
-            opposing_array = user_metrics.trade_history_yes
-            coeffs = state.poly_coeffs_no
+    primary_price_int = max(0, min(1000, int(expected_p * 1000)))
+    opposing_price_int = max(0, min(1000, int((1.0 - expected_p) * 1000)))
 
-        # 3. The Global Trust Multiplier (Precision Weighting & Cold Start)
-        if user_metrics.brier_count > 0:
-            # Proven User: Use Pessimistic Brier Precision Weighting
-            trust_multiplier = calculate_precision_weight(user_metrics.brier_sum, user_metrics.brier_count)
-        else:
-            # Brand New User: Use the Global Logit Prior
-            logit_params = state.logit_model_params
-            trust_multiplier = get_cold_start_trust(logit_params, price, stake, ttr_hours)
+    # Fetch history directly from pre-allocated lists
+    if is_yes:
+        primary_array = state.user_history_yes[uid]
+        opposing_array = state.user_history_no[uid]
+        coeffs = state.poly_coeffs_yes
+    else:
+        primary_array = state.user_history_no[uid]
+        opposing_array = state.user_history_yes[uid]
+        coeffs = state.poly_coeffs_no
 
-        # 5. Tally the Evidence from Both Arrays (100% Buffer-Safe Copy Approach)
-        arr_primary = np.array(primary_array, dtype=np.uint32)
-        n1_raw, w1_raw = fast_numba_scan(arr_primary, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        
-        arr_opposing = np.array(opposing_array, dtype=np.uint32)
-        n2_raw, w2_raw = fast_numba_scan(arr_opposing, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
-        
-        # Apply the Global Trust Multiplier outside the loop!
-        N_eff = (n1_raw + n2_raw) * trust_multiplier
-        W_eff = (w1_raw + w2_raw) * trust_multiplier
+    b_count = state.user_brier_count[uid]
+    if b_count > 0:
+        trust_multiplier = calculate_precision_weight(state.user_brier_sum[uid], b_count)
+    else:
+        trust_multiplier = get_cold_start_trust(state.logit_model_params, price, stake, ttr_hours)
 
-        # 6. Empirical Bayes Population Priors (Polynomial Smoothing)
-        a, b, c = coeffs
-        V = (a * (expected_p ** 2)) + (b * expected_p) + c
+    with memoryview(primary_array) as mv1:
+        n1_raw, w1_raw = fast_numba_scan(np.frombuffer(mv1, dtype=np.uint32), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
         
-        theoretical_v = expected_p * (1.0 - expected_p)
-        
-        if V <= 0.0001 or V > 0.35:
-            V = max(0.0001, theoretical_v)
-            
-        M = max(1.0, (theoretical_v / V) - 1.0)
-        
-        alpha = M * expected_p
-        beta = M * (1.0 - expected_p)
+    with memoryview(opposing_array) as mv2:
+        n2_raw, w2_raw = fast_numba_scan(np.frombuffer(mv2, dtype=np.uint32), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
 
-        # 7. Final Bayesian Calculation
-        smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
+    N_eff = (n1_raw + n2_raw) * trust_multiplier
+    W_eff = (w1_raw + w2_raw) * trust_multiplier
 
-        margin = smoothed_win_rate - expected_p
-        
-        perc_margin = margin / expected_p if expected_p > 0 else 0.0
-        
-        return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
+    a, b, c = coeffs
+    V = max(0.0001, (a * (expected_p ** 2)) + (b * expected_p) + c) if ((a * (expected_p ** 2)) + (b * expected_p) + c) <= 0.35 else max(0.0001, expected_p * (1.0 - expected_p))
+    theoretical_v = expected_p * (1.0 - expected_p)
+    M = max(1.0, (theoretical_v / V) - 1.0)
+
+    alpha, beta = M * expected_p, M * (1.0 - expected_p)
+    smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
+    margin = smoothed_win_rate - expected_p
+    perc_margin = margin / expected_p if expected_p > 0 else 0.0
+
+    return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
 
 def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, result_map, data_start_date, simulation_start_date, current_sim_day, heartbeat):
     log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
@@ -1005,65 +980,64 @@ def main():
                     market_map[sibling_cid]['last_price'] = 1.0 - price
                     market_map[sibling_cid]['last_update_ts'] = ts
                     
-                # Assign pre-computed variables
                 inv = invested_arr[i]
                 packed = packed_arr[i]
                 is_buy = is_buying_arr[i]
                 
-                user_metrics = state.user_history[user]
-                if user_metrics.total_trades == 0:
+                # STRING TO INT MAPPING (Kills string pointer RAM)
+                uid = state.user_map.get(user)
+                if uid is None:
+                    uid = state.next_user_id
+                    state.user_map[user] = uid
+                    state.next_user_id += 1
+
+                # FAST C-ARRAY LOOKUPS (Kills Object Attribute lag)
+                u_trades = state.user_total_trades[uid]
+                
+                if u_trades == 0:
                     state.global_user_count += 1
                 else:
-                    state.global_total_peak -= user_metrics.peak_exposure
+                    state.global_total_peak -= state.user_peak[uid]
                     
                 current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
                 
-                # JIT call for rolling mathematical state
                 new_exp, new_peak, new_n, wager_fraction, p_true = compute_wager_and_p_true(
-                    yes_prices_arr[i], 
-                    inv, 
-                    user_metrics.current_active_exposure, 
-                    user_metrics.peak_exposure,
-                    user_metrics.total_trades, 
-                    current_global_avg, 
-                    eff_yes_arr[i]
+                    yes_prices_arr[i], inv, 
+                    state.user_exposure[uid], 
+                    state.user_peak[uid],
+                    u_trades, current_global_avg, eff_yes_arr[i]
                 )
                 
-                user_metrics.current_active_exposure = new_exp
-                user_metrics.peak_exposure = new_peak
-                user_metrics.total_trades = new_n
+                # Write back directly to NumPy
+                state.user_exposure[uid] = new_exp
+                state.user_peak[uid] = new_peak
+                state.user_total_trades[uid] = new_n
                 state.global_total_peak += new_peak
                 
-                # --- THIS IS THE FLAT OOM-SAFE MEMORY APPEND ---
                 m_pos = state.contract_positions[cid]
-                m_pos.users.append(user)
+                m_pos.user_ids.append(uid) # Appending a uint32 integer instead of a string
                 m_pos.is_yes.append(1 if eff_yes_arr[i] else 0)
                 m_pos.packed_data.append(packed)
                 m_pos.p_trues.append(p_true)
                 m_pos.stakes.append(inv)
-                # -----------------------------------------------
                     
                 amount = amounts_col[i]
-                if user not in state.known_users:
+                if u_trades == 0: # First bet check
                     qty = abs(tokens_col[i])
                     risk_vol = amount if is_buy else qty * (1.0 - price)
                     if risk_vol >= 1.0: 
-                        state.known_users.add(user)
                         m_end = market_ends[i]
                         ttr_hours = max(1.0, (m_end - ts) / 3600.0)
-                        state.first_bets_pending[cid][user] = {
-                            'log_vol': math.log1p(risk_vol),
-                            'vwap': max(1e-6, min(1.0 - 1e-6, price)),
-                            'is_long': is_buy,
-                            'log_ttr': math.log1p(ttr_hours)
-                        }
-                
-                # Variables required by the C. SIMULATE SIGNALS block below
+                        # Append flat tuple to list instead of dict bloat
+                        state.first_bets_pending[cid].append(
+                            (uid, math.log1p(risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
+                        )
+
                 invested_this_trade = inv
                 qty = abs(tokens_col[i])
                 is_buying = is_buy
                 bet_on = m['outcome_label']
-    
+                    
                 # ---------------------------------------------------------
                 # C. SIMULATE SIGNALS (Signal Logging Only)
                 # ---------------------------------------------------------
