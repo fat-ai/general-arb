@@ -398,9 +398,18 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
 
         for uid in modified_users:
             if state.user_history_yes[uid]:
-                with memoryview(state.user_history_yes[uid]) as mv: np.asarray(mv).sort()
+                mv = memoryview(state.user_history_yes[uid])
+                arr = np.asarray(mv)
+                arr.sort()
+                del arr
+                mv.release()
+
             if state.user_history_no[uid]:
-                with memoryview(state.user_history_no[uid]) as mv: np.asarray(mv).sort()
+                mv = memoryview(state.user_history_no[uid])
+                arr = np.asarray(mv)
+                arr.sort()
+                del arr
+                mv.release()
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
@@ -482,11 +491,17 @@ def process_trade(uid: int, price: float, stake: float, direction: float, is_buy
     else:
         trust_multiplier = get_cold_start_trust(state.logit_model_params, price, stake, ttr_hours)
 
-    with memoryview(primary_array) as mv1:
-        n1_raw, w1_raw = fast_numba_scan(np.frombuffer(mv1, dtype=np.uint32), primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-        
-    with memoryview(opposing_array) as mv2:
-        n2_raw, w2_raw = fast_numba_scan(np.frombuffer(mv2, dtype=np.uint32), opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+    mv_primary = memoryview(primary_array)
+    arr_primary = np.frombuffer(mv_primary, dtype=np.uint32)
+    n1_raw, w1_raw = fast_numba_scan(arr_primary, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+    del arr_primary
+    mv_primary.release()
+    
+    mv_opposing = memoryview(opposing_array)
+    arr_opposing = np.frombuffer(mv_opposing, dtype=np.uint32)
+    n2_raw, w2_raw = fast_numba_scan(arr_opposing, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+    del arr_opposing
+    mv_opposing.release()
 
     N_eff = (n1_raw + n2_raw) * trust_multiplier
     W_eff = (w1_raw + w2_raw) * trust_multiplier
