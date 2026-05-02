@@ -520,9 +520,6 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     yes_lens = np.zeros(active_uids, dtype=np.uint32)
     no_lens = np.zeros(active_uids, dtype=np.uint32)
     
-    restore_yes = []
-    restore_no = []
-    
     y_idx, n_idx = 0, 0
     
     # 1. Flatten the pre-allocated user history arrays
@@ -532,17 +529,13 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
         if y_len > 0:
             yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
             y_idx += y_len
-        restore_yes.append(state.user_history_yes[i])
-        state.user_history_yes[i] = array.array('I') 
-        
+            
         n_len = len(state.user_history_no[i])
         no_lens[i] = n_len
         if n_len > 0:
             no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
             n_idx += n_len
-        restore_no.append(state.user_history_no[i])
-        state.user_history_no[i] = array.array('I') 
-        
+            
     var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
     var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
     restore_var_yes, restore_var_no = list(state.daily_variance_yes), list(state.daily_variance_no)
@@ -616,7 +609,7 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     state.user_brier_count = restore_brier_count
     
     log.info("✅ Checkpoint securely saved to disk (Decoupled NPZ + PKL).")
-
+        
 def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
     """Blazing fast C-level byte restoring of the arrays upon resume."""
     if not npz_path.exists():
