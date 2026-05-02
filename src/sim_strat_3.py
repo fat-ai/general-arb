@@ -398,18 +398,14 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
 
         for uid in modified_users:
             if state.user_history_yes[uid]:
-                mv = memoryview(state.user_history_yes[uid])
-                arr = np.asarray(mv)
-                arr.sort()
-                del arr
-                mv.release()
+                arr_yes = np.array(state.user_history_yes[uid], dtype=np.uint32)
+                arr_yes.sort()
+                state.user_history_yes[uid] = array.array('I', arr_yes)
 
             if state.user_history_no[uid]:
-                mv = memoryview(state.user_history_no[uid])
-                arr = np.asarray(mv)
-                arr.sort()
-                del arr
-                mv.release()
+                arr_no = np.array(state.user_history_no[uid], dtype=np.uint32)
+                arr_no.sort()
+                state.user_history_no[uid] = array.array('I', arr_no)
 
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
@@ -491,17 +487,11 @@ def process_trade(uid: int, price: float, stake: float, direction: float, is_buy
     else:
         trust_multiplier = get_cold_start_trust(state.logit_model_params, price, stake, ttr_hours)
 
-    mv_primary = memoryview(primary_array)
-    arr_primary = np.frombuffer(mv_primary, dtype=np.uint32)
+    arr_primary = np.array(primary_array, dtype=np.uint32)
     n1_raw, w1_raw = fast_numba_scan(arr_primary, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-    del arr_primary
-    mv_primary.release()
     
-    mv_opposing = memoryview(opposing_array)
-    arr_opposing = np.frombuffer(mv_opposing, dtype=np.uint32)
+    arr_opposing = np.array(opposing_array, dtype=np.uint32)
     n2_raw, w2_raw = fast_numba_scan(arr_opposing, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
-    del arr_opposing
-    mv_opposing.release()
 
     N_eff = (n1_raw + n2_raw) * trust_multiplier
     W_eff = (w1_raw + w2_raw) * trust_multiplier
