@@ -112,24 +112,42 @@ for i in range(TIME_LUT_SIZE):
     TIME_LUT[i] = w if w >= 0.01 else 0.0
 
 @njit(cache=True)
+@njit(cache=True)
 def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
     """
-    Compiled to machine code via Numba. Executes the bitwise unpacking and 
-    LUT lookups at C-speeds without Python interpreter overhead.
+    Compiled to machine code via Numba. Executes custom binary search and
+    bitwise unpacking natively on Python arrays. Zero-copy, zero-lock.
     """
     n = 0.0
     w = 0.0
     
-    # Use int64 for safe arithmetic before casting bounds
     min_p = max(0, center_p_int - p_range)
     max_p = min(1000, center_p_int + p_range)
     
     left_bound = np.uint32(np.int64(min_p) << 22)
     right_bound = np.uint32((np.int64(max_p + 1) << 22) - 1)
     
-    start_idx = np.searchsorted(history_array, left_bound, side='left')
-    end_idx = np.searchsorted(history_array, right_bound, side='right')
+    # 1. Custom C-speed Binary Search for Left Bound
+    left, right = 0, len(history_array)
+    while left < right:
+        mid = (left + right) // 2
+        if history_array[mid] < left_bound:
+            left = mid + 1
+        else:
+            right = mid
+    start_idx = left
     
+    # 2. Custom C-speed Binary Search for Right Bound
+    left, right = start_idx, len(history_array)
+    while left < right:
+        mid = (left + right) // 2
+        if history_array[mid] <= right_bound:
+            left = mid + 1
+        else:
+            right = mid
+    end_idx = left
+    
+    # 3. Fast Traversal
     for i in range(start_idx, end_idx):
         packed = history_array[i]
         
@@ -137,14 +155,10 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
         hist_log_ttr = (packed >> 1) & 0x1FFFFF 
         hist_outcome = packed & 1
 
-        # Cast to int64 to prevent unsigned wrap-around underflow
         time_dist = np.int64(abs(np.int64(hist_log_ttr) - np.int64(current_log_ttr)))
-        
-        # time_dist has no guarantee from searchsorted, so we must guard it
         if time_dist >= len(time_lut):
             continue
 
-        # bisect bounds already guarantee price_dist <= p_range, so no guard needed
         price_dist = np.int64(abs(np.int64(hist_price_int) - np.int64(center_p_int)))
         
         combined_weight = price_lut[price_dist] * time_lut[time_dist]
@@ -487,11 +501,8 @@ def process_trade(uid: int, price: float, stake: float, direction: float, is_buy
     else:
         trust_multiplier = get_cold_start_trust(state.logit_model_params, price, stake, ttr_hours)
 
-    arr_primary = np.array(primary_array, dtype=np.uint32)
-    n1_raw, w1_raw = fast_numba_scan(arr_primary, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-    
-    arr_opposing = np.array(opposing_array, dtype=np.uint32)
-    n2_raw, w2_raw = fast_numba_scan(arr_opposing, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
+    n1_raw, w1_raw = fast_numba_scan(primary_array, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
+    n2_raw, w2_raw = fast_numba_scan(opposing_array, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
 
     N_eff = (n1_raw + n2_raw) * trust_multiplier
     W_eff = (w1_raw + w2_raw) * trust_multiplier
