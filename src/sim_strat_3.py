@@ -112,7 +112,6 @@ for i in range(TIME_LUT_SIZE):
     TIME_LUT[i] = w if w >= 0.01 else 0.0
 
 @njit(cache=True)
-@njit(cache=True)
 def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
     """
     Compiled to machine code via Numba. Executes custom binary search and
