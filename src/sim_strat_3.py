@@ -931,6 +931,8 @@ def main():
                     
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
+                        if outcome is None or (isinstance(outcome, float) and math.isnan(outcome)):
+                            outcome = 0.5
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
                         resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
@@ -1119,10 +1121,14 @@ def main():
                         if pm['end'] is not None and ts >= pm['end']:
                             mid = pm['id']
                             
+                            safe_outcome = pm['outcome']
+                            if safe_outcome is None or (isinstance(safe_outcome, float) and math.isnan(safe_outcome)):
+                                safe_outcome = 0.5
+                            
                             if p_data['direction'] == "yes":
-                                payout = p_data['contracts'] * pm['outcome']
+                                payout = p_data['contracts'] * safe_outcome
                             else:
-                                payout = p_data['contracts'] * (1.0 - pm['outcome'])
+                                payout = p_data['contracts'] * (1.0 - safe_outcome)
                                 
                             profit = payout - p_data['bet_size']
 
