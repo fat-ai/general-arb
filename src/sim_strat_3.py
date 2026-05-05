@@ -768,7 +768,7 @@ def main():
         resume_sim_day = None
         resume_heartbeat = None
     else:
-        log.info(f"🔄 Found checkpoint! Loading lightweight state from {ckpt_file}...")
+        log.info("🔄 Found checkpoint! Loading lightweight state from %s...", ckpt_file)
         with open(ckpt_file, 'rb') as f:
             checkpoint_data = pickle.load(f)
             
@@ -784,7 +784,48 @@ def main():
         # Restore the heavy arrays from the NPZ archive
         restore_arrays_from_npz(state, ckpt_file.with_suffix('.npz'))
         
-        log.info(f"✅ Resuming from day {state.days_simulated} (Timestamp: {state.last_processed_timestamp})")
+        # ==========================================
+        # 🧹 THE CSV GUILLOTINE (ORPHAN DATA CLEANUP)
+        # ==========================================
+        log.info("🧹 Slicing orphaned future data from CSVs. Truncating to Timestamp: %s...", state.last_processed_timestamp)
+        
+        for csv_path in [OUTPUT_PATH, EXECUTIONS_PATH]:
+            if csv_path.exists():
+                tmp_path = csv_path.with_suffix('.csv.tmp')
+                with open(csv_path, 'r', encoding='utf-8') as f_in, open(tmp_path, 'w', newline='', encoding='utf-8') as f_out:
+                    reader = csv.reader(f_in)
+                    writer = csv.writer(f_out)
+                    
+                    # 1. Preserve the headers safely
+                    try:
+                        header = next(reader)
+                        writer.writerow(header)
+                    except StopIteration:
+                        continue
+                        
+                    # 2. Stream and slice
+                    for row in reader:
+                        try:
+                            # The timestamp is always the 0th index in both of your CSV structures
+                            row_ts = float(row[0])
+                            
+                            # If the row belongs to the valid past, keep it. 
+                            if row_ts <= state.last_processed_timestamp:
+                                writer.writerow(row)
+                            else:
+                                # Because the data is strictly chronological, the moment we hit a future timestamp,
+                                # we know the rest of the file is orphaned. We can safely break the loop and stop reading.
+                                break 
+                                
+                        except (ValueError, IndexError):
+                            # Skip malformed rows
+                            continue
+                            
+                # 3. Atomically overwrite the corrupted file with the clean truncated file
+                tmp_path.replace(csv_path)
+                
+        log.info("✅ CSV cleanup complete. No duplicate timelines exist.")
+        log.info("✅ Resuming from day %s (Timestamp: %s)", state.days_simulated, state.last_processed_timestamp)
 
     # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
