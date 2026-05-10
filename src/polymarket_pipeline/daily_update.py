@@ -12,8 +12,10 @@ import shutil
 import sys
 import time
 
+import __main__
 from sim_strat_3 import (
     BayesianState, 
+    MarketPositions,
     resolve_market, 
     calibrate_models, 
     compute_wager_and_p_true,
@@ -22,6 +24,9 @@ from sim_strat_3 import (
     MARKETS_FILE, 
     TRADES_PATH
 )
+
+__main__.MarketPositions = MarketPositions
+__main__.BayesianState = BayesianState
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger("Updater")
@@ -191,7 +196,7 @@ def export_dashboard_scores(state: BayesianState):
         log.error(f"⚠️ Failed to export dashboard scores: {e}")
 
 def load_markets() -> dict:
-    """Loads market metadata via Polars using float timestamps (epoch seconds)."""
+    """Loads market metadata via Polars with optimized memory mapping."""
     log.info("📂 Loading Market Metadata...")
     markets_pl = pl.read_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
@@ -199,39 +204,41 @@ def load_markets() -> dict:
         pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
         pl.col('resolution_timestamp'),
-        pl.col('start_date').cast(pl.String).alias("start_date")
+        pl.col('start_date')
     ])
     
     market_map = {}
-    for market in markets_pl.iter_rows(named=True):
-        cid = market['contract_id']
+    
+    # Use raw tuples (iter_rows) instead of named=True to prevent instantiating 2.2 million temporary dicts
+    for row in markets_pl.iter_rows():
+        cid = sys.intern(row[0])
         
-        # Parse Start Date to Float safely
-        s_date = market['start_date']
+        # Parse Start Date safely
+        s_date = row[5]
         if isinstance(s_date, str):
             try: 
                 s_date = pd.to_datetime(s_date, utc=True).timestamp()
-            except Exception as e: 
-                log.warning(f"Failed to parse start_date for CID {cid}: {e}")
+            except Exception: 
                 s_date = None
         elif hasattr(s_date, 'timestamp'):
             s_date = s_date.timestamp()
             
-        # Parse End Date to Float safely
-        e_date = market['resolution_timestamp']
+        # Parse End Date safely
+        e_date = row[4]
         if hasattr(e_date, 'timestamp'):
             e_date = e_date.timestamp()
             
         market_map[cid] = {
-            'id': market['id'], 
+            'id': row[1], 
             'start': s_date, 
             'end': e_date,
-            'outcome': market['outcome'], 
-            'outcome_label': market['token_outcome_label']
+            'outcome': row[2], 
+            # Use sys.intern to share memory for repetitive strings like "yes" and "no"
+            'outcome_label': sys.intern(row[3]) if row[3] else None 
         }
         
     return market_map
-
+    
 def main():
     log.info("🚀 Starting Daily Bayesian State Updater...")
     state = load_state()
