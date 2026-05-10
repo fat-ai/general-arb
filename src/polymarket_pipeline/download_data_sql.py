@@ -9,7 +9,6 @@ from pathlib import Path
 from requests.adapters import HTTPAdapter, Retry
 from datetime import datetime
 from decimal import Decimal
-from collections import defaultdict
 import logging
 import gc
 import random
@@ -25,7 +24,7 @@ log = logging.getLogger(__name__)
 FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC')
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL, RPC_URLS
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, RPC_URLS
 
 # ---------------------------------------------------------------------------
 # Schema helpers
@@ -455,12 +454,16 @@ class DataFetcher:
 
         # Helper to bridge Timestamps -> Polygon Block Numbers without an API key
         def get_block_from_timestamp(ts):
-            try:
-                resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
-                if resp.status_code == 200:
-                    return resp.json()['height']
-            except Exception as e:
-                log.error(f"Failed to resolve timestamp {ts} to block: {e}")
+            for attempt in range(3):
+                try:
+                    resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
+                    if resp.status_code == 200:
+                        return resp.json()['height']
+                    time.sleep(2 ** attempt)
+                except Exception as e:
+                    log.warning(f"DefiLlama timeout (attempt {attempt+1}/3): {e}")
+                    
+            log.error(f"❌ Failed to resolve timestamp {ts} to block after 3 attempts.")
             return None
 
         with contextlib.closing(sqlite3.connect(db_file, timeout=30.0)) as conn:
@@ -569,16 +572,29 @@ class DataFetcher:
                             
                             for i in range(0, len(block_reqs), 50):
                                 chunk = block_reqs[i:i+50]
-                                b_resp = self.session.post(current_rpc, json=chunk, timeout=15).json()
-                                for r in b_resp:
-                                    if 'result' in r and r['result']:
-                                        block_times[r['id']] = int(r['result']['timestamp'], 16)
+                                chunk_success = False
+                                
+                                for attempt in range(3):
+                                    try:
+                                        b_resp = self.session.post(current_rpc, json=chunk, timeout=30).json()
+                                        for r in b_resp:
+                                            if 'result' in r and r['result']:
+                                                block_times[r['id']] = int(r['result']['timestamp'], 16)
+                                        chunk_success = True
+                                        break
+                                    except Exception as e:
+                                        log.warning(f"Block header fetch delayed (Attempt {attempt+1}/3): {e}")
+                                        time.sleep(2)
+                                        
+                                if not chunk_success:
+                                    raise Exception("Failed to fetch block headers after 3 attempts. Triggering RPC failover.")
 
                             # 3. Parse and Insert Logs
                             out_rows = []
                             for r in logs:
                                 topics = r.get('topics', [])
-                                if len(topics) < 4: continue
+                                if len(topics) < 4: 
+                                    seg_dropped += 1; continue
 
                                 maker = "0x" + topics[2][-40:]
                                 taker = "0x" + topics[3][-40:]
@@ -588,7 +604,8 @@ class DataFetcher:
                                 data_hex = r.get('data', '0x')
                                 if data_hex.startswith('0x'): data_hex = data_hex[2:]
                                 chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
-                                if len(chunks) < 4: continue
+                                if len(chunks) < 4: 
+                                    seg_dropped += 1; continue
 
                                 m_int = int(chunks[0], 16)
                                 t_int = int(chunks[1], 16)
@@ -635,7 +652,8 @@ class DataFetcher:
                         batch_size = min(5000, batch_size + 500)
 
                     except Exception as e:
-                        # Failover: Rotate to the next RPC node in your config and retry
+                        # Failover: Log the error, rotate to the next RPC node, and retry
+                        log.warning(f"⚠️ RPC failover triggered on {current_rpc}: {e}")
                         rpc_index += 1
                         batch_size = max(100, batch_size // 2)
                         time.sleep(2)
