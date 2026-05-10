@@ -19,7 +19,8 @@ RUN pip install --no-cache-dir \
     numba \
     statsmodels \
     pyarrow \
-    duckdb
+    duckdb \
+    web3
 
 # Copy your scripts into the container
 COPY download_data.py .
