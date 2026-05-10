@@ -3,3 +3,7 @@ numpy
 requests
 pyarrow
 numba
+duckdb
+polars
+statsmodels
+scipy
