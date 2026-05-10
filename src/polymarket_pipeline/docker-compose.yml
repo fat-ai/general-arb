@@ -8,9 +8,15 @@ services:
         limits:
           memory: 9G
     volumes:
-      # Assuming this is your main data cache directory
+
       - ~/data-cache/polymarket_cache:/app/data
+
+      - ~/data-cache/polymarket_cache:/app/polymarket_cache
+
       - ~/config.py:/app/config.py
+
+      - ~/sim_strat_3.py:/app/sim_strat_3.py
+      
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app
