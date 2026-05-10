@@ -5,6 +5,7 @@ import math
 import duckdb
 import polars as pl
 import pandas as pd
+import numpy as np
 from datetime import datetime, timezone, timedelta
 import csv
 import shutil
@@ -15,12 +16,12 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-# Import the core math and state definitions from our refactored backtester
 from sim_strat_3 import (
     BayesianState, 
     resolve_market, 
     calibrate_models, 
-    ingest_trade_state,
+    compute_wager_and_p_true,
+    restore_arrays_from_npz,
     CACHE_DIR, 
     MARKETS_FILE, 
     TRADES_PATH
@@ -34,18 +35,23 @@ SCORES_FILE = CACHE_DIR / "user_scores.csv"
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 
 def load_state() -> BayesianState:
-    """Loads the BayesianState from disk, or initializes a new one."""
+    """Loads the lightweight dictionary from Pickle and heavy arrays from NPZ."""
     if STATE_FILE.exists():
         log.info(f"🧠 Loading existing Bayesian Brain from {STATE_FILE}...")
         try:
             with open(STATE_FILE, 'rb') as f:
-                state = pickle.load(f)
+                checkpoint_data = pickle.load(f)
+                state = checkpoint_data['state']
                 
-                # Legacy Support: If an older state file has a datetime, convert it to a float
+                # Legacy Support
                 if hasattr(state.last_processed_timestamp, 'timestamp'):
                     state.last_processed_timestamp = state.last_processed_timestamp.timestamp()
-                
-                return state
+            
+            # Re-attach massive historical arrays via zero-copy C-level bytes
+            npz_path = STATE_FILE.with_suffix('.npz')
+            restore_arrays_from_npz(state, npz_path)
+            
+            return state
         except Exception as e:
             log.error(f"Failed to load state file: {e}")
             log.info("Initializing fresh state as fallback.")
@@ -55,28 +61,112 @@ def load_state() -> BayesianState:
         return BayesianState()
 
 def save_state(state: BayesianState):
-    """Safely saves the BayesianState using atomic file replacement."""
+    """Safely saves the BayesianState using flat NPZ array decoupling to prevent OOM limits."""
+    log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
+    
+    active_uids = state.next_user_id
+    total_yes = sum(len(state.user_history_yes[i]) for i in range(active_uids))
+    total_no = sum(len(state.user_history_no[i]) for i in range(active_uids))
+    
+    yes_arr = np.zeros(total_yes, dtype=np.uint32)
+    no_arr = np.zeros(total_no, dtype=np.uint32)
+    yes_lens = np.zeros(active_uids, dtype=np.uint32)
+    no_lens = np.zeros(active_uids, dtype=np.uint32)
+    
+    y_idx, n_idx = 0, 0
+    for i in range(active_uids):
+        y_len = len(state.user_history_yes[i])
+        yes_lens[i] = y_len
+        if y_len > 0:
+            yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
+            y_idx += y_len
+            
+        n_len = len(state.user_history_no[i])
+        no_lens[i] = n_len
+        if n_len > 0:
+            no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
+            n_idx += n_len
+            
+    var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
+    var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
+    restore_var_yes, restore_var_no = list(state.daily_variance_yes), list(state.daily_variance_no)
+    state.daily_variance_yes.clear()
+    state.daily_variance_no.clear()
+    
+    calib_X_arr = np.array(state.calib_X, dtype=np.float64) if state.calib_X else np.empty((0,3))
+    calib_y_arr = np.array(state.calib_y, dtype=np.float64) if state.calib_y else np.empty(0)
+    calib_dates_arr = np.array(state.calib_dates, dtype=np.float64) if state.calib_dates else np.empty(0)
+    restore_calib_X, restore_calib_y, restore_calib_dates = list(state.calib_X), list(state.calib_y), list(state.calib_dates)
+    state.calib_X.clear()
+    state.calib_y.clear()
+    state.calib_dates.clear()
+
+    # 1. Save Numpy data to compressed NPZ
+    npz_path = STATE_FILE.with_suffix('.npz')
+    np.savez_compressed(
+        npz_path,
+        yes_arr=yes_arr, yes_lens=yes_lens,
+        no_arr=no_arr, no_lens=no_lens,
+        var_yes=var_yes_arr, var_no=var_no_arr,
+        calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr,
+        user_exposure=state.user_exposure, user_peak=state.user_peak,
+        user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
+        user_brier_count=state.user_brier_count
+    )
+    
+    # 2. Strip large arrays from state object
+    restore_exposure, restore_peak, restore_total_trades = state.user_exposure, state.user_peak, state.user_total_trades
+    restore_brier_sum, restore_brier_count = state.user_brier_sum, state.user_brier_count
+    full_yes_list = state.user_history_yes
+    full_no_list = state.user_history_no
+    
+    state.user_exposure = np.empty(0)
+    state.user_peak = np.empty(0)
+    state.user_total_trades = np.empty(0)
+    state.user_brier_sum = np.empty(0)
+    state.user_brier_count = np.empty(0)
+    state.user_history_yes = []
+    state.user_history_no = []
+
+    # 3. Save lightweight dictionary via Pickle
     tmp_file = STATE_FILE.with_suffix('.pkl.tmp')
     try:
         with open(tmp_file, 'wb') as f:
-            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-        tmp_file.replace(STATE_FILE) # Atomic overwrite
-        log.info(f"💾 Bayesian Brain successfully saved to {STATE_FILE}")
+            pickle.dump({'state': state}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_file.replace(STATE_FILE)
+        log.info(f"💾 Bayesian Brain successfully saved to {STATE_FILE} (NPZ + PKL)")
     except Exception as e:
         log.error(f"Failed to save state: {e}")
         if tmp_file.exists():
             tmp_file.unlink()
 
+    # 4. Reattach for continued runtime execution
+    state.user_history_yes = full_yes_list
+    state.user_history_no = full_no_list
+    state.daily_variance_yes.extend(restore_var_yes)
+    state.daily_variance_no.extend(restore_var_no)
+    state.calib_X.extend(restore_calib_X)
+    state.calib_y.extend(restore_calib_y)
+    state.calib_dates.extend(restore_calib_dates)
+    state.user_exposure = restore_exposure
+    state.user_peak = restore_peak
+    state.user_total_trades = restore_total_trades
+    state.user_brier_sum = restore_brier_sum
+    state.user_brier_count = restore_brier_count
+
 def export_dashboard_scores(state: BayesianState):
-    """Exports a human-readable CSV of wallet Brier scores for your dashboards."""
+    """Exports a human-readable CSV of wallet Brier scores from flat memory arrays."""
     log.info("📊 Exporting user scores for dashboards...")
     rows = []
-    for wallet, metrics in state.user_history.items():
-        if metrics.brier_count > 0:
-            mean_brier = metrics.brier_sum / metrics.brier_count
-            rows.append([wallet, metrics.total_trades, round(mean_brier, 4), round(metrics.peak_exposure, 2)])
     
-    # Sort by number of trades (highest first) to put the most active users at the top
+    for wallet, uid in state.user_map.items():
+        brier_count = state.user_brier_count[uid]
+        if brier_count > 0:
+            mean_brier = state.user_brier_sum[uid] / brier_count
+            total_trades = state.user_total_trades[uid]
+            peak_exposure = state.user_peak[uid]
+            rows.append([wallet, total_trades, round(mean_brier, 4), round(peak_exposure, 2)])
+    
     rows.sort(key=lambda x: x[1], reverse=True)
     
     try:
@@ -255,15 +345,74 @@ def main():
                     cid = sys.intern(str(raw_cid))
                     user = sys.intern(str(raw_user))
                         
-                    m = market_map[cid]
+                    m = market_map.get(cid)
+                    if not m: continue
                     if m['start'] is not None and ts < m['start']: continue
                     if m['end'] is not None and ts > m['end']: continue
                     
                     qty = abs(tokens)
                     is_buying = (tokens > 0)
                     bet_on = m['outcome_label']
+                    is_yes = (bet_on == "yes")
                     
-                    ingest_trade_state(state, cid, user, amount, qty, price, ts, m['end'], bet_on, is_buying)
+                    # 1. Invested Amount & Bit-Packing
+                    invested = price * qty if is_buying else (1.0 - price) * qty
+                    price_int = max(0, min(1000, int(price * 1000)))
+                    m_end = m['end'] if m['end'] is not None else (ts + 86400.0)
+                    ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+                    log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+                    packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+                    
+                    # 2. Setup Directionals
+                    eff_dir = 1.0 if is_buying else -1.0
+                    if not is_yes: eff_dir *= -1.0
+                    is_effective_yes = bool(eff_dir > 0)
+                    yes_price = price if is_yes else 1.0 - price
+                    
+                    # 3. String-to-Int Dictionary Mapping
+                    uid = state.user_map.get(user)
+                    if uid is None:
+                        uid = state.next_user_id
+                        state.user_map[user] = uid
+                        state.next_user_id += 1
+                        
+                    u_trades = state.user_total_trades[uid]
+                    if u_trades == 0:
+                        state.global_user_count += 1
+                    else:
+                        state.global_total_peak -= state.user_peak[uid]
+                        
+                    current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
+                    
+                    # 4. Math execution (via Numba)
+                    new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
+                        yes_price, invested, 
+                        state.user_exposure[uid], 
+                        state.user_peak[uid],
+                        u_trades, current_global_avg, is_effective_yes
+                    )
+                    
+                    # 5. Direct Write-Back to NumPy Arrays
+                    state.user_exposure[uid] = new_exp
+                    state.user_peak[uid] = new_peak
+                    state.user_total_trades[uid] = new_n
+                    state.global_total_peak += new_peak
+                    
+                    # 6. Contract Trackers Updates
+                    m_pos = state.contract_positions[cid]
+                    m_pos.user_ids.append(uid)
+                    m_pos.is_yes.append(1 if is_effective_yes else 0)
+                    m_pos.packed_data.append(packed)
+                    m_pos.p_trues.append(p_true)
+                    m_pos.stakes.append(invested)
+                    
+                    # 7. Flattened First Bet Pending Tracker
+                    if u_trades == 0:
+                        risk_vol = amount if is_buying else qty * (1.0 - price)
+                        if risk_vol >= 1.0: 
+                            state.first_bets_pending[cid].append(
+                                (uid, math.log1p(risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buying, math.log1p(ttr_hours))
+                            )
                     
                     if ts > max_ts: max_ts = ts
                     trade_count += 1
