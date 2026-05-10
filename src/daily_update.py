@@ -36,7 +36,21 @@ MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 
 def load_state() -> BayesianState:
     """Loads the lightweight dictionary from Pickle and heavy arrays from NPZ."""
-    if STATE_FILE.exists():
+
+    sim_pkl = CACHE_DIR / "sim_checkpoint.pkl"
+    sim_npz = CACHE_DIR / "sim_checkpoint.npz"
+    
+    if not STATE_FILE.exists() and sim_pkl.exists():
+        log.info("🚀 Bootstrapping live state from backtest checkpoints...")
+        try:
+            shutil.copy2(sim_pkl, STATE_FILE)
+            if sim_npz.exists():
+                shutil.copy2(sim_npz, STATE_FILE.with_suffix('.npz'))
+            log.info("✅ Successfully forked backtest state to live environment.")
+        except Exception as e:
+            log.error(f"Failed to bootstrap from backtest: {e}")
+            
+    elif STATE_FILE.exists():
         log.info(f"🧠 Loading existing Bayesian Brain from {STATE_FILE}...")
         try:
             with open(STATE_FILE, 'rb') as f:
