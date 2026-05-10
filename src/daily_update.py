@@ -50,12 +50,14 @@ def load_state() -> BayesianState:
         except Exception as e:
             log.error(f"Failed to bootstrap from backtest: {e}")
             
-    elif STATE_FILE.exists():
+    if STATE_FILE.exists():
         log.info(f"🧠 Loading existing Bayesian Brain from {STATE_FILE}...")
         try:
             with open(STATE_FILE, 'rb') as f:
                 checkpoint_data = pickle.load(f)
-                state = checkpoint_data['state']
+                
+                # Handle the case where the backtest checkpoint has extra keys
+                state = checkpoint_data['state'] if isinstance(checkpoint_data, dict) and 'state' in checkpoint_data else checkpoint_data
                 
                 # Legacy Support
                 if hasattr(state.last_processed_timestamp, 'timestamp'):
