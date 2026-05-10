@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC')
 CACHE_DIR = Path("/app/data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL
+from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, GRAPH_URL, RPC_URLS
 
 # ---------------------------------------------------------------------------
 # Schema helpers
@@ -446,8 +446,22 @@ class DataFetcher:
     def fetch_gamma_trades(self, target_token_ids, end_date):
         db_file = CACHE_DIR / "gamma_trades.db"
         
+        # Hardcoded CTF Constants to prevent import errors
+        EXCHANGE_CONTRACT = "0x4bFB1616025664B20658FAeED52B0C272C1dcB63"
+        ORDER_FILLED_TOPIC = "0x895dc6934c2bd04f81fa8331ecac6bc7b3992b152cebf67d02ceb6db3227a944"
+        
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
+
+        # Helper to bridge Timestamps -> Polygon Block Numbers without an API key
+        def get_block_from_timestamp(ts):
+            try:
+                resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
+                if resp.status_code == 200:
+                    return resp.json()['height']
+            except Exception as e:
+                log.error(f"Failed to resolve timestamp {ts} to block: {e}")
+            return None
 
         with contextlib.closing(sqlite3.connect(db_file, timeout=30.0)) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -473,8 +487,6 @@ class DataFetcher:
             existing_low_ts = None
             
             print(f"📂 Checking existing SQLite database bounds...")
-            
-            # Let SQLite unify text strings and integers into pure integers using COALESCE
             db_cursor.execute('''
                 SELECT 
                     MAX(CAST(COALESCE(strftime('%s', timestamp), timestamp) AS INTEGER)),
@@ -486,7 +498,6 @@ class DataFetcher:
             if max_val is not None and min_val is not None:
                 existing_high_ts = max_val
                 existing_low_ts = min_val
-                
                 print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
             else:
                 print("⚠️ Database is empty or new. Starting full fetch.")
@@ -496,113 +507,138 @@ class DataFetcher:
             global_stop_ts = int(safe_end_date.timestamp())
                     
             def fetch_segment(start_ts, end_ts, db_conn, segment_name):
-                current_ts = int(start_ts)
-                stop_limit = int(end_ts)
+                print(f"🚀 Resolving {segment_name} timestamps to blocks...")
+                start_block = get_block_from_timestamp(start_ts)
+                end_block = get_block_from_timestamp(end_ts)
+
+                if not start_block or not end_block:
+                    print("❌ Failed to resolve block numbers via DefiLlama. Skipping segment.")
+                    return 0
+
+                # Ensure chronological order for iterating
+                if start_block > end_block:
+                    start_block, end_block = end_block, start_block
+
+                print(f"🚀 Starting Segment: {segment_name} | Block {start_block} -> {end_block}")
                 
-                print(f"🚀 Starting Segment: {segment_name}")
-                print(f"Range: {datetime.utcfromtimestamp(current_ts)} -> {datetime.utcfromtimestamp(stop_limit)}")
-                
+                current_block = start_block
                 seg_captured = 0
                 seg_dropped = 0
-                batch_num = 0
+                rpc_index = 0
+                batch_size = 2000 # Safe default for public RPCs
                 
-                while current_ts > stop_limit:
+                while current_block <= end_block:
+                    target_end = min(current_block + batch_size - 1, end_block)
+                    current_rpc = RPC_URLS[rpc_index % len(RPC_URLS)]
+
+                    payload = {
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+                        "params": [{
+                            "address": EXCHANGE_CONTRACT,
+                            "topics": [ORDER_FILLED_TOPIC],
+                            "fromBlock": hex(current_block),
+                            "toBlock": hex(target_end)
+                        }]
+                    }
+
                     try:
-                        batch_num += 1
-                        query = f"""
-                        query {{
-                            orderFilledEvents(
-                                first: 1000, 
-                                orderBy: timestamp, 
-                                orderDirection: desc, 
-                                where: {{ timestamp_lt: {current_ts}, timestamp_gte: {stop_limit} }}
-                            ) {{
-                                id, timestamp, maker, taker, makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled
-                            }}
-                        }}
-                        """
-                        
-                        resp = self.session.post(GRAPH_URL, json={'query': query}, timeout=10)
+                        resp = self.session.post(current_rpc, json=payload, timeout=15)
                         if resp.status_code != 200:
-                            print(f" ❌ {resp.status_code}")
-                            time.sleep(2)
-                            continue
+                            raise Exception(f"HTTP {resp.status_code}")
 
-                        data = resp.json().get('data', {}).get('orderFilledEvents', [])
-                        
-                        if not data:
-                            print(" Gap/Done.")
-                            break
-
-                        by_ts = defaultdict(list)
-                        for row in data:
-                            ts = int(row['timestamp'])
-                            by_ts[ts].append(row)
-                        
-                        sorted_ts = sorted(by_ts.keys(), reverse=True)
-                        oldest_ts = sorted_ts[-1]
-                        is_full_batch = (len(data) >= 1000)
-                        
-                        out_rows = []
-                        
-                        for ts in sorted_ts:
-                            if ts <= stop_limit: 
+                        data = resp.json()
+                        if 'error' in data:
+                            err_code = data['error'].get('code')
+                            err_msg = data['error'].get('message', '')
+                            # Dynamically shrink batch size if the RPC rejects the range width
+                            if "block range is too wide" in err_msg or err_code in [-32005, -32002]:
+                                batch_size = max(100, batch_size // 2)
+                                print(f"📉 RPC limit hit. Shrinking batch size to {batch_size}...")
                                 continue
-                            if is_full_batch and ts == oldest_ts: continue
+                            raise Exception(f"RPC Error: {data['error']}")
+
+                        logs = data.get('result', [])
+
+                        if logs:
+                            # 1. Gather unique blocks to fetch timestamps
+                            unique_blocks = list(set([int(l['blockNumber'], 16) for l in logs]))
+                            block_times = {}
+
+                            # 2. Fetch block headers in chunks of 50 via JSON-RPC Batching
+                            block_reqs = [{"jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": [hex(b), False], "id": b} for b in unique_blocks]
                             
-                            for r in by_ts[ts]:
-                                if r.get('maker') == r.get('taker'):
+                            for i in range(0, len(block_reqs), 50):
+                                chunk = block_reqs[i:i+50]
+                                b_resp = self.session.post(current_rpc, json=chunk, timeout=15).json()
+                                for r in b_resp:
+                                    if 'result' in r and r['result']:
+                                        block_times[r['id']] = int(r['result']['timestamp'], 16)
+
+                            # 3. Parse and Insert Logs
+                            out_rows = []
+                            for r in logs:
+                                topics = r.get('topics', [])
+                                if len(topics) < 4: continue
+
+                                maker = "0x" + topics[2][-40:]
+                                taker = "0x" + topics[3][-40:]
+                                if maker == taker:
                                     seg_dropped += 1; continue
-                                
-                                m_raw = str(r.get('makerAssetId', '0')).strip()
-                                if m_raw.startswith("0x"): m_int = int(m_raw, 16)
-                                else: m_int = int(Decimal(m_raw))
-                                
-                                t_raw = str(r.get('takerAssetId', '0')).strip()
-                                if t_raw.startswith("0x"): t_int = int(t_raw, 16)
-                                else: t_int = int(Decimal(t_raw))
-                                
+
+                                data_hex = r.get('data', '0x')
+                                if data_hex.startswith('0x'): data_hex = data_hex[2:]
+                                chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+                                if len(chunks) < 4: continue
+
+                                m_int = int(chunks[0], 16)
+                                t_int = int(chunks[1], 16)
+                                m_amt = int(chunks[2], 16)
+                                t_amt = int(chunks[3], 16)
+
                                 tid = None; mult = 0
                                 if m_int in target_token_ids:
                                     tid = m_int; mult = 1
-                                    val_usdc = float(r['takerAmountFilled']) / 1e6
-                                    val_size = float(r['makerAmountFilled']) / 1e6
+                                    val_usdc = float(t_amt) / 1e6
+                                    val_size = float(m_amt) / 1e6
                                 elif t_int in target_token_ids:
                                     tid = t_int; mult = -1
-                                    val_usdc = float(r['makerAmountFilled']) / 1e6
-                                    val_size = float(r['takerAmountFilled']) / 1e6
-                                
+                                    val_usdc = float(m_amt) / 1e6
+                                    val_size = float(t_amt) / 1e6
+
                                 if tid and val_usdc > 0 and val_size > 0:
                                     price = val_usdc / val_size
-                                    if price > 1.00 or price < 0.000001:
+                                    if price > 1.0 or price < 0.000001:
                                         seg_dropped += 1; continue
-                                        
+
+                                    b_num = int(r['blockNumber'], 16)
+                                    ts = block_times.get(b_num, 0)
+                                    log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
+
                                     out_rows.append((
-                                        r['id'], 
-                                        int(r['timestamp']), # ✅ FIX: Store raw integer directly
-                                        val_usdc, 
-                                        val_size * mult,
-                                        r['taker'], 
-                                        str(tid),
-                                        price, 
-                                        val_size, 
-                                        mult
+                                        log_id, ts, val_usdc, val_size * mult,
+                                        taker, str(tid), price, val_size, mult
                                     ))
 
-                        if out_rows:
-                            db_conn.executemany("""
-                                INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, out_rows)
-                            db_conn.commit()
-                            seg_captured += len(out_rows)
+                            if out_rows:
+                                db_conn.executemany("""
+                                    INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, out_rows)
+                                db_conn.commit()
+                                seg_captured += len(out_rows)
 
-                        current_ts = oldest_ts
-                        print(f"   | {segment_name} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
+                        print(f"   | {segment_name} | Blocks {current_block}-{target_end} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
+
+                        current_block = target_end + 1
+                        
+                        # Optimistically stretch the batch size back out if the RPC is handling it well
+                        batch_size = min(5000, batch_size + 500)
 
                     except Exception as e:
-                        print(f" Err: {e}")
-                        time.sleep(1)
+                        # Failover: Rotate to the next RPC node in your config and retry
+                        rpc_index += 1
+                        batch_size = max(100, batch_size // 2)
+                        time.sleep(2)
                 
                 print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
                 return seg_captured
@@ -611,8 +647,8 @@ class DataFetcher:
                
             if existing_high_ts:
                 if global_stop_ts > existing_high_ts:
-                    print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(existing_high_ts)})")
-                    count = fetch_segment(global_stop_ts, existing_high_ts, conn, "NEW_HEAD")
+                    print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(existing_high_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                    count = fetch_segment(existing_high_ts, global_stop_ts, conn, "NEW_HEAD")
                     total_captured += count
                 else:
                     print(f"\n🌊 Fetching Newer Data Skipped (Configured End Date <= Existing Head)")
@@ -630,7 +666,7 @@ class DataFetcher:
                 total_captured += count
 
             print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
-
+            
     def run(self):
         current_utc_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
         print(f"Starting data collection up to {current_utc_naive}...")
