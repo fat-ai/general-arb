@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir \
     pandas \
     numpy \
     scipy \
+    numba \
     statsmodels \
     pyarrow \
     duckdb
