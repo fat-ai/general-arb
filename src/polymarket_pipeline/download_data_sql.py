@@ -443,11 +443,15 @@ class DataFetcher:
             Path(p).unlink(missing_ok=True)
             
     def fetch_gamma_trades(self, target_token_ids, end_date):
+        from web3 import Web3
         db_file = CACHE_DIR / "gamma_trades.db"
         
-        # Hardcoded CTF Constants to prevent import errors
-        EXCHANGE_CONTRACT = "0x4bFB1616025664B20658FAeED52B0C272C1dcB63"
-        ORDER_FILLED_TOPIC = "0x895dc6934c2bd04f81fa8331ecac6bc7b3992b152cebf67d02ceb6db3227a944"
+        # Verified Polymarket CTF Exchange Address
+        EXCHANGE_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+        
+        # Dynamically generate the topic hash to guarantee accuracy
+        sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
+        ORDER_FILLED_TOPIC = Web3.keccak(text=sig).hex()
         
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
@@ -561,6 +565,9 @@ class DataFetcher:
                             raise Exception(f"RPC Error: {data['error']}")
 
                         logs = data.get('result', [])
+                        
+                        if not logs:
+                            log.debug(f"eth_getLogs returned [] for blocks {current_block}-{target_end} on {current_rpc}")
 
                         if logs:
                             # 1. Gather unique blocks to fetch timestamps
