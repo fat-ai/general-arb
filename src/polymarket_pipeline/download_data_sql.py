@@ -448,7 +448,8 @@ class DataFetcher:
         
         # The new V2 Polymarket Contracts
         EXCHANGE_CONTRACTS = [
-            "0xE111180000d2663C0091e4f400237545B87B996B"
+            "0xE111180000d2663C0091e4f400237545B87B996B", # V2 CTF Exchange
+            "0xe2222d279d744050d28e00520010520000310F59"  # V2 NegRisk Exchange
         ]
         
         # The mathematically verified V2 OrderFilled Topic Hash
