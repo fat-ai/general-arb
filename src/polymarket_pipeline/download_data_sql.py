@@ -680,11 +680,20 @@ class DataFetcher:
                         batch_size = min(5000, batch_size + 500)
 
                     except Exception as e:
-                        # Failover: Log the error, rotate to the next RPC node, and retry
-                        log.warning(f"⚠️ RPC failover triggered on {current_rpc}: {e}")
+                        err_str = str(e)
+                        log.warning(f"⚠️ RPC failover triggered on {current_rpc}: {err_str}")
+                        
+                        # 1. Handle Rate Limits (HTTP 429) gracefully to prevent permanent bans
+                        if "429" in err_str:
+                            log.info("⏳ Rate limit hit. Cooling down for 10 seconds before rotating...")
+                            time.sleep(10)
+                        else:
+                            time.sleep(2)
+                            
                         rpc_index += 1
-                        batch_size = max(100, batch_size // 2)
-                        time.sleep(2)
+                        
+                        # 2. Lower the absolute floor to 10 blocks so weak nodes like Tatum can digest the payload
+                        batch_size = max(10, batch_size // 2)
                 
                 print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
                 return seg_captured
