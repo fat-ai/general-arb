@@ -497,10 +497,16 @@ class DataFetcher:
             existing_low_ts = None
             
             print(f"📂 Checking existing SQLite database bounds...")
+            
+            # 1. Self-Healing: Delete any trades that accidentally saved with a 0 timestamp
+            db_cursor.execute("DELETE FROM trades WHERE timestamp = 0")
+            conn.commit()
+
+            # 2. Safe Bounds Query: Handle old string datetimes and new integer epochs correctly
             db_cursor.execute('''
                 SELECT 
-                    MAX(CAST(COALESCE(strftime('%s', timestamp), timestamp) AS INTEGER)),
-                    MIN(CAST(COALESCE(strftime('%s', timestamp), timestamp) AS INTEGER))
+                    MAX(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END),
+                    MIN(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
                 FROM trades
             ''')
             max_val, min_val = db_cursor.fetchone()
@@ -657,6 +663,8 @@ class DataFetcher:
 
                                     b_num = int(r['blockNumber'], 16)
                                     ts = block_times.get(b_num, 0)
+                                    if ts == 0:
+                                        seg_dropped += 1; continue
                                     log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
 
                                     out_rows.append((
