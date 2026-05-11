@@ -22,12 +22,16 @@ from strategy import TradeLogic
 from sim_strat_3 import (
     BayesianState,
     process_trade,
-    ingest_trade_state,
     fast_numba_scan,
     PRICE_LUT,
     TIME_LUT,
-    CACHE_DIR
+    CACHE_DIR,
+    restore_arrays_from_npz,   
+    compute_wager_and_p_true,  
+    P_RANGE
 )
+import numpy as np     
+import math
 from ws_handler import PolymarketWS
 
 STATE_FILE = CACHE_DIR / "bayesian_state.pkl"
@@ -109,8 +113,16 @@ class LiveTrader:
         print("🧠 Loading Bayesian State from disk...")
         if STATE_FILE.exists():
             with open(STATE_FILE, 'rb') as f:
-                self.state = pickle.load(f)
-            log.info(f"✅ Loaded Bayesian state: {len(self.state.user_history)} users tracked.")
+                checkpoint_data = pickle.load(f)
+                
+                # Handle cases where the checkpoint is wrapped in a 'state' dictionary key
+                self.state = checkpoint_data['state'] if isinstance(checkpoint_data, dict) and 'state' in checkpoint_data else checkpoint_data
+            
+            # Re-attach massive historical arrays via zero-copy C-level bytes
+            npz_path = STATE_FILE.with_suffix('.npz')
+            restore_arrays_from_npz(self.state, npz_path)
+            
+            log.info(f"✅ Loaded Bayesian state: {self.state.next_user_id} users tracked.")
         else:
             log.warning("⚠️ No bayesian_state.pkl found! Starting with a blank slate.")
             self.state = BayesianState()
@@ -754,16 +766,68 @@ class LiveTrader:
             # Ensure time-to-resolution is at least 1 hour
             ttr_hours = max(1.0, (market['end_timestamp'] - t['timestamp']) / 3600.0)
 
-            # 7. Ingest Trade into Bayesian State (Live Memory Update)
-            ingest_trade_state(
-                state=self.state, cid=token_id, user=wallet, amount=usdc_vol, 
-                qty=token_vol, price=price, ts=ts_dt, market_end=end_dt, 
-                bet_on=bet_on, is_buying=is_buy
-            )
+            # ---------------------------------------------------------
+            # 7. INGEST TRADE INTO BAYESIAN STATE (Vectorized & Flat)
+            # ---------------------------------------------------------
+            # String-to-Int Dictionary Mapping to drop string pointer RAM
+            uid = self.state.user_map.get(wallet)
+            if uid is None:
+                uid = self.state.next_user_id
+                self.state.user_map[wallet] = uid
+                self.state.next_user_id += 1
+                
+            u_trades = self.state.user_total_trades[uid]
+            if u_trades == 0:
+                self.state.global_user_count += 1
+            else:
+                self.state.global_total_peak -= self.state.user_peak[uid]
+                
+            current_global_avg = (self.state.global_total_peak / self.state.global_user_count) if self.state.global_user_count > 0 else 100.0
+            
+            eff_dir = 1.0 if is_buy else -1.0
+            if not is_yes_token: eff_dir *= -1.0
+            is_effective_yes = bool(eff_dir > 0)
+            yes_price = price if is_yes_token else 1.0 - price
 
-            # 8. Extract Bayesian Edge
-            smooth_prob, marg, perc_marg = process_trade(
-                wallet=wallet, price=price, stake=usdc_vol, 
+            # 7a. Math execution (via Numba)
+            new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
+                yes_price, usdc_vol, 
+                self.state.user_exposure[uid], 
+                self.state.user_peak[uid],
+                u_trades, current_global_avg, is_effective_yes
+            )
+            
+            # 7b. Direct Write-Back to NumPy Arrays
+            self.state.user_exposure[uid] = new_exp
+            self.state.user_peak[uid] = new_peak
+            self.state.user_total_trades[uid] = new_n
+            self.state.global_total_peak += new_peak
+            
+            # 7c. Bit-Packing (Price and TTR into uint32)
+            price_int = max(0, min(1000, int(price * 1000)))
+            log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+            packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+            
+            # 7d. Contract Trackers Updates
+            m_pos = self.state.contract_positions[token_id]
+            m_pos.user_ids.append(uid)
+            m_pos.is_yes.append(1 if is_effective_yes else 0)
+            m_pos.packed_data.append(packed)
+            m_pos.p_trues.append(p_true)
+            m_pos.stakes.append(usdc_vol)
+            
+            # 7e. Flattened First Bet Pending Tracker
+            if u_trades == 0:
+                if usdc_vol >= 1.0: 
+                    self.state.first_bets_pending[token_id].append(
+                        (uid, math.log1p(usdc_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
+                    )
+
+            # ---------------------------------------------------------
+            # 8. EXTRACT BAYESIAN EDGE
+            # ---------------------------------------------------------
+            smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
+                uid=uid, price=price, stake=usdc_vol, 
                 direction=direction, is_buying=is_buy, 
                 ttr_hours=ttr_hours, state=self.state, 
                 price_lut=PRICE_LUT, time_lut=TIME_LUT
