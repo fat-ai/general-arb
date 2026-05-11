@@ -557,36 +557,39 @@ class DataFetcher:
                 batch_size = 2000 # Safe default for public RPCs
                 
                 while current_block <= end_block:
-                    target_end = min(current_block + batch_size - 1, end_block)
+                    # 1. Hard cap batch size at 100 to prevent strict public nodes from rejecting it
+                    target_end = min(current_block + min(batch_size, 100) - 1, end_block)
                     current_rpc = RPC_URLS[rpc_index % len(RPC_URLS)]
 
-                    payload = {
-                        "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                        "params": [{
-                            "address": EXCHANGE_CONTRACTS,
-                            "topics": [ORDER_FILLED_TOPIC],
-                            "fromBlock": hex(current_block),
-                            "toBlock": hex(target_end)
-                        }]
-                    }
-
+                    logs = []
                     try:
-                        resp = self.session.post(current_rpc, json=payload, timeout=15)
-                        if resp.status_code != 200:
-                            raise Exception(f"HTTP {resp.status_code}")
+                        # 2. Query each contract separately to bypass HTTP 400 array rejection
+                        for contract_addr in EXCHANGE_CONTRACTS:
+                            payload = {
+                                "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+                                "params": [{
+                                    "address": contract_addr,
+                                    "topics": [ORDER_FILLED_TOPIC],
+                                    "fromBlock": hex(current_block),
+                                    "toBlock": hex(target_end)
+                                }]
+                            }
 
-                        data = resp.json()
-                        if 'error' in data:
-                            err_code = data['error'].get('code')
-                            err_msg = data['error'].get('message', '')
-                            # Dynamically shrink batch size if the RPC rejects the range width
-                            if "block range is too wide" in err_msg or err_code in [-32005, -32002]:
-                                batch_size = max(100, batch_size // 2)
-                                print(f"📉 RPC limit hit. Shrinking batch size to {batch_size}...")
-                                continue
-                            raise Exception(f"RPC Error: {data['error']}")
+                            resp = self.session.post(current_rpc, json=payload, timeout=15)
+                            if resp.status_code != 200:
+                                raise Exception(f"HTTP {resp.status_code}")
 
-                        logs = data.get('result', [])
+                            data = resp.json()
+                            if 'error' in data:
+                                err_code = data['error'].get('code')
+                                err_msg = data['error'].get('message', '')
+                                # Trigger failover and shrink batch if range is too wide
+                                if "block range" in err_msg.lower() or err_code in [-32005, -32002, -32001, -16412]:
+                                    raise Exception(f"Range too wide: {err_msg}")
+                                raise Exception(f"RPC Error: {data['error']}")
+
+                            # Append this contract's trades to the master list
+                            logs.extend(data.get('result', []))
                         
                         if not logs:
                             log.debug(f"eth_getLogs returned [] for blocks {current_block}-{target_end} on {current_rpc}")
