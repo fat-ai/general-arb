@@ -509,6 +509,20 @@ class DataFetcher:
                 existing_high_ts = max_val
                 existing_low_ts = min_val
                 print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
+
+
+
+                
+                # --- ADD THESE TWO LINES TEMPORARILY ---
+                # Forces the cursor back to April 28, 2026 11:00:40 UTC
+                existing_high_ts = 1714302040 
+                print(f"⚠️ OVERRIDE ACTIVE: Forcing NEW_HEAD to start from {datetime.utcfromtimestamp(existing_high_ts)}")
+                # ---------------------------------------
+
+
+
+
+            
             else:
                 print("⚠️ Database is empty or new. Starting full fetch.")
 
