@@ -250,11 +250,15 @@ def main():
     # 1. RESOLVE FINISHED MARKETS
     # ==========================================
     log.info("⚖️ Checking for newly resolved markets...")
-    cids_to_resolve = [
-        cid for cid in list(state.contract_positions.keys()) + list(state.first_bets_pending.keys())
-        if cid in market_map and market_map[cid]['outcome'] is not None
-    ]
     
+    cids_to_resolve = []
+    for cid in list(state.contract_positions.keys()) + list(state.first_bets_pending.keys()):
+        if cid in market_map:
+            outcome = market_map[cid]['outcome']
+            # Safe check: Must not be None, and must not be NaN
+            if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
+                cids_to_resolve.append(cid)
+                
     cids_to_resolve = list(set(cids_to_resolve))
     
     for r_cid in cids_to_resolve:
@@ -262,6 +266,9 @@ def main():
         outcome_label = market_map[r_cid]['outcome_label']
         # Note: resolve_market uses .pop() internally, making it idempotent
         resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
+        
+    if cids_to_resolve:
+        log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
         
     if cids_to_resolve:
         log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
