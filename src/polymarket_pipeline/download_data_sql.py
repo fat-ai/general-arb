@@ -446,15 +446,14 @@ class DataFetcher:
         from web3 import Web3
         db_file = CACHE_DIR / "gamma_trades.db"
         
-        # Verified Polymarket CTF Exchange Address
+        # The new V2 Polymarket Contracts
         EXCHANGE_CONTRACTS = [
-            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", # CTF Exchange
-            "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # NegRisk CTF Exchange
+            "0xE111180000d2663C0091e4f400237545B87B996B", # V2 CTF Exchange
+            "0xe2222d279d744050d28e00520010520000310F59"  # V2 NegRisk Exchange
         ]
         
-        # Dynamically generate the topic hash to guarantee accuracy
-        sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
-        ORDER_FILLED_TOPIC = "0x" + Web3.keccak(text=sig).hex().replace("0x", "")
+        # The mathematically verified V2 OrderFilled Topic Hash
+        ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
         
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
@@ -629,8 +628,7 @@ class DataFetcher:
                                 maker = "0x" + topics[2][-40:]
                                 taker = "0x" + topics[3][-40:]
                                 
-                                # Drop if maker/taker are identical OR if the taker is the exchange contract.
-                                # This prevents double-counting volume and stops the exchange from being tracked as a user.
+                                # Drop if taker is the exchange contract to prevent double-counting
                                 lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
                                 if maker == taker or taker.lower() in lower_exchanges:
                                     seg_dropped += 1; continue
@@ -638,25 +636,34 @@ class DataFetcher:
                                 data_hex = r.get('data', '0x')
                                 if data_hex.startswith('0x'): data_hex = data_hex[2:]
                                 chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+                                
+                                # V2 Data Payload has 7 chunks
                                 if len(chunks) < 4: 
                                     seg_dropped += 1; continue
 
-                                m_int = int(chunks[0], 16)
-                                t_int = int(chunks[1], 16)
-                                m_amt = int(chunks[2], 16)
-                                t_amt = int(chunks[3], 16)
+                                side = int(chunks[0], 16)
+                                tid = int(chunks[1], 16)
+                                amt_2 = int(chunks[2], 16)
+                                amt_3 = int(chunks[3], 16)
 
-                                tid = None; mult = 0
-                                if m_int in target_token_ids:
-                                    tid = m_int; mult = 1
-                                    val_usdc = float(t_amt) / 1e6
-                                    val_size = float(m_amt) / 1e6
-                                elif t_int in target_token_ids:
-                                    tid = t_int; mult = -1
-                                    val_usdc = float(m_amt) / 1e6
-                                    val_size = float(t_amt) / 1e6
+                                # V2 specifically provides the token ID, making filtering perfectly precise
+                                if tid not in target_token_ids:
+                                    seg_dropped += 1; continue
 
-                                if tid and val_usdc > 0 and val_size > 0:
+                                if side == 0:
+                                    # Maker is BID: Taker pays Shares (amt_2) and receives USDC (amt_3) -> Taker is SELLING
+                                    val_size = float(amt_2) / 1e6
+                                    val_usdc = float(amt_3) / 1e6
+                                    mult = -1
+                                elif side == 1:
+                                    # Maker is ASK: Taker pays USDC (amt_2) and receives Shares (amt_3) -> Taker is BUYING
+                                    val_usdc = float(amt_2) / 1e6
+                                    val_size = float(amt_3) / 1e6
+                                    mult = 1
+                                else:
+                                    seg_dropped += 1; continue
+
+                                if val_usdc > 0 and val_size > 0:
                                     price = val_usdc / val_size
                                     if price > 1.0 or price < 0.000001:
                                         seg_dropped += 1; continue
@@ -665,6 +672,7 @@ class DataFetcher:
                                     ts = block_times.get(b_num, 0)
                                     if ts == 0:
                                         seg_dropped += 1; continue
+
                                     log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
 
                                     out_rows.append((
