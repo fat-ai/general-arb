@@ -1165,8 +1165,6 @@ class LiveTrader:
                 log.info("🌍 Hourly Metadata Refresh...")
                 await self.metadata.refresh()
                 log.info("🧠 Hourly Brain Refresh: Reloading JSON parameters...")
-
-                await asyncio.to_thread(self.scorer.load)
                 
                 self.sub_manager.dirty = True
                 
