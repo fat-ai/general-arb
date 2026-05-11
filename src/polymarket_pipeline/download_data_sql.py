@@ -48,7 +48,7 @@ def _safe_is_null(val):
 class DataFetcher:
     def __init__(self):
         self.session = requests.Session()
-        self.retries = Retry(total=None, backoff_factor=2, backoff_max=60, status_forcelist=[500, 502, 503, 504, 429])
+        self.retries = Retry(total=2, backoff_factor=1, backoff_max=10, status_forcelist=[500, 502, 503, 504])
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=self.retries))
          
     def fetch_gamma_markets(self):
