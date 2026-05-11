@@ -447,7 +447,10 @@ class DataFetcher:
         db_file = CACHE_DIR / "gamma_trades.db"
         
         # Verified Polymarket CTF Exchange Address
-        EXCHANGE_CONTRACT = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+        EXCHANGE_CONTRACTS = [
+            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", # CTF Exchange
+            "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # NegRisk CTF Exchange
+        ]
         
         # Dynamically generate the topic hash to guarantee accuracy
         sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
@@ -541,7 +544,7 @@ class DataFetcher:
                     payload = {
                         "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
                         "params": [{
-                            "address": EXCHANGE_CONTRACT,
+                            "address": EXCHANGE_CONTRACTS,
                             "topics": [ORDER_FILLED_TOPIC],
                             "fromBlock": hex(current_block),
                             "toBlock": hex(target_end)
@@ -605,7 +608,11 @@ class DataFetcher:
 
                                 maker = "0x" + topics[2][-40:]
                                 taker = "0x" + topics[3][-40:]
-                                if maker == taker:
+                                
+                                # Drop if maker/taker are identical OR if the taker is the exchange contract.
+                                # This prevents double-counting volume and stops the exchange from being tracked as a user.
+                                lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
+                                if maker == taker or taker.lower() in lower_exchanges:
                                     seg_dropped += 1; continue
 
                                 data_hex = r.get('data', '0x')
