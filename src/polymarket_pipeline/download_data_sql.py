@@ -451,7 +451,7 @@ class DataFetcher:
         
         # Dynamically generate the topic hash to guarantee accuracy
         sig = "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)"
-        ORDER_FILLED_TOPIC = Web3.keccak(text=sig).hex()
+        ORDER_FILLED_TOPIC = "0x" + Web3.keccak(text=sig).hex().replace("0x", "")
         
         print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
         if not target_token_ids: return
