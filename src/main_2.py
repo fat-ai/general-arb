@@ -357,11 +357,20 @@ class LiveTrader:
         """
         The 'Ground Truth' Loop.
         Upgraded to use aiohttp for persistent connections, dynamic backoff, 
-        and Round-Robin RPC failover to prevent stalling.
+        and Round-Robin RPC failover to prevent stalling. (V2 Compatible)
         """
         import aiohttp
         import asyncio
-        from config import RPC_URLS, EXCHANGE_CONTRACT, ORDER_FILLED_TOPIC
+        from config import RPC_URLS
+        
+        # The new V2 Polymarket Contracts
+        EXCHANGE_CONTRACTS = [
+            "0xE111180000d2663C0091e4f400237545B87B996B", # V2 CTF Exchange
+            "0xe2222d279d744050d28e00520010520000310F59"  # V2 NegRisk Exchange
+        ]
+        
+        # The mathematically verified V2 OrderFilled Topic Hash
+        ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
         
         rpc_index = 0
         
@@ -376,7 +385,6 @@ class LiveTrader:
             while current_block_num is None and self.running:
                 try:
                     payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
-                    # Added a 5-second timeout so dead RPCs fail fast
                     async with session.post(get_rpc(), json=payload, timeout=5) as resp:
                         data = await resp.json()
                         current_block_num = int(data['result'], 16) - 10
@@ -405,127 +413,146 @@ class LiveTrader:
                     if current_block_num <= chain_tip:
                         end_block = min(current_block_num + batch_size - 1, chain_tip)
                         
-                        log_payload = {
-                            "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
-                            "params": [{
-                                "address": EXCHANGE_CONTRACT,
-                                "fromBlock": hex(current_block_num),
-                                "toBlock": hex(end_block)
-                            }]
-                        }
+                        logs = []
+                        has_error = False
+                        error_data = None
                         
-                        # 10-second timeout for pulling heavy log batches
-                        async with session.post(current_rpc, json=log_payload, timeout=10) as logs_resp:
-                            data = await logs_resp.json()
+                        # Fetch logs for each V2 contract
+                        for contract_addr in EXCHANGE_CONTRACTS:
+                            log_payload = {
+                                "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
+                                "params": [{
+                                    "address": contract_addr,
+                                    "topics": [ORDER_FILLED_TOPIC],
+                                    "fromBlock": hex(current_block_num),
+                                    "toBlock": hex(end_block)
+                                }]
+                            }
                             
-                            if 'result' in data:
-                                logs = data['result']
-                                count = len(logs)
+                            # 10-second timeout for pulling heavy log batches
+                            async with session.post(current_rpc, json=log_payload, timeout=10) as logs_resp:
+                                data = await logs_resp.json()
                                 
-                                if count > 0:
-                                    trade_count = 0
-                                    for log_item in logs:
-                                        topics = log_item.get('topics', [])
-                                        if not topics: continue
-                                        
-                                        if topics[0].lower() == ORDER_FILLED_TOPIC.lower():
-                                            res = await self._parse_log(log_item)
-                                            if res == "TRADE": trade_count += 1
+                                if 'result' in data:
+                                    logs.extend(data['result'])
+                                elif 'error' in data:
+                                    has_error = True
+                                    error_data = data
+                                    break
                                     
-                                    if trade_count > 0:
-                                        log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                        if not has_error:
+                            count = len(logs)
+                            
+                            if count > 0:
+                                trade_count = 0
+                                for log_item in logs:
+                                    res = await self._parse_log(log_item)
+                                    if res == "TRADE": trade_count += 1
                                 
-                                # Move cursor and sprint (Using the fixed math trap logic!)
-                                current_block_num = end_block + 1
-                                batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
-                                
-                            elif 'error' in data:
-                                log.error(f"🚨 RPC Error from {current_rpc}: {data['error']}")
-                                error_code = data['error'].get('code')
-                                
-                                if error_code in [-32002, -32005, -32000]:
-                                    if batch_size > 1:
-                                        batch_size = max(1, batch_size // 2)
-                                        log.warning(f"📉 Shrinking batch size to {batch_size}...")
-                                        
-                                        # If it's a strict timeout (-32002), punish the RPC by rotating
-                                        if error_code == -32002:
-                                            rpc_index = (rpc_index + 1) % len(RPC_URLS)
-                                            log.warning(f"🔄 Rotating to new RPC: {get_rpc()}")
-                                    else:
-                                        log.warning(f"⏳ Single block {current_block_num} timed out. Rotating RPC and retrying...")
+                                if trade_count > 0:
+                                    log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                            
+                            # Move cursor and sprint
+                            current_block_num = end_block + 1
+                            batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
+                            
+                        else:
+                            data = error_data
+                            log.error(f"🚨 RPC Error from {current_rpc}: {data['error']}")
+                            error_code = data['error'].get('code')
+                            
+                            if error_code in [-32002, -32005, -32000]:
+                                if batch_size > 1:
+                                    batch_size = max(1, batch_size // 2)
+                                    log.warning(f"📉 Shrinking batch size to {batch_size}...")
+                                    
+                                    if error_code == -32002:
                                         rpc_index = (rpc_index + 1) % len(RPC_URLS)
-                                        await asyncio.sleep(2.0)
-                                        continue
-                                        
-                                await asyncio.sleep(1.0) 
+                                        log.warning(f"🔄 Rotating to new RPC: {get_rpc()}")
+                                else:
+                                    log.warning(f"⏳ Single block {current_block_num} timed out. Rotating RPC and retrying...")
+                                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                    await asyncio.sleep(2.0)
+                                    continue
+                                    
+                            await asyncio.sleep(1.0) 
                     
                     else:
                         await asyncio.sleep(2.0)
                         
                 except Exception as e:
-                    # Catch network drops, disconnected websockets, or Python timeout errors
                     log.error(f"⚠️ Connection dropped/timeout on {get_rpc()}: {e}. Rotating RPC...")
                     rpc_index = (rpc_index + 1) % len(RPC_URLS)
-                    batch_size = max(1, batch_size // 2) # Cut batch size to be safe
+                    batch_size = max(1, batch_size // 2)
                     await asyncio.sleep(2.0)
     
     async def _parse_log(self, log_item):
         """
-        Parses Polymarket CTF Exchange logs.
-        Fixes the 1:1000 scaling artifact by using the max volume value.
+        Parses Polymarket V2 CTF Exchange logs.
+        Uses comparative math validation logic to determine trade direction.
         """
         try:
             topics = log_item.get('topics', [])
             if len(topics) < 4: return "ERROR"
 
-            # 1. EXTRACT ADDRESSES
             maker = "0x" + topics[2][-40:]
             taker = "0x" + topics[3][-40:]
+            
+            EXCHANGE_CONTRACTS = [
+                "0xE111180000d2663C0091e4f400237545B87B996B",
+                "0xe2222d279d744050d28e00520010520000310F59"
+            ]
+            
+            # Drop if taker is the exchange contract to prevent double-counting
+            lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
+            if maker == taker or taker.lower() in lower_exchanges:
+                return "IGNORED"
 
-            # 2. EXTRACT DATA CHUNKS
             data_hex = log_item.get('data', '0x')
             if data_hex.startswith('0x'): data_hex = data_hex[2:]
-            
-            # Split into 32-byte chunks
             chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
-            
-            if len(chunks) >= 4:
-                # Raw Parsing
-                asset_a_str = str(int(chunks[0], 16))
-                asset_b_str = str(int(chunks[1], 16))
-                amt_a_raw = int(chunks[2], 16)
-                amt_b_raw = int(chunks[3], 16)
-                
-                # Normalise USDC address to "0"
-                usdc_decimal = str(int("2791bca1f2de4661ed88a30c99a7a9449aa84174", 16))
-                if asset_a_str == usdc_decimal or asset_a_str == "0":
-                    asset_a_str = "0"
-                if asset_b_str == usdc_decimal or asset_b_str == "0":
-                    asset_b_str = "0"
 
-                # --- VOLUME NORMALIZATION ---
-                # The logs show a 1000x difference between Amt A and Amt B.
-                # We interpret the LARGER value as the true micro-USDC amount 
-                # to capture the real economic size (e.g. $8.00 vs $0.008).
-                
-                # Check if this looks like a USDC trade (Asset 0 or known USDC)
-                target_usdc_dec = "2791bca1f2de4661ed88a30c99a7a9449aa84174" # Decimal of USDC Addr
-                is_usdc_trade = (
-                    asset_a_str in ["0", target_usdc_dec] or 
-                    asset_b_str in ["0", target_usdc_dec]
-                )
+            # V2 Data Payload has 7 chunks minimum
+            if len(chunks) >= 7:
+                tid = str(int(chunks[1], 16))
+                makerAmount = int(chunks[2], 16)
+                takerAmount = int(chunks[3], 16)
 
-                # --- FIX: Preserve the actual split to calculate Price ---
+                # PURE MATH VALIDATION LOGIC
+                if makerAmount < takerAmount:
+                    # Maker pays USDC, Taker pays Shares -> Taker is SELLING
+                    val_usdc = float(makerAmount) / 1e6
+                    val_size = float(takerAmount) / 1e6
+                    is_buy = False
+                elif makerAmount > takerAmount:
+                    # Maker pays Shares, Taker pays USDC -> Taker is BUYING
+                    val_usdc = float(takerAmount) / 1e6
+                    val_size = float(makerAmount) / 1e6
+                    is_buy = True
+                else:
+                    # Exact $1.00 resolution boundary trade
+                    val_usdc = float(makerAmount) / 1e6
+                    val_size = float(takerAmount) / 1e6
+                    is_buy = True
+
+                if val_usdc > 0 and val_size > 0:
+                    price = val_usdc / val_size
+                    if price > 1.0 or price < 0.000001:
+                        return "ERROR"
+                else:
+                    return "ERROR"
+
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
                     'timestamp': int(time.time()),
                     'taker': taker,
                     'maker': maker,
-                    'makerAssetId': asset_a_str, 
-                    'takerAssetId': asset_b_str,
-                    'makerAmountFilled': str(amt_a_raw), # Actual Maker Vol
-                    'takerAmountFilled': str(amt_b_raw)  # Actual Taker Vol
+                    'token_id': tid,
+                    'usdc_vol': val_usdc,
+                    'token_vol': val_size,
+                    'price': price,
+                    'is_buy': is_buy,
+                    'retry_count': 0
                 }
                 
                 await self.trade_queue.put(trade_obj)
@@ -674,10 +701,11 @@ class LiveTrader:
                     'timestamp': int(raw_trade.get('timestamp', 0)),
                     'maker': raw_trade.get('maker'),
                     'taker': raw_trade.get('taker'),
-                    'makerAssetId': raw_trade.get('maker_asset_id') or raw_trade.get('makerAssetId'),
-                    'takerAssetId': raw_trade.get('taker_asset_id') or raw_trade.get('takerAssetId'),
-                    'makerAmountFilled': float(raw_trade.get('makerAmountFilled') or 0),
-                    'takerAmountFilled': float(raw_trade.get('takerAmountFilled') or 0),
+                    'token_id': raw_trade.get('token_id'),
+                    'usdc_vol': raw_trade.get('usdc_vol'),
+                    'token_vol': raw_trade.get('token_vol'),
+                    'price': raw_trade.get('price'),
+                    'is_buy': raw_trade.get('is_buy'),
                     'retry_count': raw_trade.get('retry_count', 0),
                 }
                 
@@ -689,45 +717,31 @@ class LiveTrader:
                 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"not_usdc": 0, "expired": 0, "no_tokens": 0, "old": 0}
+        skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
 
         for t in trades:
             
-            # 1. Normalize Address Data
+            # 1. Load Normalized Data
             wallet = t['taker']
-            raw_maker = float(t['makerAmountFilled'])
-            raw_taker = float(t['takerAmountFilled'])
+            token_id = t['token_id']
+            usdc_vol = t['usdc_vol']
+            token_vol = t['token_vol']
+            price = t['price']
+            is_buy = t['is_buy']
 
-            # 2. Identify Token, USDC Volume, and Trade Side
-            if t.get('makerAssetId') == "0":
-                token_id = t.get('takerAssetId')
-                usdc_vol = raw_maker / 1e6 
-                token_vol = raw_taker / 1e6
-                is_buy = False # Taker gave Token, received USDC (Sell)
-            elif t.get('takerAssetId') == "0":
-                token_id = t.get('makerAssetId')
-                usdc_vol = raw_taker / 1e6
-                token_vol = raw_maker / 1e6
-                is_buy = True # Taker gave USDC, received Token (Buy)
-            else:
-                log.info(f"Could not identify token for trade: {t}")
-                skipped_counts["not_usdc"] += 1
-                continue
-                
-            # 3. Calculate execution price 
+            # 2. Calculate execution price & Validate Market
             market = self.metadata.token_to_market.get(token_id)
             if not market:
                 found = await self.metadata.fetch_missing_token(token_id)
                 market = self.metadata.token_to_market.get(token_id)
                 if not market:
                     retry_count = t.get('retry_count', 0)
-                    if retry_count < 20: # Try for up to 60 seconds (6 attempts * 10s delay)
-                        log.warning(f"⏳ Gamma delay for {token_id}. Re-queueing trade (Attempt {retry_count + 1}/6)...")
+                    if retry_count < 20: 
+                        log.warning(f"⏳ Gamma delay for {token_id}. Re-queueing trade (Attempt {retry_count + 1}/20)...")
                         t['retry_count'] = retry_count + 1
                         asyncio.create_task(self._requeue_trade(t, delay=10))
                     else:
-                        # Only drop if Gamma is fundamentally broken for 60+ seconds
-                        log.error(f"💀 FATAL: Gamma failed to index {token_id} after 60s. Trade dropped.")
+                        log.error(f"💀 FATAL: Gamma failed to index {token_id} after retries. Trade dropped.")
                         skipped_counts["no_tokens"] += 1
                     continue
                     
@@ -745,11 +759,7 @@ class LiveTrader:
 
             self.sub_manager.add_active(list(market['tokens'].values()))
 
-            if token_vol > 0:
-                price = usdc_vol / token_vol
-            else:
-                continue
-                
+            # Direction Logic
             is_yes_token = (token_id == list(market['tokens'].values())[0])
             
             if is_yes_token:
