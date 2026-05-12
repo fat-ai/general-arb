@@ -220,6 +220,8 @@ class DataFetcher:
                 'outcomePrices', 'market_row_id',
             ]
             df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
+            if 'updated_at' in df.columns:
+                df = df.sort_values('updated_at', na_position='first')
             df = df.drop_duplicates(subset=['contract_id'], keep='last')
 
             temp_path = CACHE_DIR / f"temp_market_chunk_{chunk_idx}.parquet"
@@ -232,7 +234,7 @@ class DataFetcher:
         chunk_idx = 0
         current_raw_rows = []
 
-        cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE
+        cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE.tz_localize(None)
         print(f"   🔄 Fetching markets created after {cutoff_date}")
 
         for state in ['false', 'true']:
@@ -336,6 +338,7 @@ class DataFetcher:
                                             else:
                                                 time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                                     except Exception:
+                                        log.warning(f"Gap fill attempt {attempt+1}/3 failed for ID {mid}: {e}")
                                         time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                                 
                                 print(f"      [{i+1}/{len(missing_ids)}] Gap Checked: ID {mid}      ", end='\r')
@@ -379,6 +382,7 @@ class DataFetcher:
                                     else:
                                         time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                                 except Exception:
+                                    log.warning(f"Unresolved update attempt {attempt+1}/3 failed for ID {mid}: {e}")
                                     time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                             print(f"      [{i+1}/{len(unresolved_ids)}] Checked     ", end='\r')
                         
@@ -408,7 +412,7 @@ class DataFetcher:
             con.execute("""
                 CREATE TABLE new_data AS 
                 SELECT * EXCLUDE(rn) FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY rowid DESC) as rn 
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY updated_at DESC NULLS LAST) as rn 
                     FROM raw_new
                 ) WHERE rn = 1
             """)
@@ -443,7 +447,7 @@ class DataFetcher:
             Path(p).unlink(missing_ok=True)
             
     def fetch_gamma_trades(self, target_token_ids, end_date):
-        from web3 import Web3
+      
         db_file = CACHE_DIR / "gamma_trades.db"
         
         # The new V2 Polymarket Contracts
@@ -560,7 +564,7 @@ class DataFetcher:
                 
                 while current_block <= end_block:
                     # 1. Hard cap batch size at 100 to prevent strict public nodes from rejecting it
-                    target_end = min(current_block + min(batch_size, 100) - 1, end_block)
+                    target_end = min(current_block + batch_size - 1, end_block)
                     current_rpc = RPC_URLS[rpc_index % len(RPC_URLS)]
 
                     logs = []
