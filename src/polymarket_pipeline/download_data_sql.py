@@ -627,6 +627,8 @@ class DataFetcher:
                             out_rows = []
                             for r in logs:
                                 topics = r.get('topics', [])
+                                
+                                # V2 topics array has 4 elements: [Signature, orderHash, maker, taker]
                                 if len(topics) < 4: 
                                     seg_dropped += 1; continue
 
@@ -642,48 +644,57 @@ class DataFetcher:
                                 if data_hex.startswith('0x'): data_hex = data_hex[2:]
                                 chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
                                 
-                                # V2 Data Payload has 7 chunks
-                                if len(chunks) < 4: 
+                                # V2 Data Payload has 7 chunks minimum
+                                if len(chunks) < 7: 
                                     seg_dropped += 1; continue
 
-                                side = int(chunks[0], 16)
-                                tid = int(chunks[1], 16)
-                                amt_2 = int(chunks[2], 16)
-                                amt_3 = int(chunks[3], 16)
+                                # V2 empirical layout:
+                                # chunks[1] = assetId (tid)
+                                # chunks[2] = makerAmount
+                                # chunks[3] = takerAmount
 
-                                # V2 specifically provides the token ID, making filtering perfectly precise
+                                tid = int(chunks[1], 16)
+                                makerAmount = int(chunks[2], 16)
+                                takerAmount = int(chunks[3], 16)
+
                                 if tid not in target_token_ids:
                                     seg_dropped += 1; continue
 
-                                if side == 0:
-                                    # Maker is BID: Taker pays Shares (amt_2) and receives USDC (amt_3) -> Taker is SELLING
-                                    val_size = float(amt_2) / 1e6
-                                    val_usdc = float(amt_3) / 1e6
+                                # PURE MATH VALIDATION LOGIC
+                                if makerAmount < takerAmount:
+                                    # Maker pays USDC, Taker pays Shares -> Taker is SELLING
+                                    val_usdc = float(makerAmount) / 1e6
+                                    val_size = float(takerAmount) / 1e6
                                     mult = -1
-                                elif side == 1:
-                                    # Maker is ASK: Taker pays USDC (amt_2) and receives Shares (amt_3) -> Taker is BUYING
-                                    val_usdc = float(amt_2) / 1e6
-                                    val_size = float(amt_3) / 1e6
+                                elif makerAmount > takerAmount:
+                                    # Maker pays Shares, Taker pays USDC -> Taker is BUYING
+                                    val_usdc = float(takerAmount) / 1e6
+                                    val_size = float(makerAmount) / 1e6
                                     mult = 1
                                 else:
-                                    seg_dropped += 1; continue
+                                    # Exact $1.00 resolution boundary trade
+                                    val_usdc = float(makerAmount) / 1e6
+                                    val_size = float(takerAmount) / 1e6
+                                    mult = 1
 
                                 if val_usdc > 0 and val_size > 0:
                                     price = val_usdc / val_size
                                     if price > 1.0 or price < 0.000001:
                                         seg_dropped += 1; continue
+                                else:
+                                    seg_dropped += 1; continue
 
-                                    b_num = int(r['blockNumber'], 16)
-                                    ts = block_times.get(b_num, 0)
-                                    if ts == 0:
-                                        seg_dropped += 1; continue
+                                b_num = int(r['blockNumber'], 16)
+                                ts = block_times.get(b_num, 0)
+                                if ts == 0:
+                                    seg_dropped += 1; continue
 
-                                    log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
+                                log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
 
-                                    out_rows.append((
-                                        log_id, ts, val_usdc, val_size * mult,
-                                        taker, str(tid), price, val_size, mult
-                                    ))
+                                out_rows.append((
+                                    log_id, ts, val_usdc, val_size * mult,
+                                    taker, str(tid), price, val_size, mult
+                                ))
 
                             if out_rows:
                                 db_conn.executemany("""
