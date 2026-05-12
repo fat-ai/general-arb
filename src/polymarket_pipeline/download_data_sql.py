@@ -337,7 +337,7 @@ class DataFetcher:
                                                 break # 'with' block will auto-close the dangling 404 response
                                             else:
                                                 time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                    except Exception:
+                                    except Exception as e:
                                         log.warning(f"Gap fill attempt {attempt+1}/3 failed for ID {mid}: {e}")
                                         time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                                 
@@ -381,7 +381,7 @@ class DataFetcher:
                                         break
                                     else:
                                         time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                except Exception:
+                                except Exception as e:
                                     log.warning(f"Unresolved update attempt {attempt+1}/3 failed for ID {mid}: {e}")
                                     time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
                             print(f"      [{i+1}/{len(unresolved_ids)}] Checked     ", end='\r')
