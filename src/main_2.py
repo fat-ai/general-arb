@@ -395,7 +395,7 @@ class LiveTrader:
                     await asyncio.sleep(1)
 
             batch_size = 5 
-            max_batch_size = 1000 
+            max_batch_size = 1000
 
             while self.running:
                 try:
