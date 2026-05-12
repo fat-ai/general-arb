@@ -547,7 +547,9 @@ class DataFetcher:
                 # Ensure chronological order for iterating
                 if start_block > end_block:
                     start_block, end_block = end_block, start_block
-
+                    
+                start_block = 86138000
+                
                 print(f"🚀 Starting Segment: {segment_name} | Block {start_block} -> {end_block}")
                 
                 current_block = start_block
