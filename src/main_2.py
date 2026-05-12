@@ -1,454 +1,367 @@
+import asyncio
 import json
-import requests
-import pandas as pd
-import numpy as np
+import threading
 import time
-import sqlite3
-import contextlib
-from pathlib import Path
-from requests.adapters import HTTPAdapter, Retry
-from datetime import datetime
-from decimal import Decimal
+import signal
 import logging
-import gc
-import random
-import duckdb
-import shutil
+import requests
+import csv
+import queue
+from typing import Dict, List, Set
+import aiohttp
+import copy
+import pickle
+from datetime import datetime, timezone
 
-# Configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-log = logging.getLogger(__name__)
+# --- MODULE IMPORTS ---
+from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
+from reporting import generate_institutional_report, generate_html_report
+from broker import PersistenceManager, PaperBroker
+from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
+from strategy import TradeLogic
+from sim_strat_3 import (
+    BayesianState,
+    process_trade,
+    fast_numba_scan,
+    PRICE_LUT,
+    TIME_LUT,
+    CACHE_DIR,
+    restore_arrays_from_npz,   
+    compute_wager_and_p_true,  
+    P_RANGE
+)
+import numpy as np     
+import math
+from ws_handler import PolymarketWS
 
-# Constants
-# Construct an aware UTC timestamp, then safely convert to naive
-FIXED_START_DATE = pd.Timestamp("2026-03-20", tz='UTC')
-CACHE_DIR = Path("/app/data")
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-from config import MARKETS_FILE, GAMMA_API_URL, TRADES_FILE, RPC_URLS
+STATE_FILE = CACHE_DIR / "bayesian_state.pkl"
 
-# ---------------------------------------------------------------------------
-# Schema helpers
-# ---------------------------------------------------------------------------
+# Setup Logging
+log, _ = setup_logging()
 
-def _safe_is_null(val):
-    """
-    Return True if val is None, NaN, or an empty string.
-    Avoids the ValueError that pd.isna() raises on list/dict values.
-    """
-    if val is None:
-        return True
-    if isinstance(val, (list, dict)):
-        return False
-    try:
-        return pd.isna(val)
-    except (TypeError, ValueError):
-        return False
+def _chunked(lst, size):
+    """Split a list into chunks of a given size."""
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
 
 
-class DataFetcher:
-    def __init__(self):
-        self.session = requests.Session()
-        self.retries = Retry(total=2, backoff_factor=1, backoff_max=10, status_forcelist=[500, 502, 503, 504])
-        self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=self.retries))
-         
-    def fetch_gamma_markets(self):
-        cache_file = CACHE_DIR / MARKETS_FILE
-        min_created_at = None
-        max_created_at = None
-
-        if cache_file.exists():
-                print(f"   📂 Loading existing markets cache to determine update range...")
-                date_df = pd.read_parquet(cache_file, columns=['created_at'])
-                if not date_df.empty and 'created_at' in date_df.columns:
-                    dates = pd.to_datetime(date_df['created_at'], format='ISO8601', utc=True).dt.tz_convert(None)
-                    min_created_at = dates.min()
-                    max_created_at = dates.max()
-                    print(f"Existing Range: {min_created_at} <-> {max_created_at}")
-                del date_df
-                gc.collect()
-        else:
-            print(f"   ⚠️ Could not read existing cache: Starting fresh.")
-
-        temp_files = []
-
-        def process_and_save_chunk(raw_rows, chunk_idx):
-            if not raw_rows:
-                return
-            df = pd.DataFrame(raw_rows)
-
-            rename_map = {
-                'id':           'market_id',
-                'question':     'question',
-                'conditionId':  'condition_id',
-                'slug':         'slug',
-                'endDate':      'resolution_timestamp',
-                'startDate':    'start_date',
-                'createdAt':    'created_at',
-                'updatedAt':    'updated_at',
-                'closedTime':   'closed_time',
-                'volume':       'volume',
-                'description':  'description',
-                'resolutionSource': 'resolution_source',
-                'active':       'active',
-                'closed':       'closed',
-                'archived':     'archived',
-                'featured':     'featured',
-                'restricted':   'restricted',
-                'liquidity':    'liquidity',
-                'marketType':   'market_type',
-                'groupItemTitle': 'group_item_title',
-                'questionID':   'question_id',
-                'umaResolutionStatus': 'uma_resolution_status',
-                'enableOrderBook': 'enable_order_book',
-                'acceptingOrders': 'accepting_orders',
-                'competitive':  'competitive',
-                'spread':       'spread',
-                'lastTradePrice': 'last_trade_price',
-                'bestBid':      'best_bid',
-                'bestAsk':      'best_ask',
-                'oneDayPriceChange':   'price_change_1d',
-                'oneHourPriceChange':  'price_change_1h',
-                'oneWeekPriceChange':  'price_change_1w',
-                'oneMonthPriceChange': 'price_change_1m',
-                'volume24hr':   'volume_24h',
-                'volume1wk':    'volume_1w',
-                'volume1mo':    'volume_1m',
-                'volume1yr':    'volume_1y',
-                'liquidityNum': 'liquidity_num',
-                'volumeNum':    'volume_num',
-                'negRiskOther': 'neg_risk_other',
-                'sportsMarketType': 'sports_market_type',
-                'gameId':       'game_id',
-                'gameStartTime': 'game_start_time',
-                'line':         'line',
-                'automaticallyResolved': 'automatically_resolved',
-                'rewardsMinSize':   'rewards_min_size',
-                'rewardsMaxSpread': 'rewards_max_spread',
-            }
-            
-            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-            
-            critical_cols = ['market_id', 'resolution_timestamp', 'created_at']
-            missing_cols = [c for c in critical_cols if c not in df.columns]
-            
-            if missing_cols:
-                log.error(f"🚨 SCHEMA WARNING: Missing critical columns {missing_cols} after mapping! Did the Gamma API schema change?")
-                
-            def extract_tokens(row):
-                raw = row.get('clobTokenIds') or row.get('tokens')
-                if isinstance(raw, str):
-                    try:
-                        raw = json.loads(raw)
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                if isinstance(raw, list):
-                    clean_tokens = []
-                    for t in raw:
-                        if isinstance(t, dict):
-                            tid = t.get('token_id') or t.get('id') or t.get('tokenId')
-                            if tid:
-                                clean_tokens.append(str(tid).strip())
-                        else:
-                            clean_tokens.append(str(t).strip())
-                    if len(clean_tokens) >= 2:
-                        return ",".join(clean_tokens)
-                return None
-
-            df['contract_id'] = df.apply(extract_tokens, axis=1)
-            df = df.dropna(subset=['contract_id'])
-
-            def derive_outcome(row):
-                val = row.get('outcome')
-                if not _safe_is_null(val):
-                    try:
-                        return float(str(val).replace('"', '').strip())
-                    except (TypeError, ValueError):
-                        pass
-                prices = row.get('outcomePrices')
-                if prices:
-                    try:
-                        if isinstance(prices, str):
-                            prices = json.loads(prices)
-                        if isinstance(prices, list):
-                            p_floats = [float(p) for p in prices]
-                            for i, p in enumerate(p_floats):
-                                if p >= 0.95:
-                                    return float(i)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pass
-                return np.nan
-
-            df['outcome'] = df.apply(derive_outcome, axis=1)
-
-            date_cols_iso = ['resolution_timestamp', 'created_at', 'updated_at', 'start_date']
-            date_cols_mixed = ['closed_time', 'game_start_time']
-            
-            for col in date_cols_iso:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='ISO8601').dt.tz_convert(None)
-            
-            for col in date_cols_mixed:
-                if col in df.columns:
-                    df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='mixed').dt.tz_convert(None)
-
-            if 'resolution_timestamp' not in df.columns:
-                return
-            df = df.dropna(subset=['resolution_timestamp'])
-            if df.empty:
-                return
-
-            df['contract_id_list'] = df['contract_id'].str.split(',')
-            df['market_row_id'] = df.index
-            df = df.explode('contract_id_list')
-            df['token_index'] = df.groupby('market_row_id').cumcount()
-            df['contract_id'] = df['contract_id_list'].str.strip()
-            df['token_outcome_label'] = np.where(df['token_index'] == 0, "Yes", "No")
-
-            def final_payout(row):
-                if pd.isna(row['outcome']):
-                    return np.nan
-                winning_idx = int(round(row['outcome']))
-                return 1.0 if row['token_index'] == winning_idx else 0.0
-
-            df['outcome'] = df.apply(final_payout, axis=1)
-
-            for col in df.columns:
-                df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (list, dict)) else x)
-
-            drops = [
-                'contract_id_list', 'token_index', 'clobTokenIds', 'tokens',
-                'outcomePrices', 'market_row_id',
-            ]
-            df = df.drop(columns=[c for c in drops if c in df.columns], errors='ignore')
-            if 'updated_at' in df.columns:
-                df = df.sort_values('updated_at', na_position='first')
-            df = df.drop_duplicates(subset=['contract_id'], keep='last')
-
-            temp_path = CACHE_DIR / f"temp_market_chunk_{chunk_idx}.parquet"
-            df.to_parquet(temp_path)
-            temp_files.append(temp_path)
-            print(f"   💾 Saved chunk {chunk_idx} ({len(df)} rows)")
-
-        BATCH_SIZE = 500
-        MAX_API_RETRIES = 5
-        chunk_idx = 0
-        current_raw_rows = []
-
-        cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE.tz_localize(None)
-        print(f"   🔄 Fetching markets created after {cutoff_date}")
-
-        for state in ['false', 'true']:
-            offset = 0
-            retry_count = 0
-            print(f"   Fetching (closed={state})...", end="", flush=True)
-            
-            while True:
-                params = {
-                    'limit': BATCH_SIZE,
-                    'offset': offset,
-                    'closed': state,
-                    'order': 'createdAt',
-                    'ascending': 'false'
-                }
-                
-                try:
-                    resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
-                    resp.raise_for_status()
-                    batch = resp.json()
-                    retry_count = 0  # Reset on success
-                except Exception as e:
-                    retry_count += 1
-                    print(f"\n   ❌ API error at offset {offset} (Attempt {retry_count}/{MAX_API_RETRIES}): {e}")
-                    if retry_count >= MAX_API_RETRIES:
-                        print(f"   🚨 Max retries reached. Aborting fetch for closed={state}.")
-                        break
-                    time.sleep(5)
-                    continue
-
-                if not batch:
-                    break
-
-                stop_signal = False
-                valid_batch = []
-                
-                for r in batch:
-                    c_date = r.get('createdAt')
-                    if c_date:
-                        try:
-                            ts = pd.to_datetime(c_date, utc=True).tz_convert(None)
-                            if ts < cutoff_date:
-                                stop_signal = True
-                                break
-                        except (TypeError, ValueError):
-                            pass
-                            
-                    valid_batch.append(r)
-
-                current_raw_rows.extend(valid_batch)
-                if len(batch) == BATCH_SIZE:
-                    offset += (BATCH_SIZE - 50)
-                else:
-                    offset += len(batch)
-                
-                print(".", end="", flush=True)
-
-                if len(current_raw_rows) >= 1000:
-                    process_and_save_chunk(current_raw_rows, chunk_idx)
-                    current_raw_rows = []
-                    chunk_idx += 1
-
-                if stop_signal or len(batch) < BATCH_SIZE:
-                    break
-                    
-            print(f" Done.")
-
-        if current_raw_rows:
-            process_and_save_chunk(current_raw_rows, chunk_idx)
-            current_raw_rows = []
-            chunk_idx += 1        
-            
-        if cache_file.exists():
-                if temp_files: # ✅ Only run if we actually downloaded new chunks this session
-                    print(f"   🕵️ Checking for missing market IDs (Gaps in current session)...")
-                    try:
-                        # ✅ Read ONLY the newly downloaded session chunks instead of the massive cache
-                        df_new = pd.concat([pd.read_parquet(p, columns=['market_id']) for p in temp_files], ignore_index=True)
-                        ids = np.sort(df_new['market_id'].dropna().astype(int).unique())
-                        missing_ids = [m for i in range(len(ids)-1) for m in range(ids[i]+1, ids[i+1])]
-                        
-                        del df_new
-                        gc.collect()
-                          
-                        if missing_ids:
-                            gap_raw_rows = []
-                            print(f"   🚀 Fetching {len(missing_ids)} missing sequence IDs...")
-                            
-                            for i, mid in enumerate(missing_ids):
-                                for attempt in range(3):
-                                    try:
-                                        # ✅ FIX: Using 'with' forces Python to instantly clear the memory and socket
-                                        with self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10) as resp:
-                                            if resp.status_code == 200:
-                                                raw_data = resp.json()
-                                                if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
-                                                    gap_raw_rows.append(raw_data)
-                                                break
-                                            elif resp.status_code == 404:
-                                                break # 'with' block will auto-close the dangling 404 response
-                                            else:
-                                                time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                    except Exception as e:
-                                        log.warning(f"Gap fill attempt {attempt+1}/3 failed for ID {mid}: {e}")
-                                        time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                
-                                print(f"      [{i+1}/{len(missing_ids)}] Gap Checked: ID {mid}      ", end='\r')
-                                
-                                # Batch save to prevent memory spikes if there are many gaps
-                                if len(gap_raw_rows) >= 500:
-                                    process_and_save_chunk(gap_raw_rows, f"gap_fill_{mid}")
-                                    gap_raw_rows.clear() # Faster than reassigning []
-                                    gc.collect()
-        
-                            if gap_raw_rows:
-                                process_and_save_chunk(gap_raw_rows, "gap_fill_final")
-                                print("\n   ✅ Gap updates saved to temp chunks.")
-                    except Exception as e:
-                        print(f"\n   ⚠️ Could not process gap updates: {e}")    
-            
-        if cache_file.exists():
-                print(f"   🔄 Checking for unresolved market updates...")
-                try:
-                    df_ext = pd.read_parquet(cache_file, columns=['market_id', 'closed'])
-                    unresolved_ids = df_ext[(df_ext['closed'] == False)]['market_id'].dropna().astype(int).unique()
-                    del df_ext
-                    gc.collect()
-                    
-                    if len(unresolved_ids) > 0:
-                        
-                        updated_raw_rows = []
-                        print(f"   🚀 Fetching updates for {len(unresolved_ids)} unresolved markets...")
-                        
-                        for i, mid in enumerate(unresolved_ids):
-                            for attempt in range(3): # Short retry loop for updates
-                                try:
-                                    resp = self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
-                                    if resp.status_code == 200:
-                                        raw_data = resp.json()
-                                        if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
-                                            updated_raw_rows.append(raw_data)
-                                        break
-                                    elif resp.status_code == 404:
-                                        break
-                                    else:
-                                        time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                except Exception as e:
-                                    log.warning(f"Unresolved update attempt {attempt+1}/3 failed for ID {mid}: {e}")
-                                    time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                            print(f"      [{i+1}/{len(unresolved_ids)}] Checked     ", end='\r')
-                        
-                        if updated_raw_rows:
-                            # Feed the updated rows straight into the chunk saver
-                            process_and_save_chunk(updated_raw_rows, "unresolved_updates")
-                            print("\n   ✅ Unresolved updates saved to temp chunk.")
-                except Exception as e:
-                    print(f"\n   ⚠️ Could not process unresolved updates: {e}")
-    
-        if not temp_files:
-            print("   ℹ️  No new market data to save.")
-            return
-
-        print(f"\n   🔀 Merging {len(temp_files)} chunk(s) (Streaming DuckDB)...")
-        
-        temp_files_str = [str(p) for p in temp_files]
-        temp_output = str(cache_file) + ".tmp.parquet"
-        
-        con = duckdb.connect()
-        con.execute("PRAGMA memory_limit='4GB';")
-        
+def _safe_json_load(x):
+    """Safely parse a JSON string; returns the original value if already parsed."""
+    if isinstance(x, str):
         try:
-            # ✅ FIX 1: Add union_by_name=True so DuckDB handles missing columns like Pandas
-            con.execute(f"CREATE TABLE raw_new AS SELECT * FROM read_parquet({temp_files_str}, union_by_name=True)")
-            
-            con.execute("""
-                CREATE TABLE new_data AS 
-                SELECT * EXCLUDE(rn) FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY contract_id ORDER BY updated_at DESC NULLS LAST) as rn 
-                    FROM raw_new
-                ) WHERE rn = 1
-            """)
-            
-            if cache_file.exists() and max_created_at is not None:
-                # ✅ FIX 2: Change to UNION ALL BY NAME to gracefully merge the old cache with new data
-                con.execute(f"""
-                    COPY (
-                        SELECT * FROM new_data
-                        UNION ALL BY NAME
-                        SELECT * FROM read_parquet('{str(cache_file)}') 
-                        WHERE contract_id NOT IN (SELECT contract_id FROM new_data)
-                    ) TO '{temp_output}' (FORMAT PARQUET)
-                """)
-            else:
-                con.execute(f"""
-                    COPY (
-                        SELECT * FROM new_data
-                    ) TO '{temp_output}' (FORMAT PARQUET)
-                """)
-                
-            final_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{temp_output}')").fetchone()[0]
-            
-        finally:
-            con.close()
-            
-        shutil.move(temp_output, str(cache_file))
-        
-        print(f"   ✅ Markets saved: {final_count:,} total rows → {cache_file}")
+            return json.loads(x)
+        except Exception:
+            return None
+    return x
 
-        for p in temp_files:
-            Path(p).unlink(missing_ok=True)
+
+class LiveTrader:
+    def __init__(self):
+        self.persistence = PersistenceManager()
+        self.broker = PaperBroker(self.persistence)
+        self.metadata = MarketMetadata()
+        self.sub_manager = SubscriptionManager()
+        self.state = None
+       
+        self.order_books: Dict[str, Dict] = {}
+        self.ws_queue = asyncio.Queue()
+        self.seen_trade_ids: Set[str] = set()
+        self.pending_orders: Set[str] = set()
+        self.pending_markets: Set[str] = set()
+        self.running = True
+        self.trade_queue = None
+        self.stats = {
+            'processed_count': 0,
+            'last_trade_time': 'Waiting...',
+            'triggers_count': 0,
+            'scores': []  
+        }
+        self.cumulative_volumes: Dict[str, float] = {}
+        self.ws_client = None
+
+    async def start(self):
+        print("\n🚀 STARTING LIVE TRADER")
+        
+        # Offload Numba JIT compilation to a separate thread to keep the event loop responsive
+        log.info("Warming up Numba JIT compiler...")
+        _dummy = np.empty(0, dtype=np.uint32)
+        
+        await asyncio.to_thread(
+            fast_numba_scan, 
+            _dummy, 500, 1, 1000, PRICE_LUT, TIME_LUT, P_RANGE
+        )
+        
+        log.info("✅ Numba JIT compilation complete.")
+        self.start_time = time.time()
+        if self.trade_queue is None:
+            self.trade_queue = asyncio.Queue()
+        
+        # 1. SETUP THREAD-SAFE BRIDGE
+        loop = asyncio.get_running_loop()
+        def safe_callback(msg):
+            loop.call_soon_threadsafe(self.ws_queue.put_nowait, msg)
             
-    def fetch_gamma_trades(self, target_token_ids, end_date):
+        # 2. CONNECT TO CLOB
+        self.ws_client = PolymarketWS(
+            "wss://ws-subscriptions-clob.polymarket.com", 
+            [], 
+            safe_callback
+        )
+        self.ws_client.start_thread()
+
+        # 3. LOAD ALL MARKETS
+        print("🧠 Loading Bayesian State from disk...")
+        if STATE_FILE.exists():
+            with open(STATE_FILE, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+                
+                # Handle cases where the checkpoint is wrapped in a 'state' dictionary key
+                self.state = checkpoint_data['state'] if isinstance(checkpoint_data, dict) and 'state' in checkpoint_data else checkpoint_data
+            
+            # Re-attach massive historical arrays via zero-copy C-level bytes
+            npz_path = STATE_FILE.with_suffix('.npz')
+            restore_arrays_from_npz(self.state, npz_path)
+            
+            log.info(f"✅ Loaded Bayesian state: {self.state.next_user_id} users tracked.")
+        else:
+            log.warning("⚠️ No bayesian_state.pkl found! Starting with a blank slate.")
+            self.state = BayesianState()
+        
+        print("⏳ Fetching Market Metadata...")
+        await self.metadata.refresh()
+
+        # 4. START LOOPS
+        await asyncio.gather(
+            self._subscription_monitor_loop(), 
+            self._ws_processor_loop(),
+            self._poll_rpc_loop(),
+            self._signal_loop(),
+            self._maintenance_loop(),
+            self._risk_monitor_loop(),
+            self._reporting_loop(),
+            self._monitor_loop(),
+            self._dashboard_loop(),
+            self._resolution_monitor_loop(),
+        )
+    
+    async def shutdown(self):
+        log.info("🛑 Shutting down...")
+        self.running = False
+        if self.ws_client: self.ws_client.running = False
+        await self.persistence.save_async()
+        try:
+            asyncio.get_running_loop().stop()
+        except: pass
+
+    async def _execute_task(self, token_id, fpmm, side, book, signal_price=None):
+        """Helper to run trades in background and release lock."""
+        try:
+            if side == "BUY":
+                await self._attempt_exec(token_id, fpmm, signal_price=signal_price)
+            else:
+                await self.broker.execute_market_order(token_id, "SELL", 0, fpmm, current_book=book)
+        finally:
+            self.pending_orders.discard(token_id)
+            self.pending_markets.discard(fpmm)
+
+    def _process_snapshot(self, item):
+        """
+        Handles initial Order Book snapshot (event_type: 'book').
+        """
+        try:
+            asset_id = item.get("asset_id")
+            if not asset_id: return
+
+            # Initialize book if missing
+            if asset_id not in self.order_books:
+                self.order_books[asset_id] = {'bids': {}, 'asks': {}}
+
+            # Polymarket sends full snapshots as lists of {price, size}
+            # We clear the old book and rebuild it
+            self.order_books[asset_id]['bids'] = {
+                x['price']: x['size'] for x in item.get('bids', [])
+            }
+            self.order_books[asset_id]['asks'] = {
+                x['price']: x['size'] for x in item.get('asks', [])
+            }
+
+        except Exception as e:
+            log.error(f"Snapshot Error: {e}")
+
+    def _process_update(self, item):
+        """
+        Handles incremental price updates (event_type: 'price_change').
+        """
+        try:
+            asset_id = item.get("asset_id")
+            if not asset_id or asset_id not in self.order_books: 
+                return
+
+            changes = item.get("changes", [])
+            for change in changes:
+                # change format: {"side": "buy", "price": "0.50", "size": "100"}
+                side = "bids" if change.get("side") == "buy" else "asks"
+                price = change.get("price")
+                size = change.get("size")
+                
+                if not price: continue
+
+                # If size is 0, remove the price level
+                if float(size) == 0:
+                    self.order_books[asset_id][side].pop(price, None)
+                else:
+                    self.order_books[asset_id][side][price] = size
+
+        except Exception as e:
+            log.error(f"Update Error: {e}")
+
+    # --- LOOPS ---
+
+    async def _subscription_monitor_loop(self):
+        """Calculates deltas and only pushes exact differences to the WS client."""
+        currently_subscribed = set()
+        
+        while self.running:
+            if self.sub_manager.dirty:
+                async with self.sub_manager.lock:
+                    # Get the exact list of what we WANT to be watching
+                    desired_list = set(self.sub_manager.get_all_subs())
+                    self.sub_manager.dirty = False
+                
+                # 1. Find tokens that are in the desired list, but not currently subscribed
+                to_subscribe = list(desired_list - currently_subscribed)
+                
+                # 2. Find tokens we are subscribed to, but that fell out of the desired list
+                to_unsubscribe = list(currently_subscribed - desired_list)
+                
+                if self.ws_client:
+                    if to_subscribe:
+                        self.ws_client.subscribe(to_subscribe)
+                        await asyncio.sleep(0.05) 
+                        
+                    if to_unsubscribe:
+                        self.ws_client.unsubscribe(to_unsubscribe)
+                
+                # Update our local memory of what the WS is doing
+                currently_subscribed = desired_list
+                
+            await asyncio.sleep(1.0)
+
+    async def _dashboard_loop(self):
+        while self.running:
+            await asyncio.sleep(5) # Update fast (every 5s) for HTML dashboard
+            
+            # --- 1. DATA COLLECTION ---
+            for tid, pos in self.persistence.state["positions"].items():
+                if 'trace_price' not in pos: pos['trace_price'] = []
+                
+                # Get Best Bid Price safely
+                price = pos['avg_price']
+                raw_book = self.order_books.get(tid)
+                if raw_book:
+                    # Handle both Dict and List formats safely
+                    bids = raw_book.get('bids')
+                    if isinstance(bids, dict) and bids:
+                        price = float(max(bids.keys(), key=float))
+                    elif isinstance(bids, list) and bids:
+                        price = float(bids[0][0])
+                
+                pos['trace_price'].append(price)
+                if len(pos['trace_price']) > 50: pos['trace_price'].pop(0)
+
+            # --- 2. GENERATE HTML DASHBOARD ---
+            # Create a clean price map
+            live_prices_map = {}
+            for tid, book in self.order_books.items():
+                # Same safe extraction logic
+                bids = book.get('bids')
+                if isinstance(bids, dict) and bids:
+                    live_prices_map[tid] = float(max(bids.keys(), key=float))
+                elif isinstance(bids, list) and bids:
+                    live_prices_map[tid] = float(bids[0][0])
+
+            # Generate HTML
       
-        db_file = CACHE_DIR / "gamma_trades.db"
+            res = generate_html_report(self.persistence.state, live_prices_map, self.metadata)
+            
+            # Only print log every 60s to keep terminal clean, but update HTML every 5s
+            if self.stats['processed_count'] % 12 == 0: 
+                log.info(res)
+
+    async def _monitor_loop(self):
+        """
+        Prints a detailed Traffic Report with Top 3 Scores every 30 seconds.
+        """
+        while self.running:
+            await asyncio.sleep(30) # Wait 30 seconds
+            
+            # 1. Retrieve Data
+            count = self.stats['processed_count']
+            last_seen = self.stats['last_trade_time']
+            triggers = self.stats['triggers_count']
+            scores = self.stats['scores']
+
+            q_size = self.trade_queue.qsize() if self.trade_queue else -1
+            # 2. Find Top 3 Scores
+            top_3 = sorted(scores, reverse=True)[:3]
+            
+            if top_3:
+                top_scores_str = ", ".join([f"{s:.4f}" for s in top_3])
+            else:
+                top_scores_str = "None"
+
+            # 3. Create the Log Message
+            if count > 0 or q_size > 0:
+                log.info(
+                    f"📊 REPORT (30s): Analyzed {count} trades | "
+                    f"Last: {last_seen} | "
+                    f"🏆 Top Scores: [{top_scores_str}] | "
+                    f"🎯 Triggers: {triggers} | "
+                    f"Queue Size: {q_size}"
+                )
+            else:
+                log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
+            
+            # 4. Reset counters for the next window
+            self.stats['processed_count'] = 0
+            self.stats['triggers_count'] = 0
+            self.stats['scores'] = []  # Clear the scores list
+
+    async def _ws_processor_loop(self):
+        """
+        ONLY handles Order Books. Ignores anonymous WS trades.
+        """
+        log.info("⚡ WS Processor: Routing Order Books ONLY")
+        while self.running:
+            msg = await self.ws_queue.get()
+            try:
+                if not msg: continue
+                try: data = json.loads(msg)
+                except: continue
+
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    event_type = item.get("event_type", "")
+                    
+                    if event_type == "book":
+                        self._process_snapshot(item)
+                    elif event_type == "price_change":
+                        self._process_update(item)
+                        
+            except Exception as e:
+                log.error(f"WS Error: {e}")
+            finally:
+                self.ws_queue.task_done()
+
+    async def _poll_rpc_loop(self):
+        """
+        The 'Ground Truth' Loop.
+        Upgraded to use aiohttp for persistent connections, dynamic backoff, 
+        and Round-Robin RPC failover to prevent stalling. (V2 Compatible)
+        """
+        import aiohttp
+        import asyncio
+        from config import RPC_URLS
         
         # The new V2 Polymarket Contracts
         EXCHANGE_CONTRACTS = [
@@ -459,346 +372,891 @@ class DataFetcher:
         # The mathematically verified V2 OrderFilled Topic Hash
         ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
         
-        print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
-        if not target_token_ids: return
+        rpc_index = 0
+        
+        def get_rpc():
+            return RPC_URLS[rpc_index]
 
-        # Helper to bridge Timestamps -> Polygon Block Numbers without an API key
-        def get_block_from_timestamp(ts):
-            for attempt in range(3):
+        log.info(f"🔗 CONNECTING TO RPC: {get_rpc()}")
+        
+        async with aiohttp.ClientSession() as session:
+            # 2. Init Cursor (With Failover Support)
+            current_block_num = None
+            while current_block_num is None and self.running:
                 try:
-                    resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
-                    if resp.status_code == 200:
-                        return resp.json()['height']
-                    time.sleep(2 ** attempt)
+                    payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                    async with session.post(get_rpc(), json=payload, timeout=5) as resp:
+                        data = await resp.json()
+                        current_block_num = int(data['result'], 16) - 10
+                        log.info(f"🚦 STARTING FROM BLOCK: {current_block_num}")
                 except Exception as e:
-                    log.warning(f"DefiLlama timeout (attempt {attempt+1}/3): {e}")
+                    log.warning(f"⚠️ Initial RPC {get_rpc()} failed: {e}. Rotating...")
+                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                    await asyncio.sleep(1)
+
+            batch_size = 5 
+            max_batch_size = 1000 
+
+            while self.running:
+                try:
+                    current_rpc = get_rpc()
                     
-            log.error(f"❌ Failed to resolve timestamp {ts} to block after 3 attempts.")
-            return None
-
-        with contextlib.closing(sqlite3.connect(db_file, timeout=30.0)) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout = 30000;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            db_cursor = conn.cursor()
-            
-            db_cursor.execute('''
-                CREATE TABLE IF NOT EXISTS trades (
-                    id TEXT PRIMARY KEY,
-                    timestamp INTEGER,
-                    tradeAmount REAL,
-                    outcomeTokensAmount REAL,
-                    user TEXT,
-                    contract_id TEXT,
-                    price REAL,
-                    size REAL,
-                    side_mult INTEGER
-                )
-            ''')
-            
-            existing_high_ts = None
-            existing_low_ts = None
-            
-            print(f"📂 Checking existing SQLite database bounds...")
-            
-            # 1. Self-Healing: Delete any trades that accidentally saved with a 0 timestamp
-            db_cursor.execute("DELETE FROM trades WHERE timestamp = 0")
-            conn.commit()
-
-            # 2. Safe Bounds Query: Handle old string datetimes and new integer epochs correctly
-            db_cursor.execute('''
-                SELECT 
-                    MAX(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END),
-                    MIN(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
-                FROM trades
-            ''')
-            max_val, min_val = db_cursor.fetchone()
-            
-            if max_val is not None and min_val is not None:
-                existing_high_ts = max_val
-                existing_low_ts = min_val
-                print(f"Existing Range: {datetime.utcfromtimestamp(existing_low_ts)} <-> {datetime.utcfromtimestamp(existing_high_ts)}")
-
-
-
-                
-                # --- ADD THESE TWO LINES TEMPORARILY ---
-                # Forces the cursor back to April 28, 2026 11:00:40 UTC
-                existing_high_ts = 1714302040 
-                print(f"⚠️ OVERRIDE ACTIVE: Forcing NEW_HEAD to start from {datetime.utcfromtimestamp(existing_high_ts)}")
-                # ---------------------------------------
-
-
-
-
-            
-            else:
-                print("⚠️ Database is empty or new. Starting full fetch.")
-
-            global_start_cursor = int(FIXED_START_DATE.timestamp())
-            safe_end_date = end_date if end_date.tzinfo else end_date.tz_localize('UTC')
-            global_stop_ts = int(safe_end_date.timestamp())
+                    # 3. Get Chain Tip
+                    payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+                    async with session.post(current_rpc, json=payload, timeout=5) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP Status {resp.status}")
+                        tip_data = await resp.json()
+                        chain_tip = int(tip_data['result'], 16)
                     
-            def fetch_segment(start_ts, end_ts, db_conn, segment_name):
-                print(f"🚀 Resolving {segment_name} timestamps to blocks...")
-                start_block = get_block_from_timestamp(start_ts)
-                end_block = get_block_from_timestamp(end_ts)
-
-                if not start_block or not end_block:
-                    print("❌ Failed to resolve block numbers via DefiLlama. Skipping segment.")
-                    return 0
-
-                # Ensure chronological order for iterating
-                if start_block > end_block:
-                    start_block, end_block = end_block, start_block
-                    
-                start_block = 86138000
-                
-                print(f"🚀 Starting Segment: {segment_name} | Block {start_block} -> {end_block}")
-                
-                current_block = start_block
-                seg_captured = 0
-                seg_dropped = 0
-                rpc_index = 0
-                batch_size = 100 # Safe default for public RPCs
-                
-                while current_block <= end_block:
-                    # 1. Hard cap batch size at 100 to prevent strict public nodes from rejecting it
-                    target_end = min(current_block + batch_size - 1, end_block)
-                    current_rpc = RPC_URLS[rpc_index % len(RPC_URLS)]
-
-                    logs = []
-                    try:
-                        # 2. Query each contract separately to bypass HTTP 400 array rejection
+                    # 4. Scan Batch
+                    if current_block_num <= chain_tip:
+                        end_block = min(current_block_num + batch_size - 1, chain_tip)
+                        
+                        logs = []
+                        has_error = False
+                        error_data = None
+                        
+                        # Fetch logs for each V2 contract
                         for contract_addr in EXCHANGE_CONTRACTS:
-                            payload = {
+                            log_payload = {
                                 "jsonrpc": "2.0", "id": 1, "method": "eth_getLogs",
                                 "params": [{
                                     "address": contract_addr,
                                     "topics": [ORDER_FILLED_TOPIC],
-                                    "fromBlock": hex(current_block),
-                                    "toBlock": hex(target_end)
+                                    "fromBlock": hex(current_block_num),
+                                    "toBlock": hex(end_block)
                                 }]
                             }
-
-                            resp = self.session.post(current_rpc, json=payload, timeout=15)
-                            if resp.status_code != 200:
-                                raise Exception(f"HTTP {resp.status_code}")
-
-                            data = resp.json()
-                            if 'error' in data:
-                                err_code = data['error'].get('code')
-                                err_msg = data['error'].get('message', '')
-                                # Trigger failover and shrink batch if range is too wide
-                                if "block range" in err_msg.lower() or err_code in [-32005, -32002, -32001, -16412]:
-                                    raise Exception(f"Range too wide: {err_msg}")
-                                raise Exception(f"RPC Error: {data['error']}")
-
-                            # Append this contract's trades to the master list
-                            logs.extend(data.get('result', []))
-                        
-                        if not logs:
-                            log.debug(f"eth_getLogs returned [] for blocks {current_block}-{target_end} on {current_rpc}")
-
-                        if logs:
-                            # 1. Gather unique blocks to fetch timestamps
-                            unique_blocks = list(set([int(l['blockNumber'], 16) for l in logs]))
-                            block_times = {}
-
-                            # 2. Fetch block headers in chunks of 50 via JSON-RPC Batching
-                            block_reqs = [{"jsonrpc": "2.0", "method": "eth_getBlockByNumber", "params": [hex(b), False], "id": b} for b in unique_blocks]
                             
-                            for i in range(0, len(block_reqs), 50):
-                                chunk = block_reqs[i:i+50]
-                                chunk_success = False
+                            # 10-second timeout for pulling heavy log batches
+                            async with session.post(current_rpc, json=log_payload, timeout=10) as logs_resp:
+                                data = await logs_resp.json()
                                 
-                                for attempt in range(3):
-                                    try:
-                                        b_resp = self.session.post(current_rpc, json=chunk, timeout=30).json()
-                                        for r in b_resp:
-                                            if 'result' in r and r['result']:
-                                                block_times[r['id']] = int(r['result']['timestamp'], 16)
-                                        chunk_success = True
-                                        break
-                                    except Exception as e:
-                                        log.warning(f"Block header fetch delayed (Attempt {attempt+1}/3): {e}")
-                                        time.sleep(2)
-                                        
-                                if not chunk_success:
-                                    raise Exception("Failed to fetch block headers after 3 attempts. Triggering RPC failover.")
-
-                            # 3. Parse and Insert Logs
-                            out_rows = []
-                            for r in logs:
-                                topics = r.get('topics', [])
+                                if 'result' in data:
+                                    logs.extend(data['result'])
+                                elif 'error' in data:
+                                    has_error = True
+                                    error_data = data
+                                    break
+                                    
+                        if not has_error:
+                            count = len(logs)
+                            
+                            if count > 0:
+                                trade_count = 0
+                                for log_item in logs:
+                                    res = await self._parse_log(log_item)
+                                    if res == "TRADE": trade_count += 1
                                 
-                                # V2 topics array has 4 elements: [Signature, orderHash, maker, taker]
-                                if len(topics) < 4: 
-                                    seg_dropped += 1; continue
-
-                                maker = "0x" + topics[2][-40:]
-                                taker = "0x" + topics[3][-40:]
-                                
-                                # Drop if taker is the exchange contract to prevent double-counting
-                                lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
-                                if maker == taker or taker.lower() in lower_exchanges:
-                                    seg_dropped += 1; continue
-
-                                data_hex = r.get('data', '0x')
-                                if data_hex.startswith('0x'): data_hex = data_hex[2:]
-                                chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
-                                
-                                # V2 Data Payload has 7 chunks minimum
-                                if len(chunks) < 7: 
-                                    seg_dropped += 1; continue
-
-                                # V2 empirical layout:
-                                # chunks[1] = assetId (tid)
-                                # chunks[2] = makerAmount
-                                # chunks[3] = takerAmount
-
-                                tid = int(chunks[1], 16)
-                                makerAmount = int(chunks[2], 16)
-                                takerAmount = int(chunks[3], 16)
-
-                                if tid not in target_token_ids:
-                                    seg_dropped += 1; continue
-
-                                # PURE MATH VALIDATION LOGIC
-                                if makerAmount < takerAmount:
-                                    # Maker pays USDC, Taker pays Shares -> Taker is SELLING
-                                    val_usdc = float(makerAmount) / 1e6
-                                    val_size = float(takerAmount) / 1e6
-                                    mult = -1
-                                elif makerAmount > takerAmount:
-                                    # Maker pays Shares, Taker pays USDC -> Taker is BUYING
-                                    val_usdc = float(takerAmount) / 1e6
-                                    val_size = float(makerAmount) / 1e6
-                                    mult = 1
-                                else:
-                                    # Exact $1.00 resolution boundary trade
-                                    val_usdc = float(makerAmount) / 1e6
-                                    val_size = float(takerAmount) / 1e6
-                                    mult = 1
-
-                                if val_usdc > 0 and val_size > 0:
-                                    price = val_usdc / val_size
-                                    if price > 1.0 or price < 0.000001:
-                                        seg_dropped += 1; continue
-                                else:
-                                    seg_dropped += 1; continue
-
-                                b_num = int(r['blockNumber'], 16)
-                                ts = block_times.get(b_num, 0)
-                                if ts == 0:
-                                    seg_dropped += 1; continue
-
-                                log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
-
-                                out_rows.append((
-                                    log_id, ts, val_usdc, val_size * mult,
-                                    taker, str(tid), price, val_size, mult
-                                ))
-
-                            if out_rows:
-                                db_conn.executemany("""
-                                    INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """, out_rows)
-                                db_conn.commit()
-                                seg_captured += len(out_rows)
-
-                        print(f"   | {segment_name} | Blocks {current_block}-{target_end} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
-
-                        current_block = target_end + 1
-                        
-                        # Optimistically stretch the batch size back out if the RPC is handling it well
-                        batch_size = min(200, batch_size + 10)
-
-                    except Exception as e:
-                        err_str = str(e)
-                        log.warning(f"⚠️ RPC failover triggered on {current_rpc}: {err_str}")
-                        
-                        # 1. Handle Rate Limits (HTTP 429) gracefully to prevent permanent bans
-                        if "429" in err_str:
-                            log.info("⏳ Rate limit hit. Cooling down for 10 seconds before rotating...")
-                            time.sleep(10)
+                                if trade_count > 0:
+                                    log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                            
+                            # Move cursor and sprint
+                            current_block_num = end_block + 1
+                            batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
+                            
                         else:
-                            time.sleep(2)
+                            data = error_data
+                            log.error(f"🚨 RPC Error from {current_rpc}: {data['error']}")
+                            error_code = data['error'].get('code')
                             
-                        rpc_index += 1
+                            if error_code in [-32002, -32005, -32000]:
+                                if batch_size > 1:
+                                    batch_size = max(1, batch_size // 2)
+                                    log.warning(f"📉 Shrinking batch size to {batch_size}...")
+                                    
+                                    if error_code == -32002:
+                                        rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                        log.warning(f"🔄 Rotating to new RPC: {get_rpc()}")
+                                else:
+                                    log.warning(f"⏳ Single block {current_block_num} timed out. Rotating RPC and retrying...")
+                                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                    await asyncio.sleep(2.0)
+                                    continue
+                                    
+                            await asyncio.sleep(1.0) 
+                    
+                    else:
+                        await asyncio.sleep(2.0)
                         
-                        # 2. Lower the absolute floor to 10 blocks so weak nodes like Tatum can digest the payload
-                        batch_size = max(10, batch_size // 2)
+                except Exception as e:
+                    log.error(f"⚠️ Connection dropped/timeout on {get_rpc()}: {e}. Rotating RPC...")
+                    rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                    batch_size = max(1, batch_size // 2)
+                    await asyncio.sleep(2.0)
+    
+    async def _parse_log(self, log_item):
+        """
+        Parses Polymarket V2 CTF Exchange logs.
+        Uses comparative math validation logic to determine trade direction.
+        """
+        try:
+            topics = log_item.get('topics', [])
+            if len(topics) < 4: return "ERROR"
+
+            maker = "0x" + topics[2][-40:]
+            taker = "0x" + topics[3][-40:]
+            
+            EXCHANGE_CONTRACTS = [
+                "0xE111180000d2663C0091e4f400237545B87B996B",
+                "0xe2222d279d744050d28e00520010520000310F59"
+            ]
+            
+            # Drop if taker is the exchange contract to prevent double-counting
+            lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
+            if maker == taker or taker.lower() in lower_exchanges:
+                return "IGNORED"
+
+            data_hex = log_item.get('data', '0x')
+            if data_hex.startswith('0x'): data_hex = data_hex[2:]
+            chunks = [data_hex[i:i+64] for i in range(0, len(data_hex), 64)]
+
+            # V2 Data Payload has 7 chunks minimum
+            if len(chunks) >= 7:
+                tid = str(int(chunks[1], 16))
+                makerAmount = int(chunks[2], 16)
+                takerAmount = int(chunks[3], 16)
+
+                # PURE MATH VALIDATION LOGIC
+                if makerAmount < takerAmount:
+                    # Maker pays USDC, Taker pays Shares -> Taker is SELLING
+                    val_usdc = float(makerAmount) / 1e6
+                    val_size = float(takerAmount) / 1e6
+                    is_buy = False
+                elif makerAmount > takerAmount:
+                    # Maker pays Shares, Taker pays USDC -> Taker is BUYING
+                    val_usdc = float(takerAmount) / 1e6
+                    val_size = float(makerAmount) / 1e6
+                    is_buy = True
+                else:
+                    # Exact $1.00 resolution boundary trade
+                    val_usdc = float(makerAmount) / 1e6
+                    val_size = float(takerAmount) / 1e6
+                    is_buy = True
+
+                if val_usdc > 0 and val_size > 0:
+                    price = val_usdc / val_size
+                    if price > 1.0 or price < 0.000001:
+                        return "ERROR"
+                else:
+                    return "ERROR"
+
+                trade_obj = {
+                    'id': log_item.get('transactionHash'),
+                    'timestamp': int(time.time()),
+                    'taker': taker,
+                    'maker': maker,
+                    'token_id': tid,
+                    'usdc_vol': val_usdc,
+                    'token_vol': val_size,
+                    'price': price,
+                    'is_buy': is_buy,
+                    'retry_count': 0
+                }
                 
-                print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
-                return seg_captured
-
-            total_captured = 0
-               
-            if existing_high_ts:
-                if global_stop_ts > existing_high_ts:
-                    print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(existing_high_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                    count = fetch_segment(existing_high_ts, global_stop_ts, conn, "NEW_HEAD")
-                    total_captured += count
-                else:
-                    print(f"\n🌊 Fetching Newer Data Skipped (Configured End Date <= Existing Head)")
-
-            if existing_low_ts is not None:
-                if existing_low_ts > global_start_cursor:
-                    print(f"\n📜 Fetching Older Data ({datetime.utcfromtimestamp(existing_low_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                    count = fetch_segment(existing_low_ts, global_start_cursor, conn, "OLD_TAIL")
-                    total_captured += count
-                else:
-                    print(f"\n📜 Fetching Older Data Skipped (Existing Tail covers request)")
-            elif not existing_high_ts:
-                print(f"\n📥 Full Historical Download ({datetime.utcfromtimestamp(global_stop_ts)} -> {datetime.utcfromtimestamp(global_start_cursor)})")
-                count = fetch_segment(global_stop_ts, global_start_cursor, conn, "FULL_HISTORY")
-                total_captured += count
-
-            print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
+                await self.trade_queue.put(trade_obj)
+                self.stats['processed_count'] += 1
+                return "TRADE"
             
-    def run(self):
-        current_utc_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
-        print(f"Starting data collection up to {current_utc_naive}...")
-        
-        print("Cleaning up any stale temporary files...")
-        for p in CACHE_DIR.glob("temp_market_chunk_*.parquet"):
-            p.unlink(missing_ok=True)
+            return "UNKNOWN"
+
+        except Exception as e:
+            log.error(f"Parse Fail: {e}")
+            return "ERROR"
             
-        print("\n--- Phase 1: Fetching Markets ---")
-        self.fetch_gamma_markets()
+    async def _ensure_session(self):
+        """Creates a shared aiohttp session if one doesn't exist or has been closed."""
+        if not hasattr(self, "http_session") or self.http_session.closed:
+            self.http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+
+    async def _resolution_monitor_loop(self):
+        """Production-grade resolution monitor with batching, retries, and idempotency."""
+        log.info("⚖️ Resolution Monitor Started (Production Mode)")
         
-        gc.collect()
-        market_file = CACHE_DIR / MARKETS_FILE
-        
-        if market_file.exists():
-            print("Loading contract IDs efficiently...")
-            market_ids_series = pd.read_parquet(market_file, columns=['contract_id'])['contract_id']
+        while self.running:
+            try:
+                positions = self.persistence.state.get("positions", {})
+    
+                # Build fpmm -> [token_id, ...] map, skipping already-redeemed positions
+                market_map: Dict[str, List[str]] = {}
+                for token_id, pos in positions.items():
+                    if pos.get("redeemed"):
+                        continue
+                    fpmm = pos.get("market_fpmm")
+                    if fpmm:
+                        market_map.setdefault(fpmm.lower(), []).append(token_id)
+    
+                if not market_map:
+                    await asyncio.sleep(60)
+                    continue
+    
+                await self._ensure_session()
+                redeemed_any = False
+    
+                for fpmm_id in market_map.keys():
+ 
+                    url = f"{GAMMA_API_URL.rstrip('/')}/{fpmm_id}"
+    
+                    # Fetch with exponential backoff
+                    data = None
+                    for attempt in range(10):
+                        try:
+                            async with self.http_session.get(url) as resp:
+                                if resp.status == 404:
+                                    break  # Stop retrying if the market flat-out doesn't exist
+                                if resp.status != 200:
+                                    raise RuntimeError(f"HTTP {resp.status}")
+                                data = await resp.json()
+                                break
+                        except Exception as e:
+                            if attempt == 9:
+                                log.error(f"Resolution fetch failed for {fpmm_id} after 10 attempts: {e}")
+                            else:
+                                await asyncio.sleep(min(2 ** attempt, 10))
+    
+                    if not data:
+                        continue
+
+                    mkt = data
+                    
+                    try:
+                        if not mkt or mkt.get("closed") is not True:
+                            continue
+    
+                        outcome_tokens = _safe_json_load(mkt.get("tokens"))
+                        outcome_prices_raw = _safe_json_load(mkt.get("outcomePrices"))
+    
+                        if not outcome_prices_raw:
+                            continue
+    
+                        outcome_prices = [float(p) for p in outcome_prices_raw]
+    
+                        if (
+                            not outcome_tokens
+                            or not isinstance(outcome_tokens, list)
+                            or not isinstance(outcome_prices, list)
+                            or len(outcome_tokens) != len(outcome_prices)
+                        ):
+                            continue
+    
+                        winner_idx = max(range(len(outcome_prices)), key=lambda i: outcome_prices[i])
+                        if outcome_prices[winner_idx] < 0.99:
+                            continue  # Market not conclusively resolved yet
+    
+                        for token_id in market_map.get(fpmm_id, []):
+                            pos = positions.get(token_id)
+                            if not pos or pos.get("redeemed"):
+                                continue
+    
+                            is_winner = outcome_tokens[winner_idx] == token_id
+                            payout = 1.0 if is_winner else 0.0
+    
+                            pos["redeemed"] = True
+                            await self.persistence.save_async()
+    
+                            try:
+                                await self.broker.redeem_position(token_id, payout)
+                                redeemed_any = True
+                                log.info(
+                                    f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
+                                    f"Token: {token_id} | Win: {is_winner}"
+                                )
+                            except Exception as e:
+                                pos["redeemed"] = False
+                                await self.persistence.save_async()
+                                log.error(f"Redeem failed for {token_id}: {e}")
+    
+                    except Exception as e:
+                        log.error(f"Market processing error for {fpmm_id}: {e}")
+    
+                    await asyncio.sleep(0.2)
+    
+                await asyncio.sleep(5 if redeemed_any else 60)
+    
+            except Exception as loop_error:
+                log.error(f"Resolution loop critical error: {loop_error}")
+                await asyncio.sleep(10)
             
-            valid_market_ints = set()
-            for val in market_ids_series.dropna():
-                try:
-                    s = str(val).strip().lower()
-                    if s.startswith("0x"): 
-                        valid_market_ints.add(int(s, 16))
-                    elif "e+" in s: 
-                        valid_market_ints.add(int(float(s)))
-                    else: 
-                        valid_market_ints.add(int(Decimal(s)))
-                except Exception:
+    # --- SIGNAL LOOPS ---
+
+    async def _signal_loop(self):
+        """
+        Polls the internal queue for new trades.
+        """
+        log.info("⚡ Signal Loop: Waiting for Webhook Data...")
+        
+        while self.running:
+            raw_trade = await self.trade_queue.get()
+         #   print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
+            
+            try:
+                self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
+
+                # Normalize Data
+                trade = {
+                    'id': raw_trade.get('id'),
+                    'timestamp': int(raw_trade.get('timestamp', 0)),
+                    'maker': raw_trade.get('maker'),
+                    'taker': raw_trade.get('taker'),
+                    'token_id': raw_trade.get('token_id'),
+                    'usdc_vol': raw_trade.get('usdc_vol'),
+                    'token_vol': raw_trade.get('token_vol'),
+                    'price': raw_trade.get('price'),
+                    'is_buy': raw_trade.get('is_buy'),
+                    'retry_count': raw_trade.get('retry_count', 0),
+                }
+                
+                await self._process_batch([trade])
+                
+            except Exception as e:
+                log.info(raw_trade)
+                log.error(f"❌ Processing Error: {e}")
+                
+    async def _process_batch(self, trades):
+        batch_scores = []
+        skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
+
+        for t in trades:
+            
+            # 1. Load Normalized Data
+            wallet = t['taker']
+            token_id = t['token_id']
+            usdc_vol = t['usdc_vol']
+            token_vol = t['token_vol']
+            price = t['price']
+            is_buy = t['is_buy']
+
+            # 2. Calculate execution price & Validate Market
+            market = self.metadata.token_to_market.get(token_id)
+            if not market:
+                found = await self.metadata.fetch_missing_token(token_id)
+                market = self.metadata.token_to_market.get(token_id)
+                if not market:
+                    retry_count = t.get('retry_count', 0)
+                    if retry_count < 20: 
+                        log.warning(f"⏳ Gamma delay for {token_id}. Re-queueing trade (Attempt {retry_count + 1}/20)...")
+                        t['retry_count'] = retry_count + 1
+                        asyncio.create_task(self._requeue_trade(t, delay=10))
+                    else:
+                        log.error(f"💀 FATAL: Gamma failed to index {token_id} after retries. Trade dropped.")
+                        skipped_counts["no_tokens"] += 1
                     continue
                     
-            del market_ids_series
-            gc.collect()
-            print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
+                log.info(f"New market: {market}")
 
-            print("\n--- Phase 2: Fetching Trades ---")
-            self.fetch_gamma_trades(valid_market_ints, end_date=current_utc_naive) 
+            mid = market['id']
+
+            if market.get('start_timestamp', 0) < self.start_time:
+                skipped_counts["old"] += 1
+                continue
+
+            if market.get('end_timestamp', 0) < time.time():
+                skipped_counts["expired"] += 1
+                continue
+
+            self.sub_manager.add_active(list(market['tokens'].values()))
+
+            # Direction Logic
+            is_yes_token = (token_id == list(market['tokens'].values())[0])
             
-        else:
-            print("No markets file found. Skipping trade fetch.")
+            if is_yes_token:
+                direction = 1.0 if is_buy else -1.0
+            else:
+                direction = -1.0 if is_buy else 1.0
+                
+            # 6. Format Datetimes for State Ingestion
+            # Convert the raw RPC timestamp and the market end_timestamp to UTC datetimes
+            ts_dt = datetime.fromtimestamp(t['timestamp'], tz=timezone.utc).replace(tzinfo=None)
+            end_dt = datetime.fromtimestamp(market['end_timestamp'], tz=timezone.utc).replace(tzinfo=None)
+            bet_on = "yes" if is_yes_token else "no"
             
+            # Ensure time-to-resolution is at least 1 hour
+            ttr_hours = max(1.0, (market['end_timestamp'] - t['timestamp']) / 3600.0)
+
+            # ---------------------------------------------------------
+            # 7. INGEST TRADE INTO BAYESIAN STATE (Vectorized & Flat)
+            # ---------------------------------------------------------
+            # String-to-Int Dictionary Mapping to drop string pointer RAM
+            uid = self.state.user_map.get(wallet)
+            if uid is None:
+                uid = self.state.next_user_id
+                self.state.user_map[wallet] = uid
+                self.state.next_user_id += 1
+                
+            u_trades = self.state.user_total_trades[uid]
+            if u_trades == 0:
+                self.state.global_user_count += 1
+            else:
+                self.state.global_total_peak -= self.state.user_peak[uid]
+                
+            current_global_avg = (self.state.global_total_peak / self.state.global_user_count) if self.state.global_user_count > 0 else 100.0
+            
+            eff_dir = 1.0 if is_buy else -1.0
+            if not is_yes_token: eff_dir *= -1.0
+            is_effective_yes = bool(eff_dir > 0)
+            yes_price = price if is_yes_token else 1.0 - price
+
+            # 7a. Math execution (via Numba)
+            new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
+                yes_price, usdc_vol, 
+                self.state.user_exposure[uid], 
+                self.state.user_peak[uid],
+                u_trades, current_global_avg, is_effective_yes
+            )
+            
+            # 7b. Direct Write-Back to NumPy Arrays
+            self.state.user_exposure[uid] = new_exp
+            self.state.user_peak[uid] = new_peak
+            self.state.user_total_trades[uid] = new_n
+            self.state.global_total_peak += new_peak
+            
+            # 7c. Bit-Packing (Price and TTR into uint32)
+            price_int = max(0, min(1000, int(price * 1000)))
+            log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+            packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+            
+            # 7d. Contract Trackers Updates
+            m_pos = self.state.contract_positions[token_id]
+            m_pos.user_ids.append(uid)
+            m_pos.is_yes.append(1 if is_effective_yes else 0)
+            m_pos.packed_data.append(packed)
+            m_pos.p_trues.append(p_true)
+            m_pos.stakes.append(usdc_vol)
+            
+            # 7e. Flattened First Bet Pending Tracker
+            if u_trades == 0:
+                if usdc_vol >= 1.0: 
+                    self.state.first_bets_pending[token_id].append(
+                        (uid, math.log1p(usdc_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
+                    )
+
+            # ---------------------------------------------------------
+            # 8. EXTRACT BAYESIAN EDGE
+            # ---------------------------------------------------------
+            smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
+                uid=uid, price=price, stake=usdc_vol, 
+                direction=direction, is_buying=is_buy, 
+                ttr_hours=ttr_hours, state=self.state, 
+                price_lut=PRICE_LUT, time_lut=TIME_LUT
+            )
+            
+            # The percentage margin is exactly equivalent to our normalized_weight/edge
+            normalized_weight = perc_marg
+            
+            self.stats['scores'].append(normalized_weight)
+            batch_scores.append((abs(normalized_weight), normalized_weight, mid))
+
+            # 9. Smart Exits
+            if CONFIG.get('use_smart_exit'):
+                await self._check_smart_exits_for_market(mid, normalized_weight)
+
+            for pos_data in self.persistence.state["positions"].values():
+              if pos_data.get("market_fpmm") == mid:
+                continue
+
+            if token_id in self.pending_orders or mid in self.pending_markets:
+                continue
+    
+            # 10. Entry Actions (With price bounds)
+            if 0.05 < price < 0.95:
+      
+                end_ts = market['end_timestamp']
+                passes_roi_filter = False
+             
+                days_to_expiry = (end_ts - time.time()) / 86400.0
+                    
+                if normalized_weight > 0:
+                    if is_yes_token:
+                        absolute_roi = (1.0 - price) / price
+                    else:
+                        absolute_roi = price / (1 - price)
+                else:
+                    if is_yes_token:
+                        absolute_roi = price / (1 - price)
+                    else:
+                        absolute_roi = (1.0 - price) / price 
+                              
+                annualized_roi = absolute_roi * (365.0 / days_to_expiry)
+                        
+                if annualized_roi > 5.0:
+                        passes_roi_filter = True
+                
+                if not passes_roi_filter and days_to_expiry > 0:
+                    continue 
+                    
+                action = TradeLogic.check_entry_signal(normalized_weight)
+                
+                if action == 'BUY':
+                    if token_id not in self.pending_orders and mid not in self.pending_markets:
+                        self.pending_orders.add(token_id)
+                        self.pending_markets.add(mid) 
+                        asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
+                    else:
+                        log.info(f"🔒 Market {mid} or Token {token_id} is currently locked by an in-flight order. Skipping.")
+
+        # End of Batch Summary
+        if batch_scores:
+            batch_scores.sort(key=lambda x: x[0], reverse=True)
+            top_3 = batch_scores[:3]
+            msg_parts = [f"Mkt {item[2]}..: {item[1]:.1f}" for item in top_3]
+            log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
+        #else:
+        #    log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
+            
+    async def _check_smart_exits_for_market(self, mkt_id, current_signal):
+        """Iterates over held positions in this market and checks for reversal exits."""
+        relevant_positions = [
+            (tid, p) for tid, p in self.persistence.state["positions"].items() 
+            if p.get("market_fpmm") == mkt_id
+        ]
+        
+        for pos_token, pos_data in relevant_positions:
+            # FIX: Rename to 'market_obj' for clarity
+            market_obj = self.metadata.markets.get(mkt_id)
+            if not market_obj: continue
+            
+            # FIX: Properly reference market_obj
+            is_yes = (str(pos_token) == market_obj['tokens'].get('yes'))
+            pos_type = 'YES' if is_yes else 'NO'
+            
+            should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
+            
+            if should_exit:
+                clean_book = self._prepare_clean_book(pos_token)
+                if clean_book:
+                    log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
+                    await self.broker.execute_market_order(pos_token, "SELL", 0, mkt_id, current_book=clean_book)
+                else:
+                    log.warning(f"❌ Missed Opportunity: Empty Book for {pos_token}")
+
+    # --- EXECUTION HELPERS ---
+
+    def _prepare_clean_book(self, token_id):
+        """Helper to convert dictionary order books to sorted lists."""
+        raw_book = self.order_books.get(str(token_id))
+        if not raw_book:
+            return None
+
+        bids_dict = raw_book.get('bids', {})
+        asks_dict = raw_book.get('asks', {})
+
+        if not bids_dict or not asks_dict:
+            return None
+
+        # Create Lists: [[price, size], [price, size], ...]
+        bids_list = [[p, s] for p, s in bids_dict.items()]
+        asks_list = [[p, s] for p, s in asks_dict.items()]
+
+        # Sort: Bids = Highest First, Asks = Lowest First
+        sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
+        sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
+        
+        return {'bids': sorted_bids, 'asks': sorted_asks}
+
+    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
+        token_id = str(token_id)
+        
+        # 1. Position Guard
+        if token_id in self.persistence.state["positions"]:
+            return
+
+        for pos_data in self.persistence.state["positions"].values():
+            if pos_data.get("market_fpmm") == mkt_id:
+                log.info(f"🛡️ Market Guard: Already hold a position in market {mkt_id}... Skipping.")
+                return
+
+        # 2. Wait for Initial Liquidity
+        raw_book = self.order_books.get(token_id)
+            
+        if not raw_book or not raw_book.get('asks') or not raw_book.get('bids'):
+            
+            if _resubscribe_attempts >= 50:
+                log.error(f"❌ Aborting execution for {token_id}. Book never populated after multiple resubscribe attempts.")
+                return
+                
+            if _retries >= 10:
+                log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
+                self.ws_client.resubscribe_single(token_id)
+                await asyncio.sleep(3.0)
+                return await self._attempt_exec(token_id, mkt_id, _retries=0, _resubscribe_attempts=_resubscribe_attempts + 1, signal_price=signal_price)
+                
+            log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
+            await asyncio.sleep(0.5)
+            return await self._attempt_exec(token_id, mkt_id, _retries=_retries+1, signal_price=signal_price)
+                
+        # 3. Determine Total Target Trade Size
+        trade_size = CONFIG['fixed_size'] 
+        available_cash = self.persistence.state["cash"]
+        
+        if CONFIG.get('use_percentage_staking'):
+            try:
+                total_equity = self.persistence.calculate_equity()
+                calculated_stake = total_equity * CONFIG['percentage_stake']
+                trade_size = max(2.0, calculated_stake)    
+            except Exception as e:
+                log.error(f"Sizing Failed: {e}")
+                trade_size = CONFIG['fixed_size']
+
+        if trade_size > available_cash:
+                    log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
+                    return
+            
+        # 4. Patient Execution Window Setup
+        max_duration = CONFIG.get('exec_timeout', 300) 
+        max_slippage = CONFIG.get('max_slippage', 0.05)
+        start_time = time.time()
+        accumulated_usdc = 0.0
+
+        is_paper_trading = isinstance(self.broker, PaperBroker)
+        virtual_consumption = {}
+        log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
+
+        # 5. Dynamic Sweep Loop
+        while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
+            clean_book = self._prepare_clean_book(token_id)
+            if not clean_book or not clean_book['asks'] or not clean_book['bids']:
+                await asyncio.sleep(2.0)
+                continue
+
+            # ==========================================
+            # Virtually Deplete the Book 
+            # ==========================================
+            if is_paper_trading:
+                adjusted_asks = []
+                for p_str, s_str in clean_book['asks']:
+                    p_float = float(p_str)
+                    raw_level_usdc = float(s_str) * p_float
+                    eaten = virtual_consumption.get(p_str, 0.0)
+                    
+                    left_usdc = max(0.0, raw_level_usdc - eaten)
+                    if left_usdc > 0.001:  # Keep level only if liquidity remains
+                        adjusted_asks.append([p_str, str(left_usdc / p_float)])
+                        
+                clean_book['asks'] = adjusted_asks # Broker will now see the depleted book!
+
+            if not clean_book['asks']:
+                await asyncio.sleep(2.0) # Wait for new sellers if book is virtually empty
+                continue
+
+            # Calculate Current Spread
+            best_bid = float(clean_book['bids'][0][0])
+            best_ask = float(clean_book['asks'][0][0])
+            spread = (best_ask - best_bid) / best_ask if best_ask > 0 else 0
+
+            remaining_usdc = trade_size - accumulated_usdc
+            
+            optimal_chunk_usdc = 0.0
+            accumulated_tokens_test = 0.0
+            max_allowance = CONFIG['max_allowable_slippage']
+            planned_consumption = {}
+            
+            for ask_price_str, ask_size_tokens_str in clean_book['asks']:
+                ask_p = float(ask_price_str)
+                level_usdc = float(ask_size_tokens_str) * ask_p
+                
+                # Only take what we still need
+                budget_left_in_chunk = remaining_usdc - optimal_chunk_usdc
+                take_usdc = min(level_usdc, budget_left_in_chunk)
+                if take_usdc <= 0:
+                    break
+                    
+                take_tokens = take_usdc / ask_p
+                
+                # Test the VWAP
+                test_tokens = accumulated_tokens_test + take_tokens
+                test_usdc = optimal_chunk_usdc + take_usdc
+                test_vwap = test_usdc / test_tokens if test_tokens > 0 else 0
+                
+                if signal_price and test_vwap > 0:
+                    test_slippage = (test_vwap - signal_price) / signal_price
+                    total_penalty = test_slippage + spread
+                    absolute_cost_difference = test_vwap - signal_price
+                    
+                    if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
+                        break
+                
+                # Lock in this slice
+                optimal_chunk_usdc += take_usdc
+                accumulated_tokens_test += take_tokens
+                planned_consumption[ask_price_str] = take_usdc 
+                
+                if optimal_chunk_usdc >= remaining_usdc:
+                    break
+
+            # --- EXECUTE THE CHUNK ---
+            if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
+                log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
+                
+                market_obj = self.metadata.markets.get(mkt_id)
+                
+                # 1. Grab the expiration timestamp (default to 0 if not found)
+                expiration_ts = market_obj.get('end_timestamp', 0.0) if market_obj else 0.0
+                
+                if market_obj:
+                    market_tokens = [str(t) for t in market_obj['tokens'].values()]
+                    for held_token in self.persistence.state["positions"].keys():
+                        # If we hold a token in this market, and it is NOT the one we are currently buying
+                        if str(held_token) in market_tokens and str(held_token) != str(token_id):
+                            log.critical(f"🛡️ Async Guard: Opposing side ({held_token}) already held! Aborting sweep for {token_id}.")
+                            return
+                            
+                # 2. Pass expiration_ts to the broker
+                success = await self.broker.execute_market_order(
+                    token_id, "BUY", optimal_chunk_usdc, mkt_id, 
+                    current_book=clean_book, expiration_ts=expiration_ts
+                )
+                
+                if success is not False:
+                    accumulated_usdc += optimal_chunk_usdc
+                    
+                    if is_paper_trading:
+                        for p_str, amt in planned_consumption.items():
+                            virtual_consumption[p_str] = virtual_consumption.get(p_str, 0.0) + amt
+                    
+                    if accumulated_usdc >= trade_size:
+                        log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
+                        return
+                else:
+                    log.error(f"❌ Broker rejected the ${optimal_chunk_usdc:.2f} order for {token_id}. Aborting.")
+                    break 
+            else:
+                pass 
+            
+            await asyncio.sleep(5.0)
+
+        # 6. Timeout handling
+        if accumulated_usdc > 0 and accumulated_usdc < trade_size:
+            log.warning(f"⏰ Execution timeout for {token_id}. Total filled: ${accumulated_usdc:.2f} / ${trade_size:.2f}.")
+        elif accumulated_usdc == 0:
+            log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the requirements.")
+
+    async def _requeue_trade(self, trade_obj, delay=10):
+        """
+        Holds a trade that is waiting for Gamma metadata to propagate,
+        then injects it back into the main processing queue.
+        """
+        await asyncio.sleep(delay)
+        await self.trade_queue.put(trade_obj)
+        
+    async def _check_stop_loss(self, token_id, price):
+        pos = self.persistence.state["positions"].get(token_id)
+        if not pos: return
+        
+        avg = pos['avg_price']
+        pnl = (price - avg) / avg
+        
+        if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
+            clean_book = self._prepare_clean_book(token_id)
+            if clean_book:
+                log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
+                
+                success = await self.broker.execute_market_order(
+                    token_id, "SELL", 0, pos['market_fpmm'], current_book=clean_book
+                )
+                
+            else:
+                log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
+
+    # --- MAINTENANCE ---
+
+    async def _maintenance_loop(self):
+        """
+        Refreshes market metadata hourly to catch NEW markets.
+        """
+        last_metadata_refresh = time.time()
+
+        while self.running:
+            await asyncio.sleep(60)
+
+            if time.time() - last_metadata_refresh > 3600:
+                log.info("🌍 Hourly Metadata Refresh...")
+                await self.metadata.refresh()
+                log.info("🧠 Hourly Brain Refresh: Reloading JSON parameters...")
+                
+                self.sub_manager.dirty = True
+                
+                last_metadata_refresh = time.time()
+
+    async def _reporting_loop(self):
+        """Generates and prints the institutional report every 5 minutes."""
+        while self.running:
+            await asyncio.sleep(60) 
+            
+            report_str = await asyncio.to_thread(generate_institutional_report)
+            if report_str:
+                print(f"\n{report_str}\n")
+
+    async def _risk_monitor_loop(self):
+        if not EQUITY_FILE.exists():
+            with open(EQUITY_FILE, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp", "equity", "cash", "invested", "drawdown"])
+
+        while self.running:
+            live_prices = {}
+            # [FIX] Correctly parse the Order Book Dictionary
+            for token_id, book in self.order_books.items():
+                bids = book.get('bids', {}) # Get the Dict {'price': 'size'}
+                
+                if bids:
+                    # 1. Extract keys (prices)
+                    # 2. Convert to float for comparison
+                    # 3. Find Max
+                    best_price = float(max(bids.keys(), key=lambda x: float(x)))
+                    live_prices[token_id] = best_price
+                else:
+                    live_prices[token_id] = 0.0
+            
+            # Now live_prices contains FLOATS, so this won't crash
+            equity = self.persistence.calculate_equity(current_prices=live_prices)
+            cash = self.persistence.state["cash"]
+            invested = equity - cash
+            
+            high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
+            if equity > high_water:
+                self.persistence.state["highest_equity"] = equity
+
+            drawdown = 0.0
+            if high_water > 0:
+                drawdown = (high_water - equity) / high_water
+
+            # Persist max drawdown to state so it survives restarts and appears in reports
+            prev_max_dd = self.persistence.state.get("max_drawdown", 0.0)
+            if drawdown > prev_max_dd:
+                self.persistence.state["max_drawdown"] = drawdown
+
+            try:
+                with open(EQUITY_FILE, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([int(time.time()), round(equity, 2), round(cash, 2), round(invested, 2), round(drawdown, 4)])
+            except Exception as e:
+                log.error(f"Equity Log Error: {e}")
+
+            if abs(drawdown) > CONFIG['max_drawdown']:
+                log.critical(f"💀 HALT: Max Drawdown {drawdown:.1%} exceeded.")
+                self.running = False
+                return 
+            
+            log.info(f"💰 Equity: ${equity:.2f} | Drawdown: {drawdown:.1%}")
+            
+            await asyncio.sleep(60)
+            
+async def main():
+    trader = None
+    try:
+        trader = LiveTrader()
+        await trader.start()
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+        if trader:
+            await trader.shutdown()
+    except Exception as e:
+        log.critical(f"Fatal Error: {e}")
+        if trader:
+            await trader.shutdown()
+
 if __name__ == "__main__":
-    fetcher = DataFetcher()
-    fetcher.run()
+    asyncio.run(main())
