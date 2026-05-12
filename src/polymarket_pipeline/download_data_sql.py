@@ -560,7 +560,7 @@ class DataFetcher:
                 seg_captured = 0
                 seg_dropped = 0
                 rpc_index = 0
-                batch_size = 2000 # Safe default for public RPCs
+                batch_size = 100 # Safe default for public RPCs
                 
                 while current_block <= end_block:
                     # 1. Hard cap batch size at 100 to prevent strict public nodes from rejecting it
@@ -713,7 +713,7 @@ class DataFetcher:
                         current_block = target_end + 1
                         
                         # Optimistically stretch the batch size back out if the RPC is handling it well
-                        batch_size = min(5000, batch_size + 500)
+                        batch_size = min(200, batch_size + 10)
 
                     except Exception as e:
                         err_str = str(e)
