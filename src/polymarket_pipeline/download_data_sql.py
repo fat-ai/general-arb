@@ -446,7 +446,7 @@ class DataFetcher:
         for p in temp_files:
             Path(p).unlink(missing_ok=True)
             
-    def fetch_gamma_trades(self, target_token_ids, end_date):
+    def fetch_gamma_trades(self, end_date):
       
         db_file = CACHE_DIR / "gamma_trades.db"
         
@@ -458,9 +458,6 @@ class DataFetcher:
         
         # The mathematically verified V2 OrderFilled Topic Hash
         ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
-        
-        print(f"🎯 Global Fetcher targets: {len(target_token_ids)} valid numeric IDs.")
-        if not target_token_ids: return
 
         # Helper to bridge Timestamps -> Polygon Block Numbers without an API key
         def get_block_from_timestamp(ts):
@@ -661,9 +658,6 @@ class DataFetcher:
                                 makerAmount = int(chunks[2], 16)
                                 takerAmount = int(chunks[3], 16)
 
-                                if tid not in target_token_ids:
-                                    seg_dropped += 1; continue
-
                                 # PURE MATH VALIDATION LOGIC
                                 if makerAmount < takerAmount:
                                     # Maker pays USDC, Taker pays Shares -> Taker is SELLING
@@ -794,7 +788,7 @@ class DataFetcher:
             print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
 
             print("\n--- Phase 2: Fetching Trades ---")
-            self.fetch_gamma_trades(valid_market_ints, end_date=current_utc_naive) 
+            self.fetch_gamma_trades(end_date=current_utc_naive)
             
         else:
             print("No markets file found. Skipping trade fetch.")
