@@ -198,19 +198,28 @@ def export_dashboard_scores(state: BayesianState):
 def load_markets() -> dict:
     """Loads market metadata via Polars with optimized memory mapping."""
     log.info("📂 Loading Market Metadata...")
-    markets_pl = pl.read_parquet(MARKETS_PATH).select([
+    
+    # Define only the columns we actually need to read from disk
+    cols_to_read = [
+        'contract_id', 'market_id', 'outcome', 
+        'token_outcome_label', 'resolution_timestamp', 'start_date'
+    ]
+    
+    # Use scan_parquet for lazy evaluation, select only needed columns, then collect
+    markets_pl = pl.scan_parquet(MARKETS_PATH).select([
         pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
         pl.col('market_id').alias('id'),
         pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
         pl.col('resolution_timestamp'),
         pl.col('start_date')
-    ])
+    ]).collect()
     
     market_map = {}
     
     # Use raw tuples (iter_rows) instead of named=True to prevent instantiating 2.2 million temporary dicts
     for row in markets_pl.iter_rows():
+        if not row[0]: continue # Skip if contract_id is null after processing
         cid = sys.intern(row[0])
         
         # Parse Start Date safely
