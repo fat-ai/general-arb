@@ -258,44 +258,42 @@ def main():
     # ==========================================
     # 1. RESOLVE FINISHED MARKETS
     # ==========================================
-    log.info("⚖️ Checking for newly resolved markets...")
+    log.info("⚖️ Checking for newly resolved and orphaned markets...")
+    
+    # 1. Gather all unique tracked contract IDs efficiently using sets (Zero list concatenation)
+    tracked_cids = set(state.contract_positions.keys())
+    tracked_cids.update(state.first_bets_pending.keys())
     
     cids_to_resolve = []
-    for cid in list(state.contract_positions.keys()) + list(state.first_bets_pending.keys()):
-        if cid in market_map:
-            outcome = market_map[cid]['outcome']
+    orphan_cids = []
+    orphan_cutoff_ts = current_day_ts - 864000.0  # 10 days
+    
+    # 2. Single pass through tracked contracts
+    for cid in tracked_cids:
+        m = market_map.get(cid)
+        
+        if m is not None:
+            outcome = m['outcome']
             # Safe check: Must not be None, and must not be NaN
             if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
                 cids_to_resolve.append(cid)
-                
-    cids_to_resolve = list(set(cids_to_resolve))
-    
-    for r_cid in cids_to_resolve:
-        outcome = market_map[r_cid]['outcome']
-        outcome_label = market_map[r_cid]['outcome_label']
-        # Note: resolve_market uses .pop() internally, making it idempotent
-        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
-        
-    if cids_to_resolve:
-        log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
-        
-    if cids_to_resolve:
-        log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
-        
-    log.info("🧹 Sweeping for orphaned/dead markets to prevent memory leaks...")
-    orphan_cutoff_ts = current_day_ts - 864000.0
-    orphan_cids = []
-    
-    tracked_cids = set(state.contract_positions.keys()).union(set(state.first_bets_pending.keys()))
-    
-    for c in tracked_cids:
-        if c in market_map:
-            m = market_map[c]
-            if m['end'] is not None and m['end'] < orphan_cutoff_ts:
-                orphan_cids.append(c)
+            # Check if orphaned/expired beyond cutoff
+            elif m['end'] is not None and m['end'] < orphan_cutoff_ts:
+                orphan_cids.append(cid)
         else:
-            orphan_cids.append(c)
+            # If it is completely missing from market_map, it is dead/orphaned
+            orphan_cids.append(cid)
             
+    # 3. Process Resolutions
+    for r_cid in cids_to_resolve:
+        m = market_map[r_cid]
+        # Note: resolve_market uses .pop() internally, making it idempotent
+        resolve_market(r_cid, m['outcome'], m['outcome_label'], current_day_ts, state)
+        
+    if cids_to_resolve:
+        log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
+        
+    # 4. Process Orphans (clean up markets that never resolved but are old)
     for o_cid in orphan_cids:
         state.contract_positions.pop(o_cid, None)
         state.first_bets_pending.pop(o_cid, None)
