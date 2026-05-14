@@ -244,6 +244,54 @@ def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, t
     # Return the updated state variables PLUS the computed math
     return new_exposure, new_peak, N, fraction, p_true
 
+@njit(cache=True)
+def _process_trade_core(
+    primary_history, opposing_history,
+    primary_price_int, opposing_price_int, current_log_ttr,
+    expected_p, price, stake, ttr_hours,
+    V,
+    brier_sum_uid, brier_count_uid,
+    logit_params,
+    price_lut, time_lut, p_range
+):
+    if brier_count_uid > 0:
+        mean_brier = brier_sum_uid / brier_count_uid
+        confidence_penalty = 0.5 / math.sqrt(brier_count_uid)
+        bs_ucb = min(1.0, mean_brier + confidence_penalty)
+        trust_multiplier = 1.0 / (bs_ucb + 0.01)
+    else:
+        if len(logit_params) != 4:
+            trust_multiplier = 1.33
+        else:
+            log_vol  = math.log1p(stake)
+            log_ttr_ = math.log1p(ttr_hours)
+            log_odds = (logit_params[0]
+                        + logit_params[1] * log_vol
+                        + logit_params[2] * price
+                        + logit_params[3] * log_ttr_)
+            p_model  = 1.0 / (1.0 + math.exp(-log_odds))
+            edge     = abs(p_model - price)
+            trust_multiplier = min(5.0, 1.0 + (edge * 20.0))
+
+    n1_raw, w1_raw = fast_numba_scan(primary_history,  primary_price_int,  1,
+                                     current_log_ttr, price_lut, time_lut, p_range)
+    n2_raw, w2_raw = fast_numba_scan(opposing_history, opposing_price_int, 0,
+                                     current_log_ttr, price_lut, time_lut, p_range)
+
+    N_eff = (n1_raw + n2_raw) * trust_multiplier
+    W_eff = (w1_raw + w2_raw) * trust_multiplier
+
+    theoretical_v = expected_p * (1.0 - expected_p)
+    M = max(1.0, (theoretical_v / V) - 1.0)
+    alpha = M * expected_p
+    beta  = M * (1.0 - expected_p)
+    smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
+    margin = smoothed_win_rate - expected_p
+    if expected_p > 0.0:
+        perc_margin = margin / expected_p
+    else:
+        perc_margin = 0.0
+    return smoothed_win_rate, margin, perc_margin, trust_multiplier
 
 def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
                   state, price_lut, time_lut):
@@ -465,11 +513,6 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
             arr.frombytes(new_entries.tobytes())
             np.asarray(arr, dtype=np.uint32).sort(kind='stable')
 
-            if state.user_history_no[uid]:
-                arr_no = np.array(state.user_history_no[uid], dtype=np.uint32)
-                arr_no.sort()
-                state.user_history_no[uid] = array.array('I', arr_no)
-
         if r_cid in state.first_bets_pending:
             first_bets = state.first_bets_pending.pop(r_cid)
             token_won = True if (outcome_label == 'yes' and is_yes_win) or (outcome_label == 'no' and is_no_win) else False
@@ -525,49 +568,6 @@ def calibrate_models(current_day_ts, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO Polyfit failed: {e}")
 
-
-def process_trade(uid: int, price: float, stake: float, direction: float, is_buying: bool, ttr_hours: float, state: BayesianState, price_lut: list, time_lut: list):
-    current_log_ttr = min(int(math.log(ttr_hours) * 1000), 2097151)
-    expected_p = price if is_buying else 1.0 - price
-    is_yes = (direction > 0)
-
-    primary_price_int = max(0, min(1000, int(expected_p * 1000)))
-    opposing_price_int = max(0, min(1000, int((1.0 - expected_p) * 1000)))
-
-    # Fetch history directly from pre-allocated lists
-    if is_yes:
-        primary_array = state.user_history_yes[uid]
-        opposing_array = state.user_history_no[uid]
-        coeffs = state.poly_coeffs_yes
-    else:
-        primary_array = state.user_history_no[uid]
-        opposing_array = state.user_history_yes[uid]
-        coeffs = state.poly_coeffs_no
-
-    b_count = state.user_brier_count[uid]
-    if b_count > 0:
-        trust_multiplier = calculate_precision_weight(state.user_brier_sum[uid], b_count)
-    else:
-        trust_multiplier = get_cold_start_trust(state.logit_model_params, price, stake, ttr_hours)
-
-    n1_raw, w1_raw = fast_numba_scan(primary_array, primary_price_int, 1, current_log_ttr, price_lut, time_lut, P_RANGE)
-    n2_raw, w2_raw = fast_numba_scan(opposing_array, opposing_price_int, 0, current_log_ttr, price_lut, time_lut, P_RANGE)
-
-    N_eff = (n1_raw + n2_raw) * trust_multiplier
-    W_eff = (w1_raw + w2_raw) * trust_multiplier
-
-    a, b, c = coeffs
-    V = max(0.0001, (a * (expected_p ** 2)) + (b * expected_p) + c) if ((a * (expected_p ** 2)) + (b * expected_p) + c) <= 0.35 else max(0.0001, expected_p * (1.0 - expected_p))
-    theoretical_v = expected_p * (1.0 - expected_p)
-    M = max(1.0, (theoretical_v / V) - 1.0)
-
-    alpha, beta = M * expected_p, M * (1.0 - expected_p)
-    smoothed_win_rate = (W_eff + alpha) / (N_eff + alpha + beta)
-    margin = smoothed_win_rate - expected_p
-    perc_margin = margin / expected_p if expected_p > 0 else 0.0
-
-    return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
-
 def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, result_map, data_start_date, simulation_start_date, current_sim_day, heartbeat):
     log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
     
@@ -583,18 +583,20 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     y_idx, n_idx = 0, 0
     
     # 1. Flatten the pre-allocated user history arrays
+    yes_bytes = yes_arr.tobytes()
+    no_bytes  = no_arr.tobytes()
+    y_byte_idx, n_byte_idx = 0, 0
     for i in range(active_uids):
-        y_len = len(state.user_history_yes[i])
-        yes_lens[i] = y_len
+        y_len = int(yes_lens[i])
         if y_len > 0:
-            yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
-            y_idx += y_len
-            
-        n_len = len(state.user_history_no[i])
-        no_lens[i] = n_len
+            nbytes = y_len * 4   # uint32 = 4 bytes
+            state.user_history_yes[i].frombytes(yes_bytes[y_byte_idx:y_byte_idx + nbytes])
+            y_byte_idx += nbytes
+        n_len = int(no_lens[i])
         if n_len > 0:
-            no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
-            n_idx += n_len
+            nbytes = n_len * 4
+            state.user_history_no[i].frombytes(no_bytes[n_byte_idx:n_byte_idx + nbytes])
+            n_byte_idx += nbytes
             
     var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
     var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
