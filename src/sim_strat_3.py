@@ -335,37 +335,6 @@ def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
     )
     return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
         
-def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
-    """
-    Calculates the Trust Weight using Precision Weighting (Inverse Brier Score) 
-    applied to the Pessimistic Bound (Upper Confidence Bound).
-    
-    Args:
-        brier_sum (float): The running sum of the user's squared errors.
-        brier_count (int): The total number of resolved trades (N).
-        
-    Returns:
-        float: The final Bayesian trust multiplier / weight.
-    """
-    if brier_count == 0:
-        return 0.0 # No data, no trust
-        
-    # 1. Calculate Mean Brier
-    mean_brier = brier_sum / brier_count
-    
-    # 2. Calculate the Pessimistic Bound (95% UCB using max variance assumption)
-    # Penalty decays proportional to the square root of N
-    confidence_penalty = 0.5 / math.sqrt(brier_count)
-    
-    bs_ucb = min(1.0, mean_brier + confidence_penalty)
-    
-    # 3. Precision Weighting (Inverse Variance)
-    # We add a tiny epsilon (0.01) to the denominator to prevent division-by-zero 
-    # and to cap the maximum possible weight of a "perfect" infinite-N trader at 100.
-    epsilon = 0.01
-    weight = 1.0 / (bs_ucb + epsilon)
-    
-    return weight
 
 def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
     """
@@ -397,49 +366,6 @@ def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
     except Exception as e:
         log.warning(f"Logit calibration failed: {e}")
         return None
-
-def get_cold_start_trust(model_params: np.ndarray, price: float, stake: float, ttr_hours: float) -> float:
-    """
-    Calculates the temporary Trust Weight for a user's first trade based on the global Logit prior.
-    
-    Args:
-        model_params (np.ndarray): The fitted Logit coefficients.
-        price (float): Execution price of the trade.
-        stake (float): The dollar amount risked.
-        ttr_hours (float): Time to resolution in hours.
-        
-    Returns:
-        float: A temporary Bayesian trust weight to use for this specific trade.
-    """
-    # 1. Fallback if the daily model failed to train
-    # We assign a baseline weight of 1.33 (Equivalent to a UCB Brier of 0.75, which is typical for N=1)
-    if model_params is None or len(model_params) != 4:
-        return 1.33
-        
-    # 2. Prepare the features
-    log_vol = math.log1p(stake)
-    log_ttr = math.log1p(ttr_hours)
-    
-    intercept, coef_vol, coef_price, coef_ttr = model_params
-    
-    # 3. Calculate Log-Odds (Linear combination)
-    log_odds = intercept + (coef_vol * log_vol) + (coef_price * price) + (coef_ttr * log_ttr)
-    
-    # 4. Convert Log-Odds to Probability using the Sigmoid function
-    p_model = 1.0 / (1.0 + math.exp(-log_odds))
-    
-    # 5. Calculate the Implied Edge
-    # How much does our model disagree with the current market price?
-    edge = abs(p_model - price)
-    
-    # 6. Map Edge to a Temporary Precision Weight
-    # A base weight of 1.0 implies no edge. 
-    # For every 1% of edge, we add to the weight, capping at a maximum weight of 5.0.
-    # This ensures a brand new user can't have a higher weight than a proven sharp, 
-    # but still allows strong first-trade signals to carry influence.
-    weight = 1.0 + (edge * 20.0) 
-    
-    return min(5.0, weight)
 
 def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
     """
@@ -583,10 +509,7 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     y_idx, n_idx = 0, 0
     
     # 1. Flatten the pre-allocated user history arrays
-    yes_bytes = yes_arr.tobytes()
-    no_bytes  = no_arr.tobytes()
-    y_byte_idx, n_byte_idx = 0, 0
-    y_idx, n_idx = 0, 0
+
     for i in range(active_uids):
         y_len = len(state.user_history_yes[i])
         yes_lens[i] = y_len
@@ -688,7 +611,6 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         state.user_history_no = [array.array('I') for _ in range(state.next_user_id)]
         
         active_uids = len(yes_lens)
-        y_idx, n_idx = 0, 0
         
         # 2. Re-populate the byte arrays
         yes_bytes = yes_arr.tobytes()
