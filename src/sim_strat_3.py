@@ -586,17 +586,18 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     yes_bytes = yes_arr.tobytes()
     no_bytes  = no_arr.tobytes()
     y_byte_idx, n_byte_idx = 0, 0
+    y_idx, n_idx = 0, 0
     for i in range(active_uids):
-        y_len = int(yes_lens[i])
+        y_len = len(state.user_history_yes[i])
+        yes_lens[i] = y_len
         if y_len > 0:
-            nbytes = y_len * 4   # uint32 = 4 bytes
-            state.user_history_yes[i].frombytes(yes_bytes[y_byte_idx:y_byte_idx + nbytes])
-            y_byte_idx += nbytes
-        n_len = int(no_lens[i])
+            yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
+            y_idx += y_len
+        n_len = len(state.user_history_no[i])
+        no_lens[i] = n_len
         if n_len > 0:
-            nbytes = n_len * 4
-            state.user_history_no[i].frombytes(no_bytes[n_byte_idx:n_byte_idx + nbytes])
-            n_byte_idx += nbytes
+            no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
+            n_idx += n_len
             
     var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
     var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
@@ -690,16 +691,20 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         y_idx, n_idx = 0, 0
         
         # 2. Re-populate the byte arrays
+        yes_bytes = yes_arr.tobytes()
+        no_bytes  = no_arr.tobytes()
+        y_byte_idx, n_byte_idx = 0, 0
         for i in range(active_uids):
-            y_len = yes_lens[i]
+            y_len = int(yes_lens[i])
             if y_len > 0:
-                state.user_history_yes[i].frombytes(yes_arr[y_idx:y_idx+y_len].tobytes())
-                y_idx += y_len
-                
-            n_len = no_lens[i]
+                nbytes = y_len * 4
+                state.user_history_yes[i].frombytes(yes_bytes[y_byte_idx:y_byte_idx + nbytes])
+                y_byte_idx += nbytes
+            n_len = int(no_lens[i])
             if n_len > 0:
-                state.user_history_no[i].frombytes(no_arr[n_idx:n_idx+n_len].tobytes())
-                n_idx += n_len
+                nbytes = n_len * 4
+                state.user_history_no[i].frombytes(no_bytes[n_byte_idx:n_byte_idx + nbytes])
+                n_byte_idx += nbytes
                 
         # 3. Restore the deques
         state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
