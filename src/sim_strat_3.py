@@ -39,6 +39,9 @@ executions_buffer = []
 
 MAX_USERS = 5_000_000
 
+_EMPTY_U32 = np.empty(0, dtype=np.uint32)
+_EMPTY_F64 = np.empty(0, dtype=np.float64)
+
 @dataclass(slots=True)
 class MarketPositions:
     user_ids: array.array = field(default_factory=lambda: array.array('I')) # uint32 IDs
@@ -60,8 +63,8 @@ class BayesianState:
     user_brier_count: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.uint32))
 
     # 2. Pre-allocated arrays for user trade histories
-    user_history_yes: list = field(default_factory=lambda: [array.array('I') for _ in range(MAX_USERS)])
-    user_history_no: list = field(default_factory=lambda: [array.array('I') for _ in range(MAX_USERS)])
+    user_history_yes: list = field(default_factory=list)
+    user_history_no:  list = field(default_factory=list)
 
     # 3. String-to-Int Mapping
     user_map: dict = field(default_factory=dict) 
@@ -240,6 +243,49 @@ def compute_wager_and_p_true(price, invested, current_exposure, peak_exposure, t
     
     # Return the updated state variables PLUS the computed math
     return new_exposure, new_peak, N, fraction, p_true
+
+
+def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
+                  state, price_lut, time_lut):
+    current_log_ttr  = min(int(math.log(ttr_hours) * 1000), 2097151)
+    expected_p       = price if is_buying else 1.0 - price
+    is_yes           = (direction > 0)
+    primary_price_int  = max(0, min(1000, int(expected_p * 1000)))
+    opposing_price_int = max(0, min(1000, int((1.0 - expected_p) * 1000)))
+
+    if is_yes:
+        primary_arr  = state.user_history_yes[uid]
+        opposing_arr = state.user_history_no[uid]
+        a, b, c = state.poly_coeffs_yes[0], state.poly_coeffs_yes[1], state.poly_coeffs_yes[2]
+    else:
+        primary_arr  = state.user_history_no[uid]
+        opposing_arr = state.user_history_yes[uid]
+        a, b, c = state.poly_coeffs_no[0],  state.poly_coeffs_no[1],  state.poly_coeffs_no[2]
+
+    # V computed in Python — matches the original line bit-for-bit.
+    # Doing it inside @njit lets LLVM contract the polynomial into FMA,
+    # which produces 1-ULP differences in ~0.01% of inputs. Keep it here.
+    poly_v = (a * (expected_p ** 2)) + (b * expected_p) + c
+    if poly_v <= 0.35:
+        V = max(0.0001, poly_v)
+    else:
+        V = max(0.0001, expected_p * (1.0 - expected_p))
+
+    primary_np  = np.frombuffer(primary_arr,  dtype=np.uint32) if len(primary_arr)  else _EMPTY_U32
+    opposing_np = np.frombuffer(opposing_arr, dtype=np.uint32) if len(opposing_arr) else _EMPTY_U32
+
+    logit_params = state.logit_model_params if state.logit_model_params is not None else _EMPTY_F64
+
+    smoothed_win_rate, margin, perc_margin, trust_multiplier = _process_trade_core(
+        primary_np, opposing_np,
+        primary_price_int, opposing_price_int, current_log_ttr,
+        expected_p, price, stake, ttr_hours,
+        V,
+        state.user_brier_sum[uid], state.user_brier_count[uid],
+        logit_params,
+        price_lut, time_lut, P_RANGE
+    )
+    return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
         
 def calculate_precision_weight(brier_sum: float, brier_count: int) -> float:
     """
@@ -635,8 +681,8 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         no_arr, no_lens = data['no_arr'], data['no_lens']
         
         # 1. Re-initialize the lists (since they were empty in the Pickle)
-        state.user_history_yes = [array.array('I') for _ in range(MAX_USERS)]
-        state.user_history_no = [array.array('I') for _ in range(MAX_USERS)]
+        state.user_history_yes = [array.array('I') for _ in range(state.next_user_id)]
+        state.user_history_no = [array.array('I') for _ in range(state.next_user_id)]
         
         active_uids = len(yes_lens)
         y_idx, n_idx = 0, 0
@@ -831,19 +877,31 @@ def main():
         log.info("✅ CSV cleanup complete. No duplicate timelines exist.")
         log.info("✅ Resuming from day %s (Timestamp: %s)", state.days_simulated, state.last_processed_timestamp)
 
-    # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
     _dummy_history = np.zeros(1, dtype=np.uint32)
     fast_numba_scan(_dummy_history, 500, 1, 500, PRICE_LUT, TIME_LUT, P_RANGE)
     compute_wager_and_p_true(0.5, 100.0, 0.0, 0.0, 0, 100.0, True)
-    
-    _dummy_tokens = np.zeros(1, dtype=np.float64)
-    _dummy_prices = np.zeros(1, dtype=np.float64)
-    _dummy_ts = np.zeros(1, dtype=np.float64)
-    _dummy_ends = np.ones(1, dtype=np.float64) * 1e10
-    _dummy_is_yes = np.zeros(1, dtype=np.bool_)
-    _dummy_valid = np.zeros(1, dtype=np.bool_)
-    compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts, _dummy_ends, _dummy_is_yes, _dummy_valid)
+
+    # Also warm compute_batch_stateless (it's called inside the loop and was missing)
+    _dummy_tokens   = np.zeros(1, dtype=np.float64)
+    _dummy_prices   = np.zeros(1, dtype=np.float64)
+    _dummy_ts       = np.zeros(1, dtype=np.float64)
+    _dummy_ends     = np.full(1, 1e10, dtype=np.float64)
+    _dummy_is_yes   = np.zeros(1, dtype=np.bool_)
+    _dummy_valid    = np.zeros(1, dtype=np.bool_)
+    compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts,
+                        _dummy_ends, _dummy_is_yes, _dummy_valid)
+
+    # Warm the new process-trade core with both code paths
+    _dummy_logit = np.empty(0, dtype=np.float64)
+    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
+                    0.5, 0.5, 100.0, 50.0, 0.25,
+                    np.float64(0.2), np.uint32(1), _dummy_logit,
+                    PRICE_LUT, TIME_LUT, P_RANGE)
+    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
+                    0.5, 0.5, 100.0, 50.0, 0.25,
+                    np.float64(0.0), np.uint32(0), _dummy_logit,
+                    PRICE_LUT, TIME_LUT, P_RANGE)
     log.info("✅ Numba JIT warmed up and locked.")
 
     # ==========================================
@@ -1062,6 +1120,8 @@ def main():
                     uid = state.next_user_id
                     state.user_map[user] = uid
                     state.next_user_id += 1
+                    state.user_history_yes.append(array.array('I'))
+                    state.user_history_no.append(array.array('I'))
 
                 # FAST C-ARRAY LOOKUPS (Kills Object Attribute lag)
                 u_trades = state.user_total_trades[uid]
