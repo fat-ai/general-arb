@@ -379,41 +379,45 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
         is_no_win = 1 if outcome <= 0.5 else 0
         yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
 
-        modified_users = set()
-
-        # Iterate through flat memory via index
+        user_updates_yes = defaultdict(list)
+        user_updates_no  = defaultdict(list)
+        
         for i in range(len(m_pos.user_ids)):
             uid = m_pos.user_ids[i]
             is_yes_bet = m_pos.is_yes[i]
             partial_packed = m_pos.packed_data[i]
             p_true = m_pos.p_trues[i]
             initial_stake = m_pos.stakes[i]
-
+        
             if outcome != 0.5:
+                exact_price = (partial_packed >> 22) / 1000.0   # keep ORIGINAL order
                 if is_yes_bet:
-                    state.user_history_yes[uid].append(partial_packed | is_yes_win)
-                    exact_price = (partial_packed >> 22) / 1000.0
-                    state.daily_variance_yes.append((exact_price, (is_yes_win - exact_price)**2))
+                    user_updates_yes[uid].append(partial_packed)
+                    state.daily_variance_yes.append(
+                        (exact_price, (is_yes_win - exact_price) ** 2))
                 else:
-                    state.user_history_no[uid].append(partial_packed | is_no_win)
-                    exact_price = (partial_packed >> 22) / 1000.0
-                    state.daily_variance_no.append((exact_price, (is_no_win - exact_price)**2))
-                modified_users.add(uid)
-
-            # Inlined exposure release (Removes function call overhead)
+                    user_updates_no[uid].append(partial_packed)
+                    state.daily_variance_no.append(
+                        (exact_price, (is_no_win - exact_price) ** 2))
+        
             state.user_exposure[uid] -= initial_stake
             if state.user_exposure[uid] < 0.0:
                 state.user_exposure[uid] = 0.0
-
-            squared_error = (p_true - yes_outcome)**2
-            state.user_brier_sum[uid] += squared_error
+            state.user_brier_sum[uid] += (p_true - yes_outcome) ** 2
             state.user_brier_count[uid] += 1
-
-        for uid in modified_users:
-            if state.user_history_yes[uid]:
-                arr_yes = np.array(state.user_history_yes[uid], dtype=np.uint32)
-                arr_yes.sort()
-                state.user_history_yes[uid] = array.array('I', arr_yes)
+        
+        # Now do only the heavy part with the zero-copy trick:
+        for uid, packed_list in user_updates_yes.items():
+            new_entries = np.array(packed_list, dtype=np.uint32) | np.uint32(is_yes_win)
+            arr = state.user_history_yes[uid]
+            arr.frombytes(new_entries.tobytes())
+            np.asarray(arr, dtype=np.uint32).sort(kind='stable')
+        
+        for uid, packed_list in user_updates_no.items():
+            new_entries = np.array(packed_list, dtype=np.uint32) | np.uint32(is_no_win)
+            arr = state.user_history_no[uid]
+            arr.frombytes(new_entries.tobytes())
+            np.asarray(arr, dtype=np.uint32).sort(kind='stable')
 
             if state.user_history_no[uid]:
                 arr_no = np.array(state.user_history_no[uid], dtype=np.uint32)
@@ -829,6 +833,18 @@ def main():
 
     # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
+    _dummy_history = np.zeros(1, dtype=np.uint32)
+    fast_numba_scan(_dummy_history, 500, 1, 500, PRICE_LUT, TIME_LUT, P_RANGE)
+    compute_wager_and_p_true(0.5, 100.0, 0.0, 0.0, 0, 100.0, True)
+    
+    _dummy_tokens = np.zeros(1, dtype=np.float64)
+    _dummy_prices = np.zeros(1, dtype=np.float64)
+    _dummy_ts = np.zeros(1, dtype=np.float64)
+    _dummy_ends = np.ones(1, dtype=np.float64) * 1e10
+    _dummy_is_yes = np.zeros(1, dtype=np.bool_)
+    _dummy_valid = np.zeros(1, dtype=np.bool_)
+    compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts, _dummy_ends, _dummy_is_yes, _dummy_valid)
+    log.info("✅ Numba JIT warmed up and locked.")
 
     # ==========================================
     # 3. DUCKDB BULK-SORT STREAM SETUP
