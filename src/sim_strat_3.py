@@ -987,316 +987,353 @@ def main():
             valid_mask = np.ones(num_rows, dtype=np.bool_)
             
             # 4. Fast Python pre-pass for dictionary lookups
+            valid_mask &= ~np.isnan(ts_col)
+
+            m_refs       = [None] * num_rows
+            sibling_refs = [None] * num_rows
+            out_labels   = [None] * num_rows
+
             for i in range(num_rows):
-                raw_cid = str(cids_col[i])
-                cid = sys.intern(raw_cid)
-                cids_col[i] = cid 
-                
+                if not valid_mask[i]: continue
+
+                cid = sys.intern(cids_col[i])  # FIX 7: dropped redundant str()
+                cids_col[i] = cid
+
                 m = market_map.get(cid)
                 ts = ts_col[i]
-                
+
                 if m is None or (m['start'] is not None and ts < m['start']) or (m['end'] is not None and ts > m['end']):
                     valid_mask[i] = False
                     continue
-                    
-                market_ends[i] = m['end'] if m['end'] is not None else (ts + 86400.0)
-                bet_on_is_yes[i] = (m['outcome_label'] == "yes")
-                
+
+                market_ends[i]   = m['end'] if m['end'] is not None else (ts + 86400.0)
+                out_labels[i]    = m['outcome_label']
+                bet_on_is_yes[i] = (out_labels[i] == "yes")
+                m_refs[i]        = m
+
+                sib = m.get('sibling_cid')
+                # NOTE: sibling_refs[i] is captured at pre-pass time. Safe with the
+                # current 10-day orphan cutoff; revisit if the cutoff is ever shortened.
+                sibling_refs[i] = market_map.get(sib) if sib else None
+
             # 5. Execute vectorized C-speed math for the entire batch
             invested_arr, packed_arr, eff_yes_arr, yes_prices_arr, is_buying_arr = compute_batch_stateless(
                 tokens_col, prices_col, ts_col, market_ends, bet_on_is_yes, valid_mask
             )
-            
+
+            ts_list          = ts_col.tolist()
+            prices_list      = prices_col.tolist()
+            tokens_list      = tokens_col.tolist()
+            amounts_list     = amounts_col.tolist()
+            invested_list    = invested_arr.tolist()
+            packed_list      = packed_arr.tolist()
+            is_buying_list   = is_buying_arr.tolist()
+            eff_yes_list     = eff_yes_arr.tolist()
+            yes_prices_list  = yes_prices_arr.tolist()
+            market_ends_list = market_ends.tolist()
+            valid_list       = valid_mask.tolist()
+
+            user_map            = state.user_map
+            user_history_yes    = state.user_history_yes
+            user_history_no     = state.user_history_no
+            user_exposure       = state.user_exposure
+            user_peak           = state.user_peak
+            user_total_trades   = state.user_total_trades
+            user_brier_count    = state.user_brier_count
+            contract_positions  = state.contract_positions
+            first_bets_pending  = state.first_bets_pending
+
+            next_user_id      = state.next_user_id
+            global_total_peak = state.global_total_peak
+            global_user_count = state.global_user_count
+
             # 6. Chronological State Machine Loop
             for i in range(num_rows):
-                if not valid_mask[i]: continue
-                
-                ts = ts_col[i]
-                if np.isnan(ts): continue
-                
-                cid = cids_col[i]
-                user = sys.intern(str(users_col[i]))
+                if not valid_list[i]: continue
+
+                ts   = ts_list[i]
+                cid  = cids_col[i]
+                user = sys.intern(users_col[i])
                 active_scan_cids.add(cid)
 
-                trade_day_int = int(ts // 86400)
-                
+                trade_day_int = int(ts * (1.0 / 86400.0))  # FIX 7
+
                 if data_start_date is None:
                     data_start_date = trade_day_int
                     simulation_start_date = (data_start_date + WARMUP_DAYS) * 86400.0
                     log.info(f"🔥 Warm-up Anchor Set. Sim starts trading on Day INT: {simulation_start_date}")
-                
+
                 # ---------------------------------------------------------
                 # A. DETECT NEW DAY -> RESOLVE & CALIBRATE
                 # ---------------------------------------------------------
                 if current_sim_day is None:
                     current_sim_day = trade_day_int
-                    
+
                 elif trade_day_int > current_sim_day:
                     current_day_ts = trade_day_int * 86400.0
-                    
+
+                    resolved_cids = [
+                        c for c, m_data in market_map.items()
+                        if m_data['end'] is not None and m_data['end'] < current_day_ts and not m_data['resolved']
+                    ]
+
                     day_yes_updates = defaultdict(list)
-                    day_no_updates = defaultdict(list)
+                    day_no_updates  = defaultdict(list)
 
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
                         if outcome is None or (isinstance(outcome, float) and math.isnan(outcome)):
                             outcome = 0.5
-                            
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
-                        
-                        # Phase A: Accumulate the math updates via the Numba Kernel
                         resolve_market(r_cid, outcome, outcome_label, current_day_ts, state, day_yes_updates, day_no_updates)
-                        
-                    # Phase B: Process the history merges strictly once per user
+
                     process_daily_history_merges(state, day_yes_updates, day_no_updates)
-                                      
+
                     orphan_cutoff_ts = current_day_ts - 864000.0
                     purge_cids = []
-                    for c, m in market_map.items():
-                        is_past_end = m['end'] is not None and m['end'] < orphan_cutoff_ts
-                        last_ts = m.get('last_update_ts', current_day_ts)
-                        is_dead = m['end'] is None and last_ts < orphan_cutoff_ts
-                        
+                    for c, m_data in market_map.items():
+                        is_past_end = m_data['end'] is not None and m_data['end'] < orphan_cutoff_ts
+                        last_ts = m_data.get('last_update_ts', current_day_ts)
+                        is_dead = m_data['end'] is None and last_ts < orphan_cutoff_ts
                         if is_past_end or is_dead:
                             purge_cids.append(c)
-                    
+
                     for p_cid in purge_cids:
-                        m_data = market_map.pop(p_cid, None) 
-                        state.contract_positions.pop(p_cid, None)
-                        state.first_bets_pending.pop(p_cid, None)
+                        m_data = market_map.pop(p_cid, None)
+                        contract_positions.pop(p_cid, None)
+                        first_bets_pending.pop(p_cid, None)
                         if m_data: result_map.pop(m_data['id'], None)
-                                
+
                     calibrate_models(current_day_ts, state)
                     current_sim_day = trade_day_int
 
-                    # ---------------------------------------------------------
                     # E. PROGRESS CHECKPOINTING
-                    # ---------------------------------------------------------
                     state.days_simulated += 1
-                    
                     if state.days_simulated % 90 == 0:
                         log.info(f"💾 Initiating 90-day checkpoint sequence at simulated day {state.days_simulated}...")
-                        state.last_processed_timestamp = ts 
-                        
+                        state.last_processed_timestamp = ts
+
                         if results_buffer:
                             with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
                                 csv.writer(f).writerows(results_buffer)
                             results_buffer.clear()
-                            
+
                         if executions_buffer:
                             with open(EXECUTIONS_PATH, mode='a', newline='', encoding='utf-8') as f:
                                 csv.writer(f).writerows(executions_buffer)
                             executions_buffer.clear()
 
-                        # Fire the new decoupled checkpointing function
+                        state.next_user_id      = next_user_id
+                        state.global_total_peak = global_total_peak
+                        state.global_user_count = global_user_count
+
                         save_checkpoint(
-                            ckpt_file, state, active_portfolio, result_map, 
-                            data_start_date, simulation_start_date, 
+                            ckpt_file, state, active_portfolio, result_map,
+                            data_start_date, simulation_start_date,
                             current_sim_day, heartbeat
                         )
-    
-                # ---------------------------------------------------------
-                # B. PROCESS TRADE INTO STATE TRACKERS (Vectorized & Flat)
-                # ---------------------------------------------------------
-                price = prices_col[i]
-                m = market_map[cid]
-                m['last_price'] = price
-                m['last_update_ts'] = ts
-                
-                sibling_cid = m.get('sibling_cid')
-                if sibling_cid and sibling_cid in market_map:
-                    market_map[sibling_cid]['last_price'] = 1.0 - price
-                    market_map[sibling_cid]['last_update_ts'] = ts
-                    
-                inv = invested_arr[i]
-                packed = packed_arr[i]
-                is_buy = is_buying_arr[i]
-                
-                # STRING TO INT MAPPING (Kills string pointer RAM)
-                uid = state.user_map.get(user)
-                if uid is None:
-                    uid = state.next_user_id
-                    state.user_map[user] = uid
-                    state.next_user_id += 1
-                    state.user_history_yes.append(array.array('I'))
-                    state.user_history_no.append(array.array('I'))
 
-                # FAST C-ARRAY LOOKUPS (Kills Object Attribute lag)
-                u_trades = state.user_total_trades[uid]
-                
+                # ---------------------------------------------------------
+                # B. PROCESS TRADE INTO STATE TRACKERS
+                # ---------------------------------------------------------
+                m = m_refs[i]
+                price = prices_list[i]
+                m['last_price']     = price
+                m['last_update_ts'] = ts
+
+                sibling_m = sibling_refs[i]
+                if sibling_m is not None:
+                    sibling_m['last_price']     = 1.0 - price
+                    sibling_m['last_update_ts'] = ts
+
+                inv         = invested_list[i]
+                packed      = packed_list[i]
+                is_buy      = is_buying_list[i]
+                eff_yes_bet = eff_yes_list[i]
+
+                uid = user_map.get(user)
+                if uid is None:
+                    uid = next_user_id
+                    user_map[user] = uid
+                    next_user_id += 1
+                    # CRITICAL: keep history slots in lockstep with user_map
+                    user_history_yes.append(array.array('I'))
+                    user_history_no.append(array.array('I'))
+
+                u_trades = user_total_trades[uid]
+
                 if u_trades == 0:
-                    state.global_user_count += 1
+                    global_user_count += 1
                 else:
-                    state.global_total_peak -= state.user_peak[uid]
-                    
-                current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
-                
+                    global_total_peak -= user_peak[uid]
+
+                current_global_avg = (global_total_peak / global_user_count) if global_user_count > 0 else 100.0
+
                 new_exp, new_peak, new_n, wager_fraction, p_true = compute_wager_and_p_true(
-                    yes_prices_arr[i], inv, 
-                    state.user_exposure[uid], 
-                    state.user_peak[uid],
-                    u_trades, current_global_avg, eff_yes_arr[i]
+                    yes_prices_list[i], inv,
+                    user_exposure[uid],
+                    user_peak[uid],
+                    u_trades, current_global_avg, eff_yes_bet
                 )
-                
-                # Write back directly to NumPy
-                state.user_exposure[uid] = new_exp
-                state.user_peak[uid] = new_peak
-                state.user_total_trades[uid] = new_n
-                state.global_total_peak += new_peak
-                
-                m_pos = state.contract_positions[cid]
-                m_pos.user_ids.append(uid) # Appending a uint32 integer instead of a string
-                m_pos.is_yes.append(1 if eff_yes_arr[i] else 0)
+
+                user_exposure[uid]     = new_exp
+                user_peak[uid]         = new_peak
+                user_total_trades[uid] = new_n
+                global_total_peak     += new_peak
+
+                m_pos = contract_positions[cid]
+                m_pos.user_ids.append(uid)
+                m_pos.is_yes.append(1 if eff_yes_bet else 0)
                 m_pos.packed_data.append(packed)
                 m_pos.p_trues.append(p_true)
                 m_pos.stakes.append(inv)
-                    
-                amount = amounts_col[i]
-                if u_trades == 0: # First bet check
-                    qty = abs(tokens_col[i])
+
+                amount = amounts_list[i]
+                if u_trades == 0:
+                    qty = abs(tokens_list[i])  # FIX 7: computed once
                     risk_vol = amount if is_buy else qty * (1.0 - price)
-                    if risk_vol >= 1.0: 
-                        m_end = market_ends[i]
-                        ttr_hours = max(1.0, (m_end - ts) / 3600.0)
-                        # Append flat tuple to list instead of dict bloat
-                        state.first_bets_pending[cid].append(
-                            (uid, math.log1p(risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
+                    if risk_vol >= 1.0:
+                        m_end_fb     = market_ends_list[i]
+                        ttr_hours_fb = max(1.0, (m_end_fb - ts) / 3600.0)
+                        first_bets_pending[cid].append(
+                            (uid, math.log1p(risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours_fb))
                         )
 
-                invested_this_trade = inv
-                qty = abs(tokens_col[i])
-                is_buying = is_buy
-                bet_on = m['outcome_label']
-                    
                 # ---------------------------------------------------------
-                # C. SIMULATE SIGNALS (Signal Logging Only)
+                # C. SIMULATE SIGNALS (Throttled Signal Logging)
                 # ---------------------------------------------------------
                 if m['start'] is None or m['start'] < simulation_start_date: continue
                 if ts < simulation_start_date: continue
 
                 m['volume'] += amount
-                
-                ttr_hours = max(1.0, (m['end'] - ts) / 3600.0) if m['end'] is not None else 24.0
-                direction = 1.0 if is_buying else -1.0
-                if bet_on != "yes": direction *= -1.0
-                
-                smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
-                    uid=uid, price=price, stake=invested_this_trade, 
-                    direction=direction, is_buying=is_buying,
-                    ttr_hours=ttr_hours, state=state, 
-                    price_lut=PRICE_LUT, time_lut=TIME_LUT
+
+                last_logged_price = m.get('log_price',  0.0)
+                last_logged_ts    = m.get('log_ts',     0.0)
+                last_signal_ts    = m.get('signal_ts',  0.0)
+
+                # FIX 5: throttled signal computation. The 5-min fallback samples
+                # perc_marg drift on a coarser cadence than the original code.
+                should_compute = (
+                    abs(price - last_logged_price) >= 0.01
+                    or (ts - last_logged_ts) >= 3600.0
+                    or (ts - last_signal_ts) >= 300.0
                 )
-                
-                m['last_perc_marg'] = perc_marg
 
-                last_logged_price = m.get('log_price', 0.0)
-                last_logged_ts = m.get('log_ts', 0.0)
-                last_logged_perc_marg = m.get('log_perc_marg', 0.0)
-                
-                # Extract the current Brier count for this specific wallet
-                current_brier_count = state.user_brier_count[uid]
+                if should_compute:
+                    m_end = m['end']
+                    ttr_hours = max(1.0, (m_end - ts) / 3600.0) if m_end is not None else 24.0
+                    # FIX 7: derive direction directly from eff_yes_bet
+                    direction = 1.0 if eff_yes_bet else -1.0
 
-                # Log if the price moves by at least 1 cent, OR if an hour has passed since the last log
-                if abs(price - last_logged_price) >= 0.01 or abs(perc_marg - last_logged_perc_marg) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
-                    m['log_price'] = price
-                    m['log_ts'] = ts
-                    m['log_perc_marg'] = perc_marg
-                    
-                    results_buffer.append([
-                        ts, m['id'], cid, bet_on, price, ttr_hours, 
-                        smooth_prob, marg, perc_marg, variance_v, m['volume'], 
-                        user, current_brier_count, trust_weight,
-                        m['end'], m['outcome']
-                    ])
-                    
-                    if len(results_buffer) >= 10000:
-                        with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
-                            csv.writer(f).writerows(results_buffer)
-                        results_buffer.clear()
+                    smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
+                        uid=uid, price=price, stake=inv,
+                        direction=direction, is_buying=is_buy,
+                        ttr_hours=ttr_hours, state=state,
+                        price_lut=PRICE_LUT, time_lut=TIME_LUT
+                    )
+
+                    m['signal_ts']      = ts
+                    m['last_perc_marg'] = perc_marg
+
+                    last_logged_perc_marg = m.get('log_perc_marg', 0.0)
+
+                    if abs(price - last_logged_price) >= 0.01 or abs(perc_marg - last_logged_perc_marg) >= 0.01 or (ts - last_logged_ts) >= 3600.0:
+                        m['log_price']     = price
+                        m['log_ts']        = ts
+                        m['log_perc_marg'] = perc_marg
+
+                        results_buffer.append([
+                            ts, m['id'], cid, out_labels[i], price, ttr_hours,
+                            smooth_prob, marg, perc_marg, variance_v, m['volume'],
+                            user, user_brier_count[uid], trust_weight,
+                            m_end, m['outcome']
+                        ])
+
+                        if len(results_buffer) >= 10000:
+                            with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
+                                csv.writer(f).writerows(results_buffer)
+                            results_buffer.clear()
 
                 # ---------------------------------------------------------
                 # D. THE HEDGE FUND HEARTBEAT (Hourly Rotation)
                 # ---------------------------------------------------------
                 if heartbeat is None:
                     heartbeat = ts
-    
-                # 3600 seconds = 1 hour
+
                 if (ts - heartbeat) >= 3600.0:
                     heartbeat = ts
-                    
-                    # 1. SETTLE EXPIRED POSITIONS 
+
+                    # 1. SETTLE EXPIRED POSITIONS
                     cids_to_remove = []
                     for p_cid, p_data in active_portfolio.items():
                         pm = market_map.get(p_cid)
-                        
+
                         if pm is None:
                             cids_to_remove.append(p_cid)
                             continue
-                            
+
                         if pm['end'] is not None and ts >= pm['end']:
                             mid = pm['id']
-                            
+
                             safe_outcome = pm['outcome']
                             if safe_outcome is None or (isinstance(safe_outcome, float) and math.isnan(safe_outcome)):
                                 safe_outcome = 0.5
-                            
+
                             if p_data['direction'] == "yes":
                                 payout = p_data['contracts'] * safe_outcome
                             else:
                                 payout = p_data['contracts'] * (1.0 - safe_outcome)
-                                
+
                             profit = payout - p_data['bet_size']
 
-                            # Only sell early for a profit
-                            result_map['performance']['cash'] += payout
+                            result_map['performance']['cash']   += payout
                             result_map['performance']['equity'] += profit
-                            if profit > 0: result_map['performance']['wins'] += 1
+                            if profit > 0:   result_map['performance']['wins']   += 1
                             elif profit < 0: result_map['performance']['losses'] += 1
-                                    
+
                             executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
                             cids_to_remove.append(p_cid)
-                            
+
                     for c in cids_to_remove: del active_portfolio[c]
 
                     # 2. SCAN THE TOKENS FOR THE TOP 100 (AER > 500%)
                     candidates = []
-                    
+
                     for scan_cid in list(active_scan_cids):
                         scan_m = market_map.get(scan_cid)
-                        
-                        if scan_m is None or scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']: 
+
+                        if scan_m is None or scan_m['resolved'] or scan_m.get('end') is None or ts >= scan_m['end']:
                             active_scan_cids.discard(scan_cid)
                             continue
-                            
-                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m: 
+
+                        if 'last_price' not in scan_m or 'last_update_ts' not in scan_m:
                             continue
-                        
-                        # --- STALENESS & PATH-DEPENDENCY FILTER ---
+
                         hours_since_trade = (ts - scan_m['last_update_ts']) / 3600.0
-                        if hours_since_trade > 24.0: 
+                        if hours_since_trade > 24.0:
                             continue
-                        
-                        scan_ttr = max(1.0, (scan_m['end'] - ts) / 3600.0)
-                        annualization_ttr = max(24.0, scan_ttr) 
+
+                        scan_ttr             = max(1.0, (scan_m['end'] - ts) / 3600.0)
+                        annualization_ttr    = max(24.0, scan_ttr)
                         annualization_factor = 8760.0 / annualization_ttr
-                        
+
                         p_marg = scan_m.get('last_perc_marg', 0.0)
-                        aer = p_marg * annualization_factor
-                        
-                        if aer > 5.0 and p_marg > (P_RANGE / 1000) + ( MAX_SLIPPAGE * 1.5 ):
+                        aer    = p_marg * annualization_factor
+
+                        if aer > 5.0 and p_marg > (P_RANGE / 1000) + (MAX_SLIPPAGE * 1.5):
                             candidates.append({
-                                'cid': scan_cid, 
-                                'dir': scan_m['outcome_label'], 
-                                'aer': aer, 
+                                'cid':   scan_cid,
+                                'dir':   scan_m['outcome_label'],
+                                'aer':   aer,
                                 'price': scan_m['last_price']
                             })
-                            
+
                     candidates.sort(key=lambda x: x['aer'], reverse=True)
                     target_portfolio = candidates[:500]
                     target_cids = {c['cid']: c for c in target_portfolio}
 
-                    # 3. SELL DECAYED POSITIONS 
+                    # 3. SELL DECAYED POSITIONS
                     cids_to_sell = []
                     for p_cid, p_data in active_portfolio.items():
                         if p_cid not in target_cids:
@@ -1304,63 +1341,61 @@ def main():
                             if smkt is None:
                                 cids_to_sell.append(p_cid)
                                 continue
-                            
-                            slippage = MAX_SLIPPAGE * ( p_data['bet_size'] / MAX_BET )
+
+                            slippage      = MAX_SLIPPAGE * (p_data['bet_size'] / MAX_BET)
                             current_price = smkt.get('last_price', p_data['entry_price'])
-                            sell_price = current_price * (1.0 - slippage)
-                            
-                            payout = p_data['contracts'] * sell_price
-                            profit = payout - p_data['bet_size']
-                            perc_profit = profit / p_data['bet_size']
-                            
+                            sell_price    = current_price * (1.0 - slippage)
+
+                            payout       = p_data['contracts'] * sell_price
+                            profit       = payout - p_data['bet_size']
+                            perc_profit  = profit / p_data['bet_size']
+
                             if perc_profit > MAX_SLIPPAGE * 1.1:
-                                result_map['performance']['cash'] += payout
+                                result_map['performance']['cash']   += payout
                                 result_map['performance']['equity'] += profit
-                                if profit > 0: result_map['performance']['wins'] += 1
-                                else: result_map['performance']['losses'] += 1
-                                
+                                if profit > 0: result_map['performance']['wins']   += 1
+                                else:          result_map['performance']['losses'] += 1
+
                                 executions_buffer.append([ts, smkt['id'], "SOLD EARLY", p_data['direction'], 0, sell_price, MAX_SLIPPAGE, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
                                 cids_to_sell.append(p_cid)
-                            
+
                     for c in cids_to_sell: del active_portfolio[c]
 
                     # 4. BUY NEW POSITIONS (Fill the Slots)
                     target_slot_size = result_map['performance']['equity'] * 0.002
-                    
+
                     for target in target_portfolio:
                         if len(active_portfolio) >= 500: break
                         t_cid = target['cid']
-                        
-                        # Prevent Directional Flipping Collision
-                        # We must ensure we don't own the sibling CID before we buy this one
+
                         sibling_check = market_map[t_cid].get('sibling_cid')
                         if sibling_check in active_portfolio:
-                            continue 
-                        
+                            continue
+
                         if t_cid not in active_portfolio:
-                            slippage = MAX_SLIPPAGE * (target_slot_size / MAX_BET) 
-                            buy_price = max(0.001, min(0.99, target['price'] * (1.0 + slippage)))
+                            slippage   = MAX_SLIPPAGE * (target_slot_size / MAX_BET)
+                            buy_price  = max(0.001, min(0.99, target['price'] * (1.0 + slippage)))
                             actual_bet = min(target_slot_size, result_map['performance']['cash'])
-                            
-                            if actual_bet > 1.0: 
+
+                            if actual_bet > 1.0:
                                 contracts = actual_bet / buy_price
                                 active_portfolio[t_cid] = {
-                                    'direction': target['dir'],
+                                    'direction':   target['dir'],
                                     'entry_price': buy_price,
-                                    'contracts': contracts,
-                                    'bet_size': actual_bet
+                                    'contracts':   contracts,
+                                    'bet_size':    actual_bet
                                 }
                                 result_map['performance']['cash'] -= actual_bet
                                 executions_buffer.append([ts, market_map[t_cid]['id'], "BOUGHT", target['dir'], 0, buy_price, MAX_SLIPPAGE, actual_bet, 0, 0, 0, 0, target['aer']])
-                    
+
                     # 5. HIGH-WATER MARK TRACKING
                     if result_map['performance']['equity'] > result_map['performance']['peak_equity']:
                         result_map['performance']['peak_equity'] = result_map['performance']['equity']
-                        
+
                     drawdown = result_map['performance']['peak_equity'] - result_map['performance']['equity']
                     if drawdown > result_map['performance']['max_drawdown'][0]:
                         result_map['performance']['max_drawdown'][0] = drawdown
-                        
+
                     percent_drawdown = drawdown / result_map['performance']['peak_equity']
                     if round(percent_drawdown, 3) * 100 > result_map['performance']['max_drawdown'][1]:
                         result_map['performance']['max_drawdown'][1] = round(percent_drawdown, 3) * 100
@@ -1370,26 +1405,21 @@ def main():
                             csv.writer(f).writerows(executions_buffer)
                         executions_buffer.clear()
 
-                    # ---------------------------------------------------------
                     # 6. LIVE DASHBOARD LOGGING
-                    # ---------------------------------------------------------
-                    perf = result_map['performance']
-                    open_pos_count = len(active_portfolio)
+                    perf                = result_map['performance']
+                    open_pos_count      = len(active_portfolio)
                     total_closed_trades = perf['wins'] + perf['losses']
-                    
-                    # Calculate win rate safely
+
                     if total_closed_trades > 0:
                         win_rate = (perf['wins'] / total_closed_trades) * 100.0
                     else:
                         win_rate = 0.0
-                        
-                    # Calculate average entry price of currently open positions
+
                     if open_pos_count > 0:
                         avg_price = sum(p_data['entry_price'] for p_data in active_portfolio.values()) / open_pos_count
                     else:
                         avg_price = 0.0
 
-                    # Print a clean, single-line summary to the console
                     log_time_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
                     log.info(
                         f"🕒 [{log_time_str}] "
@@ -1399,6 +1429,15 @@ def main():
                         f"Trades: {total_closed_trades} (WR: {win_rate:.1f}%) | "
                         f"Max DD: {perf['max_drawdown'][1]:.1f}%"
                     )
+
+            # ---------------------------------------------------------
+            # END-OF-BATCH WRITEBACK
+            # Flush hoisted scalars back to state so the next batch starts fresh
+            # and any external code reading state.* sees current values.
+            # ---------------------------------------------------------
+            state.next_user_id      = next_user_id
+            state.global_total_peak = global_total_peak
+            state.global_user_count = global_user_count
                         
         if results_buffer:
             with open(OUTPUT_PATH, mode='a', newline='', encoding='utf-8') as f:
