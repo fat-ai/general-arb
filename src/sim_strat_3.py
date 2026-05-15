@@ -172,6 +172,77 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
     return n, w
 
 @njit(cache=True)
+def _merge_sorted_uint32(old, new_sorted, out):
+    """O(N + M) pure C two-pointer merge for sorted arrays."""
+    n, m = len(old), len(new_sorted)
+    i = j = k = 0
+    while i < n and j < m:
+        if old[i] <= new_sorted[j]:
+            out[k] = old[i]
+            i += 1
+        else:
+            out[k] = new_sorted[j]
+            j += 1
+        k += 1
+    while i < n: 
+        out[k] = old[i]
+        i += 1
+        k += 1
+    while j < m: 
+        out[k] = new_sorted[j]
+        j += 1
+        k += 1
+
+@njit(cache=True)
+def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
+                            is_yes_win, is_no_win, yes_outcome, skip_history,
+                            user_exposure, user_brier_sum, user_brier_count,
+                            out_yes_uids, out_yes_packed, out_yes_prices, out_yes_errors,
+                            out_no_uids, out_no_packed, out_no_prices, out_no_errors):
+    """Processes exposure, brier scores, and formats history appends strictly in C."""
+    yes_idx = 0
+    no_idx = 0
+
+    # EXPLICIT HOIST: Check the void status ONCE, before the loops begin.
+    if not skip_history:
+        # Standard Resolution Loop
+        for i in range(len(user_ids)):
+            uid = user_ids[i]
+            stake = stakes[i]
+            p_true = p_trues[i]
+            is_yes_bet = is_yes[i]
+
+            user_exposure[uid] = max(0.0, user_exposure[uid] - stake)
+            user_brier_sum[uid] += (p_true - yes_outcome) ** 2
+            user_brier_count[uid] += 1
+
+            packed = packed_data[i]
+            exact_price = (packed >> 22) / 1000.0
+            
+            if is_yes_bet:
+                out_yes_uids[yes_idx] = uid
+                out_yes_packed[yes_idx] = packed | is_yes_win
+                out_yes_prices[yes_idx] = exact_price
+                out_yes_errors[yes_idx] = (is_yes_win - exact_price) ** 2
+                yes_idx += 1
+            else:
+                out_no_uids[no_idx] = uid
+                out_no_packed[no_idx] = packed | is_no_win
+                out_no_prices[no_idx] = exact_price
+                out_no_errors[no_idx] = (is_no_win - exact_price) ** 2
+                no_idx += 1
+    else:
+        # Void Resolution Loop (Skips all history and variance tracking)
+        for i in range(len(user_ids)):
+            uid = user_ids[i]
+            
+            user_exposure[uid] = max(0.0, user_exposure[uid] - stakes[i])
+            user_brier_sum[uid] += (p_trues[i] - yes_outcome) ** 2
+            user_brier_count[uid] += 1
+
+    return yes_idx, no_idx
+
+@njit(cache=True)
 def compute_batch_stateless(tokens, prices, tss, market_ends, bet_on_is_yes, valid_mask):
     """
     Processes a PyArrow batch at native C speeds, pre-computing all stateless 
@@ -391,63 +462,60 @@ def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
         
     return True
 
-def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState):
-    if r_cid in state.contract_positions:
-        m_pos = state.contract_positions.pop(r_cid)
+def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState, day_yes_updates, day_no_updates):
+    if r_cid not in state.contract_positions:
+        return
+        
+    m_pos = state.contract_positions.pop(r_cid)
+    n_pos = len(m_pos.user_ids)
+    if n_pos == 0:
+        return
 
-        is_yes_win = 1 if outcome > 0.5 else 0
-        is_no_win = 1 if outcome <= 0.5 else 0
-        yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
+    is_yes_win = np.uint32(1 if outcome > 0.5 else 0)
+    is_no_win = np.uint32(1 if outcome <= 0.5 else 0)
+    yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
+    skip_history = (outcome == 0.5)
 
-        user_updates_yes = defaultdict(list)
-        user_updates_no  = defaultdict(list)
-        
-        for i in range(len(m_pos.user_ids)):
-            uid = m_pos.user_ids[i]
-            is_yes_bet = m_pos.is_yes[i]
-            partial_packed = m_pos.packed_data[i]
-            p_true = m_pos.p_trues[i]
-            initial_stake = m_pos.stakes[i]
-        
-            if outcome != 0.5:
-                exact_price = (partial_packed >> 22) / 1000.0   # keep ORIGINAL order
-                if is_yes_bet:
-                    user_updates_yes[uid].append(partial_packed)
-                    state.daily_variance_yes.append(
-                        (exact_price, (is_yes_win - exact_price) ** 2))
-                else:
-                    user_updates_no[uid].append(partial_packed)
-                    state.daily_variance_no.append(
-                        (exact_price, (is_no_win - exact_price) ** 2))
-        
-            state.user_exposure[uid] -= initial_stake
-            if state.user_exposure[uid] < 0.0:
-                state.user_exposure[uid] = 0.0
-            state.user_brier_sum[uid] += (p_true - yes_outcome) ** 2
-            state.user_brier_count[uid] += 1
-        
-        # Now do only the heavy part with the zero-copy trick:
-        for uid, packed_list in user_updates_yes.items():
-            new_entries = np.array(packed_list, dtype=np.uint32) | np.uint32(is_yes_win)
-            arr = state.user_history_yes[uid]
-            arr.frombytes(new_entries.tobytes())
-            np.asarray(arr, dtype=np.uint32).sort(kind='stable')
-        
-        for uid, packed_list in user_updates_no.items():
-            new_entries = np.array(packed_list, dtype=np.uint32) | np.uint32(is_no_win)
-            arr = state.user_history_no[uid]
-            arr.frombytes(new_entries.tobytes())
-            np.asarray(arr, dtype=np.uint32).sort(kind='stable')
+    # Pre-allocate output arrays for Numba
+    out_yes_uids, out_yes_packed = np.empty(n_pos, dtype=np.uint32), np.empty(n_pos, dtype=np.uint32)
+    out_yes_prices, out_yes_errors = np.empty(n_pos, dtype=np.float64), np.empty(n_pos, dtype=np.float64)
+    out_no_uids, out_no_packed = np.empty(n_pos, dtype=np.uint32), np.empty(n_pos, dtype=np.uint32)
+    out_no_prices, out_no_errors = np.empty(n_pos, dtype=np.float64), np.empty(n_pos, dtype=np.float64)
 
-        if r_cid in state.first_bets_pending:
-            first_bets = state.first_bets_pending.pop(r_cid)
-            token_won = True if (outcome_label == 'yes' and is_yes_win) or (outcome_label == 'no' and is_no_win) else False
-            
-            for (uid, log_vol, vwap, is_long, log_ttr) in first_bets:
-                is_win = 1.0 if (is_long and token_won) or (not is_long and not token_won) else 0.0
-                state.calib_dates.append(current_sim_day)
-                state.calib_X.append([log_vol, vwap, log_ttr])
-                state.calib_y.append(is_win)
+    # Zero-copy buffer views
+    v_uids = np.frombuffer(m_pos.user_ids, dtype=np.uint32)
+    v_is_yes = np.frombuffer(m_pos.is_yes, dtype=np.int8)
+    v_packed = np.frombuffer(m_pos.packed_data, dtype=np.uint32)
+    v_ptrues = np.frombuffer(m_pos.p_trues, dtype=np.float64)
+    v_stakes = np.frombuffer(m_pos.stakes, dtype=np.float64)
+
+    yes_idx, no_idx = _resolve_positions_core(
+        v_uids, v_is_yes, v_packed, v_ptrues, v_stakes,
+        is_yes_win, is_no_win, yes_outcome, skip_history,
+        state.user_exposure, state.user_brier_sum, state.user_brier_count,
+        out_yes_uids, out_yes_packed, out_yes_prices, out_yes_errors,
+        out_no_uids, out_no_packed, out_no_prices, out_no_errors
+    )
+
+    if yes_idx > 0:
+        state.daily_variance_yes.extend(zip(out_yes_prices[:yes_idx].tolist(), out_yes_errors[:yes_idx].tolist()))
+        for i in range(yes_idx):
+            day_yes_updates[out_yes_uids[i]].append(out_yes_packed[i])
+
+    if no_idx > 0:
+        state.daily_variance_no.extend(zip(out_no_prices[:no_idx].tolist(), out_no_errors[:no_idx].tolist()))
+        for i in range(no_idx):
+            day_no_updates[out_no_uids[i]].append(out_no_packed[i])
+
+    # Handle first bet calibration
+    if r_cid in state.first_bets_pending:
+        first_bets = state.first_bets_pending.pop(r_cid)
+        token_won = True if (outcome_label == 'yes' and is_yes_win) or (outcome_label == 'no' and is_no_win) else False
+        for (uid, log_vol, vwap, is_long, log_ttr) in first_bets:
+            is_win = 1.0 if (is_long and token_won) or (not is_long and not token_won) else 0.0
+            state.calib_dates.append(current_sim_day)
+            state.calib_X.append([log_vol, vwap, log_ttr])
+            state.calib_y.append(is_win)
 
 def calibrate_models(current_day_ts, state: BayesianState):
     """Runs the daily OLS and Logit models to update global coefficients."""
@@ -806,31 +874,29 @@ def main():
         log.info("✅ CSV cleanup complete. No duplicate timelines exist.")
         log.info("✅ Resuming from day %s (Timestamp: %s)", state.days_simulated, state.last_processed_timestamp)
 
+    # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
+    
     _dummy_history = np.zeros(1, dtype=np.uint32)
-    fast_numba_scan(_dummy_history, 500, 1, 500, PRICE_LUT, TIME_LUT, P_RANGE)
+    fused_trade_kernel(_dummy_history, _dummy_history, 500, 500, 500, PRICE_LUT, TIME_LUT, P_RANGE, 1.0, 0.5, 0.25)
     compute_wager_and_p_true(0.5, 100.0, 0.0, 0.0, 0, 100.0, True)
-
-    # Also warm compute_batch_stateless (it's called inside the loop and was missing)
-    _dummy_tokens   = np.zeros(1, dtype=np.float64)
-    _dummy_prices   = np.zeros(1, dtype=np.float64)
-    _dummy_ts       = np.zeros(1, dtype=np.float64)
-    _dummy_ends     = np.full(1, 1e10, dtype=np.float64)
-    _dummy_is_yes   = np.zeros(1, dtype=np.bool_)
-    _dummy_valid    = np.zeros(1, dtype=np.bool_)
-    compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts,
-                        _dummy_ends, _dummy_is_yes, _dummy_valid)
-
-    # Warm the new process-trade core with both code paths
-    _dummy_logit = np.empty(0, dtype=np.float64)
-    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
-                    0.5, 0.5, 100.0, 50.0, 0.25,
-                    np.float64(0.2), np.uint32(1), _dummy_logit,
-                    PRICE_LUT, TIME_LUT, P_RANGE)
-    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
-                    0.5, 0.5, 100.0, 50.0, 0.25,
-                    np.float64(0.0), np.uint32(0), _dummy_logit,
-                    PRICE_LUT, TIME_LUT, P_RANGE)
+    
+    _dummy_tokens, _dummy_prices, _dummy_ts = np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64)
+    _dummy_ends = np.ones(1, dtype=np.float64) * 1e10
+    _dummy_is_yes, _dummy_valid = np.zeros(1, dtype=np.bool_), np.zeros(1, dtype=np.bool_)
+    compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts, _dummy_ends, _dummy_is_yes, _dummy_valid)
+    
+    # Warmup the new daily resolution kernels
+    _merge_sorted_uint32(_dummy_history, _dummy_history, _dummy_history)
+    _dummy_int8 = np.zeros(1, dtype=np.int8)
+    _resolve_positions_core(
+        _dummy_history, _dummy_int8, _dummy_history, _dummy_tokens, _dummy_tokens,
+        np.uint32(1), np.uint32(0), 1.0, False,
+        _dummy_tokens, _dummy_tokens, _dummy_history,
+        _dummy_history, _dummy_history, _dummy_tokens, _dummy_tokens,
+        _dummy_history, _dummy_history, _dummy_tokens, _dummy_tokens
+    )
+    
     log.info("✅ Numba JIT warmed up and locked.")
 
     # ==========================================
@@ -968,18 +1034,22 @@ def main():
                 elif trade_day_int > current_sim_day:
                     current_day_ts = trade_day_int * 86400.0
                     
-                    resolved_cids = [
-                        c for c, m in market_map.items() 
-                        if m['end'] is not None and m['end'] < current_day_ts and not m['resolved']
-                    ]
-                    
+                    day_yes_updates = defaultdict(list)
+                    day_no_updates = defaultdict(list)
+
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
                         if outcome is None or (isinstance(outcome, float) and math.isnan(outcome)):
                             outcome = 0.5
+                            
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
-                        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state)
+                        
+                        # Phase A: Accumulate the math updates via the Numba Kernel
+                        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state, day_yes_updates, day_no_updates)
+                        
+                    # Phase B: Process the history merges strictly once per user
+                    process_daily_history_merges(state, day_yes_updates, day_no_updates)
                                       
                     orphan_cutoff_ts = current_day_ts - 864000.0
                     purge_cids = []
