@@ -462,14 +462,49 @@ def is_valid_variance_fit(a: float, b: float, c: float) -> bool:
         
     return True
 
+def process_daily_history_merges(state, day_yes_updates, day_no_updates):
+    """Merge today's accumulated per-user trade outcomes into the long-running
+    history arrays. Runs once per user per day regardless of how many markets
+    they were in, using an O(N+M) two-pointer merge instead of a full re-sort.
+    The packed values already carry the win/loss bit (OR'd in by
+    _resolve_positions_core), so we only need to merge — no further bit math."""
+
+    for uid, packed_list in day_yes_updates.items():
+        # Sort the small batch of new entries (they come from different markets
+        # so they're not naturally ordered by packed value)
+        new_arr = np.array(packed_list, dtype=np.uint32)
+        new_arr.sort()
+
+        old_arr = state.user_history_yes[uid]
+        old_view = np.frombuffer(old_arr, dtype=np.uint32) if len(old_arr) else _EMPTY_U32
+
+        out = np.empty(len(old_view) + len(new_arr), dtype=np.uint32)
+        _merge_sorted_uint32(old_view, new_arr, out)
+
+        merged = array.array('I')
+        merged.frombytes(out.tobytes())
+        state.user_history_yes[uid] = merged
+
+    for uid, packed_list in day_no_updates.items():
+        new_arr = np.array(packed_list, dtype=np.uint32)
+        new_arr.sort()
+
+        old_arr = state.user_history_no[uid]
+        old_view = np.frombuffer(old_arr, dtype=np.uint32) if len(old_arr) else _EMPTY_U32
+
+        out = np.empty(len(old_view) + len(new_arr), dtype=np.uint32)
+        _merge_sorted_uint32(old_view, new_arr, out)
+
+        merged = array.array('I')
+        merged.frombytes(out.tobytes())
+        state.user_history_no[uid] = merged
+
 def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState, day_yes_updates, day_no_updates):
     if r_cid not in state.contract_positions:
         return
         
     m_pos = state.contract_positions.pop(r_cid)
     n_pos = len(m_pos.user_ids)
-    if n_pos == 0:
-        return
 
     is_yes_win = np.uint32(1 if outcome > 0.5 else 0)
     is_no_win = np.uint32(1 if outcome <= 0.5 else 0)
@@ -498,14 +533,18 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
     )
 
     if yes_idx > 0:
-        state.daily_variance_yes.extend(zip(out_yes_prices[:yes_idx].tolist(), out_yes_errors[:yes_idx].tolist()))
-        for i in range(yes_idx):
-            day_yes_updates[out_yes_uids[i]].append(out_yes_packed[i])
+            state.daily_variance_yes.extend(zip(out_yes_prices[:yes_idx].tolist(), out_yes_errors[:yes_idx].tolist()))
+            uids_l   = out_yes_uids[:yes_idx].tolist()
+            packed_l = out_yes_packed[:yes_idx].tolist()
+            for u, p in zip(uids_l, packed_l):
+                day_yes_updates[u].append(p)
 
     if no_idx > 0:
-        state.daily_variance_no.extend(zip(out_no_prices[:no_idx].tolist(), out_no_errors[:no_idx].tolist()))
-        for i in range(no_idx):
-            day_no_updates[out_no_uids[i]].append(out_no_packed[i])
+            state.daily_variance_no.extend(zip(out_no_prices[:no_idx].tolist(), out_no_errors[:no_idx].tolist()))
+            uids_l   = out_no_uids[:no_idx].tolist()
+            packed_l = out_no_packed[:no_idx].tolist()
+            for u, p in zip(uids_l, packed_l):
+                day_no_updates[u].append(p)
 
     # Handle first bet calibration
     if r_cid in state.first_bets_pending:
@@ -876,27 +915,49 @@ def main():
 
     # Force Numba compilation before starting the tight simulation loop
     log.info("Warming up Numba JIT compiler...")
-    
+
     _dummy_history = np.zeros(1, dtype=np.uint32)
-    fused_trade_kernel(_dummy_history, _dummy_history, 500, 500, 500, PRICE_LUT, TIME_LUT, P_RANGE, 1.0, 0.5, 0.25)
+    _dummy_int8    = np.zeros(1, dtype=np.int8)
+    _dummy_f64     = np.zeros(1, dtype=np.float64)
+    _dummy_logit   = np.empty(0, dtype=np.float64)
+
+    fast_numba_scan(_dummy_history, 500, 1, 500, PRICE_LUT, TIME_LUT, P_RANGE)
     compute_wager_and_p_true(0.5, 100.0, 0.0, 0.0, 0, 100.0, True)
-    
+
     _dummy_tokens, _dummy_prices, _dummy_ts = np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64)
-    _dummy_ends = np.ones(1, dtype=np.float64) * 1e10
+    _dummy_ends  = np.full(1, 1e10, dtype=np.float64)
     _dummy_is_yes, _dummy_valid = np.zeros(1, dtype=np.bool_), np.zeros(1, dtype=np.bool_)
     compute_batch_stateless(_dummy_tokens, _dummy_prices, _dummy_ts, _dummy_ends, _dummy_is_yes, _dummy_valid)
-    
-    # Warmup the new daily resolution kernels
+
+    # Warm both branches of _process_trade_core (cold-start logit path AND warm-Brier path)
+    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
+                        0.5, 0.5, 100.0, 50.0, 0.25,
+                        np.float64(0.2), np.uint32(1), _dummy_logit,
+                        PRICE_LUT, TIME_LUT, P_RANGE)
+    _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
+                        0.5, 0.5, 100.0, 50.0, 0.25,
+                        np.float64(0.0), np.uint32(0), _dummy_logit,
+                        PRICE_LUT, TIME_LUT, P_RANGE)
+
+    # Warm the daily-resolution kernels
     _merge_sorted_uint32(_dummy_history, _dummy_history, _dummy_history)
-    _dummy_int8 = np.zeros(1, dtype=np.int8)
+
+    # Warm both branches of _resolve_positions_core (skip_history False AND True)
     _resolve_positions_core(
-        _dummy_history, _dummy_int8, _dummy_history, _dummy_tokens, _dummy_tokens,
+        _dummy_history, _dummy_int8, _dummy_history, _dummy_f64, _dummy_f64,
         np.uint32(1), np.uint32(0), 1.0, False,
-        _dummy_tokens, _dummy_tokens, _dummy_history,
-        _dummy_history, _dummy_history, _dummy_tokens, _dummy_tokens,
-        _dummy_history, _dummy_history, _dummy_tokens, _dummy_tokens
+        _dummy_f64, _dummy_f64, _dummy_history,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
     )
-    
+    _resolve_positions_core(
+        _dummy_history, _dummy_int8, _dummy_history, _dummy_f64, _dummy_f64,
+        np.uint32(1), np.uint32(0), 1.0, True,
+        _dummy_f64, _dummy_f64, _dummy_history,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
+    )
+
     log.info("✅ Numba JIT warmed up and locked.")
 
     # ==========================================
