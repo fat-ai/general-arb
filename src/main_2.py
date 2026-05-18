@@ -768,9 +768,7 @@ class LiveTrader:
                 direction = -1.0 if is_buy else 1.0
                 
             # 6. Format Datetimes for State Ingestion
-            # Convert the raw RPC timestamp and the market end_timestamp to UTC datetimes
-            ts_dt = datetime.fromtimestamp(t['timestamp'], tz=timezone.utc).replace(tzinfo=None)
-            end_dt = datetime.fromtimestamp(market['end_timestamp'], tz=timezone.utc).replace(tzinfo=None)
+
             bet_on = "yes" if is_yes_token else "no"
             
             # Ensure time-to-resolution is at least 1 hour
@@ -1213,7 +1211,7 @@ class LiveTrader:
             # Now live_prices contains FLOATS, so this won't crash
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             cash = self.persistence.state["cash"]
-            invested = equity - cash
+            invested = usdc_vol if is_buy else token_vol * (1.0 - price)
             
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             if equity > high_water:
