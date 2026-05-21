@@ -37,6 +37,7 @@ SLIPPAGE = 0.02  # 2 cents worse price per share
 cash = INITIAL_BANKROLL
 locked_capital = 0.0
 active_trades = []  # Min-heap to track when trades unlock: (end_timestamp, payout)
+seen_market_ids = set()
 
 # Metrics Tracking
 total_trades = 0
@@ -108,7 +109,11 @@ for chunk_idx, chunk in enumerate(pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, u
         group = group.sort_values('priority', ascending=False)
 
         for row in group.itertuples():
+            if row.market_id in seen_market_ids:
+                continue
+                
             if cash >= STAKE:
+                seen_market_ids.add(row.market_id)
                 # 1. Deduct capital
                 cash -= STAKE
                 locked_capital += STAKE
