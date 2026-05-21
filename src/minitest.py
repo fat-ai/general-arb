@@ -2,6 +2,22 @@ import pandas as pd
 import numpy as np
 import heapq
 from collections import defaultdict
+import resource
+import sys
+
+# --- MEMORY SAFEGUARD ---
+# Define max memory allowed for JUST this script (e.g., 3.0 GB)
+MAX_MEM_GB = 4.0  
+
+def apply_script_memory_limit(gb):
+    # Convert GB to bytes
+    bytes_limit = int(gb * 1024 * 1024 * 1024)
+    # RLIMIT_AS controls the maximum area of virtual memory for this process
+    resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
+    print(f"[SAFEGUARD] Memory strictly limited to {gb} GB for this script execution.")
+
+apply_script_memory_limit(MAX_MEM_GB)
+# ------------------------
 
 # --- CONFIGURATION ---
 FILE_PATH = 'simulation_results.csv'
