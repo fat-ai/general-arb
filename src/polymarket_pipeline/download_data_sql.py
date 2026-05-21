@@ -738,6 +738,7 @@ class DataFetcher:
                 total_captured += count
 
             print(f"\n🏁 Update Complete. Total New Rows: {total_captured}")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             
     def run(self):
         current_utc_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
