@@ -477,6 +477,8 @@ class DataFetcher:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout = 30000;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            print("WAL Autocheckpoint limit:", conn.execute("PRAGMA wal_autocheckpoint;").fetchone())
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             db_cursor = conn.cursor()
             
             db_cursor.execute('''
@@ -682,12 +684,19 @@ class DataFetcher:
                                 ))
 
                             if out_rows:
+                                out_rows.sort(key=lambda x: x[0])
+                                
                                 db_conn.executemany("""
                                     INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, out_rows)
                                 db_conn.commit()
+                                
+                                old_captured = seg_captured
                                 seg_captured += len(out_rows)
+                                
+                                if (old_captured // 50000) < (seg_captured // 50000):
+                                    db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
                         print(f"   | {segment_name} | Blocks {current_block}-{target_end} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
 
