@@ -13,10 +13,12 @@ import sys
 import time
 
 import __main__
+from collections import defaultdict
 from sim_strat_3 import (
     BayesianState, 
     MarketPositions,
     resolve_market, 
+    process_daily_history_merges,
     calibrate_models, 
     compute_wager_and_p_true,
     restore_arrays_from_npz,
@@ -285,12 +287,15 @@ def main():
             orphan_cids.append(cid)
             
     # 3. Process Resolutions
+    day_yes_updates = defaultdict(list)
+    day_no_updates = defaultdict(list)
     for r_cid in cids_to_resolve:
         m = market_map[r_cid]
         # Note: resolve_market uses .pop() internally, making it idempotent
-        resolve_market(r_cid, m['outcome'], m['outcome_label'], current_day_ts, state)
+        resolve_market(r_cid, m['outcome'], m['outcome_label'], current_day_ts, state, day_yes_updates, day_no_updates)
         
     if cids_to_resolve:
+        process_daily_history_merges(state, day_yes_updates, day_no_updates)
         log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
         
     # 4. Process Orphans (clean up markets that never resolved but are old)
