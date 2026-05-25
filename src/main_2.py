@@ -18,7 +18,6 @@ from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, set
 from reporting import generate_institutional_report, generate_html_report
 from broker import PersistenceManager, PaperBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
-from strategy import TradeLogic
 from sim_strat_3 import (
     BayesianState,
     process_trade,
@@ -68,6 +67,7 @@ class LiveTrader:
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.pending_markets: Set[str] = set()
+        self.seen_market_ids: Set[str] = set()
         self.running = True
         self.trade_queue = None
         self.stats = {
@@ -843,57 +843,28 @@ class LiveTrader:
             
             # The percentage margin is exactly equivalent to our normalized_weight/edge
             normalized_weight = perc_marg
-            
+            log.info(f"📐 SCALE_CHECK | NW={normalized_weight:+.4f} | V={variance_v:.4f} | P={price:.3f}")
             self.stats['scores'].append(normalized_weight)
             batch_scores.append((abs(normalized_weight), normalized_weight, mid))
 
-            # 9. Smart Exits
-            if CONFIG.get('use_smart_exit'):
-                await self._check_smart_exits_for_market(mid, normalized_weight)
-
-            for pos_data in self.persistence.state["positions"].values():
-              if pos_data.get("market_fpmm") == mid:
+           # 9. Entry rule (matches minitest.py backtest):
+            #    edge > 0.3, variance < 0.15, price < 0.40, positive direction only.
+            #    Permanent re-entry ban via seen_market_ids.
+            if mid in self.seen_market_ids:
                 continue
 
             if token_id in self.pending_orders or mid in self.pending_markets:
                 continue
-    
-            # 10. Entry Actions (With price bounds)
-            if 0.05 < price < 0.95:
-      
-                end_ts = market['end_timestamp']
-                passes_roi_filter = False
-             
-                days_to_expiry = (end_ts - time.time()) / 86400.0
-                    
-                if normalized_weight > 0:
-                    if is_yes_token:
-                        absolute_roi = (1.0 - price) / price
-                    else:
-                        absolute_roi = price / (1 - price)
-                else:
-                    if is_yes_token:
-                        absolute_roi = price / (1 - price)
-                    else:
-                        absolute_roi = (1.0 - price) / price 
-                              
-                annualized_roi = absolute_roi * (365.0 / days_to_expiry)
-                        
-                if annualized_roi > 5.0:
-                        passes_roi_filter = True
-                
-                if not passes_roi_filter and days_to_expiry > 0:
-                    continue 
-                    
-                action = TradeLogic.check_entry_signal(normalized_weight)
-                
-                if action == 'BUY':
-                    if token_id not in self.pending_orders and mid not in self.pending_markets:
-                        self.pending_orders.add(token_id)
-                        self.pending_markets.add(mid) 
-                        asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
-                    else:
-                        log.info(f"🔒 Market {mid} or Token {token_id} is currently locked by an in-flight order. Skipping.")
+
+            if (normalized_weight > 0.3
+                    and variance_v < 0.15
+                    and price < 0.40):
+                self.pending_orders.add(token_id)
+                self.pending_markets.add(mid)
+                self.seen_market_ids.add(mid)
+                asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
+
+        
 
         # End of Batch Summary
         if batch_scores:
@@ -904,31 +875,7 @@ class LiveTrader:
         #else:
         #    log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
-    async def _check_smart_exits_for_market(self, mkt_id, current_signal):
-        """Iterates over held positions in this market and checks for reversal exits."""
-        relevant_positions = [
-            (tid, p) for tid, p in self.persistence.state["positions"].items() 
-            if p.get("market_fpmm") == mkt_id
-        ]
-        
-        for pos_token, pos_data in relevant_positions:
-            # FIX: Rename to 'market_obj' for clarity
-            market_obj = self.metadata.markets.get(mkt_id)
-            if not market_obj: continue
-            
-            # FIX: Properly reference market_obj
-            is_yes = (str(pos_token) == market_obj['tokens'].get('yes'))
-            pos_type = 'YES' if is_yes else 'NO'
-            
-            should_exit = TradeLogic.check_smart_exit(pos_type, current_signal)
-            
-            if should_exit:
-                clean_book = self._prepare_clean_book(pos_token)
-                if clean_book:
-                    log.info(f"🧠 SMART EXIT {pos_token} | Signal Reversal: {current_signal:.1f}")
-                    await self.broker.execute_market_order(pos_token, "SELL", 0, mkt_id, current_book=clean_book)
-                else:
-                    log.warning(f"❌ Missed Opportunity: Empty Book for {pos_token}")
+    
 
     # --- EXECUTION HELPERS ---
 
@@ -1139,24 +1086,6 @@ class LiveTrader:
         await asyncio.sleep(delay)
         await self.trade_queue.put(trade_obj)
         
-    async def _check_stop_loss(self, token_id, price):
-        pos = self.persistence.state["positions"].get(token_id)
-        if not pos: return
-        
-        avg = pos['avg_price']
-        pnl = (price - avg) / avg
-        
-        if pnl < -CONFIG['stop_loss'] or pnl > CONFIG['take_profit']:
-            clean_book = self._prepare_clean_book(token_id)
-            if clean_book:
-                log.info(f"⚡ EXIT {token_id} | PnL: {pnl:.1%}")
-                
-                success = await self.broker.execute_market_order(
-                    token_id, "SELL", 0, pos['market_fpmm'], current_book=clean_book
-                )
-                
-            else:
-                log.warning(f"❌ Missed Opportunity: Empty Book for {token_id}")
 
     # --- MAINTENANCE ---
 
@@ -1209,9 +1138,31 @@ class LiveTrader:
                     live_prices[token_id] = 0.0
             
             # Now live_prices contains FLOATS, so this won't crash
+            # --- Take-profit exit: sell when best bid >= $0.95 ---
+            # Mirrors minitest.py: sell early when the market price reaches the take-profit level.
+            # Order-book best bid is the true expression of the price we can sell into.
+            for held_tid, pos in list(self.persistence.state["positions"].items()):
+                best_bid = live_prices.get(held_tid, 0.0)
+                if best_bid < 0.95:
+                    continue
+                fpmm = pos.get("market_fpmm")
+                if not fpmm:
+                    continue
+                if held_tid in self.pending_orders or fpmm in self.pending_markets:
+                    continue
+                clean_book = self._prepare_clean_book(held_tid)
+                if not clean_book:
+                    log.warning(f"⏳ Take-profit triggered for {held_tid} (bid ${best_bid:.3f}) but order book unavailable; will retry next cycle.")
+                    continue
+                self.pending_orders.add(held_tid)
+                self.pending_markets.add(fpmm)
+                log.info(f"🎯 TAKE-PROFIT {held_tid} | Best bid: ${best_bid:.3f}")
+                asyncio.create_task(self._execute_task(held_tid, fpmm, "SELL", clean_book))
+
+            # Now live_prices contains FLOATS, so this won't crash
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             cash = self.persistence.state["cash"]
-            invested = usdc_vol if is_buy else token_vol * (1.0 - price)
+            invested = equity - cash  # Portfolio-level mark-to-market value of held positions.
             
             high_water = self.persistence.state.get("highest_equity", CONFIG['initial_capital'])
             if equity > high_water:
