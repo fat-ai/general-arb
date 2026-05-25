@@ -843,11 +843,10 @@ class LiveTrader:
             
             # The percentage margin is exactly equivalent to our normalized_weight/edge
             normalized_weight = perc_marg
-            log.info(f"📐 SCALE_CHECK | NW={normalized_weight:+.4f} | V={variance_v:.4f} | P={price:.3f}")
             self.stats['scores'].append(normalized_weight)
             batch_scores.append((abs(normalized_weight), normalized_weight, mid))
 
-           # 9. Entry rule (matches minitest.py backtest):
+            # 9. Entry rule (matches minitest.py backtest):
             #    edge > 0.3, variance < 0.15, price < 0.40, positive direction only.
             #    Permanent re-entry ban via seen_market_ids.
             if mid in self.seen_market_ids:
@@ -1159,7 +1158,6 @@ class LiveTrader:
                 log.info(f"🎯 TAKE-PROFIT {held_tid} | Best bid: ${best_bid:.3f}")
                 asyncio.create_task(self._execute_task(held_tid, fpmm, "SELL", clean_book))
 
-            # Now live_prices contains FLOATS, so this won't crash
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             cash = self.persistence.state["cash"]
             invested = equity - cash  # Portfolio-level mark-to-market value of held positions.
