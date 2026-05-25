@@ -11,6 +11,7 @@ import csv
 import shutil
 import sys
 import time
+import array
 
 import __main__
 from collections import defaultdict
@@ -413,6 +414,8 @@ def main():
                         uid = state.next_user_id
                         state.user_map[user] = uid
                         state.next_user_id += 1
+                        state.user_history_yes.append(array.array('I'))
+                        state.user_history_no.append(array.array('I'))
                         
                     u_trades = state.user_total_trades[uid]
                     if u_trades == 0:
