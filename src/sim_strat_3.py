@@ -1005,6 +1005,12 @@ def main():
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0 
                   AND t.price <= 1.0
+                  AND LOWER(t.user) NOT IN (                              -- ADD
+                  '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',       -- V1 CTF Exchange
+                  '0xc5d563a36ae78145c45a50134d48a1215220f80a',       -- V1 NegRisk Exchange
+                  '0xe111180000d2663c0091e4f400237545b87b996b',       -- V2 CTF Exchange (defensive)
+                  '0xe2222d279d744050d28e00520010520000310f59'        -- V2 NegRisk Exchange (defensive)
+              )
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
