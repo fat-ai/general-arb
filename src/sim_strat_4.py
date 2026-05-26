@@ -1175,8 +1175,8 @@ def main():
 
                     # E. PROGRESS CHECKPOINTING
                     state.days_simulated += 1
-                    if state.days_simulated % 90 == 0:
-                        log.info(f"💾 Initiating 90-day checkpoint sequence at simulated day {state.days_simulated}...")
+                    if state.days_simulated % 30 == 0:
+                        log.info(f"💾 Initiating 30-day checkpoint sequence at simulated day {state.days_simulated}...")
                         state.last_processed_timestamp = ts
 
                         if results_buffer:
