@@ -500,17 +500,38 @@ class DataFetcher:
             
             print(f"📂 Checking existing SQLite database bounds...")
             
-            # 1. Self-Healing: Delete any trades that accidentally saved with a 0 timestamp
+            # 1. Self-Healing: Delete any trades that accidentally saved with a 0 timestamp.
+            #    Works under both INTEGER and TEXT affinity — SQLite's `=` operator
+            #    coerces TEXT operands to NUMERIC when comparing against a NUMERIC literal.
             db_cursor.execute("DELETE FROM trades WHERE timestamp = 0")
             conn.commit()
 
-            # 2. Safe Bounds Query: Handle old string datetimes and new integer epochs correctly
-            db_cursor.execute('''
-                SELECT 
-                    MAX(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END),
-                    MIN(CASE WHEN typeof(timestamp) = 'integer' THEN timestamp ELSE CAST(strftime('%s', timestamp) AS INTEGER) END)
-                FROM trades
-            ''')
+            # 2. Bounds query that is robust to whatever affinity the trades table
+            #    actually has.  In a legacy DB the column may have been created with
+            #    TEXT affinity, in which case Python int epochs got silently coerced
+            #    to text strings like '1779062611'.  We can't rely on `typeof()`
+            #    alone, and we can't pass an epoch string to `strftime('%s', ...)`
+            #    (it returns NULL — that was the original bug that froze the bounds
+            #    at the last legacy ISO-date row).  Branch on what the value
+            #    actually looks like:
+            #
+            #      - INTEGER storage          → use directly
+            #      - REAL storage             → cast to int
+            #      - TEXT looking like epoch  → CAST to integer (any text whose
+            #                                   leading digits exceed 1e9 must be
+            #                                   an epoch, since ISO dates start
+            #                                   with a 4-digit year)
+            #      - Otherwise (ISO date str) → parse via strftime
+            BOUNDS_EXPR = """
+                CASE
+                    WHEN typeof(timestamp) = 'integer' THEN timestamp
+                    WHEN typeof(timestamp) = 'real'    THEN CAST(timestamp AS INTEGER)
+                    WHEN CAST(timestamp AS INTEGER) > 1000000000
+                        THEN CAST(timestamp AS INTEGER)
+                    ELSE CAST(strftime('%s', timestamp) AS INTEGER)
+                END
+            """
+            db_cursor.execute(f"SELECT MAX({BOUNDS_EXPR}), MIN({BOUNDS_EXPR}) FROM trades")
             max_val, min_val = db_cursor.fetchone()
             
             if max_val is not None and min_val is not None:
@@ -537,9 +558,12 @@ class DataFetcher:
                 # Ensure chronological order for iterating
                 if start_block > end_block:
                     start_block, end_block = end_block, start_block
-                    
-                start_block = 86138000
-                
+
+                # NOTE: there used to be a hardcoded `start_block = 86138000`
+                # debug override here. Removed — it was breaking OLD_TAIL
+                # entirely (forcing start past end) and causing NEW_HEAD to
+                # re-fetch the same range every run.
+
                 print(f"🚀 Starting Segment: {segment_name} | Block {start_block} -> {end_block}")
                 
                 current_block = start_block
@@ -547,6 +571,9 @@ class DataFetcher:
                 seg_dropped = 0
                 rpc_index = 0
                 batch_size = 100 # Safe default for public RPCs
+                consecutive_failures = 0
+                MAX_CONSECUTIVE_FAILURES = max(8, 2 * len(RPC_URLS))
+                last_progress_block = start_block
                 
                 while current_block <= end_block:
                     # 1. Hard cap batch size at 100 to prevent strict public nodes from rejecting it
@@ -601,9 +628,18 @@ class DataFetcher:
                                 for attempt in range(3):
                                     try:
                                         b_resp = self.session.post(current_rpc, json=chunk, timeout=30).json()
+                                        # Defensive: some RPCs return a single error object instead of an array.
+                                        if not isinstance(b_resp, list):
+                                            raise Exception(f"Expected JSON-RPC batch response, got: {type(b_resp).__name__}")
                                         for r in b_resp:
                                             if 'result' in r and r['result']:
-                                                block_times[r['id']] = int(r['result']['timestamp'], 16)
+                                                # ✅ Use the block number from the result payload directly.
+                                                # Don't rely on the JSON-RPC `id` round-trip — some public RPCs
+                                                # (notably some Tatum / Ankr edge nodes) echo numeric IDs back as
+                                                # strings, which silently breaks the int-keyed `block_times` dict
+                                                # and causes every trade in the batch to be dropped with ts=0.
+                                                blk = int(r['result']['number'], 16)
+                                                block_times[blk] = int(r['result']['timestamp'], 16)
                                         chunk_success = True
                                         break
                                     except Exception as e:
@@ -625,9 +661,11 @@ class DataFetcher:
                                 maker = "0x" + topics[2][-40:]
                                 taker = "0x" + topics[3][-40:]
                                 
-                                # Drop if taker is the exchange contract to prevent double-counting
+                                # Drop self-trades and trades involving the exchange contract on either side
                                 lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
-                                if maker == taker or taker.lower() in lower_exchanges:
+                                if (maker == taker 
+                                        or taker.lower() in lower_exchanges 
+                                        or maker.lower() in lower_exchanges):
                                     seg_dropped += 1; continue
 
                                 data_hex = r.get('data', '0x')
@@ -676,7 +714,13 @@ class DataFetcher:
                                 if ts == 0:
                                     seg_dropped += 1; continue
 
-                                log_id = r.get('transactionHash', '') + "-" + str(int(r.get('logIndex', '0x0'), 16))
+                                tx_hash = r.get('transactionHash')
+                                log_idx_hex = r.get('logIndex')
+                                if not tx_hash or log_idx_hex is None:
+                                    # Without both fields we can't form a unique primary key.
+                                    # Skip rather than silently colliding via INSERT OR IGNORE.
+                                    seg_dropped += 1; continue
+                                log_id = tx_hash + "-" + str(int(log_idx_hex, 16))
 
                                 out_rows.append((
                                     log_id, ts, val_usdc, val_size * mult,
@@ -698,38 +742,70 @@ class DataFetcher:
                                 if (old_captured // 50000) < (seg_captured // 50000):
                                     db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
 
-                        print(f"   | {segment_name} | Blocks {current_block}-{target_end} | Captured: {seg_captured} | Dropped: {seg_dropped}", end='\r', flush=True)
+                        # ── On success: print a real progress line every 10k blocks so
+                        # the user can see drop rates accumulating. Final summary
+                        # still appears at end of segment.
+                        if current_block - last_progress_block >= 10000 or target_end == end_block:
+                            pct = 100 * (target_end - start_block) / max(1, end_block - start_block)
+                            print(f"   | {segment_name} | {current_block}-{target_end} "
+                                  f"({pct:5.1f}%) | Captured: {seg_captured:,} | Dropped: {seg_dropped:,} "
+                                  f"| batch={batch_size} rpc={rpc_index % len(RPC_URLS)}",
+                                  flush=True)
+                            last_progress_block = target_end
 
                         current_block = target_end + 1
-                        
+                        consecutive_failures = 0  # reset on any successful batch
+
                         # Optimistically stretch the batch size back out if the RPC is handling it well
                         batch_size = min(200, batch_size + 10)
 
                     except Exception as e:
                         err_str = str(e)
-                        log.warning(f"⚠️ RPC failover triggered on {current_rpc}: {err_str}")
-                        
+                        consecutive_failures += 1
+                        log.warning(
+                            f"⚠️ RPC failover triggered on {current_rpc} "
+                            f"(failure {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {err_str}"
+                        )
+
                         # 1. Handle Rate Limits (HTTP 429) gracefully to prevent permanent bans
                         if "429" in err_str:
                             log.info("⏳ Rate limit hit. Cooling down for 10 seconds before rotating...")
                             time.sleep(10)
                         else:
                             time.sleep(2)
-                            
+
                         rpc_index += 1
-                        
+
                         # 2. Lower the absolute floor to 10 blocks so weak nodes like Tatum can digest the payload
                         batch_size = max(10, batch_size // 2)
+
+                        # 3. Escape hatch: if we've burned through every RPC repeatedly without
+                        # progress, skip this range with a logged warning. Better to leave a small
+                        # gap (which a future run can fill) than to loop forever.
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            skipped_to = min(current_block + batch_size, end_block + 1)
+                            log.error(
+                                f"❌ Could not make progress at block {current_block} after "
+                                f"{consecutive_failures} consecutive failures across all RPCs. "
+                                f"Skipping ahead to block {skipped_to}. A future run will need to "
+                                f"backfill this gap."
+                            )
+                            current_block = skipped_to
+                            consecutive_failures = 0
+                            batch_size = 100  # reset for the next range
                 
-                print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured}")
+                print(f"\n   ✅ Segment '{segment_name}' Done. Captured: {seg_captured:,} | Dropped: {seg_dropped:,}")
                 return seg_captured
 
             total_captured = 0
                
             if existing_high_ts:
                 if global_stop_ts > existing_high_ts:
-                    print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(existing_high_ts)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
-                    count = fetch_segment(existing_high_ts, global_stop_ts, conn, "NEW_HEAD")
+                    # +1 second so we don't redundantly re-scan the boundary block every run.
+                    # INSERT OR IGNORE would dedup it anyway, but this saves the RPC traffic.
+                    start_from = existing_high_ts + 1
+                    print(f"\n🌊 Fetching Newer Data ({datetime.utcfromtimestamp(start_from)} -> {datetime.utcfromtimestamp(global_stop_ts)})")
+                    count = fetch_segment(start_from, global_stop_ts, conn, "NEW_HEAD")
                     total_captured += count
                 else:
                     print(f"\n🌊 Fetching Newer Data Skipped (Configured End Date <= Existing Head)")
