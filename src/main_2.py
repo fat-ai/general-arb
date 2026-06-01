@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
 from reporting import generate_institutional_report, generate_html_report
-from broker import PersistenceManager, PaperBroker
+from broker import PersistenceManager, PaperBroker, LiveBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
 from sim_strat_3 import (
     BayesianState,
@@ -57,7 +57,7 @@ def _safe_json_load(x):
 class LiveTrader:
     def __init__(self):
         self.persistence = PersistenceManager()
-        self.broker = PaperBroker(self.persistence)
+        self.broker = LiveBroker(self.persistence) if CONFIG.get("live_trading") else PaperBroker(self.persistence)
         self.metadata = MarketMetadata()
         self.sub_manager = SubscriptionManager()
         self.state = None
