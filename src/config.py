@@ -32,11 +32,12 @@ USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 # --- TRADING CONFIGURATION ---
 # Adjust these values to tune the strategy risk profile
 CONFIG = {
+    "live_trading": os.environ.get("LIVE_TRADING", "false").lower() == "true",
     "splash_threshold": 5.0,
     "decay_factor": 0.95,
     "sizing_mode": "fixed",
-    "fixed_size": 10.0,
-    "use_percentage_staking": True,
+    "fixed_size": 100.0,
+    "use_percentage_staking": False,
     "percentage_stake": 0.01,
     "stop_loss": 0.99,
     "take_profit": 1000.0,
