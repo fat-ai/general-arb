@@ -15,35 +15,19 @@ log = logging.getLogger("PaperGold")
 audit_log = logging.getLogger("TradeAudit")
 
 # --------------------------------------------------------------------------- #
-#  On-chain redemption constants (Polygon mainnet, CLOB V1 / USDC.e regime).
-#  ⚠️ VERIFY against https://docs.polymarket.com — Polymarket is migrating to
-#  CLOB V2 with a PMCT collateral token, which changes the collateral address
-#  and may route redemption through a collateral adapter instead of the CTF.
+#  On-chain redemption constants (Polygon mainnet, CLOB V2).
+#  Source: https://docs.polymarket.com/resources/contracts
+#  ⚠️ V2 collateral is pUSD (not USDC.e). Redeeming CTF positions pays out the
+#  collateral the CTF holds, which now flows through the collateral adapters
+#  below — so the direct CTF.redeemPositions(USDC.e, …) call from the old V1
+#  path is NOT correct for V2. See _settle_redemption for the V2 approach.
 # --------------------------------------------------------------------------- #
-USDC_E_ADDR       = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-CTF_ADDR          = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-NEG_RISK_ADAPTER  = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
-ZERO_BYTES32      = "0x" + "00" * 32
-
-# CTF.redeemPositions redeems your FULL balance of the position tokens for the
-# given index sets — no amount needed. NegRiskAdapter.redeemPositions takes the
-# explicit per-outcome amounts you hold.
-CTF_REDEEM_ABI = [{
-    "inputs": [
-        {"internalType": "address",   "name": "collateralToken",    "type": "address"},
-        {"internalType": "bytes32",   "name": "parentCollectionId", "type": "bytes32"},
-        {"internalType": "bytes32",   "name": "conditionId",        "type": "bytes32"},
-        {"internalType": "uint256[]", "name": "indexSets",          "type": "uint256[]"},
-    ],
-    "name": "redeemPositions", "outputs": [], "stateMutability": "nonpayable", "type": "function",
-}]
-NEG_RISK_REDEEM_ABI = [{
-    "inputs": [
-        {"internalType": "bytes32",   "name": "_conditionId", "type": "bytes32"},
-        {"internalType": "uint256[]", "name": "_amounts",     "type": "uint256[]"},
-    ],
-    "name": "redeemPositions", "outputs": [], "stateMutability": "nonpayable", "type": "function",
-}]
+PUSD_ADDR          = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # collateral token
+CTF_ADDR           = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens (unchanged)
+NEG_RISK_ADAPTER   = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"
+CTF_COLLATERAL_ADAPTER     = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+NEGRISK_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+ZERO_BYTES32       = "0x" + "00" * 32
 
 
 class PersistenceManager:
@@ -346,49 +330,45 @@ class PaperBroker(BaseBroker):
 
 
 # ======================================================================== #
-#  LIVE BROKER — fill = real FOK order on the Polymarket CLOB.
+#  LIVE BROKER — fill = real FOK order on the Polymarket CLOB **V2**.
 #  Same state bookkeeping as paper (inherited), so every report / risk loop
 #  in main_2.py keeps working untouched.
 #
-#  pip install py-clob-client web3
-#  env: POLYMARKET_PK, POLYMARKET_FUNDER, POLYMARKET_SIG_TYPE (0 EOA / 1 Magic / 2 Safe)
+#  pip install py-clob-client-v2 web3
+#  env: POLYMARKET_PK, POLYMARKET_SIG_TYPE (0 = EOA, recommended)
+#  Collateral is pUSD — fund by wrapping USDC.e (see set_allowances.py).
+#  Confirm exact SDK method/arg names with verify_setup.py before trusting.
 # ======================================================================== #
 class LiveBroker(BaseBroker):
     is_paper = False
 
     HOST = "https://clob.polymarket.com"
-    CHAIN_ID = 137
+    CHAIN_ID = 137  # 80002 = Amoy testnet for dry runs
 
     def __init__(self, persistence: PersistenceManager):
         super().__init__(persistence)
 
-        # Lazy imports so pure-paper users don't need py-clob-client installed.
-        from py_clob_client.client import ClobClient
-        self._OrderType = __import__("py_clob_client.clob_types", fromlist=["OrderType"]).OrderType
-        self._MarketOrderArgs = __import__("py_clob_client.clob_types", fromlist=["MarketOrderArgs"]).MarketOrderArgs
-        consts = __import__("py_clob_client.order_builder.constants", fromlist=["BUY", "SELL"])
-        self._BUY, self._SELL = consts.BUY, consts.SELL
+        # Lazy import so pure-paper users don't need the V2 client installed.
+        import py_clob_client_v2 as v2
+        self._v2 = v2
+        self._OrderType = v2.OrderType
+        self._MarketOrderArgs = v2.MarketOrderArgs
+        self._Side = v2.Side  # V2 uses a Side enum, not BUY/SELL string constants
 
         pk = os.environ["POLYMARKET_PK"]
-        funder = os.environ["POLYMARKET_FUNDER"]
-        sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "1"))
+        sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "0"))  # 0 = EOA (recommended)
         self.sig_type = sig_type
 
-        self.client = ClobClient(self.HOST, key=pk, chain_id=self.CHAIN_ID,
-                                 signature_type=sig_type, funder=funder)
-        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        # V2 auth: derive creds (L1), then re-init fully authenticated (L1+L2).
+        # NB: the V2 constructor takes an options-style kwargs set; confirm the
+        # exact names (chain_id vs chain, creds vs api_creds) via verify_setup.py.
+        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk)
+        creds = self.client.create_or_derive_api_key()
+        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk, creds=creds)
         self.slippage = CONFIG.get("max_slippage", 0.05)
         self._tick_cache: Dict[str, float] = {}
 
-        # web3 handle for on-chain redemption (only used for held-to-resolution
-        # winners; ordinary entries/exits go through the gasless CLOB).
-        from web3 import Web3
-        from eth_account import Account
-        from config import RPC_URLS
-        self.w3 = Web3(Web3.HTTPProvider(RPC_URLS[0]))
-        self.account = Account.from_key(pk)
-
-        log.info("✅ LiveBroker authenticated against the CLOB.")
+        log.info("✅ LiveBroker authenticated against the CLOB (V2).")
 
     # ---- tick-size rounding (orders are rejected off the grid) --------- #
     def _tick(self, token_id: str) -> float:
@@ -436,10 +416,10 @@ class LiveBroker(BaseBroker):
 
         if side == "BUY":
             limit = min(self.MAX_BUY_PRICE, self._round_tick(best * (1 + self.slippage), token_id, up=True))
-            api_side, amount = self._BUY, float(calc_amount)         # amount = USDC
+            api_side, amount = self._Side.BUY, float(calc_amount)     # amount = pUSD
         else:
             limit = max(0.001, self._round_tick(best * (1 - self.slippage), token_id, up=False))
-            api_side, amount = self._SELL, float(calc_amount)        # amount = shares
+            api_side, amount = self._Side.SELL, float(calc_amount)    # amount = shares
 
         args = self._MarketOrderArgs(token_id=token_id, amount=amount,
                                      side=api_side, price=limit,
@@ -458,72 +438,35 @@ class LiveBroker(BaseBroker):
 
     async def _settle_redemption(self, token_id, pos, payout_price,
                                  condition_id=None, neg_risk=False, outcome_index=None):
-        """Redeem a resolved position on-chain.
+        """Redeem a resolved position under CLOB V2.
 
         Losers (payout 0) are worthless — drop them, book $0, no transaction.
-        Winners are redeemed via the CTF (standard) or the NegRisk adapter.
-        Returns the realized USDC proceeds (qty * payout) only after the tx
-        confirms; raising on failure makes main_2.py revert pos['redeemed'] so
-        the position isn't silently lost.
+
+        Winners: in V2 the CTF position is collateralized by pUSD and redemption
+        flows through the collateral adapter (CtfCollateralAdapter /
+        NegRiskCtfCollateralAdapter), not a direct CTF.redeemPositions(USDC.e, …)
+        call. The robust, future-proof path is Polymarket's **gasless Builder
+        Relayer**, which performs the redeem (and pUSD unwrap) correctly server
+        side — see https://docs.polymarket.com/trading/gasless . Wire that here:
+        submit the redeem via the relayer, await its receipt, then return the
+        realized USDC.
+
+        Raising (rather than returning a fake $0) is deliberate: main_2.py reverts
+        pos['redeemed']=False on exception, so a not-yet-wired redeemer keeps the
+        position tracked instead of silently losing the funds.
+
+        Practical note: your $0.95 take-profit SELL already exits most winners on
+        the (gasless) CLOB before resolution, so this path is the exception, not
+        the rule.
         """
         if payout_price <= 0:
-            return 0.0  # losing side — nothing to claim on-chain
+            return 0.0  # losing side — nothing to claim
 
-        if self.sig_type != 0:
-            # Proxy wallets (Magic/Safe) hold CTF tokens in the proxy, not the
-            # EOA, so a direct web3 call finds no balance. Route via the Builder
-            # Relayer instead (gasless, needs Builder API creds).
-            raise NotImplementedError(
-                "Direct on-chain redeem requires an EOA wallet (signature_type=0). "
-                "Use the Builder Relayer for proxy wallets."
-            )
-        if not condition_id:
-            raise ValueError(f"Redeem {token_id}: missing condition_id from market metadata")
-
-        qty = pos["qty"]
-        receipt = await asyncio.to_thread(
-            self._redeem_onchain, condition_id, bool(neg_risk), qty, outcome_index
+        raise NotImplementedError(
+            "V2 winner redemption not wired. Use the Builder Relayer (gasless, "
+            "handles pUSD + collateral adapter) — direct CTF.redeemPositions with "
+            "USDC.e is a V1 path and is wrong for V2 pUSD collateral."
         )
-        if not receipt or receipt.get("status") != 1:
-            raise RuntimeError(f"Redeem tx failed/reverted for {token_id}: {receipt}")
-
-        log.info(f"⛓️ Redeemed on-chain: {qty:.2f} {token_id} | gas {receipt.get('gasUsed')}")
-        # Winning shares settle 1:1 to USDC, so qty * payout is exact; any rounding
-        # drift is corrected by sync_state_from_chain().
-        return qty * payout_price
-
-    def _redeem_onchain(self, condition_id, neg_risk, qty, outcome_index):
-        """Synchronous web3 redemption (runs in a worker thread). Costs ~0.02 POL."""
-        w3, acct = self.w3, self.account
-        cid = condition_id if str(condition_id).startswith("0x") else "0x" + str(condition_id)
-
-        if neg_risk:
-            if outcome_index is None:
-                raise ValueError("neg-risk redeem needs outcome_index to place the amount")
-            amounts = [0, 0]
-            amounts[outcome_index] = int(round(qty * 1e6))  # CTF tokens use 6 decimals
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(NEG_RISK_ADAPTER), abi=NEG_RISK_REDEEM_ABI)
-            fn = contract.functions.redeemPositions(cid, amounts)
-        else:
-            contract = w3.eth.contract(
-                address=w3.to_checksum_address(CTF_ADDR), abi=CTF_REDEEM_ABI)
-            # indexSets [1, 2] covers both outcome slots; the contract pays out
-            # whatever winning balance you actually hold.
-            fn = contract.functions.redeemPositions(
-                w3.to_checksum_address(USDC_E_ADDR), ZERO_BYTES32, cid, [1, 2])
-
-        tx = fn.build_transaction({
-            "from": acct.address,
-            "nonce": w3.eth.get_transaction_count(acct.address),
-            "gas": 250000,
-            "gasPrice": int(w3.eth.gas_price * 1.25),
-            "chainId": self.CHAIN_ID,
-        })
-        signed = acct.sign_transaction(tx)
-        raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction
-        tx_hash = w3.eth.send_raw_transaction(raw)
-        return dict(w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180))
 
     # ---- reconciliation: pull real balance so the mirror can't drift ---- #
     async def sync_state_from_chain(self):
