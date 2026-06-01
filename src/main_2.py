@@ -658,7 +658,12 @@ class LiveTrader:
                             await self.persistence.save_async()
     
                             try:
-                                await self.broker.redeem_position(token_id, payout)
+                                await self.broker.redeem_position(
+                                    token_id, payout,
+                                    condition_id=mkt.get("conditionId"),
+                                    neg_risk=bool(mkt.get("negRisk", False)),
+                                    outcome_index=outcome_tokens.index(token_id) if token_id in outcome_tokens else None,
+                                )
                                 redeemed_any = True
                                 log.info(
                                     f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
