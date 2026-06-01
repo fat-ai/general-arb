@@ -351,20 +351,21 @@ class LiveBroker(BaseBroker):
         # Lazy import so pure-paper users don't need the V2 client installed.
         import py_clob_client_v2 as v2
         self._v2 = v2
-        self._OrderType = v2.OrderType
         self._MarketOrderArgs = v2.MarketOrderArgs
-        self._Side = v2.Side  # V2 uses a Side enum, not BUY/SELL string constants
+        self._Side = v2.Side
 
         pk = os.environ["POLYMARKET_PK"]
-        sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "0"))  # 0 = EOA (recommended)
+        sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "0"))  # 0 = EOA
         self.sig_type = sig_type
 
-        # V2 auth: derive creds (L1), then re-init fully authenticated (L1+L2).
-        # NB: the V2 constructor takes an options-style kwargs set; confirm the
-        # exact names (chain_id vs chain, creds vs api_creds) via verify_setup.py.
-        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk)
+        # V2 auth (verified via verify_setup.py): derive creds, then re-init fully
+        # authenticated. signature_type matters for order *signing* (order posting
+        # exercises it even though read-only auth didn't), so pass it explicitly.
+        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk,
+                                    signature_type=sig_type)
         creds = self.client.create_or_derive_api_key()
-        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk, creds=creds)
+        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk,
+                                    creds=creds, signature_type=sig_type)
         self.slippage = CONFIG.get("max_slippage", 0.05)
         self._tick_cache: Dict[str, float] = {}
 
@@ -386,19 +387,29 @@ class LiveBroker(BaseBroker):
         return round(n * t, 4)
 
     @staticmethod
-    def _parse_fill(resp: dict) -> Tuple[float, float]:
-        """Return (avg_price, filled_qty) from a post_order response.
-        TODO: confirm field names against your installed py-clob-client version;
-        never assume the order fully filled — read the matched amounts."""
+    def _parse_fill(resp: dict, side: str) -> Tuple[float, float]:
+        """Return (avg_price, filled_qty) from a V2 POST /order response.
+
+        SendOrderResponse: success(bool), orderID, status in {live,matched,delayed},
+        makingAmount/takingAmount as 6-decimal strings, transactionsHashes, errorMsg.
+
+        A FOK fill means status == 'matched'. The two amounts are side-relative:
+          BUY  → we provide pUSD (makingAmount), receive shares (takingAmount)
+          SELL → we provide shares (makingAmount), receive pUSD (takingAmount)
+        so the pUSD leg and the share leg swap places with side.
+        """
         try:
-            shares = float(resp.get("size_matched") or resp.get("makingAmount") or 0.0)
-            if shares <= 0:
+            if not resp.get("success") or resp.get("status") != "matched":
                 return 0.0, 0.0
-            avg = float(resp.get("price") or 0.0)
-            if avg <= 0:
-                usdc = float(resp.get("takingAmount") or 0.0)
-                avg = usdc / shares if usdc > 0 else 0.0
-            return avg, shares
+            making = float(resp.get("makingAmount") or 0) / 1e6
+            taking = float(resp.get("takingAmount") or 0) / 1e6
+            if making <= 0 or taking <= 0:
+                return 0.0, 0.0
+            if side == "BUY":
+                cash, shares = making, taking
+            else:                       # SELL
+                shares, cash = making, taking
+            return cash / shares, shares  # (avg pUSD/share, shares filled)
         except Exception:
             return 0.0, 0.0
 
@@ -422,16 +433,23 @@ class LiveBroker(BaseBroker):
             api_side, amount = self._Side.SELL, float(calc_amount)    # amount = shares
 
         args = self._MarketOrderArgs(token_id=token_id, amount=amount,
-                                     side=api_side, price=limit,
-                                     order_type=self._OrderType.FOK)
+                                     side=api_side, price=limit, order_type="FOK")
         try:
-            signed = self.client.create_market_order(args)
-            resp = await asyncio.to_thread(self.client.post_order, signed, self._OrderType.FOK)
+            # create_and_post_market_order signs + submits atomically (verified
+            # method name). options=None lets the SDK resolve tick size; if a
+            # neg-risk market ever fails to route, pass PartialCreateOrderOptions(
+            # neg_risk=True) here.
+            resp = await asyncio.to_thread(
+                self.client.create_and_post_market_order, args, None, "FOK"
+            )
         except Exception as e:
             log.error(f"Live order submission failed for {token_id}: {e}")
             return 0.0, 0.0
 
-        avg, qty = self._parse_fill(resp)
+        # First live order: log the raw response so the fill schema can be pinned.
+        log.info(f"📨 raw order response ({side} {token_id}): {resp}")
+
+        avg, qty = self._parse_fill(resp, side)
         if qty <= 0:
             log.error(f"❌ Live {side} not filled for {token_id}: {resp}")
         return avg, qty
