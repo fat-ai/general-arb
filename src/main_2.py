@@ -626,7 +626,7 @@ class LiveTrader:
                         if not mkt or mkt.get("closed") is not True:
                             continue
     
-                        outcome_tokens = _safe_json_load(mkt.get("tokens"))
+                        outcome_tokens = _safe_json_load(mkt.get("clobTokenIds"))
                         outcome_prices_raw = _safe_json_load(mkt.get("outcomePrices"))
     
                         if not outcome_prices_raw:
