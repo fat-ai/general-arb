@@ -4,7 +4,6 @@ import polars as pl
 import pandas as pd
 import pyarrow as pa
 import numpy as np
-from numba import njit
 import statsmodels.api as sm
 import logging
 import gc
@@ -19,7 +18,7 @@ import array
 import pickle
 import sys
 import os
-from numba import set_num_threads
+from numba import njit, prange, set_num_threads
 
 CACHE_DIR = Path("/app/polymarket_cache")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1420,11 +1419,11 @@ def main():
                 direction = 1.0 if eff_yes_bet else -1.0
 
                 if fast_signals is not None:
-                    smooth_prob  = fast_signals[0][i]
-                    marg         = fast_signals[1][i]
-                    perc_marg    = fast_signals[2][i]
-                    variance_v   = fast_signals[3][i]
-                    trust_weight = fast_signals[4][i]
+                    smooth_prob  = float(fast_signals[0][i])
+                    marg         = float(fast_signals[1][i])
+                    perc_marg    = float(fast_signals[2][i])
+                    variance_v   = float(fast_signals[3][i])
+                    trust_weight = float(fast_signals[4][i])
                 else:
                     smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
                         uid=uid, price=price, stake=inv,
