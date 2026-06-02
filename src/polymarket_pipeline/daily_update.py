@@ -15,7 +15,7 @@ import array
 
 import __main__
 from collections import defaultdict
-from sim_strat_3 import (
+from sim_strat_4 import (
     BayesianState, 
     MarketPositions,
     resolve_market, 
