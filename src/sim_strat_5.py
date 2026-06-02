@@ -866,7 +866,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     return out_prob, out_marg, out_perc, out_V, out_trust
             
 def main():
-    set_num_threads(4)
+    set_num_threads(len(os.sched_getaffinity(0)))
     ckpt_file = CACHE_DIR / "sim_checkpoint.pkl"
     is_resuming = ckpt_file.exists()
 
