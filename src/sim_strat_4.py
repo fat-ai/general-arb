@@ -1189,7 +1189,7 @@ def main():
                             data_start_date, simulation_start_date,
                             current_sim_day, heartbeat
                         )
-
+                        gc.collect()
                 # ---------------------------------------------------------
                 # B. PROCESS TRADE INTO STATE TRACKERS
                 # ---------------------------------------------------------
