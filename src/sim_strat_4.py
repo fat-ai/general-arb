@@ -1023,7 +1023,7 @@ def main():
         data_start_date = resume_data_start
         heartbeat = resume_heartbeat
         results_buffer = []
-        active_scan_cids = set()
+        # active_scan_cids = set()
     
         log.info("🔥 Streaming perfectly sorted columnar Arrow batches...")
 
@@ -1032,6 +1032,7 @@ def main():
         seen_market_ids = set()
     
         # Iterate natively through the PyArrow RecordBatchReader
+        gc.disable()
         for batch in record_batch_reader:
             
             # 1. Extract zero-copy NumPy arrays for blazing fast math
@@ -1119,7 +1120,7 @@ def main():
                 ts   = ts_list[i]
                 cid  = cids_col[i]
                 user = sys.intern(users_col[i])
-                active_scan_cids.add(cid)
+                # active_scan_cids.add(cid)
 
                 trade_day_int = int(ts * (1.0 / 86400.0))  # FIX 7
 
@@ -1503,6 +1504,7 @@ def main():
         # ==========================================
         # 5. CLEANUP
         # ==========================================
+        gc.enable()
         log.info("🧹 Cleaning up DuckDB and temporary files...")
         
         if con:
