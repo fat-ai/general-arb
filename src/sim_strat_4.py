@@ -390,8 +390,8 @@ def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
     else:
         V = max(0.0001, expected_p * (1.0 - expected_p))
 
-    primary_np  = np.frombuffer(primary_arr,  dtype=np.uint32) if len(primary_arr)  else _EMPTY_U32
-    opposing_np = np.frombuffer(opposing_arr, dtype=np.uint32) if len(opposing_arr) else _EMPTY_U32
+    primary_np  = primary_arr
+    opposing_np = opposing_arr
 
     logit_params = state.logit_model_params if state.logit_model_params is not None else _EMPTY_F64
 
@@ -475,29 +475,23 @@ def process_daily_history_merges(state, day_yes_updates, day_no_updates):
         new_arr = np.array(packed_list, dtype=np.uint32)
         new_arr.sort()
 
-        old_arr = state.user_history_yes[uid]
-        old_view = np.frombuffer(old_arr, dtype=np.uint32) if len(old_arr) else _EMPTY_U32
+        old_view = state.user_history_yes[uid]
 
         out = np.empty(len(old_view) + len(new_arr), dtype=np.uint32)
         _merge_sorted_uint32(old_view, new_arr, out)
 
-        merged = array.array('I')
-        merged.frombytes(out.tobytes())
-        state.user_history_yes[uid] = merged
+        state.user_history_yes[uid] = out
 
     for uid, packed_list in day_no_updates.items():
         new_arr = np.array(packed_list, dtype=np.uint32)
         new_arr.sort()
 
-        old_arr = state.user_history_no[uid]
-        old_view = np.frombuffer(old_arr, dtype=np.uint32) if len(old_arr) else _EMPTY_U32
+        old_view = state.user_history_no[uid]
 
         out = np.empty(len(old_view) + len(new_arr), dtype=np.uint32)
         _merge_sorted_uint32(old_view, new_arr, out)
 
-        merged = array.array('I')
-        merged.frombytes(out.tobytes())
-        state.user_history_no[uid] = merged
+        state.user_history_no[uid] = out
 
 def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState, day_yes_updates, day_no_updates):
     if r_cid not in state.contract_positions:
@@ -713,27 +707,23 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         yes_arr, yes_lens = data['yes_arr'], data['yes_lens']
         no_arr, no_lens = data['no_arr'], data['no_lens']
         
-        # 1. Re-initialize the lists (since they were empty in the Pickle)
-        state.user_history_yes = [array.array('I') for _ in range(state.next_user_id)]
-        state.user_history_no = [array.array('I') for _ in range(state.next_user_id)]
-        
+        # 1. Pre-size the history lists (shared empty sentinel for zero-history users)
+        state.user_history_yes = [_EMPTY_U32] * state.next_user_id
+        state.user_history_no  = [_EMPTY_U32] * state.next_user_id
+
         active_uids = len(yes_lens)
-        
-        # 2. Re-populate the byte arrays
-        yes_bytes = yes_arr.tobytes()
-        no_bytes  = no_arr.tobytes()
-        y_byte_idx, n_byte_idx = 0, 0
+
+        # 2. Slice each user's run out of the flat array (.copy() = writable + independent)
+        y_idx = n_idx = 0
         for i in range(active_uids):
             y_len = int(yes_lens[i])
             if y_len > 0:
-                nbytes = y_len * 4
-                state.user_history_yes[i].frombytes(yes_bytes[y_byte_idx:y_byte_idx + nbytes])
-                y_byte_idx += nbytes
+                state.user_history_yes[i] = yes_arr[y_idx:y_idx + y_len].copy()
+                y_idx += y_len
             n_len = int(no_lens[i])
             if n_len > 0:
-                nbytes = n_len * 4
-                state.user_history_no[i].frombytes(no_bytes[n_byte_idx:n_byte_idx + nbytes])
-                n_byte_idx += nbytes
+                state.user_history_no[i] = no_arr[n_idx:n_idx + n_len].copy()
+                n_idx += n_len
                 
         # 3. Restore the deques
         state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
@@ -1224,8 +1214,8 @@ def main():
                     user_map[user] = uid
                     next_user_id += 1
                     # CRITICAL: keep history slots in lockstep with user_map
-                    user_history_yes.append(array.array('I'))
-                    user_history_no.append(array.array('I'))
+                    user_history_yes.append(_EMPTY_U32)
+                    user_history_no.append(_EMPTY_U32)
 
                 u_trades = user_total_trades[uid]
 
