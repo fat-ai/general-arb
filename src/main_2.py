@@ -27,7 +27,8 @@ from sim_strat_5 import (
     CACHE_DIR,
     restore_arrays_from_npz,   
     compute_wager_and_p_true,  
-    P_RANGE
+    P_RANGE,
+    _EMPTY_U32,
 )
 import numpy as np     
 import math
@@ -788,6 +789,8 @@ class LiveTrader:
                 uid = self.state.next_user_id
                 self.state.user_map[wallet] = uid
                 self.state.next_user_id += 1
+                self.state.user_history_yes.append(_EMPTY_U32)
+                self.state.user_history_no.append(_EMPTY_U32)
                 
             u_trades = self.state.user_total_trades[uid]
             if u_trades == 0:
