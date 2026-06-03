@@ -11,11 +11,10 @@ import csv
 import shutil
 import sys
 import time
-import array
 
 import __main__
 from collections import defaultdict
-from sim_strat_4 import (
+from sim_strat_5 import (
     BayesianState, 
     MarketPositions,
     resolve_market, 
@@ -39,7 +38,7 @@ SCORES_FILE = CACHE_DIR / "user_scores.csv"
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
 
 def load_state() -> BayesianState:
-    """Loads the lightweight dictionary from Pickle and heavy arrays from NPZ."""
+    """Loads the lightweight dictionary from Pickle and heavy s from NPZ."""
 
     sim_pkl = CACHE_DIR / "sim_checkpoint.pkl"
     sim_npz = CACHE_DIR / "sim_checkpoint.npz"
@@ -414,8 +413,8 @@ def main():
                         uid = state.next_user_id
                         state.user_map[user] = uid
                         state.next_user_id += 1
-                        state.user_history_yes.append(array.array('I'))
-                        state.user_history_no.append(array.array('I'))
+                        state.user_history_yes.append(_EMPTY_U32)
+                        state.user_history_no.append(_EMPTY_U32)
                         
                     u_trades = state.user_total_trades[uid]
                     if u_trades == 0:
