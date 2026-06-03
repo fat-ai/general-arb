@@ -24,7 +24,8 @@ from sim_strat_5 import (
     restore_arrays_from_npz,
     CACHE_DIR, 
     MARKETS_FILE, 
-    TRADES_PATH
+    TRADES_PATH,
+    _EMPTY_U32,
 )
 
 __main__.MarketPositions = MarketPositions
