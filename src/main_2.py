@@ -18,7 +18,7 @@ from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, set
 from reporting import generate_institutional_report, generate_html_report
 from broker import PersistenceManager, PaperBroker, LiveBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
-from sim_strat_3 import (
+from sim_strat_5 import (
     BayesianState,
     process_trade,
     fast_numba_scan,
