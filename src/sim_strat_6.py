@@ -766,10 +766,8 @@ def build_flat_histories(state):
     """Concatenate all per-user histories into global flat arrays + offsets, once.
     Rebuilt only when histories change (daily merge); the parallel kernel slices
     each user's history out of these by uid — no per-batch copy.
-    Also rebinds state.user_history_yes/no to zero-copy VIEWS into the flat, so the
-    data is stored ONCE (no duplicate copy) — steady-state RAM matches the current
-    per-user-list footprint. The old per-user arrays are freed.
-    Returns (yes_flat, yes_off, no_flat, no_off, coverage)."""
+    Rebinds the per-user histories to zero-copy VIEWS into the flat (data stored
+    once). Returns (yes_flat, yes_off, no_flat, no_off, coverage)."""
     n = state.next_user_id
     uhy, uhn = state.user_history_yes, state.user_history_no
 
@@ -781,11 +779,16 @@ def build_flat_histories(state):
     yes_flat = np.concatenate(uhy) if n else _EMPTY_U32
     no_flat  = np.concatenate(uhn) if n else _EMPTY_U32
 
-    state.user_history_yes = [yes_flat[yes_off[u]:yes_off[u + 1]] for u in range(n)]
-    state.user_history_no  = [no_flat[no_off[u]:no_off[u + 1]]   for u in range(n)]
+    # IN-PLACE slice-assign, NOT reassign. The main loop holds a per-batch alias
+    # (user_history_yes = state.user_history_yes) and appends new wallets to it.
+    # Reassigning state.* to a fresh list would orphan those appends and desync the
+    # two, causing process_trade to read a too-short list -> IndexError. Slice
+    # assignment mutates the SAME list object, so every alias stays valid.
+    state.user_history_yes[:] = [yes_flat[yes_off[u]:yes_off[u + 1]] for u in range(n)]
+    state.user_history_no[:]  = [no_flat[no_off[u]:no_off[u + 1]]   for u in range(n)]
 
     return yes_flat, yes_off, no_flat, no_off, n
-  
+        
 def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              invested_list, is_buying_list, eff_yes_list, users_col,
                              simulation_start_date, state,
