@@ -117,19 +117,20 @@ for i in range(TIME_LUT_SIZE):
 
 @njit(parallel=True, cache=True)
 def compute_signals_parallel(
-        didx, is_yes_dir, primary_pi, opposing_pi, cur_log_ttr,
+        is_yes_dir, primary_pi, opposing_pi, cur_log_ttr,
         expected_p, price, stake, ttr_hours, V, brier_s, brier_c,
-        yes_flat, yes_off, no_flat, no_off,
+        yes_flat, no_flat, yes_start, yes_end, no_start, no_end,
         logit, price_lut, time_lut, p_range,
         out_prob, out_marg, out_perc, out_trust):
-    for i in prange(len(didx)):
-        d = didx[i]
+    for i in prange(len(is_yes_dir)):
+        ys, ye = yes_start[i], yes_end[i]
+        ns, ne = no_start[i], no_end[i]
         if is_yes_dir[i]:
-            primary  = yes_flat[yes_off[d]:yes_off[d+1]]
-            opposing = no_flat[no_off[d]:no_off[d+1]]
+            primary  = yes_flat[ys:ye]
+            opposing = no_flat[ns:ne]
         else:
-            primary  = no_flat[no_off[d]:no_off[d+1]]
-            opposing = yes_flat[yes_off[d]:yes_off[d+1]]
+            primary  = no_flat[ns:ne]
+            opposing = yes_flat[ys:ye]
         sp, mg, pm, tm = _process_trade_core(
             primary, opposing, primary_pi[i], opposing_pi[i], cur_log_ttr[i],
             expected_p[i], price[i], stake[i], ttr_hours[i], V[i],
@@ -761,11 +762,39 @@ def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
         state.user_brier_sum = data['user_brier_sum'].copy()
         state.user_brier_count = data['user_brier_count'].copy()
 
+def build_flat_histories(state):
+    """Concatenate all per-user histories into global flat arrays + offsets, once.
+    Rebuilt only when histories change (daily merge); the parallel kernel slices
+    each user's history out of these by uid — no per-batch copy.
+    Rebinds the per-user histories to zero-copy VIEWS into the flat (data stored
+    once). Returns (yes_flat, yes_off, no_flat, no_off, coverage)."""
+    n = state.next_user_id
+    uhy, uhn = state.user_history_yes, state.user_history_no
+
+    yes_lens = np.array([len(a) for a in uhy], dtype=np.int64)
+    no_lens  = np.array([len(a) for a in uhn], dtype=np.int64)
+    yes_off = np.zeros(n + 1, dtype=np.int64); np.cumsum(yes_lens, out=yes_off[1:])
+    no_off  = np.zeros(n + 1, dtype=np.int64); np.cumsum(no_lens,  out=no_off[1:])
+
+    yes_flat = np.concatenate(uhy) if n else _EMPTY_U32
+    no_flat  = np.concatenate(uhn) if n else _EMPTY_U32
+
+    # IN-PLACE slice-assign, NOT reassign. The main loop holds a per-batch alias
+    # (user_history_yes = state.user_history_yes) and appends new wallets to it.
+    # Reassigning state.* to a fresh list would orphan those appends and desync the
+    # two, causing process_trade to read a too-short list -> IndexError. Slice
+    # assignment mutates the SAME list object, so every alias stays valid.
+    state.user_history_yes[:] = [yes_flat[yes_off[u]:yes_off[u + 1]] for u in range(n)]
+    state.user_history_no[:]  = [no_flat[no_off[u]:no_off[u + 1]]   for u in range(n)]
+
+    return yes_flat, yes_off, no_flat, no_off, n
+        
 def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              invested_list, is_buying_list, eff_yes_list, users_col,
-                             simulation_start_date, state, price_lut, time_lut, p_range):
+                             simulation_start_date, state,
+                             yes_flat, yes_off, no_flat, no_off, coverage,
+                             price_lut, time_lut, p_range):
     user_map = state.user_map
-    uhy, uhn = state.user_history_yes, state.user_history_no
     bsum, bcnt = state.user_brier_sum, state.user_brier_count
     ay, by, cy = state.poly_coeffs_yes
     an, bn, cn = state.poly_coeffs_no
@@ -775,10 +804,10 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     out_prob = np.zeros(num_rows); out_marg = np.zeros(num_rows)
     out_perc = np.zeros(num_rows); out_V = np.zeros(num_rows); out_trust = np.zeros(num_rows)
 
-    dense = {}; hy_list = []; hn_list = []
-    elig_idx = []; didx_l = []; isyes_l = []
+    elig_idx = []; isyes_l = []
     ppi_l = []; opi_l = []; clt_l = []; ep_l = []; pr_l = []
     st_l = []; ttr_l = []; V_l = []; bs_l = []; bc_l = []
+    ys_l = []; ye_l = []; ns_l = []; ne_l = []
 
     for i in range(num_rows):
         if not valid_list[i]:
@@ -823,42 +852,39 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
 
         user = users_col[i]
         uid = user_map.get(user)
-        d = dense.get(user)
-        if d is None:
-            d = len(dense); dense[user] = d
-            if uid is None:
-                hy_list.append(_EMPTY_U32); hn_list.append(_EMPTY_U32)
-            else:
-                hy_list.append(uhy[uid]); hn_list.append(uhn[uid])
+        # uid present and within the flat's coverage -> real history slice.
+        # uid is None, or beyond coverage (added after the flat was built) -> empty,
+        # which matches the old gather's empty-for-new-users behaviour exactly.
+        if uid is None or uid >= coverage:
+            ys = ye = ns = ne = 0
+        else:
+            ys = int(yes_off[uid]); ye = int(yes_off[uid + 1])
+            ns = int(no_off[uid]);  ne = int(no_off[uid + 1])
+
         bs = 0.0 if uid is None else bsum[uid]
         bc = 0   if uid is None else bcnt[uid]
 
-        elig_idx.append(i); didx_l.append(d); isyes_l.append(eff_yes)
+        elig_idx.append(i); isyes_l.append(eff_yes)
         ppi_l.append(ppi); opi_l.append(opi); clt_l.append(cur_log_ttr)
         ep_l.append(expected_p); pr_l.append(price); st_l.append(stake)
         ttr_l.append(ttr_hours); V_l.append(V); bs_l.append(bs); bc_l.append(bc)
+        ys_l.append(ys); ye_l.append(ye); ns_l.append(ns); ne_l.append(ne)
         out_V[i] = V
 
     n = len(elig_idx)
     if n == 0:
         return out_prob, out_marg, out_perc, out_V, out_trust
 
-    nd = len(dense)
-    yes_off = np.zeros(nd + 1, dtype=np.int64); no_off = np.zeros(nd + 1, dtype=np.int64)
-    for d in range(nd):
-        yes_off[d+1] = yes_off[d] + len(hy_list[d])
-        no_off[d+1]  = no_off[d]  + len(hn_list[d])
-    yes_flat = np.ascontiguousarray(np.concatenate(hy_list), dtype=np.uint32)
-    no_flat  = np.ascontiguousarray(np.concatenate(hn_list), dtype=np.uint32)
-
-    didx = np.array(didx_l, np.int64); isyes = np.array(isyes_l, np.bool_)
+    isyes = np.array(isyes_l, np.bool_)
     ppi = np.array(ppi_l, np.int64); opi = np.array(opi_l, np.int64); clt = np.array(clt_l, np.int64)
     ep = np.array(ep_l); pr = np.array(pr_l); st = np.array(st_l)
     ttr = np.array(ttr_l); Vv = np.array(V_l); bs = np.array(bs_l); bc = np.array(bc_l, np.uint32)
+    ys = np.array(ys_l, np.int64); ye = np.array(ye_l, np.int64)
+    ns = np.array(ns_l, np.int64); ne = np.array(ne_l, np.int64)
 
     cp = np.zeros(n); cm = np.zeros(n); cpe = np.zeros(n); ct = np.zeros(n)
-    compute_signals_parallel(didx, isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
-                             yes_flat, yes_off, no_flat, no_off,
+    compute_signals_parallel(isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
+                             yes_flat, no_flat, ys, ye, ns, ne,
                              logit, price_lut, time_lut, p_range, cp, cm, cpe, ct)
 
     eidx = np.array(elig_idx, np.int64)
@@ -1074,12 +1100,12 @@ def main():
         _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
     )
   
-    _do = np.array([0, 1], np.int64); _df = np.zeros(1, np.uint32); _o = np.zeros(1)
+    _i1 = np.zeros(1, np.int64); _f1 = np.zeros(1); _df = np.zeros(1, np.uint32)
     compute_signals_parallel(
-        np.zeros(1, np.int64), np.zeros(1, np.bool_), np.zeros(1, np.int64),
-        np.zeros(1, np.int64), np.zeros(1, np.int64), _o, _o, _o, _o, _o, _o,
-        np.zeros(1, np.uint32), _df, _do, _df, _do,
-        _EMPTY_F64, PRICE_LUT, TIME_LUT, P_RANGE, _o, _o, _o, _o)
+        np.zeros(1, np.bool_), _i1, _i1, _i1,
+        _f1, _f1, _f1, _f1, _f1, _f1, np.zeros(1, np.uint32),
+        _df, _df, _i1, _i1, _i1, _i1,
+        _EMPTY_F64, PRICE_LUT, TIME_LUT, P_RANGE, _f1, _f1, _f1, _f1)
   
     log.info("✅ Numba JIT warmed up and locked.")
 
@@ -1156,6 +1182,10 @@ def main():
     
         # Iterate natively through the PyArrow RecordBatchReader
         gc.disable()
+        hist_yes_flat = hist_no_flat = None
+        hist_yes_off = hist_no_off = None
+        hist_coverage = 0
+        hist_dirty = True
         for batch in record_batch_reader:
             
             # 1. Extract zero-copy NumPy arrays for blazing fast math
@@ -1240,10 +1270,14 @@ def main():
             if data_start_date is not None and current_sim_day is not None:
                 _dv = (ts_col[valid_mask] * (1.0/86400.0)).astype(np.int64)
                 if _dv.size and int(_dv.min()) == current_sim_day and int(_dv.max()) == current_sim_day:
+                    if hist_dirty or hist_yes_flat is None:
+                        hist_yes_flat, hist_yes_off, hist_no_flat, hist_no_off, hist_coverage = build_flat_histories(state)
+                        hist_dirty = False
                     fast_signals = precompute_batch_signals(
                         num_rows, valid_list, m_refs, ts_list, prices_list, invested_list,
-                        is_buying_list, eff_yes_list, users_col, simulation_start_date,
-                        state, PRICE_LUT, TIME_LUT, P_RANGE)
+                        is_buying_list, eff_yes_list, users_col, simulation_start_date, state,
+                        hist_yes_flat, hist_yes_off, hist_no_flat, hist_no_off, hist_coverage,
+                        PRICE_LUT, TIME_LUT, P_RANGE)
 
             # 6. Chronological State Machine Loop
             for i in range(num_rows):
@@ -1287,7 +1321,8 @@ def main():
                         resolve_market(r_cid, outcome, outcome_label, current_day_ts, state, day_yes_updates, day_no_updates)
 
                     process_daily_history_merges(state, day_yes_updates, day_no_updates)
-
+                    hist_dirty = True
+                  
                     orphan_cutoff_ts = current_day_ts - 864000.0
                     purge_cids = []
                     for c, m_data in market_map.items():
