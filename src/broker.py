@@ -335,9 +335,9 @@ class PaperBroker(BaseBroker):
 #  in main_2.py keeps working untouched.
 #
 #  pip install py-clob-client-v2 web3
-#  env: POLYMARKET_PK, POLYMARKET_SIG_TYPE (0 = EOA, recommended)
+#  Key is passed in (resolved via secrets_gcp), NOT read from the environment.
+#  env still used only for non-secret POLYMARKET_SIG_TYPE (0 = EOA).
 #  Collateral is pUSD — fund by wrapping USDC.e (see set_allowances.py).
-#  Confirm exact SDK method/arg names with verify_setup.py before trusting.
 # ======================================================================== #
 class LiveBroker(BaseBroker):
     is_paper = False
@@ -345,8 +345,10 @@ class LiveBroker(BaseBroker):
     HOST = "https://clob.polymarket.com"
     CHAIN_ID = 137  # 80002 = Amoy testnet for dry runs
 
-    def __init__(self, persistence: PersistenceManager):
+    def __init__(self, persistence: PersistenceManager, private_key: str):
         super().__init__(persistence)
+        if not private_key:
+            raise ValueError("LiveBroker requires a private_key (resolve it via secrets_gcp).")
 
         # Lazy import so pure-paper users don't need the V2 client installed.
         import py_clob_client_v2 as v2
@@ -354,7 +356,7 @@ class LiveBroker(BaseBroker):
         self._MarketOrderArgs = v2.MarketOrderArgs
         self._Side = v2.Side
 
-        pk = os.environ["POLYMARKET_PK"]
+        pk = private_key
         sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "0"))  # 0 = EOA
         self.sig_type = sig_type
 
