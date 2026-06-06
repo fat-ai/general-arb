@@ -1214,4 +1214,8 @@ async def main():
             await trader.shutdown()
 
 if __name__ == "__main__":
+    import os, getpass
+    from config import CONFIG
+    if CONFIG.get("live_trading") and not os.environ.get("POLYMARKET_PK"):
+        os.environ["POLYMARKET_PK"] = getpass.getpass("Enter wallet private key (live): ")
     asyncio.run(main())
