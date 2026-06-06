@@ -56,9 +56,9 @@ def _safe_json_load(x):
 
 
 class LiveTrader:
-    def __init__(self):
+    def __init__(self, private_key=None):
         self.persistence = PersistenceManager()
-        self.broker = LiveBroker(self.persistence) if CONFIG.get("live_trading") else PaperBroker(self.persistence)
+        self.broker = LiveBroker(self.persistence, private_key) if CONFIG.get("live_trading") else PaperBroker(self.persistence)
         self.metadata = MarketMetadata()
         self.sub_manager = SubscriptionManager()
         self.state = None
@@ -1199,10 +1199,10 @@ class LiveTrader:
             
             await asyncio.sleep(60)
             
-async def main():
+async def main(private_key=None):
     trader = None
     try:
-        trader = LiveTrader()
+        trader = LiveTrader(private_key)
         await trader.start()
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
@@ -1214,8 +1214,6 @@ async def main():
             await trader.shutdown()
 
 if __name__ == "__main__":
-    import os, getpass
-    from config import CONFIG
-    if CONFIG.get("live_trading") and not os.environ.get("POLYMARKET_PK"):
-        os.environ["POLYMARKET_PK"] = getpass.getpass("Enter wallet private key (live): ")
-    asyncio.run(main())
+    from secrets_gcp import resolve_private_key
+    pk = resolve_private_key() if CONFIG.get("live_trading") else None
+    asyncio.run(main(pk))
