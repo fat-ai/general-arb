@@ -59,6 +59,9 @@ CTF_ABI = [
      "outputs": [{"name": "", "type": "bool"}]},
     {"name": "setApprovalForAll", "type": "function", "stateMutability": "nonpayable",
      "inputs": [{"name": "operator", "type": "address"}, {"name": "approved", "type": "bool"}], "outputs": []},
+    {"name": "balanceOf", "type": "function", "stateMutability": "view",
+     "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+     "outputs": [{"name": "", "type": "uint256"}]},
 ]
 ADAPTER_ABI = [
     {"name": "redeemPositions", "type": "function", "stateMutability": "nonpayable",
@@ -707,20 +710,226 @@ class LiveBroker(BaseBroker):
         except Exception as e:
             print(f"Data API check FAILED: {e}")
 
-    # ---- reconciliation: pull real balance so the mirror can't drift ---- #
-    async def sync_state_from_chain(self):
-        """Overwrite mirrored cash with the real CLOB balance. Call at startup
-        (and periodically) in live mode. Positions reconciliation via the Data
-        API is a recommended TODO."""
+    # ---- reconciliation: make the mirror match on-chain / CLOB truth ----- #
+    @staticmethod
+    def _parse_iso_ts(s):
+        if not s:
+            return None
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            bal = await asyncio.to_thread(
-                self.client.get_balance_allowance,
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            real_cash = float(bal.get("balance", 0)) / 1e6
-            log.info(f"🔄 Balance sync: mirror ${self.pm.state['cash']:.2f} -> real ${real_cash:.2f}")
-            self.pm.state["cash"] = real_cash
-            await self.pm.save_async()
+            from datetime import datetime
+            return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+
+    def _fetch_real_cash(self):
+        """Real pUSD collateral balance via the CLOB (authoritative). None on error."""
+        try:
+            try:
+                BAP, AT = self._v2.BalanceAllowanceParams, self._v2.AssetType
+            except AttributeError:
+                from py_clob_client_v2.clob_types import BalanceAllowanceParams as BAP, AssetType as AT
+            bal = self.client.get_balance_allowance(BAP(asset_type=AT.COLLATERAL))
+            raw = bal.get("balance", 0) if isinstance(bal, dict) else getattr(bal, "balance", 0)
+            return float(raw) / 1e6
         except Exception as e:
-            log.error(f"Balance sync failed: {e}")
+            log.error(f"reconcile: collateral balance read failed: {e}")
+            return None
+
+    def _fetch_api_positions(self):
+        """All currently-held positions per Polymarket's Data API (discovery)."""
+        import requests
+        r = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": self.address, "sizeThreshold": 0, "limit": 500},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        return data if isinstance(data, list) else []
+
+    def _reconcile_blocking(self, mirror_snapshot, cross_check_chain):
+        """Pure reads — CLOB balance, Data API, and on-chain CTF.balanceOf — that
+        produce a per-token action plan. Does NOT mutate state (the async caller
+        applies the plan under the lock). Returns {real_cash, tokens, errors}."""
+        Web3 = self._Web3
+        DUST, QEPS = 1e-6, 1e-4
+        report = {"real_cash": self._fetch_real_cash(), "tokens": {}, "errors": []}
+
+        api_map = {}
+        try:
+            for p in self._fetch_api_positions():
+                tid = str(p.get("asset") or p.get("tokenId") or p.get("token_id") or "")
+                if not tid:
+                    continue
+                api_map[tid] = {
+                    "qty": float(p.get("size", 0) or 0),
+                    "avg": float(p.get("avgPrice", 0) or 0) or None,
+                    "conditionId": p.get("conditionId") or p.get("condition_id"),
+                    "neg": p.get("negativeRisk", p.get("negRisk")),
+                    "endDate_ts": self._parse_iso_ts(p.get("endDate")),
+                    "title": p.get("title") or p.get("slug"),
+                }
+        except Exception as e:
+            report["errors"].append(f"data-api: {e}")
+
+        union = set(mirror_snapshot.keys()) | set(api_map.keys())
+
+        ctf = None
+        if cross_check_chain and union:
+            try:
+                w3 = self._get_w3()
+                ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDR), abi=CTF_ABI)
+            except Exception as e:
+                report["errors"].append(f"rpc: {e}")
+
+        def chain_qty(tid):
+            if ctf is None:
+                return None
+            try:
+                return float(ctf.functions.balanceOf(self.address, int(tid)).call()) / 1e6
+            except Exception as e:
+                report["errors"].append(f"balanceOf {tid[:10]}: {e}")
+                return None
+
+        for tid in union:
+            in_mirror = tid in mirror_snapshot
+            api = api_map.get(tid)
+            cq = chain_qty(tid)  # None => could not verify on-chain
+            meta = {k: (api or {}).get(k) for k in ("conditionId", "neg", "endDate_ts", "title")}
+
+            if cq is not None and cq > DUST:                      # chain confirms a holding
+                avg = api["avg"] if (api and api["avg"]) else None
+                if in_mirror:
+                    diff = abs(float(mirror_snapshot[tid].get("qty", 0)) - cq) > QEPS
+                    act = "update" if diff else "keep"
+                    note = (f"qty {mirror_snapshot[tid].get('qty', 0):.4f} -> {cq:.4f} (chain)"
+                            if diff else f"qty {cq:.4f} ok (chain)")
+                else:
+                    act, note = "add", f"discovered {cq:.4f} on-chain ({'in api' if api else 'NOT in api'})"
+                report["tokens"][tid] = {"action": act, "qty": cq, "avg": avg, "note": note, **meta}
+
+            elif cq is not None:                                  # chain says ~0
+                if api and api["qty"] > DUST:
+                    report["tokens"][tid] = {"action": "conflict_keep", "qty": api["qty"], "avg": api["avg"],
+                        "note": f"CONFLICT: api size={api['qty']:.4f} but on-chain ~0; kept, verify manually", **meta}
+                elif in_mirror:
+                    report["tokens"][tid] = {"action": "remove",
+                        "note": "on-chain ~0 and not in api -> closed/settled"}
+
+            else:                                                 # chain unverified
+                if api and api["qty"] > DUST:
+                    if in_mirror:
+                        diff = abs(float(mirror_snapshot[tid].get("qty", 0)) - api["qty"]) > QEPS
+                        act = "update" if diff else "keep"
+                        note = (f"qty {mirror_snapshot[tid].get('qty', 0):.4f} -> {api['qty']:.4f} (api; chain unverified)"
+                                if diff else f"qty {api['qty']:.4f} ok (api; chain unverified)")
+                    else:
+                        act, note = "add", f"discovered {api['qty']:.4f} via api (chain unverified)"
+                    report["tokens"][tid] = {"action": act, "qty": api["qty"], "avg": api["avg"], "note": note, **meta}
+                elif in_mirror:
+                    report["tokens"][tid] = {"action": "unverified_keep",
+                        "note": "could not verify on-chain and not in api; kept (no delete on uncertainty)"}
+        return report
+
+    async def reconcile_state_from_chain(self, *, apply: bool = True, cross_check_chain: bool = True) -> dict:
+        """Reconcile the mirror (cash + positions) against on-chain / CLOB truth.
+
+        Source of truth: cash = CLOB pUSD collateral balance (overwrite). Positions
+        = Polymarket Data API for discovery, cross-checked against CTF.balanceOf
+        on-chain for trustless quantities. A position is DELETED only when the
+        chain confirms ~0 AND the Data API doesn't list it; any disagreement is
+        kept and flagged so a transient RPC/indexer hiccup never strands funds.
+
+        apply=False => dry run (logs the plan, mutates nothing). Returns a report.
+        Discovered ("untracked") positions are added so equity is correct and are
+        tagged untracked=True; they carry conditionId so redemption works, but
+        have no market_fpmm so the resolution loop won't auto-monitor them — they
+        are logged loudly for you to wire up or close manually.
+        """
+        async with self.lock:
+            snapshot = {tid: dict(p) for tid, p in self.pm.state.get("positions", {}).items()}
+            rep = await asyncio.to_thread(self._reconcile_blocking, snapshot, cross_check_chain)
+
+            toks = rep["tokens"]
+            by = lambda a: [(t, d) for t, d in toks.items() if d["action"] == a]
+            added, changed, removed = by("add"), by("update"), by("remove")
+            conflicts, unverified = by("conflict_keep"), by("unverified_keep")
+
+            state = self.pm.state
+            mirror_cash = float(state.get("cash", 0.0))
+            real_cash = rep.get("real_cash")
+            cash_delta = (real_cash - mirror_cash) if real_cash is not None else None
+            changed_any = bool(added or changed or removed) or (cash_delta is not None and abs(cash_delta) > 1e-4)
+
+            # Visible audit trail (logged whether or not we apply).
+            if cash_delta is not None and abs(cash_delta) > 1e-4:
+                log.warning(f"🔄 cash drift: mirror ${mirror_cash:.2f} -> real ${real_cash:.2f} (Δ ${cash_delta:+.2f})")
+            elif real_cash is None:
+                log.error("🔄 cash: could not read real collateral balance; leaving mirror cash unchanged")
+            for t, d in changed:   log.warning(f"🔄 adjust {t[:12]}…: {d['note']}")
+            for t, d in removed:   log.warning(f"🔄 drop   {t[:12]}…: {d['note']}")
+            for t, d in added:     log.warning(f"🔄 NEW    {t[:12]}…: {d['note']} "
+                                               f"(untracked: redeem works via conditionId, but NOT auto-monitored)")
+            for t, d in conflicts: log.error(  f"🔄 CONFLICT {t[:12]}…: {d['note']}")
+            for t, d in unverified:log.warning(f"🔄 unverified {t[:12]}…: {d['note']}")
+            for e in rep.get("errors", []):    log.warning(f"🔄 read issue: {e}")
+
+            if apply:
+                positions = state["positions"]
+
+                def _untracked_entry(d):
+                    return {
+                        "qty": d["qty"], "avg_price": d.get("avg") or 0.0,
+                        "market_fpmm": None, "opened_at": time.time(),
+                        "market_end": d.get("endDate_ts") or 0.0,
+                        "conditionId": d.get("conditionId"),
+                        "neg_risk": (bool(d["neg"]) if d.get("neg") is not None else None),
+                        "untracked": True,
+                    }
+
+                for t, _ in removed:
+                    positions.pop(t, None)
+                for t, d in changed:
+                    p = positions.get(t)
+                    if not p:
+                        continue
+                    p["qty"] = d["qty"]
+                    if d.get("avg"):
+                        p["avg_price"] = d["avg"]
+                    if d.get("conditionId") and not p.get("conditionId"):
+                        p["conditionId"] = d["conditionId"]
+                    if d.get("neg") is not None and p.get("neg_risk") is None:
+                        p["neg_risk"] = bool(d["neg"])
+                for t, d in added:
+                    positions[t] = _untracked_entry(d)
+                for t, d in conflicts:
+                    if t not in positions:          # api claims it, chain ~0, mirror absent
+                        positions[t] = _untracked_entry(d)
+                    # else: keep the existing mirror entry untouched
+
+                if real_cash is not None:
+                    state["cash"] = real_cash
+                eq = self.pm.calculate_equity()
+                if eq > state.get("highest_equity", 0):
+                    state["highest_equity"] = eq
+                if changed_any:
+                    await self.pm.save_async()
+
+            summary = (f"cash Δ {('$%+.2f' % cash_delta) if cash_delta is not None else 'n/a'}, "
+                       f"+{len(added)} new, ~{len(changed)} adjusted, -{len(removed)} closed, "
+                       f"{len(conflicts)} conflict, {len(unverified)} unverified")
+            log.info(f"🔄 Reconcile {'applied' if apply else 'DRY-RUN'}: {summary}")
+            return {"summary": summary, "changed_any": changed_any, "cash_delta": cash_delta,
+                    "added": added, "changed": changed, "removed": removed,
+                    "conflicts": conflicts, "unverified": unverified, "errors": rep.get("errors", [])}
+
+    async def sync_state_from_chain(self):
+        """Cash-only refresh. Superseded by reconcile_state_from_chain (which also
+        reconciles positions); kept for callers that want just a fast cash sync."""
+        real_cash = await asyncio.to_thread(self._fetch_real_cash)
+        if real_cash is None:
+            return
+        log.info(f"🔄 Balance sync: mirror ${self.pm.state['cash']:.2f} -> real ${real_cash:.2f}")
+        self.pm.state["cash"] = real_cash
+        await self.pm.save_async()
