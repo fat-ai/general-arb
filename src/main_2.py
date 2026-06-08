@@ -649,30 +649,38 @@ class LiveTrader:
     
                         for token_id in market_map.get(fpmm_id, []):
                             pos = positions.get(token_id)
-                            if not pos or pos.get("redeemed"):
+                            if not pos:
                                 continue
-    
+
                             is_winner = outcome_tokens[winner_idx] == token_id
                             payout = 1.0 if is_winner else 0.0
-    
-                            pos["redeemed"] = True
-                            await self.persistence.save_async()
-    
+
+                            # redeem_position is atomic + idempotent: it books
+                            # proceeds and removes the position ONLY on confirmed
+                            # settlement, returns False if the market isn't
+                            # redeemable on-chain yet (UMA not reported), and
+                            # raises only on a real failure. No optimistic
+                            # pre-marking → an interrupted run never strands a
+                            # winner; it just retries next cycle.
                             try:
-                                await self.broker.redeem_position(
+                                done = await self.broker.redeem_position(
                                     token_id, payout,
                                     condition_id=mkt.get("conditionId"),
                                     neg_risk=bool(mkt.get("negRisk", False)),
                                     outcome_index=outcome_tokens.index(token_id) if token_id in outcome_tokens else None,
                                 )
-                                redeemed_any = True
-                                log.info(
-                                    f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
-                                    f"Token: {token_id} | Win: {is_winner}"
-                                )
+                                if done:
+                                    redeemed_any = True
+                                    log.info(
+                                        f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
+                                        f"Token: {token_id} | Win: {is_winner}"
+                                    )
+                                else:
+                                    log.debug(
+                                        f"⏳ {token_id} resolved on Gamma but not yet "
+                                        f"redeemable on-chain; will retry."
+                                    )
                             except Exception as e:
-                                pos["redeemed"] = False
-                                await self.persistence.save_async()
                                 log.error(f"Redeem failed for {token_id}: {e}")
     
                     except Exception as e:
