@@ -15,7 +15,7 @@ services:
 
       - ~/config.py:/app/config.py
 
-      - ~/sim_strat_3.py:/app/sim_strat_5.py
+      - ~/sim_strat_5.py:/app/sim_strat_5.py
       
     environment:
       - PYTHONUNBUFFERED=1
