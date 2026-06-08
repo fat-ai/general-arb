@@ -131,6 +131,16 @@ class LiveTrader:
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
 
+        # 3b. RECONCILE MIRROR AGAINST CHAIN before any trading begins, so cash,
+        #     positions and equity reflect on-chain/CLOB truth (not a stale file).
+        if not self.broker.is_paper:
+            try:
+                log.info("🔄 Reconciling state against chain before start...")
+                report = await self.broker.reconcile_state_from_chain(apply=True)
+                log.info(f"🔄 Startup reconcile: {report['summary']}")
+            except Exception as e:
+                log.error(f"Startup reconcile failed (continuing with mirror as-is): {e}")
+
         # 4. START LOOPS
         await asyncio.gather(
             self._subscription_monitor_loop(), 
@@ -1109,6 +1119,8 @@ class LiveTrader:
         Refreshes market metadata hourly to catch NEW markets.
         """
         last_metadata_refresh = time.time()
+        last_reconcile = time.time()
+        reconcile_interval = CONFIG.get("reconcile_interval_s", 1800)  # default 30 min
 
         while self.running:
             await asyncio.sleep(60)
@@ -1121,6 +1133,17 @@ class LiveTrader:
                 self.sub_manager.dirty = True
                 
                 last_metadata_refresh = time.time()
+
+            # Periodic state reconciliation against chain/CLOB (live only).
+            if not self.broker.is_paper and time.time() - last_reconcile > reconcile_interval:
+                try:
+                    report = await self.broker.reconcile_state_from_chain(apply=True)
+                    if report["changed_any"]:
+                        log.warning(f"🔄 Periodic reconcile adjusted state: {report['summary']}")
+                except Exception as e:
+                    log.error(f"Periodic reconcile failed: {e}")
+                finally:
+                    last_reconcile = time.time()
 
     async def _reporting_loop(self):
         """Generates and prints the institutional report every 5 minutes."""
