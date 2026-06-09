@@ -117,12 +117,19 @@ for i in range(TIME_LUT_SIZE):
 
 @njit(parallel=True, cache=True)
 def compute_signals_parallel(
+        order,
         is_yes_dir, primary_pi, opposing_pi, cur_log_ttr,
         expected_p, price, stake, ttr_hours, V, brier_s, brier_c,
         yes_flat, no_flat, yes_start, yes_end, no_start, no_end,
         logit, price_lut, time_lut, p_range,
         out_prob, out_marg, out_perc, out_trust):
-    for i in prange(len(is_yes_dir)):
+    # `order` is a permutation of [0, n) (uid-sorted). Processing in this order makes
+    # each prange chunk sweep a contiguous, uid-ordered region of the flat
+    # (cache/prefetch-friendly). Results are written to the ORIGINAL index out_*[i],
+    # and there is no cross-iteration accumulation, so the output arrays are
+    # byte-identical to any other processing order.
+    for k in prange(len(order)):
+        i = order[k]
         ys, ye = yes_start[i], yes_end[i]
         ns, ne = no_start[i], no_end[i]
         if is_yes_dir[i]:
@@ -910,6 +917,9 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     logit = state.logit_model_params if state.logit_model_params is not None else _EMPTY_F64
     sim_start = simulation_start_date
 
+    ys_l = []; ye_l = []; ns_l = []; ne_l = []
+    uid_l = []
+
     out_prob = np.zeros(num_rows); out_marg = np.zeros(num_rows)
     out_perc = np.zeros(num_rows); out_V = np.zeros(num_rows); out_trust = np.zeros(num_rows)
 
@@ -978,6 +988,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
         ep_l.append(expected_p); pr_l.append(price); st_l.append(stake)
         ttr_l.append(ttr_hours); V_l.append(V); bs_l.append(bs); bc_l.append(bc)
         ys_l.append(ys); ye_l.append(ye); ns_l.append(ns); ne_l.append(ne)
+        uid_l.append(uid if uid is not None else -1)
         out_V[i] = V
 
     n = len(elig_idx)
@@ -991,8 +1002,14 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     ys = np.array(ys_l, np.int64); ye = np.array(ye_l, np.int64)
     ns = np.array(ns_l, np.int64); ne = np.array(ne_l, np.int64)
 
+    # uid-locality: process trades in uid order so each prange chunk sweeps a
+    # contiguous region of the uid-ordered flat. Stable = deterministic; outputs
+    # are written to original indices, so this changes no value.
+    order = np.argsort(np.array(uid_l, np.int64), kind='stable').astype(np.int64)
+
     cp = np.zeros(n); cm = np.zeros(n); cpe = np.zeros(n); ct = np.zeros(n)
-    compute_signals_parallel(isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
+    compute_signals_parallel(order,
+                             isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
                              yes_flat, no_flat, ys, ye, ns, ne,
                              logit, price_lut, time_lut, p_range, cp, cm, cpe, ct)
 
@@ -1211,6 +1228,7 @@ def main():
   
     _i1 = np.zeros(1, np.int64); _f1 = np.zeros(1); _df = np.zeros(1, np.uint32)
     compute_signals_parallel(
+        _i1,
         np.zeros(1, np.bool_), _i1, _i1, _i1,
         _f1, _f1, _f1, _f1, _f1, _f1, np.zeros(1, np.uint32),
         _df, _df, _i1, _i1, _i1, _i1,
