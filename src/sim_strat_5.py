@@ -140,20 +140,27 @@ def compute_signals_parallel(
 @njit(cache=True)
 def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
     """
-    Compiled to machine code via Numba. Executes custom binary search and
-    bitwise unpacking natively on Python arrays. Zero-copy, zero-lock.
+    Compiled to machine code via Numba. Binary search + bitwise unpacking,
+    now with an inner log_ttr-band prune per price bucket. Bit-identical to the
+    original full-window scan (skipped entries contribute exactly 0.0; kept
+    entries summed in identical order).
     """
     n = 0.0
     w = 0.0
-    
+ 
+    H = len(history_array)
+    if H == 0:
+        return n, w
+ 
+    # ---- price window bounds (UNCHANGED from the original) ----
     min_p = max(0, center_p_int - p_range)
     max_p = min(1000, center_p_int + p_range)
-    
+ 
     left_bound = np.uint32(np.int64(min_p) << 22)
     right_bound = np.uint32((np.int64(max_p + 1) << 22) - 1)
-    
-    # 1. Custom C-speed Binary Search for Left Bound
-    left, right = 0, len(history_array)
+ 
+    # binary search: start_idx = first index with packed >= left_bound
+    left, right = 0, H
     while left < right:
         mid = (left + right) // 2
         if history_array[mid] < left_bound:
@@ -161,9 +168,9 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
         else:
             right = mid
     start_idx = left
-    
-    # 2. Custom C-speed Binary Search for Right Bound
-    left, right = start_idx, len(history_array)
+ 
+    # binary search: end_idx = first index with packed > right_bound
+    left, right = start_idx, H
     while left < right:
         mid = (left + right) // 2
         if history_array[mid] <= right_bound:
@@ -171,27 +178,88 @@ def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr
         else:
             right = mid
     end_idx = left
-    
-    # 3. Fast Traversal
-    for i in range(start_idx, end_idx):
-        packed = history_array[i]
-        
-        hist_price_int = packed >> 22
-        hist_log_ttr = (packed >> 1) & 0x1FFFFF 
-        hist_outcome = packed & 1
-
-        time_dist = np.int64(abs(np.int64(hist_log_ttr) - np.int64(current_log_ttr)))
-        if time_dist >= len(time_lut):
-            continue
-
-        price_dist = np.int64(abs(np.int64(hist_price_int) - np.int64(center_p_int)))
-        
-        combined_weight = price_lut[price_dist] * time_lut[time_dist]
-        
-        n += combined_weight
-        if hist_outcome == target_outcome:
-            w += combined_weight
-            
+ 
+    if start_idx >= end_idx:
+        return n, w
+ 
+    # ---- derive the time-band cutoff from the table itself ----
+    # time_lut is strictly decreasing then 0, so "last index with value > 0" is a
+    # clean monotone boundary; ~O(log len) and identical every call (free).
+    lo_c, hi_c = 0, len(time_lut) - 1
+    while lo_c < hi_c:
+        mid_c = (lo_c + hi_c + 1) // 2
+        if time_lut[mid_c] > 0.0:
+            lo_c = mid_c
+        else:
+            hi_c = mid_c - 1
+    time_cutoff = lo_c
+ 
+    q = np.int64(current_log_ttr)
+    lo_ttr = q - time_cutoff
+    if lo_ttr < 0:
+        lo_ttr = 0
+    hi_ttr = q + time_cutoff
+    if hi_ttr > 0x1FFFFF:          # clamp to the 21-bit log_ttr field
+        hi_ttr = 0x1FFFFF
+ 
+    # ---- iterate price buckets within [start_idx, end_idx); band-prune each ----
+    i = start_idx
+    while i < end_idx:
+        p = np.int64(history_array[i] >> 22)          # price_int of this bucket
+ 
+        # bucket spans [i, block_end): block_end = first index with price_int > p
+        block_hi_bound = np.uint32((np.int64(p + 1) << 22) - 1)
+        bl, br = i, end_idx
+        while bl < br:
+            mid = (bl + br) // 2
+            if history_array[mid] <= block_hi_bound:
+                bl = mid + 1
+            else:
+                br = mid
+        block_end = bl
+ 
+        # price weight is constant across the whole bucket (same float64 the
+        # original looks up per entry) → hoist it once
+        price_dist = np.int64(abs(p - np.int64(center_p_int)))
+        pw = price_lut[price_dist]
+ 
+        # live log_ttr band within the bucket: [lo_ttr, hi_ttr], both outcomes
+        band_left = np.uint32((p << 22) | (lo_ttr << 1))
+        band_right = np.uint32((p << 22) | (hi_ttr << 1) | np.int64(1))
+ 
+        # band_start = first index in [i, block_end) with packed >= band_left
+        bl, br = i, block_end
+        while bl < br:
+            mid = (bl + br) // 2
+            if history_array[mid] < band_left:
+                bl = mid + 1
+            else:
+                br = mid
+        band_start = bl
+ 
+        # band_end = first index in [band_start, block_end) with packed > band_right
+        bl, br = band_start, block_end
+        while bl < br:
+            mid = (bl + br) // 2
+            if history_array[mid] <= band_right:
+                bl = mid + 1
+            else:
+                br = mid
+        band_end = bl
+ 
+        # walk only the live entries, ascending (log_ttr, outcome) — same order
+        for k in range(band_start, band_end):
+            packed = history_array[k]
+            hist_log_ttr = (packed >> 1) & 0x1FFFFF
+            hist_outcome = packed & 1
+            time_dist = np.int64(abs(np.int64(hist_log_ttr) - q))
+            combined_weight = pw * time_lut[time_dist]
+            n += combined_weight
+            if hist_outcome == target_outcome:
+                w += combined_weight
+ 
+        i = block_end
+ 
     return n, w
 
 @njit(cache=True)
