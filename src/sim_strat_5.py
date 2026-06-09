@@ -618,41 +618,67 @@ def calibrate_models(current_day_ts, state: BayesianState):
         except Exception as e:
             log.warning(f"Variance NO Polyfit failed: {e}")
 
-def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, result_map, data_start_date, simulation_start_date, current_sim_day, heartbeat):
-    log.info("🗜️ Decoupling heavy arrays for flat NPZ serialization...")
-    
-    active_uids = state.next_user_id
-    total_yes = sum(len(state.user_history_yes[i]) for i in range(active_uids))
-    total_no = sum(len(state.user_history_no[i]) for i in range(active_uids))
-    
-    yes_arr = np.zeros(total_yes, dtype=np.uint32)
-    no_arr = np.zeros(total_no, dtype=np.uint32)
-    yes_lens = np.zeros(active_uids, dtype=np.uint32)
-    no_lens = np.zeros(active_uids, dtype=np.uint32)
-    
-    y_idx, n_idx = 0, 0
-    
-    # 1. Flatten the pre-allocated user history arrays
 
+def _hist_sidecar_paths(p: Path):
+    """The two .npy sidecars that hold the flat histories next to the checkpoint.
+    Derives the same names whether given the .pkl or the .npz path."""
+    stem = p.stem  # e.g. 'sim_checkpoint'
+    return p.parent / f"{stem}_yhist.npy", p.parent / f"{stem}_nhist.npy"
+
+
+def save_checkpoint(ckpt_path: Path, state, active_portfolio, result_map,
+                    data_start_date, simulation_start_date, current_sim_day, heartbeat):
+    log.info("🗜️ Streaming heavy arrays to disk (memmap sidecars + light NPZ)...")
+
+    active_uids = state.next_user_id
+
+    # --- history lengths (O(1) per user, tiny arrays) ---
+    yes_lens = np.fromiter((len(state.user_history_yes[i]) for i in range(active_uids)),
+                           dtype=np.uint32, count=active_uids)
+    no_lens = np.fromiter((len(state.user_history_no[i]) for i in range(active_uids)),
+                          dtype=np.uint32, count=active_uids)
+    total_yes = int(yes_lens.sum(dtype=np.int64))
+    total_no = int(no_lens.sum(dtype=np.int64))
+
+    npz_path = ckpt_path.with_suffix('.npz')
+    yhist_path, nhist_path = _hist_sidecar_paths(ckpt_path)
+    tmp_yhist = yhist_path.with_name(yhist_path.name + '.tmp')
+    tmp_nhist = nhist_path.with_name(nhist_path.name + '.tmp')
+
+    # --- 1. stream histories into disk-backed memmaps (no 2nd in-RAM copy) ---
+    # open_memmap allocates the .npy on disk; each per-user write goes through the
+    # reclaimable page cache, so peak RAM stays ~1× history instead of ~2×, and
+    # the pages are file-backed (evictable) rather than anonymous (OOM-prone).
+    ya = np.lib.format.open_memmap(tmp_yhist, mode='w+', dtype=np.uint32, shape=(total_yes,))
+    y_idx = 0
     for i in range(active_uids):
-        y_len = len(state.user_history_yes[i])
-        yes_lens[i] = y_len
-        if y_len > 0:
-            yes_arr[y_idx:y_idx+y_len] = state.user_history_yes[i]
-            y_idx += y_len
-        n_len = len(state.user_history_no[i])
-        no_lens[i] = n_len
-        if n_len > 0:
-            no_arr[n_idx:n_idx+n_len] = state.user_history_no[i]
-            n_idx += n_len
-            
-    var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0,2))
-    var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0,2))
+        L = int(yes_lens[i])
+        if L:
+            ya[y_idx:y_idx + L] = state.user_history_yes[i]
+            y_idx += L
+    ya.flush()
+    del ya
+    os.replace(tmp_yhist, yhist_path)
+
+    na = np.lib.format.open_memmap(tmp_nhist, mode='w+', dtype=np.uint32, shape=(total_no,))
+    n_idx = 0
+    for i in range(active_uids):
+        M = int(no_lens[i])
+        if M:
+            na[n_idx:n_idx + M] = state.user_history_no[i]
+            n_idx += M
+    na.flush()
+    del na
+    os.replace(tmp_nhist, nhist_path)
+
+    # --- 2. small arrays -> compressed NPZ (NO yes_arr/no_arr anymore) ---
+    var_yes_arr = np.array(state.daily_variance_yes, dtype=np.float64) if state.daily_variance_yes else np.empty((0, 2))
+    var_no_arr = np.array(state.daily_variance_no, dtype=np.float64) if state.daily_variance_no else np.empty((0, 2))
     restore_var_yes, restore_var_no = list(state.daily_variance_yes), list(state.daily_variance_no)
     state.daily_variance_yes.clear()
     state.daily_variance_no.clear()
-    
-    calib_X_arr = np.array(state.calib_X, dtype=np.float64) if state.calib_X else np.empty((0,3))
+
+    calib_X_arr = np.array(state.calib_X, dtype=np.float64) if state.calib_X else np.empty((0, 3))
     calib_y_arr = np.array(state.calib_y, dtype=np.float64) if state.calib_y else np.empty(0)
     calib_dates_arr = np.array(state.calib_dates, dtype=np.float64) if state.calib_dates else np.empty(0)
     restore_calib_X, restore_calib_y, restore_calib_dates = list(state.calib_X), list(state.calib_y), list(state.calib_dates)
@@ -660,26 +686,25 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     state.calib_y.clear()
     state.calib_dates.clear()
 
-    # 2. Save ALL massive Numpy data to compressed NPZ to keep the Pickle empty
-    npz_path = ckpt_path.with_suffix('.npz')
-    np.savez_compressed(
-        npz_path,
-        yes_arr=yes_arr, yes_lens=yes_lens,
-        no_arr=no_arr, no_lens=no_lens,
-        var_yes=var_yes_arr, var_no=var_no_arr,
-        calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr,
-        user_exposure=state.user_exposure, user_peak=state.user_peak,
-        user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
-        user_brier_count=state.user_brier_count
-    )
-    
-    # 3. Strip the big numpy arrays AND the 5M-element lists to prevent memory spikes
+    tmp_npz = npz_path.with_name(npz_path.name + '.tmp')
+    # Pass a file handle so savez does NOT append a stray '.npz' to the tmp name.
+    with open(tmp_npz, 'wb') as f:
+        np.savez_compressed(
+            f,
+            yes_lens=yes_lens, no_lens=no_lens,
+            var_yes=var_yes_arr, var_no=var_no_arr,
+            calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr,
+            user_exposure=state.user_exposure, user_peak=state.user_peak,
+            user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
+            user_brier_count=state.user_brier_count,
+        )
+    os.replace(tmp_npz, npz_path)
+
+    # --- 3. strip big arrays from state, pickle the light dict, then re-attach ---
     restore_exposure, restore_peak, restore_total_trades = state.user_exposure, state.user_peak, state.user_total_trades
     restore_brier_sum, restore_brier_count = state.user_brier_sum, state.user_brier_count
-    
-    full_yes_list = state.user_history_yes
-    full_no_list = state.user_history_no
-    
+    full_yes_list, full_no_list = state.user_history_yes, state.user_history_no
+
     state.user_exposure = np.empty(0)
     state.user_peak = np.empty(0)
     state.user_total_trades = np.empty(0)
@@ -688,7 +713,6 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
     state.user_history_yes = []
     state.user_history_no = []
 
-    # 4. Save the lightweight dictionary via Pickle
     tmp_ckpt = ckpt_path.with_suffix('.pkl.tmp')
     with open(tmp_ckpt, 'wb') as f:
         pickle.dump({
@@ -700,62 +724,79 @@ def save_checkpoint(ckpt_path: Path, state: BayesianState, active_portfolio, res
             'current_sim_day': current_sim_day,
             'heartbeat': heartbeat
         }, f, protocol=pickle.HIGHEST_PROTOCOL)
-    tmp_ckpt.replace(ckpt_path)
-    
-    # 5. Re-attach everything so the simulation continues natively
+    os.replace(tmp_ckpt, ckpt_path)
+
+    # re-attach so the simulation continues natively
     state.user_history_yes = full_yes_list
     state.user_history_no = full_no_list
-        
     state.daily_variance_yes.extend(restore_var_yes)
     state.daily_variance_no.extend(restore_var_no)
     state.calib_X.extend(restore_calib_X)
     state.calib_y.extend(restore_calib_y)
     state.calib_dates.extend(restore_calib_dates)
-    
     state.user_exposure = restore_exposure
     state.user_peak = restore_peak
     state.user_total_trades = restore_total_trades
     state.user_brier_sum = restore_brier_sum
     state.user_brier_count = restore_brier_count
-    
-    log.info("✅ Checkpoint securely saved to disk (Decoupled NPZ + PKL).")
-        
-def restore_arrays_from_npz(state: BayesianState, npz_path: Path):
-    """Blazing fast C-level byte restoring of the arrays upon resume."""
+
+    log.info("✅ Checkpoint saved (memmap sidecars + NPZ + PKL).")
+
+
+def restore_arrays_from_npz(state, npz_path: Path):
+    """Restore histories + flat arrays on resume.
+
+    Backward-compatible: if the NPZ contains yes_arr (legacy format, and what
+    daily_update.save_state writes), read it from there; otherwise read the
+    memmap sidecars. Either way each user gets an independent uint32 array with
+    byte-identical contents to what was saved.
+    """
     if not npz_path.exists():
         return
-        
-    log.info(f"🔄 Restoring massive historical arrays from {npz_path}...")
-    with np.load(npz_path, allow_pickle=True) as data:
-        yes_arr, yes_lens = data['yes_arr'], data['yes_lens']
-        no_arr, no_lens = data['no_arr'], data['no_lens']
-        
-        # 1. Pre-size the history lists (shared empty sentinel for zero-history users)
-        state.user_history_yes = [_EMPTY_U32] * state.next_user_id
-        state.user_history_no  = [_EMPTY_U32] * state.next_user_id
 
+    log.info(f"🔄 Restoring historical arrays from {npz_path}...")
+    yhist_path, nhist_path = _hist_sidecar_paths(npz_path)
+
+    with np.load(npz_path, allow_pickle=True) as data:
+        yes_lens = data['yes_lens']
+        no_lens = data['no_lens']
         active_uids = len(yes_lens)
 
-        # 2. Slice each user's run out of the flat array (.copy() = writable + independent)
+        # Pre-size with the shared empty sentinel for zero-history users.
+        state.user_history_yes = [_EMPTY_U32] * state.next_user_id
+        state.user_history_no = [_EMPTY_U32] * state.next_user_id
+
+        legacy = 'yes_arr' in data.files
+        if legacy:
+            # OLD format: histories live inside the NPZ (in-RAM ndarrays).
+            yes_src, no_src = data['yes_arr'], data['no_arr']
+        else:
+            # NEW format: memmapped sidecars — reclaimable, low-RAM restore.
+            yes_src = np.load(yhist_path, mmap_mode='r')
+            no_src = np.load(nhist_path, mmap_mode='r')
+
         y_idx = n_idx = 0
         for i in range(active_uids):
-            y_len = int(yes_lens[i])
-            if y_len > 0:
-                state.user_history_yes[i] = yes_arr[y_idx:y_idx + y_len].copy()
-                y_idx += y_len
-            n_len = int(no_lens[i])
-            if n_len > 0:
-                state.user_history_no[i] = no_arr[n_idx:n_idx + n_len].copy()
-                n_idx += n_len
-                
-        # 3. Restore the deques
+            L = int(yes_lens[i])
+            if L:
+                # np.array(...) copies the slice (view or memmap) into a standalone
+                # writable uint32 array — same semantics as the previous .copy().
+                state.user_history_yes[i] = np.array(yes_src[y_idx:y_idx + L], dtype=np.uint32)
+                y_idx += L
+            M = int(no_lens[i])
+            if M:
+                state.user_history_no[i] = np.array(no_src[n_idx:n_idx + M], dtype=np.uint32)
+                n_idx += M
+
+        if not legacy:
+            del yes_src, no_src  # close the memmaps
+
         state.daily_variance_yes.extend([tuple(x) for x in data['var_yes']])
         state.daily_variance_no.extend([tuple(x) for x in data['var_no']])
         state.calib_X.extend([list(x) for x in data['calib_X']])
         state.calib_y.extend(data['calib_y'])
         state.calib_dates.extend(data['calib_dates'])
-        
-        # 4. Restore the flat NumPy state arrays WITH .copy() for write access
+
         state.user_exposure = data['user_exposure'].copy()
         state.user_peak = data['user_peak'].copy()
         state.user_total_trades = data['user_total_trades'].copy()
