@@ -1,0 +1,19 @@
+# Use a lightweight Python base image
+FROM python:3.11-slim
+
+# Set the working directory
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y libjemalloc2 numactl && rm -rf /var/lib/apt/lists/*
+
+# Force the container to use jemalloc for all memory allocations instead of glibc
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
+# Install dependencies
+RUN pip install --no-cache-dir duckdb polars pandas numpy numba statsmodels pyarrow scikit-learn xgboost pytz 
+
+# Copy only the python scripts
+COPY *.py ./
+
+# Run the simulation
+CMD ["numactl", "--interleave=all", "python", "sim_strat_5.py"]
