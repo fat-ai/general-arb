@@ -20,8 +20,21 @@ import sys
 import os
 from numba import njit, prange, set_num_threads
 
-CACHE_DIR = Path("/app/polymarket_cache")
+CACHE_DIR = Path(os.environ.get("SIM_CACHE_DIR", "/app/polymarket_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Recovery / rebuild controls (no-ops in normal operation) ----------------
+# Source of truth for *reads* (trades DB + markets parquet). Lets a recovery run
+# read a real, read-only cache while writing checkpoint / CSVs / duckdb-temp to a
+# separate scratch CACHE_DIR. Defaults to CACHE_DIR, so normal runs are unchanged.
+SOURCE_DIR = Path(os.environ.get("SIM_SOURCE_DIR", str(CACHE_DIR)))
+# Scan-free state rebuild: skip signal precompute + the strategy section so the
+# run rebuilds histories / per-user metrics / calibration ONLY (no strategy
+# output). Used to reconstruct the stripped checkpoint arrays after a crash.
+REBUILD_MODE = os.environ.get("SIM_REBUILD_MODE") == "1"
+# When > 0 and in REBUILD_MODE, sys.exit(0) immediately after the checkpoint at
+# this simulated-day count, so a specific boundary can be snapshotted.
+REBUILD_STOP_DAY = int(os.environ.get("SIM_REBUILD_STOP_DAY", "0"))
 
 WARMUP_DAYS = 547
 MAX_BET = 10000
@@ -31,8 +44,8 @@ P_RANGE = 100
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 log = logging.getLogger("Sim")
 
-TRADES_PATH = CACHE_DIR / "gamma_trades.db" 
-MARKETS_PATH = CACHE_DIR / MARKETS_FILE
+TRADES_PATH = SOURCE_DIR / "gamma_trades.db" 
+MARKETS_PATH = SOURCE_DIR / MARKETS_FILE
 OUTPUT_PATH = CACHE_DIR / SIGNAL_FILE
 EXECUTIONS_PATH = CACHE_DIR / "strategy_executions.csv"
         
@@ -1137,6 +1150,20 @@ def main():
         
         # Restore the heavy arrays from the NPZ archive
         restore_arrays_from_npz(state, ckpt_file.with_suffix('.npz'))
+
+        # Reconstruct market resolution state. market_map is rebuilt fresh from the
+        # parquet on every startup (resolved=False for all markets), but the
+        # checkpoint already merged every market that resolved before the resume
+        # day. Without this, the first post-resume day boundary would re-resolve
+        # and re-merge those markets, duplicating user-history entries. Mark every
+        # market that ended before the resume day as resolved, so only markets
+        # ending on/after the resume day resolve from here on — matching what a
+        # continuous run had resolved at this checkpoint.
+        if resume_sim_day is not None:
+            _resume_cutoff_ts = resume_sim_day * 86400.0
+            for _m in market_map.values():
+                if _m['end'] is not None and _m['end'] < _resume_cutoff_ts:
+                    _m['resolved'] = True
         
         # ==========================================
         # 🧹 THE CSV GUILLOTINE (ORPHAN DATA CLEANUP)
@@ -1164,7 +1191,7 @@ def main():
                             row_ts = float(row[0])
                             
                             # If the row belongs to the valid past, keep it. 
-                            if row_ts <= state.last_processed_timestamp:
+                            if row_ts < state.last_processed_timestamp:
                                 writer.writerow(row)
                             else:
                                 # Because the data is strictly chronological, the moment we hit a future timestamp,
@@ -1250,7 +1277,7 @@ def main():
         con = duckdb.connect(database=':memory:')
         
         # The OOM Shield: Strict memory cap, reduced threads, and explicit disk spillover
-        con.execute("SET memory_limit='12GB';")
+        con.execute(f"SET memory_limit='{os.environ.get('SIM_DUCKDB_MEM', '12GB')}';")
         con.execute("SET max_temp_directory_size = '200GB';")
         con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=false;")
@@ -1264,6 +1291,7 @@ def main():
         query = f"""
             WITH parsed_trades AS (
                 SELECT 
+                    t.id, 
                     t.contract_id, 
                     t.user, 
                     t.tradeAmount, 
@@ -1284,8 +1312,8 @@ def main():
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
-              AND ts > {state.last_processed_timestamp}
-            ORDER BY ts ASC
+              AND ts >= {state.last_processed_timestamp}
+            ORDER BY ts ASC, id ASC
         """
             
         cursor = con.execute(query)
@@ -1394,7 +1422,7 @@ def main():
             global_user_count = state.global_user_count
 
             fast_signals = None
-            if data_start_date is not None and current_sim_day is not None:
+            if (not REBUILD_MODE) and data_start_date is not None and current_sim_day is not None:
                 _dv = (ts_col[valid_mask] * (1.0/86400.0)).astype(np.int64)
                 if _dv.size and int(_dv.min()) == current_sim_day and int(_dv.max()) == current_sim_day:
                     if hist_dirty or hist_yes_flat is None:
@@ -1494,6 +1522,14 @@ def main():
                             current_sim_day, heartbeat
                         )
                         gc.collect()
+
+                        if REBUILD_MODE and REBUILD_STOP_DAY and state.days_simulated >= REBUILD_STOP_DAY:
+                            log.info(
+                                "🛑 REBUILD_MODE: reached simulated day %s "
+                                "(next_user_id=%s); checkpoint written to %s. Stopping.",
+                                state.days_simulated, state.next_user_id, ckpt_file,
+                            )
+                            sys.exit(0)
                 # ---------------------------------------------------------
                 # B. PROCESS TRADE INTO STATE TRACKERS
                 # ---------------------------------------------------------
@@ -1571,6 +1607,14 @@ def main():
                 if ts < simulation_start_date: continue
 
                 m['volume'] += amount
+
+                # REBUILD_MODE: sections A (resolve / merge / calibrate) and B
+                # (uid assignment, per-user metrics, contract_positions,
+                # first_bets_pending) have now run for this trade, and m['volume']
+                # is updated. Skip the entire strategy/signal/CSV section (C) — it
+                # is signal-driven and produces no state we need to rebuild.
+                if REBUILD_MODE:
+                    continue
 
                 last_logged_price     = m.get('log_price',      0.0)
                 last_logged_ts        = m.get('log_ts',         0.0)
