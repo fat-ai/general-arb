@@ -34,6 +34,17 @@ def _fetch_gcp_secret(project_id: str, secret_id: str, version: str = "latest") 
     resp = client.access_secret_version(request={"name": name})
     return resp.payload.data.decode("utf-8")
 
+def resolve_relayer_credentials():
+    """Fetch the Relayer API Key + its bound address. Returns (key, address)."""
+    import os
+    from google.cloud import secretmanager
+    project = os.environ["GCP_PROJECT"]
+    client = secretmanager.SecretManagerServiceClient()
+    def _get(name):
+        path = f"projects/{project}/secrets/{name}/versions/latest"
+        return client.access_secret_version(name=path).payload.data.decode("utf-8").strip()
+    return _get("polymarket-relayer-key"), _get("polymarket-relayer-address")
+
 
 def resolve_private_key(interactive: bool = True) -> str:
     """Return the wallet private key. Resolves from GCP Secret Manager, falling
