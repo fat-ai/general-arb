@@ -15,69 +15,11 @@ log = logging.getLogger("PaperGold")
 audit_log = logging.getLogger("TradeAudit")
 
 # --------------------------------------------------------------------------- #
-#  On-chain redemption constants (Polygon mainnet, CLOB V2).
-#  Source: https://docs.polymarket.com/resources/contracts (verified 2026-06).
-#
-#  How V2 redemption actually works:
-#    * The settlement layer is still the Gnosis Conditional Tokens Framework
-#      (CTF) at CTF_ADDR — unchanged from V1. It reads/writes USDC.e under the
-#      hood, which is why USDCE_ADDR is still passed as the `collateralToken`
-#      argument even though balances now display as pUSD.
-#    * V2 adds a thin *collateral adapter* in front of the CTF / NegRiskAdapter.
-#      Redeeming through the adapter performs the underlying redemption, then
-#      wraps the resulting USDC.e into pUSD and sends pUSD to the caller. Both
-#      adapters expose the SAME redeemPositions(address,bytes32,bytes32,uint256[])
-#      signature as the legacy CTF, so one calldata template covers both.
-#    * The "you must use the gasless Builder Relayer" claim only applies to
-#      *proxy* accounts (email / Magic = sig_type 1, browser Gnosis Safe =
-#      sig_type 2), where a proxy contract — not your key — owns the tokens.
-#      For a true EOA (sig_type 0, this bot's configured mode) the EOA owns the
-#      ERC-1155 outcome tokens directly, so redemption is a normal on-chain tx
-#      signed by the EOA. No relayer, no Builder API keys. That is the path
-#      implemented in LiveBroker._settle_redemption below.
-#      ⚠️ Verify the EOA assumption empirically before trusting it with funds:
-#         call LiveBroker.verify_redeem_setup() (see that method).
+#  Contract addresses are owned by the SDK (PRODUCTION env): collateral is
+#  pUSD 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB, CTF is
+#  0x4D97DCd97eC945f40cF65F87097ACe5EA0476045, and the relayer auto-selects
+#  the right (neg-risk) adapter — so the bot configures no addresses here.
 # --------------------------------------------------------------------------- #
-USDCE_ADDR         = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # legacy CTF collateral (the `collateralToken` arg)
-PUSD_ADDR          = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # V2 display collateral; NOT needed by the redeem path (see note below)
-CTF_ADDR           = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Conditional Tokens (unchanged)
-NEG_RISK_ADAPTER   = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # legacy neg-risk adapter (only used for USDC.e-out)
-CTF_COLLATERAL_ADAPTER     = "0xAdA100Db00Ca00073811820692005400218FcE1f"  # V2: standard markets -> pUSD
-NEGRISK_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"  # V2: neg-risk markets -> pUSD
-ZERO_BYTES32       = "0x" + "00" * 32
-
-# Minimal ABIs — only the methods we call. Both collateral adapters share the
-# 4-arg redeemPositions signature, so ADAPTER_ABI serves both.
-CTF_ABI = [
-    {"name": "redeemPositions", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "collateralToken", "type": "address"},
-                {"name": "parentCollectionId", "type": "bytes32"},
-                {"name": "conditionId", "type": "bytes32"},
-                {"name": "indexSets", "type": "uint256[]"}], "outputs": []},
-    {"name": "isApprovedForAll", "type": "function", "stateMutability": "view",
-     "inputs": [{"name": "owner", "type": "address"}, {"name": "operator", "type": "address"}],
-     "outputs": [{"name": "", "type": "bool"}]},
-    {"name": "setApprovalForAll", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "operator", "type": "address"}, {"name": "approved", "type": "bool"}], "outputs": []},
-    {"name": "balanceOf", "type": "function", "stateMutability": "view",
-     "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
-     "outputs": [{"name": "", "type": "uint256"}]},
-]
-ADAPTER_ABI = [
-    {"name": "redeemPositions", "type": "function", "stateMutability": "nonpayable",
-     "inputs": [{"name": "collateralToken", "type": "address"},
-                {"name": "parentCollectionId", "type": "bytes32"},
-                {"name": "conditionId", "type": "bytes32"},
-                {"name": "indexSets", "type": "uint256[]"}], "outputs": []},
-]
-
-
-class RedemptionNotReady(Exception):
-    """Raised by _settle_redemption when a position is winning per Gamma but the
-    on-chain redeem still reverts (e.g. UMA hasn't reported payouts on-chain yet,
-    or a transient RPC issue). Treated as a soft retry: the caller leaves the
-    position in place and tries again next cycle. No funds are booked, no
-    position is deleted, and it is NOT logged as a hard error."""
 
 
 class PersistenceManager:
@@ -285,26 +227,17 @@ class BaseBroker:
 
     async def redeem_position(self, token_id, payout_price,
                               condition_id=None, neg_risk=False, outcome_index=None):
-        """Settle a resolved position. Returns:
-             True  -> redeemed (proceeds booked, position removed)
-             False -> not redeemable on-chain yet (left in place; retry later)
-           Raises only on a genuine failure, so the caller can log it loudly.
-        Idempotent + atomic: the mirror position is removed ONLY after a
-        confirmed settlement, so an interrupted run never strands a winner."""
         async with self.lock:
             state = self.pm.state
             pos = state["positions"].get(token_id)
             if not pos:
-                return False
+                return
 
             qty = pos['qty']
-            try:
-                proceeds = await self._settle_redemption(
-                    token_id, pos, payout_price,
-                    condition_id=condition_id, neg_risk=neg_risk, outcome_index=outcome_index,
-                )
-            except RedemptionNotReady:
-                return False  # soft retry — keep the position, book nothing
+            proceeds = await self._settle_redemption(
+                token_id, pos, payout_price,
+                condition_id=condition_id, neg_risk=neg_risk, outcome_index=outcome_index,
+            )
 
             state["cash"] += proceeds
             cost_basis = qty * pos['avg_price']
@@ -326,7 +259,6 @@ class BaseBroker:
                 "price": payout_price, "qty": qty, "equity": current_equity,
                 "fpmm": fpmm, "pnl": pnl
             }))
-            return True
 
 
 # ======================================================================== #
@@ -390,109 +322,86 @@ class PaperBroker(BaseBroker):
 
 
 # ======================================================================== #
-#  LIVE BROKER — fill = real FOK order on the Polymarket CLOB **V2**.
-#  Same state bookkeeping as paper (inherited), so every report / risk loop
-#  in main_2.py keeps working untouched.
+#  LIVE BROKER — real orders via the Polymarket unified SDK (SecureClient),
+#  using the deposit-wallet + gasless-relayer model the CLOB now REQUIRES.
 #
-#  pip install py-clob-client-v2 web3
-#  Key is passed in (resolved via secrets_gcp), NOT read from the environment.
-#  env still used only for non-secret POLYMARKET_SIG_TYPE (0 = EOA).
-#  Collateral is pUSD — fund by wrapping USDC.e (see set_allowances.py).
+#  Why this replaced the py-clob-client-v2 path: the CLOB rejects bare-EOA
+#  order placement ("maker address not allowed, use the deposit wallet flow").
+#  SecureClient routes orders / redemptions / approvals through a relayer-
+#  deployed deposit wallet, and finally makes winner redemption actually work
+#  (the old _settle_redemption was an un-wired NotImplementedError stub).
+#
+#  Install:  pip install polymarket-client      # import name: polymarket; >=3.11
+#  Construction needs the EOA private key AND a Relayer API Key (+ its address).
+#  BOTH are secrets — resolve via secrets_gcp, never os.environ.
+#
+#  Units: CLOB order amounts (making/taking) and the COLLATERAL balance are
+#  6-decimal BASE units (divide by 1e6 — the SDK does NOT rescale the raw CLOB
+#  response). Data-API positions (list_positions) are already human units.
+#  Same state bookkeeping as paper (inherited), so every report / risk loop in
+#  main_2.py keeps working untouched.
 # ======================================================================== #
 class LiveBroker(BaseBroker):
     is_paper = False
 
-    HOST = "https://clob.polymarket.com"
-    CHAIN_ID = 137  # 80002 = Amoy testnet for dry runs
+    # CLOB amounts/balances arrive as 6-decimal fixed-point base units.
+    _BASE = 1_000_000
 
-    def __init__(self, persistence: PersistenceManager, private_key: str):
+    def __init__(self, persistence: PersistenceManager, private_key: str,
+                 relayer_key: str = None, relayer_address: str = None):
         super().__init__(persistence)
         if not private_key:
             raise ValueError("LiveBroker requires a private_key (resolve it via secrets_gcp).")
+        if not relayer_key or not relayer_address:
+            raise ValueError(
+                "LiveBroker requires a Relayer API Key + address (resolve via "
+                "secrets_gcp). The CLOB now mandates the deposit-wallet/gasless "
+                "flow, and the relayer key authorizes every gasless op."
+            )
 
-        # Lazy import so pure-paper users don't need the V2 client installed.
-        import py_clob_client_v2 as v2
-        self._v2 = v2
-        self._MarketOrderArgs = v2.MarketOrderArgs
-        self._Side = v2.Side
+        # Lazy import so pure-paper users don't need the SDK installed.
+        from polymarket import SecureClient, RelayerApiKey
 
-        pk = private_key
-        self._pk = private_key  # kept in-memory only (never env/disk) for signing redeem txs
-        sig_type = int(os.environ.get("POLYMARKET_SIG_TYPE", "0"))  # 0 = EOA
-        self.sig_type = sig_type
-
-        # V2 auth (verified via verify_setup.py): derive creds, then re-init fully
-        # authenticated. signature_type matters for order *signing* (order posting
-        # exercises it even though read-only auth didn't), so pass it explicitly.
-        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk,
-                                    signature_type=sig_type)
-        creds = self.client.create_or_derive_api_key()
-        self.client = v2.ClobClient(host=self.HOST, chain_id=self.CHAIN_ID, key=pk,
-                                    creds=creds, signature_type=sig_type)
         self.slippage = CONFIG.get("max_slippage", 0.05)
-        self._tick_cache: Dict[str, float] = {}
 
-        # --- on-chain redemption setup (direct EOA path) ----------------- #
-        # web3 + the EOA derived from the key. Built once, lazily reused. The
-        # address logged here MUST equal your funder/trading wallet; if it does
-        # not, the key is wrong or you are on a proxy account (see
-        # verify_redeem_setup) and the direct redeem path will not work.
-        from web3 import Web3
-        self._Web3 = Web3
+        # create() deploys/derives the deposit wallet gaslessly + idempotently
+        # and authenticates. The relayer api_key is REQUIRED for gasless ops.
+        self.client = SecureClient.create(
+            private_key=private_key,
+            api_key=RelayerApiKey(key=relayer_key, address=relayer_address),
+        )
+
+        self.funder = getattr(self.client, "wallet", None)
+        self.wallet_type = getattr(self.client, "wallet_type", "?")
+        gasless = False
         try:
-            from config import RPC_URLS
-            self._rpc_urls = list(RPC_URLS)
+            gasless = bool(self.client.is_gasless_ready())
         except Exception:
-            self._rpc_urls = ["https://polygon-rpc.com"]
-        self._w3 = None
-        self.account = Web3().eth.account.from_key(pk)
-        self.address = self.account.address
-        # set of adapter addresses already setApprovalForAll'd this process
-        self._approved_adapters: set = set()
+            pass
+        if not gasless:
+            log.warning("⚠️ Deposit wallet not gasless-ready — gasless orders/redeems may fail.")
+        log.info(f"✅ LiveBroker authenticated. deposit wallet (funder): {self.funder} "
+                 f"(type={self.wallet_type}, gasless_ready={gasless})")
 
-        log.info("✅ LiveBroker authenticated against the CLOB (V2).")
-        log.info(f"🔑 Redeem signer (EOA): {self.address}  "
-                 f"(must match your funder wallet; run verify_redeem_setup() to confirm)")
+    # ---- fill parsing -------------------------------------------------- #
+    def _avg_qty_from_order(self, order, side: str) -> Tuple[float, float]:
+        """Return (avg_price, filled_qty) from an AcceptedOrder.
 
-    # ---- tick-size rounding (orders are rejected off the grid) --------- #
-    def _tick(self, token_id: str) -> float:
-        if token_id not in self._tick_cache:
-            try:
-                self._tick_cache[token_id] = float(self.client.get_tick_size(token_id))
-            except Exception:
-                self._tick_cache[token_id] = 0.01
-        return self._tick_cache[token_id]
-
-    def _round_tick(self, price: float, token_id: str, up: bool) -> float:
-        t = self._tick(token_id)
-        n = price / t
-        n = (int(n) + 1) if (up and n != int(n)) else int(n)
-        return round(n * t, 4)
-
-    @staticmethod
-    def _parse_fill(resp: dict, side: str) -> Tuple[float, float]:
-        """Return (avg_price, filled_qty) from a V2 POST /order response.
-
-        SendOrderResponse: success(bool), orderID, status in {live,matched,delayed},
-        makingAmount/takingAmount as 6-decimal strings, transactionsHashes, errorMsg.
-
-        A FOK fill means status == 'matched'. The two amounts are side-relative:
-          BUY  → we provide pUSD (makingAmount), receive shares (takingAmount)
-          SELL → we provide shares (makingAmount), receive pUSD (takingAmount)
+        making_amount/taking_amount are 6-decimal BASE units and side-relative:
+          BUY  → we make pUSD, take shares
+          SELL → we make shares, take pUSD
         so the pUSD leg and the share leg swap places with side.
         """
         try:
-            if not resp.get("success") or resp.get("status") != "matched":
-                return 0.0, 0.0
-            making = float(resp.get("makingAmount") or 0) / 1e6
-            taking = float(resp.get("takingAmount") or 0) / 1e6
+            making = float(order.making_amount) / self._BASE
+            taking = float(order.taking_amount) / self._BASE
             if making <= 0 or taking <= 0:
                 return 0.0, 0.0
             if side == "BUY":
                 cash, shares = making, taking
             else:                       # SELL
                 shares, cash = making, taking
-            return cash / shares, shares  # (avg pUSD/share, shares filled)
+            return cash / shares, shares      # (avg pUSD/share, shares filled)
         except Exception:
             return 0.0, 0.0
 
@@ -502,434 +411,110 @@ class LiveBroker(BaseBroker):
         if best <= 0:
             return 0.0, 0.0
 
-        # Pre-trade bounds check: an FOK fill is irreversible, so screen BEFORE
-        # submitting rather than relying on the post-fill guard in the base class.
+        # An FOK fill is irreversible — pre-screen BUY price bounds before
+        # submitting, not just via the post-fill guard in the base class.
         if side == "BUY" and not (self.MIN_BUY_PRICE <= best <= self.MAX_BUY_PRICE):
             log.warning(f"🛡️ Live BUY pre-screened: best ask {best:.3f} out of bounds")
             return 0.0, 0.0
 
+        # SDK market order: BUY takes a pUSD notional (amount=), SELL takes a
+        # share count (shares=). It resolves tick size / book internally, so we
+        # no longer hand-roll a limit price or tick rounding. FOK = all-or-none.
+        kwargs = dict(token_id=token_id, order_type="FOK")
         if side == "BUY":
-            limit = min(self.MAX_BUY_PRICE, self._round_tick(best * (1 + self.slippage), token_id, up=True))
-            api_side, amount = self._Side.BUY, float(calc_amount)     # amount = pUSD
+            kwargs.update(side="BUY", amount=float(calc_amount))    # pUSD notional
         else:
-            limit = max(0.001, self._round_tick(best * (1 - self.slippage), token_id, up=False))
-            api_side, amount = self._Side.SELL, float(calc_amount)    # amount = shares
+            kwargs.update(side="SELL", shares=float(calc_amount))   # share count
 
-        args = self._MarketOrderArgs(token_id=token_id, amount=amount,
-                                     side=api_side, price=limit, order_type="FOK")
         try:
-            # create_and_post_market_order signs + submits atomically (verified
-            # method name). options=None lets the SDK resolve tick size; if a
-            # neg-risk market ever fails to route, pass PartialCreateOrderOptions(
-            # neg_risk=True) here.
-            resp = await asyncio.to_thread(
-                self.client.create_and_post_market_order, args, None, "FOK"
-            )
+            order = await asyncio.to_thread(lambda: self.client.place_market_order(**kwargs))
         except Exception as e:
             log.error(f"Live order submission failed for {token_id}: {e}")
             return 0.0, 0.0
 
-        # First live order: log the raw response so the fill schema can be pinned.
-        log.info(f"📨 raw order response ({side} {token_id}): {resp}")
+        # RejectedOrder → ok is False (carries code + message); AcceptedOrder → ok True.
+        if not getattr(order, "ok", False):
+            log.error(f"❌ Live {side} rejected for {token_id}: "
+                      f"code={getattr(order, 'code', '?')} msg={getattr(order, 'message', order)}")
+            return 0.0, 0.0
 
-        avg, qty = self._parse_fill(resp, side)
+        log.info(f"📨 order accepted ({side} {token_id}): id={order.order_id} "
+                 f"status={order.status} tx={order.transactions_hashes}")
+        avg, qty = self._avg_qty_from_order(order, side)
         if qty <= 0:
-            log.error(f"❌ Live {side} not filled for {token_id}: {resp}")
+            # Accepted but not (yet) matched, e.g. status 'live'/'delayed' on an FOK
+            # that didn't cross. Treat as no fill so the base class skips bookkeeping.
+            log.error(f"❌ Live {side} accepted but zero fill for {token_id}: {order}")
         return avg, qty
-
-    # ---- on-chain redemption helpers (direct EOA, no relayer) ---------- #
-    def _get_w3(self):
-        """Return a connected Web3, trying each configured RPC. Cached once good."""
-        Web3 = self._Web3
-        if self._w3 is not None:
-            try:
-                if self._w3.is_connected():
-                    return self._w3
-            except Exception:
-                pass
-        last_err = None
-        for url in self._rpc_urls:
-            try:
-                w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 15}))
-                if w3.is_connected():
-                    self._w3 = w3
-                    return w3
-            except Exception as e:
-                last_err = e
-        raise RuntimeError(f"No working Polygon RPC for redemption: {last_err}")
-
-    def _fees(self, w3):
-        """EIP-1559 fees for Polygon, with a legacy fallback. Polygon enforces a
-        ~30 gwei minimum priority fee."""
-        try:
-            base = w3.eth.get_block("latest").get("baseFeePerGas")
-            if base is not None:
-                prio = w3.to_wei(30, "gwei")
-                return {"maxPriorityFeePerGas": prio, "maxFeePerGas": int(base) * 2 + prio}
-        except Exception:
-            pass
-        return {"gasPrice": int(w3.eth.gas_price * 1.25)}
-
-    def _send(self, w3, fn):
-        """Build, sign (EOA), send, and confirm a contract-function call. Returns
-        the receipt. Raises on revert / failed status."""
-        tx = {"from": self.address, "nonce": w3.eth.get_transaction_count(self.address, "pending"),
-              "chainId": w3.eth.chain_id}
-        tx.update(self._fees(w3))
-        try:
-            tx["gas"] = int(fn.estimate_gas({"from": self.address}) * 1.25)
-        except Exception:
-            tx["gas"] = 400_000  # safe ceiling for redeem / approval
-        built = fn.build_transaction(tx)
-        signed = self.account.sign_transaction(built)
-        raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
-        h = w3.eth.send_raw_transaction(raw)
-        receipt = w3.eth.wait_for_transaction_receipt(h, timeout=180)
-        if receipt.get("status") != 1:
-            raise RuntimeError(f"tx reverted on-chain: {h.hex()}")
-        return receipt
-
-    def _redeem_onchain(self, condition_id_hex, neg_risk, qty, payout_price):
-        """Blocking redemption. Run via asyncio.to_thread. Returns realized
-        proceeds (USDC terms). Raises RedemptionNotReady for a soft retry."""
-        Web3 = self._Web3
-        if not condition_id_hex:
-            raise RuntimeError("missing conditionId from Gamma; cannot redeem")
-        cid = condition_id_hex if condition_id_hex.startswith("0x") else "0x" + condition_id_hex
-        cond = bytes.fromhex(cid[2:])
-        if len(cond) != 32:
-            raise RuntimeError(f"bad conditionId length: {cid}")
-
-        w3 = self._get_w3()
-        ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDR), abi=CTF_ABI)
-        adapter_addr = NEGRISK_COLLATERAL_ADAPTER if neg_risk else CTF_COLLATERAL_ADAPTER
-        adapter = w3.eth.contract(address=Web3.to_checksum_address(adapter_addr), abi=ADAPTER_ABI)
-
-        # 1) One-time operator approval so the adapter can pull the ERC-1155
-        #    outcome tokens via safeBatchTransferFrom. Costs gas at most twice
-        #    ever (once per adapter); persists across runs.
-        if adapter_addr not in self._approved_adapters:
-            already = False
-            try:
-                already = bool(ctf.functions.isApprovedForAll(self.address, adapter.address).call())
-            except Exception:
-                already = False  # safe default: attempt the approval
-            if not already:
-                log.info(f"🔏 One-time setApprovalForAll for adapter {adapter_addr}")
-                self._send(w3, ctf.functions.setApprovalForAll(adapter.address, True))
-            self._approved_adapters.add(adapter_addr)
-
-        # 2) Redeem. Same 4-arg signature for both adapters; the adapter reads
-        #    only conditionId and computes amounts from on-chain balances.
-        #    indexSets [1, 2] redeems whichever of YES/NO this wallet holds.
-        redeem_fn = adapter.functions.redeemPositions(
-            Web3.to_checksum_address(USDCE_ADDR), b"\x00" * 32, cond, [1, 2],
-        )
-
-        # 2a) Pre-flight simulation. A winning position whose payouts are not yet
-        #     reported on-chain reverts here — so we spend ZERO gas and signal a
-        #     soft retry instead of broadcasting a doomed tx.
-        try:
-            redeem_fn.call({"from": self.address})
-        except Exception as e:
-            raise RedemptionNotReady(f"redeem not yet executable for {cid[:12]}: {e}")
-
-        # 2b) Real transaction.
-        receipt = self._send(w3, redeem_fn)
-        log.info(f"⛓️ Redeemed on-chain | cond {cid[:12]} | neg_risk={neg_risk} | "
-                 f"tx {receipt['transactionHash'].hex()} | gas {receipt.get('gasUsed')}")
-
-        # Proceeds: a winning share pays $1. Mirror cash is reconciled against the
-        # real pUSD balance by sync_state_from_chain(), so this only needs to be
-        # close; we use the tracked quantity.
-        return float(qty) * float(payout_price)
 
     async def _settle_redemption(self, token_id, pos, payout_price,
                                  condition_id=None, neg_risk=False, outcome_index=None):
-        """Redeem a resolved position under CLOB V2 via a direct EOA transaction.
+        """Redeem a resolved position via the gasless relayer.
 
-        Losers (payout 0) are worthless — book $0, send no transaction.
+        Loser (payout 0): worthless — return 0, no transaction. redeem_position
+        still drops the position and books $0.
 
-        Winners: redeem through the V2 collateral adapter
-        (CtfCollateralAdapter for standard markets, NegRiskCtfCollateralAdapter
-        for neg-risk). The adapter performs the CTF redemption and wraps the
-        proceeds into pUSD, returning pUSD to this EOA — which keeps the funds in
-        the tradeable balance the rest of the bot uses (sync_state_from_chain
-        reads the pUSD/COLLATERAL balance). No relayer / Builder keys: those are
-        only needed for proxy accounts, and this bot runs as an EOA (sig_type 0).
+        Winner: redeem_positions(condition_id=…) runs the gasless redeem through
+        the deposit wallet; the SDK auto-detects neg-risk and selects the correct
+        adapter, so neg_risk / outcome_index are no longer needed here. We block
+        on the on-chain outcome via handle.wait(), which RETURNS a
+        TransactionOutcome only on terminal success and RAISES
+        TransactionFailedError / TimeoutError on a failed or stuck redeem.
 
-        Heavy lifting is synchronous web3, so it runs in a worker thread to keep
-        the event loop responsive (same pattern as _fill).
+        Letting that exception propagate is deliberate: redeem_position re-raises
+        and main_2 reverts pos['redeemed']=False, so the position stays tracked
+        instead of silently losing the funds. We return the *expected* proceeds
+        (winning shares pay $1 each); sync_state_from_chain then reconciles the
+        cash mirror to the realized on-chain pUSD on its next pass.
         """
         if payout_price <= 0:
-            return 0.0  # losing side — nothing to claim, no gas spent
+            return 0.0  # losing side — nothing to claim
 
-        return await asyncio.to_thread(
-            self._redeem_onchain, condition_id, bool(neg_risk), pos.get("qty", 0.0), payout_price
-        )
-
-    def verify_redeem_setup(self):
-        """One-off pre-flight to confirm the direct-EOA redeem path is valid for
-        this account BEFORE trusting it with funds. Run it once (e.g. from a REPL
-        or a tiny script) in live mode:
-
-            b = LiveBroker(PersistenceManager(), resolve_private_key())
-            b.verify_redeem_setup()
-
-        It checks three things and prints the result:
-          1. the signer address derived from your key (must equal your funder/
-             trading wallet);
-          2. whether the Polygon RPC is reachable;
-          3. how many *redeemable* positions the Data API sees under that address.
-             If you hold resolved winners but this shows 0, your tokens are held
-             by a proxy, not the EOA — in which case the relayer path is required
-             instead of this one (tell me and I'll wire it).
-        """
-        import requests
-        print(f"signer (from key): {self.address}")
-        try:
-            w3 = self._get_w3()
-            print(f"RPC connected:      {w3.is_connected()}  (chainId {w3.eth.chain_id})")
-        except Exception as e:
-            print(f"RPC connect FAILED: {e}")
-        try:
-            r = requests.get(
-                "https://data-api.polymarket.com/positions",
-                params={"user": self.address, "redeemable": "true", "sizeThreshold": 0},
-                timeout=15,
+        if not condition_id:
+            raise RuntimeError(
+                f"Cannot redeem {token_id}: market had no conditionId. "
+                f"Position kept for retry."
             )
-            data = r.json() if r.status_code == 200 else []
-            held = [p for p in data if float(p.get("size", 0)) > 0]
-            print(f"redeemable positions under this EOA: {len(held)}")
-            for p in held[:10]:
-                print(f"  - {p.get('title', p.get('conditionId'))[:60]} "
-                      f"size={p.get('size')} negRisk={p.get('negativeRisk')}")
-            if not held:
-                print("  (0 is fine if you currently hold no resolved winners; "
-                      "but if you DO and it still shows 0, you're on a proxy account.)")
-        except Exception as e:
-            print(f"Data API check FAILED: {e}")
 
-    # ---- reconciliation: make the mirror match on-chain / CLOB truth ----- #
-    @staticmethod
-    def _parse_iso_ts(s):
-        if not s:
-            return None
+        def _do_redeem():
+            handle = self.client.redeem_positions(
+                condition_id=str(condition_id), metadata="bot winner redemption"
+            )
+            return handle.wait()  # TransactionOutcome | raises on failure/timeout
+
+        outcome = await asyncio.to_thread(_do_redeem)
+        log.info(f"💸 Redeemed condition {condition_id} (token {token_id}); "
+                 f"tx={getattr(outcome, 'transaction_hash', outcome)}")
+
+        return pos["qty"] * payout_price
+
+    # ---- reconciliation: pull real balance so the mirror can't drift --- #
+    async def sync_state_from_chain(self, rebase_baseline: bool = False):
+        """Overwrite mirrored cash with the real deposit-wallet pUSD (COLLATERAL)
+        balance. Call at startup (rebase_baseline=True) and periodically in live
+        mode. (Position-level reconciliation via
+        client.list_positions(user=self.funder) is a natural extension; cash is
+        the safety-critical mirror.)"""
         try:
-            from datetime import datetime
-            return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
-        except Exception:
-            return None
+            bal = await asyncio.to_thread(
+                lambda: self.client.get_balance_allowance(asset_type="COLLATERAL")
+            )
+            real_cash = float(getattr(bal, "balance", 0) or 0) / self._BASE
+            log.info(f"🔄 Balance sync: mirror ${self.pm.state['cash']:.2f} -> real ${real_cash:.2f}")
+            self.pm.state["cash"] = real_cash
 
-    def _fetch_real_cash(self):
-        """Real pUSD collateral balance via the CLOB (authoritative). None on error."""
-        try:
-            try:
-                BAP, AT = self._v2.BalanceAllowanceParams, self._v2.AssetType
-            except AttributeError:
-                from py_clob_client_v2.clob_types import BalanceAllowanceParams as BAP, AssetType as AT
-            bal = self.client.get_balance_allowance(BAP(asset_type=AT.COLLATERAL))
-            raw = bal.get("balance", 0) if isinstance(bal, dict) else getattr(bal, "balance", 0)
-            return float(raw) / 1e6
+            # A fresh state file carries the PAPER default highest_equity
+            # (= initial_capital, e.g. $10k). Against real cash of ~$12 that
+            # reads as a ~100% drawdown and the halt kills the bot on its first
+            # pass. On startup, when flat and the baseline is still the
+            # untouched default, rebase it to reality. A baseline that differs
+            # from the default is real live history and is preserved.
+            if (rebase_baseline
+                    and not self.pm.state["positions"]
+                    and self.pm.state.get("highest_equity") == CONFIG["initial_capital"]):
+                self.pm.state["highest_equity"] = real_cash
+                log.info(f"📐 Equity baseline rebased to ${real_cash:.2f} (fresh live start)")
+
+            await self.pm.save_async()
         except Exception as e:
-            log.error(f"reconcile: collateral balance read failed: {e}")
-            return None
-
-    def _fetch_api_positions(self):
-        """All currently-held positions per Polymarket's Data API (discovery)."""
-        import requests
-        r = requests.get(
-            "https://data-api.polymarket.com/positions",
-            params={"user": self.address, "sizeThreshold": 0, "limit": 500},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            raise RuntimeError(f"HTTP {r.status_code}")
-        data = r.json()
-        return data if isinstance(data, list) else []
-
-    def _reconcile_blocking(self, mirror_snapshot, cross_check_chain):
-        """Pure reads — CLOB balance, Data API, and on-chain CTF.balanceOf — that
-        produce a per-token action plan. Does NOT mutate state (the async caller
-        applies the plan under the lock). Returns {real_cash, tokens, errors}."""
-        Web3 = self._Web3
-        DUST, QEPS = 1e-6, 1e-4
-        report = {"real_cash": self._fetch_real_cash(), "tokens": {}, "errors": []}
-
-        api_map = {}
-        try:
-            for p in self._fetch_api_positions():
-                tid = str(p.get("asset") or p.get("tokenId") or p.get("token_id") or "")
-                if not tid:
-                    continue
-                api_map[tid] = {
-                    "qty": float(p.get("size", 0) or 0),
-                    "avg": float(p.get("avgPrice", 0) or 0) or None,
-                    "conditionId": p.get("conditionId") or p.get("condition_id"),
-                    "neg": p.get("negativeRisk", p.get("negRisk")),
-                    "endDate_ts": self._parse_iso_ts(p.get("endDate")),
-                    "title": p.get("title") or p.get("slug"),
-                }
-        except Exception as e:
-            report["errors"].append(f"data-api: {e}")
-
-        union = set(mirror_snapshot.keys()) | set(api_map.keys())
-
-        ctf = None
-        if cross_check_chain and union:
-            try:
-                w3 = self._get_w3()
-                ctf = w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDR), abi=CTF_ABI)
-            except Exception as e:
-                report["errors"].append(f"rpc: {e}")
-
-        def chain_qty(tid):
-            if ctf is None:
-                return None
-            try:
-                return float(ctf.functions.balanceOf(self.address, int(tid)).call()) / 1e6
-            except Exception as e:
-                report["errors"].append(f"balanceOf {tid[:10]}: {e}")
-                return None
-
-        for tid in union:
-            in_mirror = tid in mirror_snapshot
-            api = api_map.get(tid)
-            cq = chain_qty(tid)  # None => could not verify on-chain
-            meta = {k: (api or {}).get(k) for k in ("conditionId", "neg", "endDate_ts", "title")}
-
-            if cq is not None and cq > DUST:                      # chain confirms a holding
-                avg = api["avg"] if (api and api["avg"]) else None
-                if in_mirror:
-                    diff = abs(float(mirror_snapshot[tid].get("qty", 0)) - cq) > QEPS
-                    act = "update" if diff else "keep"
-                    note = (f"qty {mirror_snapshot[tid].get('qty', 0):.4f} -> {cq:.4f} (chain)"
-                            if diff else f"qty {cq:.4f} ok (chain)")
-                else:
-                    act, note = "add", f"discovered {cq:.4f} on-chain ({'in api' if api else 'NOT in api'})"
-                report["tokens"][tid] = {"action": act, "qty": cq, "avg": avg, "note": note, **meta}
-
-            elif cq is not None:                                  # chain says ~0
-                if api and api["qty"] > DUST:
-                    report["tokens"][tid] = {"action": "conflict_keep", "qty": api["qty"], "avg": api["avg"],
-                        "note": f"CONFLICT: api size={api['qty']:.4f} but on-chain ~0; kept, verify manually", **meta}
-                elif in_mirror:
-                    report["tokens"][tid] = {"action": "remove",
-                        "note": "on-chain ~0 and not in api -> closed/settled"}
-
-            else:                                                 # chain unverified
-                if api and api["qty"] > DUST:
-                    if in_mirror:
-                        diff = abs(float(mirror_snapshot[tid].get("qty", 0)) - api["qty"]) > QEPS
-                        act = "update" if diff else "keep"
-                        note = (f"qty {mirror_snapshot[tid].get('qty', 0):.4f} -> {api['qty']:.4f} (api; chain unverified)"
-                                if diff else f"qty {api['qty']:.4f} ok (api; chain unverified)")
-                    else:
-                        act, note = "add", f"discovered {api['qty']:.4f} via api (chain unverified)"
-                    report["tokens"][tid] = {"action": act, "qty": api["qty"], "avg": api["avg"], "note": note, **meta}
-                elif in_mirror:
-                    report["tokens"][tid] = {"action": "unverified_keep",
-                        "note": "could not verify on-chain and not in api; kept (no delete on uncertainty)"}
-        return report
-
-    async def reconcile_state_from_chain(self, *, apply: bool = True, cross_check_chain: bool = True) -> dict:
-        """Reconcile the mirror (cash + positions) against on-chain / CLOB truth.
-
-        Source of truth: cash = CLOB pUSD collateral balance (overwrite). Positions
-        = Polymarket Data API for discovery, cross-checked against CTF.balanceOf
-        on-chain for trustless quantities. A position is DELETED only when the
-        chain confirms ~0 AND the Data API doesn't list it; any disagreement is
-        kept and flagged so a transient RPC/indexer hiccup never strands funds.
-
-        apply=False => dry run (logs the plan, mutates nothing). Returns a report.
-        Discovered ("untracked") positions are added so equity is correct and are
-        tagged untracked=True; they carry conditionId so redemption works, but
-        have no market_fpmm so the resolution loop won't auto-monitor them — they
-        are logged loudly for you to wire up or close manually.
-        """
-        async with self.lock:
-            snapshot = {tid: dict(p) for tid, p in self.pm.state.get("positions", {}).items()}
-            rep = await asyncio.to_thread(self._reconcile_blocking, snapshot, cross_check_chain)
-
-            toks = rep["tokens"]
-            by = lambda a: [(t, d) for t, d in toks.items() if d["action"] == a]
-            added, changed, removed = by("add"), by("update"), by("remove")
-            conflicts, unverified = by("conflict_keep"), by("unverified_keep")
-
-            state = self.pm.state
-            mirror_cash = float(state.get("cash", 0.0))
-            real_cash = rep.get("real_cash")
-            cash_delta = (real_cash - mirror_cash) if real_cash is not None else None
-            changed_any = bool(added or changed or removed) or (cash_delta is not None and abs(cash_delta) > 1e-4)
-
-            # Visible audit trail (logged whether or not we apply).
-            if cash_delta is not None and abs(cash_delta) > 1e-4:
-                log.warning(f"🔄 cash drift: mirror ${mirror_cash:.2f} -> real ${real_cash:.2f} (Δ ${cash_delta:+.2f})")
-            elif real_cash is None:
-                log.error("🔄 cash: could not read real collateral balance; leaving mirror cash unchanged")
-            for t, d in changed:   log.warning(f"🔄 adjust {t[:12]}…: {d['note']}")
-            for t, d in removed:   log.warning(f"🔄 drop   {t[:12]}…: {d['note']}")
-            for t, d in added:     log.warning(f"🔄 NEW    {t[:12]}…: {d['note']} "
-                                               f"(untracked: redeem works via conditionId, but NOT auto-monitored)")
-            for t, d in conflicts: log.error(  f"🔄 CONFLICT {t[:12]}…: {d['note']}")
-            for t, d in unverified:log.warning(f"🔄 unverified {t[:12]}…: {d['note']}")
-            for e in rep.get("errors", []):    log.warning(f"🔄 read issue: {e}")
-
-            if apply:
-                positions = state["positions"]
-
-                def _untracked_entry(d):
-                    return {
-                        "qty": d["qty"], "avg_price": d.get("avg") or 0.0,
-                        "market_fpmm": None, "opened_at": time.time(),
-                        "market_end": d.get("endDate_ts") or 0.0,
-                        "conditionId": d.get("conditionId"),
-                        "neg_risk": (bool(d["neg"]) if d.get("neg") is not None else None),
-                        "untracked": True,
-                    }
-
-                for t, _ in removed:
-                    positions.pop(t, None)
-                for t, d in changed:
-                    p = positions.get(t)
-                    if not p:
-                        continue
-                    p["qty"] = d["qty"]
-                    if d.get("avg"):
-                        p["avg_price"] = d["avg"]
-                    if d.get("conditionId") and not p.get("conditionId"):
-                        p["conditionId"] = d["conditionId"]
-                    if d.get("neg") is not None and p.get("neg_risk") is None:
-                        p["neg_risk"] = bool(d["neg"])
-                for t, d in added:
-                    positions[t] = _untracked_entry(d)
-                for t, d in conflicts:
-                    if t not in positions:          # api claims it, chain ~0, mirror absent
-                        positions[t] = _untracked_entry(d)
-                    # else: keep the existing mirror entry untouched
-
-                if real_cash is not None:
-                    state["cash"] = real_cash
-                eq = self.pm.calculate_equity()
-                if eq > state.get("highest_equity", 0):
-                    state["highest_equity"] = eq
-                if changed_any:
-                    await self.pm.save_async()
-
-            summary = (f"cash Δ {('$%+.2f' % cash_delta) if cash_delta is not None else 'n/a'}, "
-                       f"+{len(added)} new, ~{len(changed)} adjusted, -{len(removed)} closed, "
-                       f"{len(conflicts)} conflict, {len(unverified)} unverified")
-            log.info(f"🔄 Reconcile {'applied' if apply else 'DRY-RUN'}: {summary}")
-            return {"summary": summary, "changed_any": changed_any, "cash_delta": cash_delta,
-                    "added": added, "changed": changed, "removed": removed,
-                    "conflicts": conflicts, "unverified": unverified, "errors": rep.get("errors", [])}
-
-    async def sync_state_from_chain(self):
-        """Cash-only refresh. Superseded by reconcile_state_from_chain (which also
-        reconciles positions); kept for callers that want just a fast cash sync."""
-        real_cash = await asyncio.to_thread(self._fetch_real_cash)
-        if real_cash is None:
-            return
-        log.info(f"🔄 Balance sync: mirror ${self.pm.state['cash']:.2f} -> real ${real_cash:.2f}")
-        self.pm.state["cash"] = real_cash
-        await self.pm.save_async()
+            log.error(f"Balance sync failed: {e}")
