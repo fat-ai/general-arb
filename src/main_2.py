@@ -56,9 +56,12 @@ def _safe_json_load(x):
 
 
 class LiveTrader:
-    def __init__(self, private_key=None):
+    def __init__(self, private_key=None, relayer_key=None, relayer_address=None):
         self.persistence = PersistenceManager()
-        self.broker = LiveBroker(self.persistence, private_key) if CONFIG.get("live_trading") else PaperBroker(self.persistence)
+        self.broker = (
+            LiveBroker(self.persistence, private_key, relayer_key, relayer_address)
+            if CONFIG.get("live_trading") else PaperBroker(self.persistence)
+        )
         self.metadata = MarketMetadata()
         self.sub_manager = SubscriptionManager()
         self.state = None
@@ -82,7 +85,13 @@ class LiveTrader:
 
     async def start(self):
         print("\n🚀 STARTING LIVE TRADER")
-        
+
+        # LIVE: reconcile the cash mirror to the real deposit-wallet pUSD before
+        # anything trades. rebase_baseline fixes the fresh-state-file case where
+        # highest_equity is the paper default and would trip the drawdown halt.
+        if not self.broker.is_paper:
+            await self.broker.sync_state_from_chain(rebase_baseline=True)
+
         # Offload Numba JIT compilation to a separate thread to keep the event loop responsive
         log.info("Warming up Numba JIT compiler...")
         _dummy = np.empty(0, dtype=np.uint32)
@@ -130,16 +139,6 @@ class LiveTrader:
         
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
-
-        # 3b. RECONCILE MIRROR AGAINST CHAIN before any trading begins, so cash,
-        #     positions and equity reflect on-chain/CLOB truth (not a stale file).
-        if not self.broker.is_paper:
-            try:
-                log.info("🔄 Reconciling state against chain before start...")
-                report = await self.broker.reconcile_state_from_chain(apply=True)
-                log.info(f"🔄 Startup reconcile: {report['summary']}")
-            except Exception as e:
-                log.error(f"Startup reconcile failed (continuing with mirror as-is): {e}")
 
         # 4. START LOOPS
         await asyncio.gather(
@@ -659,38 +658,30 @@ class LiveTrader:
     
                         for token_id in market_map.get(fpmm_id, []):
                             pos = positions.get(token_id)
-                            if not pos:
+                            if not pos or pos.get("redeemed"):
                                 continue
-
+    
                             is_winner = outcome_tokens[winner_idx] == token_id
                             payout = 1.0 if is_winner else 0.0
-
-                            # redeem_position is atomic + idempotent: it books
-                            # proceeds and removes the position ONLY on confirmed
-                            # settlement, returns False if the market isn't
-                            # redeemable on-chain yet (UMA not reported), and
-                            # raises only on a real failure. No optimistic
-                            # pre-marking → an interrupted run never strands a
-                            # winner; it just retries next cycle.
+    
+                            pos["redeemed"] = True
+                            await self.persistence.save_async()
+    
                             try:
-                                done = await self.broker.redeem_position(
+                                await self.broker.redeem_position(
                                     token_id, payout,
                                     condition_id=mkt.get("conditionId"),
                                     neg_risk=bool(mkt.get("negRisk", False)),
                                     outcome_index=outcome_tokens.index(token_id) if token_id in outcome_tokens else None,
                                 )
-                                if done:
-                                    redeemed_any = True
-                                    log.info(
-                                        f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
-                                        f"Token: {token_id} | Win: {is_winner}"
-                                    )
-                                else:
-                                    log.debug(
-                                        f"⏳ {token_id} resolved on Gamma but not yet "
-                                        f"redeemable on-chain; will retry."
-                                    )
+                                redeemed_any = True
+                                log.info(
+                                    f"⚖️ Market Resolved | {mkt.get('question', 'Unknown')} | "
+                                    f"Token: {token_id} | Win: {is_winner}"
+                                )
                             except Exception as e:
+                                pos["redeemed"] = False
+                                await self.persistence.save_async()
                                 log.error(f"Redeem failed for {token_id}: {e}")
     
                     except Exception as e:
@@ -1119,8 +1110,6 @@ class LiveTrader:
         Refreshes market metadata hourly to catch NEW markets.
         """
         last_metadata_refresh = time.time()
-        last_reconcile = time.time()
-        reconcile_interval = CONFIG.get("reconcile_interval_s", 1800)  # default 30 min
 
         while self.running:
             await asyncio.sleep(60)
@@ -1133,17 +1122,6 @@ class LiveTrader:
                 self.sub_manager.dirty = True
                 
                 last_metadata_refresh = time.time()
-
-            # Periodic state reconciliation against chain/CLOB (live only).
-            if not self.broker.is_paper and time.time() - last_reconcile > reconcile_interval:
-                try:
-                    report = await self.broker.reconcile_state_from_chain(apply=True)
-                    if report["changed_any"]:
-                        log.warning(f"🔄 Periodic reconcile adjusted state: {report['summary']}")
-                except Exception as e:
-                    log.error(f"Periodic reconcile failed: {e}")
-                finally:
-                    last_reconcile = time.time()
 
     async def _reporting_loop(self):
         """Generates and prints the institutional report every 5 minutes."""
@@ -1227,13 +1205,22 @@ class LiveTrader:
                 return 
             
             log.info(f"💰 Equity: ${equity:.2f} | Drawdown: {drawdown:.1%}")
-            
+
+            # LIVE: re-sync the cash mirror to the real CLOB balance roughly
+            # every 30 min. Catches realized redemption proceeds (booked at the
+            # expected $1/share) and external deposits/withdrawals.
+            if not self.broker.is_paper:
+                self._sync_counter = getattr(self, "_sync_counter", 0) + 1
+                if self._sync_counter >= 30:
+                    self._sync_counter = 0
+                    await self.broker.sync_state_from_chain()
+
             await asyncio.sleep(60)
             
-async def main(private_key=None):
+async def main(private_key=None, relayer_key=None, relayer_address=None):
     trader = None
     try:
-        trader = LiveTrader(private_key)
+        trader = LiveTrader(private_key, relayer_key, relayer_address)
         await trader.start()
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
@@ -1245,6 +1232,14 @@ async def main(private_key=None):
             await trader.shutdown()
 
 if __name__ == "__main__":
-    from secrets_gcp import resolve_private_key
-    pk = resolve_private_key() if CONFIG.get("live_trading") else None
-    asyncio.run(main(pk))
+    # Both the EOA key and the Relayer API Key (+ address) are secrets; resolve
+    # them via secrets_gcp (GCP Secret Manager), never os.environ. The relayer
+    # credentials are REQUIRED in live mode — the CLOB's deposit-wallet/gasless
+    # flow authorizes every order/redeem/approval with them.
+    from secrets_gcp import resolve_private_key, resolve_relayer_credentials
+    if CONFIG.get("live_trading"):
+        pk = resolve_private_key()
+        rk, ra = resolve_relayer_credentials()
+    else:
+        pk = rk = ra = None
+    asyncio.run(main(pk, rk, ra))
