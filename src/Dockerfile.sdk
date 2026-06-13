@@ -1,0 +1,56 @@
+# Dockerfile.sdk — LEAN TOOLING image for the Polymarket SDK (polymarket-client).
+# Runs gasless_setup.py, live_smoke.py, and test_live_readiness.py — none of
+# which import the heavy strategy stack, so this stays small and fast to rebuild.
+# The LIVE BOT uses the fuller Dockerfile.bot (adds numba/duckdb/polars/etc.).
+# Your repo is bind-mounted at run time → nothing to COPY, no build context to
+# upload, no .dockerignore needed.
+#
+# Build once (empty context, so it doesn't matter what else is in the folder):
+#     docker build -t pm-sdk - < Dockerfile.sdk
+#
+# All gasless_setup.py / live_smoke.py runs need the SAME credential trio
+# (put them in allowances.env, chmod 600, delete after Phase 2):
+#     POLYMARKET_PK=0x...                 # EOA private key
+#     POLYMARKET_RELAYER_KEY=...          # polymarket.com -> Settings -> API Keys
+#     POLYMARKET_RELAYER_ADDRESS=0x...    # the address shown next to that key
+#
+# Inspect your account / funder wallet (read-only):
+#     docker run --rm -v "$PWD":/app:ro --env-file allowances.env \
+#       pm-sdk python gasless_setup.py
+#
+# Run the one-time trading approvals (gasless; -it for the confirm prompt):
+#     docker run --rm -it -v "$PWD":/app:ro --env-file allowances.env \
+#       pm-sdk python gasless_setup.py --approve
+#
+# Run the live-readiness suite, hermetic (no network, no funds, no env vars):
+#     docker run --rm -v "$PWD":/app:ro pm-sdk python test_live_readiness.py
+#
+# Suite incl. live checks (read-only: authenticates + reads balance, places nothing):
+#     docker run --rm -v "$PWD":/app:ro \
+#       -e RUN_LIVE_CHECKS=1 \
+#       -e POLYMARKET_FUNDER=0xc8B10Ee4A268e8AEdED73dfDE5327D66416c6B33 \
+#       -e POLYMARKET_TEST_PK -e POLYMARKET_RELAYER_KEY -e POLYMARKET_RELAYER_ADDRESS \
+#       pm-sdk python test_live_readiness.py
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# polymarket-client 0.1.0b4 requires Python >=3.11 (matches your runtime). Its
+# eth-* / httpx / pydantic / websockets deps ship wheels on linux amd64/arm64,
+# so no build toolchain is needed. If a dep ever must compile on your platform:
+# RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+#     && rm -rf /var/lib/apt/lists/*
+
+# requests: needed by main_2.py and asserted by the test suite.
+# google-cloud-secret-manager: the live entrypoint fetches the EOA key and the
+#   relayer credentials from GCP Secret Manager via secrets_gcp.py.
+RUN pip install --pre --timeout 120 \
+    "polymarket-client==0.1.0b4" \
+    requests \
+    google-cloud-secret-manager
+
+WORKDIR /app
