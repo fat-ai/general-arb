@@ -1,0 +1,36 @@
+# requirements.in — top-level (direct) dependencies for the live bot, pinned to
+# the set validated together on 2026-06-13. This is the ONLY dependency file you
+# hand-edit. requirements.lock (used by the build) is generated from it and
+# contains the full transitive tree with a sha256 per distribution.
+#
+# Regenerate the lock after any edit (run inside python:3.11-slim so the resolved
+# tree matches the image's Python, and so --generate-hashes records the right
+# wheel hashes):
+#
+#   docker run --rm -v "$PWD":/w -w /w python:3.11-slim sh -c \
+#     'pip install pip-tools >/dev/null && pip-compile --generate-hashes --pre \
+#        --output-file requirements.lock requirements.in'
+#
+#   # (faster alternative, same result:)
+#   # docker run --rm -v "$PWD":/w -w /w python:3.11-slim sh -c \
+#   #   'pip install uv >/dev/null && uv pip compile requirements.in \
+#   #      --generate-hashes --prerelease=allow -o requirements.lock'
+#
+# Then, before rebuilding the image:
+#   docker run --rm -v "$PWD":/w -w /w python:3.11-slim sh -c \
+#     'pip install pip-audit >/dev/null && pip-audit -r requirements.lock'
+#   # re-validate (pip check / import / smoke), then build.
+
+aiohttp==3.14.1
+numpy==2.4.6
+pandas==3.0.3
+pyarrow==24.0.0
+requests==2.34.2
+tabulate==0.10.0
+websocket-client==1.9.0
+duckdb==1.5.3
+polars==1.41.2
+statsmodels==0.14.6
+numba==0.65.1
+google-cloud-secret-manager==2.29.0
+polymarket-client==0.1.0b4
