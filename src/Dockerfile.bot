@@ -1,4 +1,4 @@
-# Dockerfile.bot — PRODUCTION image for the live trading bot (main_2.py).
+ # Dockerfile.bot — PRODUCTION image for the live trading bot (main_2.py).
 #
 # This is the FULL runtime: the SDK plus the strategy stack (numba / duckdb /
 # polars / statsmodels / pyarrow) that main_2.py pulls in via `from sim_strat_5
@@ -6,9 +6,10 @@
 # (Dockerfile.sdk) — keep pm-sdk for fast test/smoke rebuilds; build this one
 # for deployment. Expect a large image (~1 GB): numba/llvmlite, pyarrow, scipy.
 #
-# Empty-context build (your repo is bind-mounted at run time, never COPYed —
-# so the giant data files in the repo are not uploaded as build context):
-#     docker build -t pm-bot - < Dockerfile.bot
+# Build. The context is a 2-file tar (this Dockerfile + requirements.lock), so
+# the giant data files in the repo are NOT uploaded as build context:
+#     tar -czh -C "$PWD" Dockerfile.bot requirements.lock \
+#       | docker build -t pm-bot -f Dockerfile.bot -
 #
 # Launch the live bot. The repo is mounted WRITABLE (no :ro) so the bot can
 # persist state/cache/logs. The EOA key and relayer credentials are fetched from
@@ -24,13 +25,22 @@
 #
 # Paper mode (no key/GCP/SDK auth): drop the LIVE_TRADING/GCP_PROJECT env.
 #
-# Deps are pinned to the set validated together on 2026-06-13 (pip check clean,
-# all modules import, reporting's pandas ops run under pandas 3.0 / numpy 2.4).
-# Mirrors requirements.txt — keep them in sync. NOTE: sim_strat_5's numba-
-# compiled paths compile/run at bot startup (JIT is offloaded to a thread), so
-# the first live boot does a one-time compile.
+# DEPENDENCIES. requirements.lock is a fully hash-pinned lock of the WHOLE tree
+# (direct + transitive), generated from requirements.in. --require-hashes makes
+# the build fail closed if any distribution's sha256 doesn't match, so a tampered
+# or typosquatted package cannot slip in and transitive versions cannot drift on
+# rebuild. To change a dependency: edit requirements.in, regenerate the lock (see
+# that file's header), run `pip-audit -r requirements.lock`, re-validate (pip
+# check + import/smoke), then rebuild. NOTE: sim_strat_5's numba-compiled paths
+# compile/run at bot startup (JIT offloaded to a thread), so the first live boot
+# does a one-time compile.
 
-FROM python:3.11-slim
+# Base pinned by DIGEST, not the mutable :3.11-slim tag, so the base cannot change
+# under a rebuild. Get the current digest with:
+#     docker pull python:3.11-slim
+#     docker inspect --format='{{index .RepoDigests 0}}' python:3.11-slim
+# then paste it below. Re-pin deliberately (and re-audit) when you want a newer base.
+FROM python:3.11-slim@sha256:REPLACE_WITH_DIGEST_FROM_docker_inspect
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -43,21 +53,12 @@ ENV PYTHONUNBUFFERED=1 \
 # RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
 #     && rm -rf /var/lib/apt/lists/*
 
-# --pre is for the pre-release SDK; the exact (==) pins on everything else keep
-# them at the validated stable versions regardless.
-RUN pip install --pre --timeout 180 \
-    aiohttp==3.14.1 \
-    numpy==2.4.6 \
-    pandas==3.0.3 \
-    pyarrow==24.0.0 \
-    requests==2.34.2 \
-    tabulate==0.10.0 \
-    websocket-client==1.9.0 \
-    duckdb==1.5.3 \
-    polars==1.41.2 \
-    statsmodels==0.14.6 \
-    numba==0.65.1 \
-    google-cloud-secret-manager==2.29.0 \
-    "polymarket-client==0.1.0b4"
-
 WORKDIR /app
+
+COPY requirements.lock .
+
+# --require-hashes: every package (incl. transitive) must match a recorded sha256
+#   or the build aborts. --pre: the lock pins a pre-release SDK (polymarket-client
+#   beta); a no-op for the exact-pinned rest. --timeout 180: big wheels (pyarrow,
+#   numba/llvmlite) can be slow to fetch.
+RUN pip install --require-hashes --pre --timeout 180 -r requirements.lock
