@@ -1,0 +1,63 @@
+# Dockerfile.bot — PRODUCTION image for the live trading bot (main_2.py).
+#
+# This is the FULL runtime: the SDK plus the strategy stack (numba / duckdb /
+# polars / statsmodels / pyarrow) that main_2.py pulls in via `from sim_strat_5
+# import ...`. It is a SUPERSET of the lean `pm-sdk` tooling image
+# (Dockerfile.sdk) — keep pm-sdk for fast test/smoke rebuilds; build this one
+# for deployment. Expect a large image (~1 GB): numba/llvmlite, pyarrow, scipy.
+#
+# Empty-context build (your repo is bind-mounted at run time, never COPYed —
+# so the giant data files in the repo are not uploaded as build context):
+#     docker build -t pm-bot - < Dockerfile.bot
+#
+# Launch the live bot. The repo is mounted WRITABLE (no :ro) so the bot can
+# persist state/cache/logs. The EOA key and relayer credentials are fetched from
+# GCP Secret Manager by the VM's identity — none on the command line. Requires
+# the VM to carry the cloud-platform access scope.
+#     docker run -d --name pm-bot \
+#       -e LIVE_TRADING=true \
+#       -e GCP_PROJECT=encoded-antenna-207619 \
+#       -e POLYGON_RPC=https://polygon-bor-rpc.publicnode.com \
+#       -v "$PWD":/app -w /app \
+#       --restart unless-stopped \
+#       pm-bot python main_2.py
+#
+# Paper mode (no key/GCP/SDK auth): drop the LIVE_TRADING/GCP_PROJECT env.
+#
+# Deps are pinned to the set validated together on 2026-06-13 (pip check clean,
+# all modules import, reporting's pandas ops run under pandas 3.0 / numpy 2.4).
+# Mirrors requirements.txt — keep them in sync. NOTE: sim_strat_5's numba-
+# compiled paths compile/run at bot startup (JIT is offloaded to a thread), so
+# the first live boot does a one-time compile.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    NUMBA_CACHE_DIR=/tmp/numba-cache
+
+# All deps ship manylinux wheels (amd64/arm64) — no build toolchain needed. If a
+# dep ever must compile on your platform, add here:
+# RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+#     && rm -rf /var/lib/apt/lists/*
+
+# --pre is for the pre-release SDK; the exact (==) pins on everything else keep
+# them at the validated stable versions regardless.
+RUN pip install --pre --timeout 180 \
+    aiohttp==3.14.1 \
+    numpy==2.4.6 \
+    pandas==3.0.3 \
+    pyarrow==24.0.0 \
+    requests==2.34.2 \
+    tabulate==0.10.0 \
+    websocket-client==1.9.0 \
+    duckdb==1.5.3 \
+    polars==1.41.2 \
+    statsmodels==0.14.6 \
+    numba==0.65.1 \
+    google-cloud-secret-manager==2.29.0 \
+    "polymarket-client==0.1.0b4"
+
+WORKDIR /app
