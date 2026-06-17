@@ -22,6 +22,7 @@ from sim_strat_5 import (
     calibrate_models, 
     compute_wager_and_p_true,
     restore_arrays_from_npz,
+    _hist_sidecar_paths,
     CACHE_DIR, 
     MARKETS_FILE, 
     TRADES_PATH,
@@ -50,6 +51,18 @@ def load_state() -> BayesianState:
             shutil.copy2(sim_pkl, STATE_FILE)
             if sim_npz.exists():
                 shutil.copy2(sim_npz, STATE_FILE.with_suffix('.npz'))
+            # NEW checkpoint format stores per-user histories in memmap .npy
+            # sidecars (yes_arr/no_arr no longer live inside the NPZ). They must
+            # be forked too, or restore_arrays_from_npz hits its non-legacy branch
+            # and FileNotFoundErrors -> load_state silently falls back to an empty
+            # brain (total loss of backtest histories/positions/calibration).
+            # Copy-if-present keeps this a no-op for legacy NPZ-only checkpoints.
+            src_yhist, src_nhist = _hist_sidecar_paths(sim_pkl)
+            dst_yhist, dst_nhist = _hist_sidecar_paths(STATE_FILE)
+            if src_yhist.exists():
+                shutil.copy2(src_yhist, dst_yhist)
+            if src_nhist.exists():
+                shutil.copy2(src_nhist, dst_nhist)
             log.info("✅ Successfully forked backtest state to live environment.")
         except Exception as e:
             log.error(f"Failed to bootstrap from backtest: {e}")
@@ -369,6 +382,8 @@ def main():
         
         trade_count = 0
         max_ts = state.last_processed_timestamp
+        cur_day_bucket = None    # UTC days-since-epoch of the trade being processed
+        day_trade_count = 0      # trades ingested within the current day
         
         try:
             cursor = con.execute(query)
@@ -380,6 +395,18 @@ def main():
                 for row in rows:
                     raw_cid, raw_user, amount, tokens, price, ts = row
                     if ts is None: continue
+                    
+                    # --- Day-level progress (rows arrive ordered by ts ASC) ---
+                    # int day-bucket is O(1); the date format only runs on rollover.
+                    day_bucket = int(ts // 86400)
+                    if day_bucket != cur_day_bucket:
+                        if cur_day_bucket is not None:
+                            log.info(f"   ↳ {day_trade_count} trades ingested.")
+                        day_str = datetime.fromtimestamp(
+                            day_bucket * 86400, tz=timezone.utc).strftime('%Y-%m-%d')
+                        log.info(f"📅 Processing trades for {day_str}...")
+                        cur_day_bucket = day_bucket
+                        day_trade_count = 0
                     
                     cid = sys.intern(str(raw_cid))
                     user = sys.intern(str(raw_user))
@@ -457,7 +484,12 @@ def main():
                     
                     if ts > max_ts: max_ts = ts
                     trade_count += 1
+                    day_trade_count += 1
                     
+            # Flush the final day's tally (no rollover fires after the last row)
+            if cur_day_bucket is not None:
+                log.info(f"   ↳ {day_trade_count} trades ingested.")
+            
             if trade_count > 0:
                 state.last_processed_timestamp = max_ts
                 log.info(f"✅ Successfully ingested {trade_count} new trades into the Bayesian state.")
