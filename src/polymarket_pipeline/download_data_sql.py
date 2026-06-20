@@ -191,9 +191,6 @@ class DataFetcher:
                 if col in df.columns:
                     df[col] = pd.to_datetime(df[col], errors='coerce', utc=True, format='mixed').dt.tz_convert(None)
 
-            if 'resolution_timestamp' not in df.columns:
-                return
-            df = df.dropna(subset=['resolution_timestamp'])
             if df.empty:
                 return
 
@@ -235,6 +232,11 @@ class DataFetcher:
         current_raw_rows = []
 
         cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE.tz_localize(None)
+        if max_created_at is not None:
+                cutoff_date = max_created_at - pd.Timedelta(days=14) 
+            else:
+                cutoff_date = FIXED_START_DATE.tz_localize(None)
+                
         print(f"   🔄 Fetching markets created after {cutoff_date}")
 
         for state in ['false', 'true']:
@@ -313,7 +315,14 @@ class DataFetcher:
                     try:
                         # ✅ Read ONLY the newly downloaded session chunks instead of the massive cache
                         df_new = pd.concat([pd.read_parquet(p, columns=['market_id']) for p in temp_files], ignore_index=True)
-                        ids = np.sort(df_new['market_id'].dropna().astype(int).unique())
+                        new_ids = df_new['market_id'].dropna().astype(int).unique()
+                        
+                        if cache_file.exists():
+                            import pyarrow.parquet as pq
+                            old_max_id = int(pq.read_table(cache_file, columns=['market_id'])['market_id'].max().as_py())
+                            ids = np.sort(np.append(new_ids, old_max_id))
+                        else:
+                            ids = np.sort(new_ids)
                         missing_ids = [m for i in range(len(ids)-1) for m in range(ids[i]+1, ids[i+1])]
                         
                         del df_new
@@ -330,7 +339,7 @@ class DataFetcher:
                                         with self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10) as resp:
                                             if resp.status_code == 200:
                                                 raw_data = resp.json()
-                                                if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
+                                                if isinstance(raw_data, dict) and 'id' in raw_data:
                                                     gap_raw_rows.append(raw_data)
                                                 break
                                             elif resp.status_code == 404:
