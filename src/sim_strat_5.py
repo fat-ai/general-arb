@@ -1277,8 +1277,8 @@ def main():
         con = duckdb.connect(database=':memory:')
         
         # The OOM Shield: Strict memory cap, reduced threads, and explicit disk spillover
-        con.execute(f"SET memory_limit='{os.environ.get('SIM_DUCKDB_MEM', '12GB')}';")
-        con.execute("SET max_temp_directory_size = '200GB';")
+        #con.execute(f"SET memory_limit='{os.environ.get('SIM_DUCKDB_MEM', '12GB')}';")
+        con.execute("SET max_temp_directory_size = '900GB';")
         con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=false;")
         con.execute(f"SET temp_directory='{duck_tmp}';")
