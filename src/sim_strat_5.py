@@ -1282,7 +1282,8 @@ def main():
         con.execute("SET threads=2;")
         con.execute("SET preserve_insertion_order=false;")
         con.execute(f"SET temp_directory='{duck_tmp}';")
-        
+        con.execute("SET preserve_insertion_order=false;")   # biggest lever; the end-sort makes per-row order tracking pure waste
+        con.execute("SET memory_limit='180GB';")             # you have 256GB; current value is too low. leave ~70GB for Python/Numba        
         con.execute("INSTALL sqlite; LOAD sqlite;")
         con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
     
