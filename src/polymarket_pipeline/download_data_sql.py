@@ -855,9 +855,6 @@ class DataFetcher:
         else:
             print("No markets file found. Skipping trade fetch.")
             
-        else:
-            print("No markets file found. Skipping trade fetch.")
-            
 if __name__ == "__main__":
     fetcher = DataFetcher()
     fetcher.run()
