@@ -231,11 +231,12 @@ class DataFetcher:
         chunk_idx = 0
         current_raw_rows = []
 
-        cutoff_date = max_created_at if max_created_at is not None else FIXED_START_DATE.tz_localize(None)
+        now_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
         if max_created_at is not None:
-                cutoff_date = max_created_at - pd.Timedelta(days=14) 
-            else:
-                cutoff_date = FIXED_START_DATE.tz_localize(None)
+            safe_max = min(max_created_at, now_naive)
+            cutoff_date = safe_max - pd.Timedelta(days=14)
+        else:
+            cutoff_date = FIXED_START_DATE.tz_localize(None)
                 
         print(f"   🔄 Fetching markets created after {cutoff_date}")
 
@@ -849,28 +850,10 @@ class DataFetcher:
         market_file = CACHE_DIR / MARKETS_FILE
         
         if market_file.exists():
-            print("Loading contract IDs efficiently...")
-            market_ids_series = pd.read_parquet(market_file, columns=['contract_id'])['contract_id']
-            
-            valid_market_ints = set()
-            for val in market_ids_series.dropna():
-                try:
-                    s = str(val).strip().lower()
-                    if s.startswith("0x"): 
-                        valid_market_ints.add(int(s, 16))
-                    elif "e+" in s: 
-                        valid_market_ints.add(int(float(s)))
-                    else: 
-                        valid_market_ints.add(int(Decimal(s)))
-                except Exception:
-                    continue
-                    
-            del market_ids_series
-            gc.collect()
-            print(f"Found {len(valid_market_ints)} unique numeric contract IDs.")
-
             print("\n--- Phase 2: Fetching Trades ---")
             self.fetch_gamma_trades(end_date=current_utc_naive)
+        else:
+            print("No markets file found. Skipping trade fetch.")
             
         else:
             print("No markets file found. Skipping trade fetch.")
