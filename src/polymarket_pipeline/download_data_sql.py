@@ -319,8 +319,8 @@ class DataFetcher:
                         new_ids = df_new['market_id'].dropna().astype(int).unique()
                         
                         if cache_file.exists():
-                            import pyarrow.parquet as pq
-                            old_max_id = int(pq.read_table(cache_file, columns=['market_id'])['market_id'].max().as_py())
+                            old_max_val = duckdb.execute(f"SELECT MAX(CAST(market_id AS BIGINT)) FROM read_parquet('{cache_file}')").fetchone()[0]
+                            old_max_id = int(old_max_val) if old_max_val is not None else 0
                             ids = np.sort(np.append(new_ids, old_max_id))
                         else:
                             ids = np.sort(new_ids)
