@@ -235,7 +235,7 @@ class DataFetcher:
         # exhaustive reconciliation a one-time cost.
         # ===================================================================
         MAX_API_RETRIES = 5
-        ID_BATCH        = 100      # ids per List-by-id call (repeated id= params, verified)
+        ID_BATCH        = 20      # ids per List-by-id call (repeated id= params, verified)
         FRONTIER_GAP    = 20000    # consecutive empty ids past last hit => frontier reached
         SAFETY_REWIND   = 1000     # re-verify this many trailing ids next run (out-of-order safety)
         REQUEST_PAUSE   = 0.05
