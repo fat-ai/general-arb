@@ -413,7 +413,8 @@ class DataFetcher:
         temp_output = str(cache_file) + ".tmp.parquet"
         
         con = duckdb.connect()
-        con.execute("PRAGMA memory_limit='4GB';")
+        con.execute("PRAGMA memory_limit='12GB';")
+        con.execute("PRAGMA preserve_insertion_order=false;")
         
         try:
             # ✅ FIX 1: Add union_by_name=True so DuckDB handles missing columns like Pandas
