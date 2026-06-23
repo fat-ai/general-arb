@@ -353,6 +353,7 @@ class DataFetcher:
                     WHERE (closed IS NULL OR closed = FALSE)
                       AND resolution_timestamp IS NOT NULL
                       AND resolution_timestamp <= TIMESTAMP '{now_str}'
+                      AND volume_num > 0
                 """).fetchall()
                 upd_ids = [r[0] for r in upd if r[0] is not None]
                 if upd_ids:
