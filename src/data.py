@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 import os
 import pandas as pd
+import pyarrow.parquet as pq
 
 logger = logging.getLogger("PaperGold")
 
@@ -37,7 +38,15 @@ class MarketMetadata:
         self.last_refresh = time.time()
 
     def load_from_parquet(self):
-        """Loads the initial market state synchronously from the local Parquet cache."""
+        """Loads the initial market state synchronously from the local Parquet cache.
+
+        Streamed in row-group batches with only the needed columns, so peak memory
+        stays at ~one batch instead of materializing the entire file as a pandas
+        DataFrame. The previous `pd.read_parquet(file_path)` (whole-file load, then
+        iterrows on top) was the OOM source on a large markets file. The per-row
+        parsing below is byte-for-byte unchanged, so the resulting `self.markets`,
+        `self.token_to_market`, and high-water mark are identical to before.
+        """
         file_path = "/app/polymarket_cache/gamma_markets_all_tokens.parquet"
         if not os.path.exists(file_path):
             logger.error(f"❌ Parquet file not found at {file_path}")
@@ -45,71 +54,91 @@ class MarketMetadata:
 
         logger.info("🧠 Loading markets from local Parquet cache...")
         try:
-            df = pd.read_parquet(file_path)
+            pf = pq.ParquetFile(file_path)
+            available = set(pf.schema_arrow.names)
+            wanted = ["market_id", "outcomes", "clobTokenIds", "start_date",
+                      "resolution_timestamp", "condition_id", "active", "question"]
+            if "market_id" not in available:
+                logger.error(f"❌ Parquet missing required 'market_id' column. "
+                             f"Columns present: {sorted(available)}")
+                return
+            cols = [c for c in wanted if c in available]
+            missing = [c for c in wanted if c not in available]
+            if missing:
+                logger.warning(f"⚠️ Parquet missing optional columns {missing}; "
+                               f"those fields will fall back to defaults.")
+
             highest_id = 0
 
-            for _, row in df.iterrows():
-                try:
-                    raw_id = row['market_id']
-                    mid = str(raw_id).lower()
-                    
-                    # Track highest numeric ID for the high-water mark
+            # Stream row groups (batch_size caps peak transient memory). Only the
+            # needed columns are read, so wide/unused columns never materialize.
+            for batch in pf.iter_batches(batch_size=50_000, columns=cols):
+                df = batch.to_pandas()
+
+                for _, row in df.iterrows():
                     try:
-                        numeric_id = int(raw_id)
-                        if numeric_id > highest_id:
-                            highest_id = numeric_id
-                    except ValueError:
-                        pass 
-
-                    # Parse JSON array strings into actual lists
-                    outcomes_raw = row.get('outcomes')
-                    token_ids_raw = row.get('clobTokenIds')
-                    
-                    outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
-                    token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else (token_ids_raw or [])
-                    
-                    tokens = {}
-                    for outcome, t_id in zip(outcomes, token_ids):
-                        tokens[str(outcome).lower()] = str(t_id)
-
-                    # Safely handle timestamps
-                    start_ts = 0
-                    end_ts = 0
-                    
-                    start_val = row.get('start_date')
-                    if pd.notna(start_val):
-                        if isinstance(start_val, str):
-                            try: start_ts = datetime.fromisoformat(start_val.replace('Z', '+00:00')).timestamp()
-                            except: pass
-                        else: start_ts = float(start_val)
-
-                    end_val = row.get('resolution_timestamp')
-                    if pd.notna(end_val):
-                        if isinstance(end_val, str):
-                            try: end_ts = datetime.fromisoformat(end_val.replace('Z', '+00:00')).timestamp()
-                            except: pass
-                        else: end_ts = float(end_val)
-
-                    market_obj = {
-                        "id": mid,
-                        "condition_id": str(row.get('condition_id', '')).lower(),
-                        "tokens": tokens,
-                        "active": bool(row.get('active', True)),
-                        "question": str(row.get('question', 'Unknown')),
-                        "start_timestamp": start_ts,
-                        "end_timestamp": end_ts,
-                    }
-
-                    if mid not in self.markets:
-                        self.markets[mid] = market_obj
-                    else:
-                        self.markets[mid]["tokens"].update(tokens)
+                        raw_id = row['market_id']
+                        mid = str(raw_id).lower()
                         
-                    for t_id in tokens.values():
-                        self.token_to_market[t_id] = market_obj
+                        # Track highest numeric ID for the high-water mark
+                        try:
+                            numeric_id = int(raw_id)
+                            if numeric_id > highest_id:
+                                highest_id = numeric_id
+                        except ValueError:
+                            pass 
 
-                except Exception as e:
-                    continue
+                        # Parse JSON array strings into actual lists
+                        outcomes_raw = row.get('outcomes')
+                        token_ids_raw = row.get('clobTokenIds')
+                        
+                        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+                        token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else (token_ids_raw or [])
+                        
+                        tokens = {}
+                        for outcome, t_id in zip(outcomes, token_ids):
+                            tokens[str(outcome).lower()] = str(t_id)
+
+                        # Safely handle timestamps
+                        start_ts = 0
+                        end_ts = 0
+                        
+                        start_val = row.get('start_date')
+                        if pd.notna(start_val):
+                            if isinstance(start_val, str):
+                                try: start_ts = datetime.fromisoformat(start_val.replace('Z', '+00:00')).timestamp()
+                                except: pass
+                            else: start_ts = float(start_val)
+
+                        end_val = row.get('resolution_timestamp')
+                        if pd.notna(end_val):
+                            if isinstance(end_val, str):
+                                try: end_ts = datetime.fromisoformat(end_val.replace('Z', '+00:00')).timestamp()
+                                except: pass
+                            else: end_ts = float(end_val)
+
+                        market_obj = {
+                            "id": mid,
+                            "condition_id": str(row.get('condition_id', '')).lower(),
+                            "tokens": tokens,
+                            "active": bool(row.get('active', True)),
+                            "question": str(row.get('question', 'Unknown')),
+                            "start_timestamp": start_ts,
+                            "end_timestamp": end_ts,
+                        }
+
+                        if mid not in self.markets:
+                            self.markets[mid] = market_obj
+                        else:
+                            self.markets[mid]["tokens"].update(tokens)
+                            
+                        for t_id in tokens.values():
+                            self.token_to_market[t_id] = market_obj
+
+                    except Exception as e:
+                        continue
+
+                del df, batch  # release the batch before reading the next
 
             self.highest_known_id = highest_id
             logger.info(f"✅ Loaded {len(self.markets)} markets from Parquet. High-water mark ID: {self.highest_known_id}")
