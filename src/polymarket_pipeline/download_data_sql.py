@@ -226,182 +226,150 @@ class DataFetcher:
             temp_files.append(temp_path)
             print(f"   💾 Saved chunk {chunk_idx} ({len(df)} rows)")
 
-        BATCH_SIZE = 500
+        # ===================================================================
+        # ID-DRIVEN ACQUISITION  (replaces the createdAt-ordered List walk)
+        # Gamma ignores `order`, and closed=false/true both exclude
+        # closed IS NULL markets, so no List walk can be complete. Specifying
+        # `id` bypasses the closed filter (verified) and returns markets in
+        # any state, so we enumerate by id. A persisted watermark makes the
+        # exhaustive reconciliation a one-time cost.
+        # ===================================================================
         MAX_API_RETRIES = 5
+        ID_BATCH        = 100      # ids per List-by-id call (repeated id= params, verified)
+        FRONTIER_GAP    = 20000    # consecutive empty ids past last hit => frontier reached
+        SAFETY_REWIND   = 1000     # re-verify this many trailing ids next run (out-of-order safety)
+        REQUEST_PAUSE   = 0.05
+        WM_FILE         = CACHE_DIR / "markets_id_watermark.txt"
+
         chunk_idx = 0
         current_raw_rows = []
+        found = 0
 
-        now_naive = pd.Timestamp.now(tz='UTC').tz_convert(None)
-        if max_created_at is not None:
-            safe_max = min(max_created_at, now_naive)
-            cutoff_date = safe_max - pd.Timedelta(days=14)
-        else:
-            cutoff_date = FIXED_START_DATE.tz_localize(None)
-                
-        print(f"   🔄 Fetching markets created after {cutoff_date}")
-
-        for state in ['false', 'true']:
-            offset = 0
-            retry_count = 0
-            print(f"   Fetching (closed={state})...", end="", flush=True)
-            
-            while True:
-                params = {
-                    'limit': BATCH_SIZE,
-                    'offset': offset,
-                    'closed': state,
-                    'order': 'createdAt',
-                    'ascending': 'false'
-                }
-                
+        def fetch_ids_batch(id_list):
+            """List markets by id[] — returns raw dicts for whichever ids exist,
+            in ANY closed state. Absent ids simply aren't in the response."""
+            if not id_list:
+                return []
+            params = [('limit', len(id_list))] + [('id', int(i)) for i in id_list]
+            for attempt in range(MAX_API_RETRIES):
                 try:
                     resp = self.session.get(GAMMA_API_URL, params=params, timeout=30)
+                    if resp.status_code == 429:
+                        time.sleep(5 * (attempt + 1)); continue
                     resp.raise_for_status()
-                    batch = resp.json()
-                    retry_count = 0  # Reset on success
+                    data = resp.json()
+                    return data if isinstance(data, list) else []
                 except Exception as e:
-                    retry_count += 1
-                    print(f"\n   ❌ API error at offset {offset} (Attempt {retry_count}/{MAX_API_RETRIES}): {e}")
-                    if retry_count >= MAX_API_RETRIES:
-                        print(f"   🚨 Max retries reached. Aborting fetch for closed={state}.")
-                        break
-                    time.sleep(5)
-                    continue
+                    if attempt == MAX_API_RETRIES - 1:
+                        log.warning(f"id batch {id_list[0]}-{id_list[-1]} failed: {e}")
+                        return []
+                    time.sleep(2 * (attempt + 1))
+            return []
 
-                if not batch:
-                    break
+        def save_wm(value):
+            try:
+                WM_FILE.write_text(str(int(value)))
+            except Exception as e:
+                print(f"\n   ⚠️ watermark write failed: {e}")
 
-                stop_signal = False
-                valid_batch = []
-                
-                for r in batch:
-                    c_date = r.get('createdAt')
-                    if c_date:
-                        try:
-                            ts = pd.to_datetime(c_date, utc=True).tz_convert(None)
-                            if ts < cutoff_date:
-                                stop_signal = True
-                                break
-                        except (TypeError, ValueError):
-                            pass
-                            
-                    valid_batch.append(r)
+        def stash(rows):
+            nonlocal current_raw_rows, chunk_idx, found
+            if not rows:
+                return
+            found += len(rows)
+            current_raw_rows.extend(rows)
+            if len(current_raw_rows) >= 1000:
+                process_and_save_chunk(current_raw_rows, chunk_idx)
+                current_raw_rows = []
+                chunk_idx += 1
 
-                current_raw_rows.extend(valid_batch)
-                if len(batch) == BATCH_SIZE:
-                    offset += (BATCH_SIZE - 50)
-                else:
-                    offset += len(batch)
-                
-                print(".", end="", flush=True)
+        # ---- existing ids + max from cache ----
+        existing_ids, cache_max = set(), 0
+        if cache_file.exists():
+            try:
+                rows = duckdb.execute(
+                    f"SELECT DISTINCT TRY_CAST(market_id AS BIGINT) AS mid "
+                    f"FROM read_parquet('{cache_file}')"
+                ).fetchall()
+                existing_ids = {r[0] for r in rows if r[0] is not None}
+                cache_max = max(existing_ids) if existing_ids else 0
+            except Exception as e:
+                print(f"   ⚠️ Could not read existing ids: {e}")
 
-                if len(current_raw_rows) >= 1000:
-                    process_and_save_chunk(current_raw_rows, chunk_idx)
-                    current_raw_rows = []
-                    chunk_idx += 1
+        # ---- watermark: highest id already reconciled ----
+        watermark = 0
+        if WM_FILE.exists():
+            try:
+                watermark = int((WM_FILE.read_text().strip() or "0"))
+            except Exception:
+                watermark = 0
+        lo = watermark + 1
+        print(f"   🧭 cache_max={cache_max:,} | {len(existing_ids):,} cached ids | "
+              f"watermark={watermark:,} | sweeping from {lo:,}")
 
-                if stop_signal or len(batch) < BATCH_SIZE:
-                    break
-                    
-            print(f" Done.")
+        # ===== PHASE 1 — backfill holes in [lo, cache_max] (one-time/large) =====
+        if cache_max >= lo:
+            missing = [i for i in range(lo, cache_max + 1) if i not in existing_ids]
+            print(f"   🔧 Backfill: {len(missing):,} missing ids in [{lo:,}, {cache_max:,}] "
+                  f"(one-time exhaustive pass)")
+            for k in range(0, len(missing), ID_BATCH):
+                ids = missing[k:k + ID_BATCH]
+                stash(fetch_ids_batch(ids))
+                time.sleep(REQUEST_PAUSE)
+                if (k // ID_BATCH) % 25 == 0:
+                    print(f"      backfill {k + len(ids):,}/{len(missing):,} found={found:,}", end='\r')
+            print(f"\n   ✅ Backfill complete. found so far={found:,}")
+
+        # ===== PHASE 2 — forward sweep above cache_max to the live frontier =====
+        current  = max(cache_max + 1, lo)
+        last_hit = cache_max
+        print(f"   🚀 Forward sweep from {current:,}")
+        while current - last_hit <= FRONTIER_GAP:
+            ids = list(range(current, current + ID_BATCH))
+            rows = fetch_ids_batch(ids)
+            if rows:
+                got = [int(r['id']) for r in rows if r.get('id') is not None]
+                if got:
+                    last_hit = max(last_hit, max(got))
+                stash(rows)
+            current += ID_BATCH
+            time.sleep(REQUEST_PAUSE)
+            print(f"      forward id≈{current:,} found={found:,} frontier={last_hit:,}", end='\r')
 
         if current_raw_rows:
             process_and_save_chunk(current_raw_rows, chunk_idx)
             current_raw_rows = []
-            chunk_idx += 1        
-            
+            chunk_idx += 1
+        final_watermark = max(cache_max, last_hit - SAFETY_REWIND)
+        print(f"\n   ✅ Forward sweep done. frontier≈{last_hit:,}, total found={found:,}")
+
+        # ===== UPDATES — refresh ended-but-unresolved markets (catch results) ==
         if cache_file.exists():
-                if temp_files: # ✅ Only run if we actually downloaded new chunks this session
-                    print(f"   🕵️ Checking for missing market IDs (Gaps in current session)...")
-                    try:
-                        # ✅ Read ONLY the newly downloaded session chunks instead of the massive cache
-                        df_new = pd.concat([pd.read_parquet(p, columns=['market_id']) for p in temp_files], ignore_index=True)
-                        new_ids = df_new['market_id'].dropna().astype(int).unique()
-                        
-                        if cache_file.exists():
-                            old_max_val = duckdb.execute(f"SELECT MAX(CAST(market_id AS BIGINT)) FROM read_parquet('{cache_file}')").fetchone()[0]
-                            old_max_id = int(old_max_val) if old_max_val is not None else 0
-                            ids = np.sort(np.append(new_ids, old_max_id))
-                        else:
-                            ids = np.sort(new_ids)
-                        missing_ids = [m for i in range(len(ids)-1) for m in range(ids[i]+1, ids[i+1])]
-                        
-                        del df_new
-                        gc.collect()
-                          
-                        if missing_ids:
-                            gap_raw_rows = []
-                            print(f"   🚀 Fetching {len(missing_ids)} missing sequence IDs...")
-                            
-                            for i, mid in enumerate(missing_ids):
-                                for attempt in range(3):
-                                    try:
-                                        # ✅ FIX: Using 'with' forces Python to instantly clear the memory and socket
-                                        with self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10) as resp:
-                                            if resp.status_code == 200:
-                                                raw_data = resp.json()
-                                                if isinstance(raw_data, dict) and 'id' in raw_data:
-                                                    gap_raw_rows.append(raw_data)
-                                                break
-                                            elif resp.status_code == 404:
-                                                break # 'with' block will auto-close the dangling 404 response
-                                            else:
-                                                time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                    except Exception as e:
-                                        log.warning(f"Gap fill attempt {attempt+1}/3 failed for ID {mid}: {e}")
-                                        time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                
-                                print(f"      [{i+1}/{len(missing_ids)}] Gap Checked: ID {mid}      ", end='\r')
-                                
-                                # Batch save to prevent memory spikes if there are many gaps
-                                if len(gap_raw_rows) >= 500:
-                                    process_and_save_chunk(gap_raw_rows, f"gap_fill_{mid}")
-                                    gap_raw_rows.clear() # Faster than reassigning []
-                                    gc.collect()
-        
-                            if gap_raw_rows:
-                                process_and_save_chunk(gap_raw_rows, "gap_fill_final")
-                                print("\n   ✅ Gap updates saved to temp chunks.")
-                    except Exception as e:
-                        print(f"\n   ⚠️ Could not process gap updates: {e}")    
-            
-        if cache_file.exists():
-                print(f"   🔄 Checking for unresolved market updates...")
-                try:
-                    df_ext = pd.read_parquet(cache_file, columns=['market_id', 'closed'])
-                    unresolved_ids = df_ext[(df_ext['closed'] == False)]['market_id'].dropna().astype(int).unique()
-                    del df_ext
-                    gc.collect()
-                    
-                    if len(unresolved_ids) > 0:
-                        
-                        updated_raw_rows = []
-                        print(f"   🚀 Fetching updates for {len(unresolved_ids)} unresolved markets...")
-                        
-                        for i, mid in enumerate(unresolved_ids):
-                            for attempt in range(3): # Short retry loop for updates
-                                try:
-                                    resp = self.session.get(f"{GAMMA_API_URL.rstrip('/')}/{mid}", timeout=10)
-                                    if resp.status_code == 200:
-                                        raw_data = resp.json()
-                                        if isinstance(raw_data, dict) and 'id' in raw_data and raw_data.get('endDate'):
-                                            updated_raw_rows.append(raw_data)
-                                        break
-                                    elif resp.status_code == 404:
-                                        break
-                                    else:
-                                        time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                                except Exception as e:
-                                    log.warning(f"Unresolved update attempt {attempt+1}/3 failed for ID {mid}: {e}")
-                                    time.sleep(1.0 * (2 ** attempt) + random.uniform(0, 0.5))
-                            print(f"      [{i+1}/{len(unresolved_ids)}] Checked     ", end='\r')
-                        
-                        if updated_raw_rows:
-                            # Feed the updated rows straight into the chunk saver
-                            process_and_save_chunk(updated_raw_rows, "unresolved_updates")
-                            print("\n   ✅ Unresolved updates saved to temp chunk.")
-                except Exception as e:
-                    print(f"\n   ⚠️ Could not process unresolved updates: {e}")
+            try:
+                now_str = pd.Timestamp.now(tz='UTC').tz_convert(None).strftime('%Y-%m-%d %H:%M:%S')
+                upd = duckdb.execute(f"""
+                    SELECT DISTINCT TRY_CAST(market_id AS BIGINT) AS mid
+                    FROM read_parquet('{cache_file}')
+                    WHERE (closed IS NULL OR closed = FALSE)
+                      AND resolution_timestamp IS NOT NULL
+                      AND resolution_timestamp <= TIMESTAMP '{now_str}'
+                """).fetchall()
+                upd_ids = [r[0] for r in upd if r[0] is not None]
+                if upd_ids:
+                    print(f"   🔄 Refreshing {len(upd_ids):,} ended-but-open markets...")
+                    u_buf = []
+                    for k in range(0, len(upd_ids), ID_BATCH):
+                        rows = fetch_ids_batch(upd_ids[k:k + ID_BATCH])
+                        if rows:
+                            u_buf.extend(rows)
+                            if len(u_buf) >= 1000:
+                                process_and_save_chunk(u_buf, f"upd_{k}"); u_buf = []
+                        time.sleep(REQUEST_PAUSE)
+                    if u_buf:
+                        process_and_save_chunk(u_buf, "upd_final")
+                    print(f"   ✅ Update pass done.")
+            except Exception as e:
+                print(f"   ⚠️ Update pass failed: {e}")
     
         if not temp_files:
             print("   ℹ️  No new market data to save.")
@@ -451,7 +419,7 @@ class DataFetcher:
             con.close()
             
         shutil.move(temp_output, str(cache_file))
-        
+        save_wm(final_watermark)
         print(f"   ✅ Markets saved: {final_count:,} total rows → {cache_file}")
 
         for p in temp_files:
