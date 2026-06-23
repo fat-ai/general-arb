@@ -192,6 +192,10 @@ def fill_gaps():
                 
                 if resp.status_code == 200:
                     raw_data = resp.json()
+                    if raw_data == []:
+                        print(f"   [{i+1}/{len(missing_ids)}] Skipped Market {mid} (Empty API Response)        ", end='\r')
+                        success = True
+                        break
                     
                     if not isinstance(raw_data, dict) or 'id' not in raw_data:
                         raise ValueError("Payload is missing standard market data.")
