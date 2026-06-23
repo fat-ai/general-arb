@@ -38,7 +38,7 @@ class MarketMetadata:
 
     def load_from_parquet(self):
         """Loads the initial market state synchronously from the local Parquet cache."""
-        file_path = "./data-cache/polymarket_cache/gamma_markets_all_tokens.parquet"
+        file_path = "/app/polymarket_cache/gamma_markets_all_tokens.parquet"
         if not os.path.exists(file_path):
             logger.error(f"❌ Parquet file not found at {file_path}")
             return
