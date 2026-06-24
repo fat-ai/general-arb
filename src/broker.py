@@ -93,7 +93,7 @@ class BaseBroker:
 
     # Price sanity bounds for BUYs (unchanged from the original PaperBroker).
     MAX_BUY_PRICE = 0.95
-    MIN_BUY_PRICE = 0.05
+    MIN_BUY_PRICE = 0.00
 
     def __init__(self, persistence: PersistenceManager):
         self.pm = persistence
