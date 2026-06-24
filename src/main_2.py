@@ -898,8 +898,8 @@ class LiveTrader:
             top_3 = batch_scores[:3]
             msg_parts = [f"Mkt {item[2]}..: {item[1]:.1f}" for item in top_3]
             log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
-        #else:
-        #    log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
+        else:
+            log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
     
 
