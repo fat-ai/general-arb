@@ -774,9 +774,9 @@ class LiveTrader:
 
             mid = market['id']
 
-            if market.get('start_timestamp', 0) < self.start_time:
-                skipped_counts["old"] += 1
-                continue
+       #      if market.get('start_timestamp', 0) < self.start_time:
+       #          skipped_counts["old"] += 1
+       #          continue
 
             if market.get('end_timestamp', 0) < time.time():
                 skipped_counts["expired"] += 1
