@@ -443,11 +443,18 @@ class LiveTrader:
                             async with session.post(current_rpc, json=log_payload, timeout=10) as logs_resp:
                                 data = await logs_resp.json()
                                 
-                                if 'result' in data:
-                                    logs.extend(data['result'])
-                                elif 'error' in data:
+                                result = data.get('result')
+                                if isinstance(result, list):
+                                    logs.extend(result)
+                                else:
+                                    # 'error' present, or result is null / a string = malformed node
+                                    # reply. Treat as an error so the cursor does NOT advance past this
+                                    # range — otherwise extend() explodes a string into per-char "logs"
+                                    # and we silently skip any real trades in these blocks.
                                     has_error = True
                                     error_data = data
+                                    log.warning(f"eth_getLogs bad result from {current_rpc}: "
+                                                f"type={type(result).__name__} sample={str(result)[:120]}")
                                     break
                                     
                         if not has_error:
@@ -495,6 +502,7 @@ class LiveTrader:
                     rpc_index = (rpc_index + 1) % len(RPC_URLS)
                     batch_size = max(1, batch_size // 2)
                     await asyncio.sleep(2.0)
+
     
     async def _parse_log(self, log_item):
         """
@@ -502,6 +510,8 @@ class LiveTrader:
         Uses comparative math validation logic to determine trade direction.
         """
         try:
+            if not isinstance(log_item, dict):
+                return "ERROR"
             topics = log_item.get('topics', [])
             if len(topics) < 4: return "ERROR"
 
