@@ -475,22 +475,31 @@ class LiveTrader:
                             
                         else:
                             data = error_data
-                            log.error(f"🚨 RPC Error from {current_rpc}: {data['error']}")
-                            error_code = data['error'].get('code')
-                            
-                            if error_code in [-32002, -32005, -32000]:
+                            err = data.get('error', {}) or {}
+                            error_code = err.get('code')
+                            msg = str(err.get('message', ''))
+                            log.error(f"🚨 RPC Error from {current_rpc} (code {error_code}): {msg[:200]}")
+
+                            # Pruned backend can't serve this (now-old) range. Shrinking batch won't
+                            # help — only a different endpoint will.
+                            pruned = ('historical state' in msg) or ('missing trie node' in msg) \
+                                     or ('state is not available' in msg)
+
+                            if error_code in (-32002, -32005, -32000) and not pruned:
+                                # genuine "batch too large / timeout": shrink, rotate at the floor
                                 if batch_size > 1:
                                     batch_size = max(1, batch_size // 2)
                                     log.warning(f"📉 Shrinking batch size to {batch_size}...")
-                                    
-                                    if error_code == -32002:
-                                        rpc_index = (rpc_index + 1) % len(RPC_URLS)
-                                        log.warning(f"🔄 Rotating to new RPC: {get_rpc()}")
                                 else:
-                                    log.warning(f"⏳ Single block {current_block_num} timed out. Rotating RPC and retrying...")
                                     rpc_index = (rpc_index + 1) % len(RPC_URLS)
-                                    await asyncio.sleep(2.0)
-                                    continue
+                                    log.warning(f"🔄 Single block stuck, rotating RPC -> {get_rpc()}")
+                                await asyncio.sleep(1.0)
+                            else:
+                                # Pruned-range error OR any unhandled/relay-wrapped code (Pocket -31001).
+                                # Never sit on a bad endpoint — rotate immediately.
+                                rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                                log.warning(f"🔄 Rotating RPC (code {error_code}, pruned={pruned}) -> {get_rpc()}")
+                                await asyncio.sleep(0.5)
                                     
                             await asyncio.sleep(1.0) 
                     
