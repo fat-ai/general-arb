@@ -11,7 +11,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 import math
-from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG
+from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG, CACHE_DIR
 import shutil
 from dataclasses import dataclass, field
 import array
@@ -20,7 +20,6 @@ import sys
 import os
 from numba import njit, prange, set_num_threads
 
-CACHE_DIR = Path(os.environ.get("SIM_CACHE_DIR", "/app/polymarket_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Recovery / rebuild controls (no-ops in normal operation) ----------------
