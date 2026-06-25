@@ -14,7 +14,7 @@ import pickle
 from datetime import datetime, timezone
 
 # --- MODULE IMPORTS ---
-from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, setup_logging, validate_config
+from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, STATE_FILE, setup_logging, validate_config
 from reporting import generate_institutional_report, generate_html_report
 from broker import PersistenceManager, PaperBroker, LiveBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
@@ -33,9 +33,6 @@ from sim_strat_5 import (
 import numpy as np     
 import math
 from ws_handler import PolymarketWS
-
-STATE_FILE = CACHE_DIR / "bayesian_state.pkl"
-EQUITY_FILE = CACHE_DIR / EQUITY_FILE
 
 # Setup Logging
 log, _ = setup_logging()
