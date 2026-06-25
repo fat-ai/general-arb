@@ -35,6 +35,7 @@ import math
 from ws_handler import PolymarketWS
 
 STATE_FILE = CACHE_DIR / "bayesian_state.pkl"
+EQUITY_FILE = CACHE_DIR / EQUITY_FILE
 
 # Setup Logging
 log, _ = setup_logging()
