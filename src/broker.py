@@ -143,6 +143,26 @@ class BaseBroker:
                     log.warning(f"❌ Sell failed: No position found for {token_id}")
                     return False
                 calc_amount = pos["qty"]
+            else:
+                # --- 🛡️ PRE-FILL BUY GUARDS ---
+                # These MUST run before _fill(). For LiveBroker, _fill() submits a
+                # real FOK order that can match on-chain; if we only checked capacity
+                # and cash *after* the fill (as before), a rejected post-fill check
+                # would leave shares we actually own untracked in the mirror. Paper
+                # behaviour is unchanged (slightly stricter, never looser).
+                if (token_id not in state["positions"]
+                        and len(state["positions"]) >= CONFIG["max_positions"]):
+                    log.warning(f"🛑 Max positions ({CONFIG['max_positions']}) reached; "
+                                f"skipping BUY for {token_id} before fill.")
+                    return False
+                # usdc_amount is the notional we intend to spend on this BUY.
+                if state["cash"] < float(usdc_amount):
+                    log.warning(f"❌ Rejected {token_id}: Insufficient Cash "
+                                f"(need ${float(usdc_amount):.2f}, have ${state['cash']:.2f})")
+                    return False
+                if self._best_price("BUY", current_book) <= 0:
+                    log.warning(f"❌ Rejected {token_id}: no ask liquidity before fill.")
+                    return False
 
             # --- OBTAIN A FILL (paper = simulated VWAP, live = real FOK) ---
             vwap_price, filled_qty = await self._fill(side, calc_amount, current_book, token_id)
@@ -165,12 +185,12 @@ class BaseBroker:
 
             # --- BUY LOGIC ---
             if side == "BUY":
-                if token_id not in state["positions"] and len(state["positions"]) >= CONFIG["max_positions"]:
-                    return False
-
+                # Capacity was already enforced before the fill. Cash is re-checked
+                # defensively against the *actual* filled cost (a live fill can come
+                # back smaller than requested, so this should essentially never trip).
                 cost = filled_qty * vwap_price
                 if state["cash"] < cost:
-                    log.warning(f"❌ Rejected {token_id}: Insufficient Cash")
+                    log.warning(f"❌ Rejected {token_id}: Insufficient Cash post-fill")
                     return False
 
                 state["cash"] -= cost
