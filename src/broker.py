@@ -9,9 +9,7 @@ from typing import Dict, Tuple, Optional
 
 # Import configuration and constants
 from config import CONFIG, STATE_FILE
-from sim_strat_5 import CACHE_DIR
 
-STATE_FILE = CACHE_DIR / STATE_FILE
 # Initialize loggers
 log = logging.getLogger("PaperGold")
 audit_log = logging.getLogger("TradeAudit")
