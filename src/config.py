@@ -3,14 +3,16 @@ import logging
 from pathlib import Path
 
 # --- CONSTANTS & PATHS ---
-STATE_FILE = Path("paper_state.json")
-AUDIT_FILE = Path("trades_audit.jsonl")
+from sim_strat_5 import CACHE_DIR
+EQUITY_FILE = CACHE_DIR / "equity_curve.csv"
+AUDIT_FILE  = CACHE_DIR / "trade_audit.jsonl"
+STATE_FILE  = CACHE_DIR / "paper_state.json"
+BAYESIAN_FILE = CACHE_DIR / "bayesian_state.pkl"
 SIGNAL_FILE = Path("simulation_results.csv")
 WALLET_SCORES_FILE = Path("wallet_scores.json")
 FRESH_SCORE_FILE = Path("model_params_audit.json")
 TEMP_WALLET_STATS_FILE = Path("temp_universal_stats.csv")
 TRADES_FILE = Path("gamma_trades_stream.csv")
-EQUITY_FILE = Path("equity_curve.csv")
 MARKETS_FILE = Path("gamma_markets_all_tokens.parquet")
 
 # --- EXTERNAL SERVICES ---
