@@ -6,11 +6,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tabulate import tabulate
-from config import EQUITY_FILE, AUDIT_FILE, CONFIG
-from sim_strat_5 import CACHE_DIR
-DASHBOARD_PATH = CACHE_DIR / "DB.html"
+from config import EQUITY_FILE, AUDIT_FILE, DASHBOARD_PATH, CONFIG
 
-AUDIT_FILE = CACHE_DIR / AUDIT_FILE
 # Updated Template with Table Layout
 HTML_TEMPLATE = """
 <!DOCTYPE html>
