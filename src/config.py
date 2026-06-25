@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 
 # --- CONSTANTS & PATHS ---
-from sim_strat_5 import CACHE_DIR
+CACHE_DIR = Path(os.environ.get("SIM_CACHE_DIR", "/app/polymarket_cache"))
 EQUITY_FILE = CACHE_DIR / "equity_curve.csv"
 AUDIT_FILE  = CACHE_DIR / "trade_audit.jsonl"
 STATE_FILE  = CACHE_DIR / "paper_state.json"
