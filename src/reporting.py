@@ -8,7 +8,7 @@ from pathlib import Path
 from tabulate import tabulate
 from config import EQUITY_FILE, AUDIT_FILE, CONFIG
 from sim_strat_5 import CACHE_DIR
-DASHBOARD_PATH = Path("dashboard.html")
+DASHBOARD_PATH = CACHE_DIR / "DB.html"
 
 AUDIT_FILE = CACHE_DIR / AUDIT_FILE
 # Updated Template with Table Layout
