@@ -81,7 +81,12 @@ class LiveTrader:
             'scores': []  
         }
         self.cumulative_volumes: Dict[str, float] = {}
+        # Real-time last on-chain trade price per token, updated by _parse_log.
+        # Used as a mark fallback when the order book is empty/stale so open
+        # positions don't get stuck marked at entry (avg) price.
+        self.last_price: Dict[str, float] = {}
         self.ws_client = None
+        self._last_dash_log = 0.0
 
     async def start(self):
         print("\n🚀 STARTING LIVE TRADER")
@@ -147,6 +152,7 @@ class LiveTrader:
             self._poll_rpc_loop(),
             self._signal_loop(),
             self._maintenance_loop(),
+            self._exit_monitor_loop(),
             self._risk_monitor_loop(),
             self._reporting_loop(),
             self._monitor_loop(),
@@ -187,12 +193,16 @@ class LiveTrader:
                 self.order_books[asset_id] = {'bids': {}, 'asks': {}}
 
             # Polymarket sends full snapshots as lists of {price, size}
-            # We clear the old book and rebuild it
+            # We clear the old book and rebuild it.
+            # NOTE: keys are coerced to float. Previously they were raw strings,
+            # so a level quoted as "0.5" in the snapshot and "0.50" in a later
+            # price_change would NOT match on pop() — leaving a stale/ghost level
+            # that corrupted the best-bid mark. Float keys make removal reliable.
             self.order_books[asset_id]['bids'] = {
-                x['price']: x['size'] for x in item.get('bids', [])
+                float(x['price']): float(x['size']) for x in item.get('bids', [])
             }
             self.order_books[asset_id]['asks'] = {
-                x['price']: x['size'] for x in item.get('asks', [])
+                float(x['price']): float(x['size']) for x in item.get('asks', [])
             }
 
         except Exception as e:
@@ -213,14 +223,19 @@ class LiveTrader:
                 side = "bids" if change.get("side") == "buy" else "asks"
                 price = change.get("price")
                 size = change.get("size")
-                
-                if not price: continue
 
-                # If size is 0, remove the price level
-                if float(size) == 0:
-                    self.order_books[asset_id][side].pop(price, None)
+                if price is None:
+                    continue
+
+                # Coerce to float so keys are canonical and match the snapshot's
+                # float keys (see _process_snapshot). A size of 0 removes the level.
+                p = float(price)
+                s = float(size) if size is not None else 0.0
+                book_side = self.order_books[asset_id][side]
+                if s == 0:
+                    book_side.pop(p, None)
                 else:
-                    self.order_books[asset_id][side][price] = size
+                    book_side[p] = s
 
         except Exception as e:
             log.error(f"Update Error: {e}")
@@ -260,42 +275,28 @@ class LiveTrader:
     async def _dashboard_loop(self):
         while self.running:
             await asyncio.sleep(5) # Update fast (every 5s) for HTML dashboard
-            
-            # --- 1. DATA COLLECTION ---
-            for tid, pos in self.persistence.state["positions"].items():
-                if 'trace_price' not in pos: pos['trace_price'] = []
-                
-                # Get Best Bid Price safely
-                price = pos['avg_price']
-                raw_book = self.order_books.get(tid)
-                if raw_book:
-                    # Handle both Dict and List formats safely
-                    bids = raw_book.get('bids')
-                    if isinstance(bids, dict) and bids:
-                        price = float(max(bids.keys(), key=float))
-                    elif isinstance(bids, list) and bids:
-                        price = float(bids[0][0])
-                
+
+            # --- 1. DATA COLLECTION (sparkline trace per position) ---
+            # list() so a concurrent redeem/sell can't mutate the dict mid-iterate.
+            for tid, pos in list(self.persistence.state["positions"].items()):
+                if 'trace_price' not in pos:
+                    pos['trace_price'] = []
+                price = self._mark_price(tid, pos['avg_price'])
                 pos['trace_price'].append(price)
-                if len(pos['trace_price']) > 50: pos['trace_price'].pop(0)
+                if len(pos['trace_price']) > 50:
+                    pos['trace_price'].pop(0)
 
             # --- 2. GENERATE HTML DASHBOARD ---
-            # Create a clean price map
-            live_prices_map = {}
-            for tid, book in self.order_books.items():
-                # Same safe extraction logic
-                bids = book.get('bids')
-                if isinstance(bids, dict) and bids:
-                    live_prices_map[tid] = float(max(bids.keys(), key=float))
-                elif isinstance(bids, list) and bids:
-                    live_prices_map[tid] = float(bids[0][0])
-
-            # Generate HTML
-      
+            # One consistent mark map (same logic as risk + reporting).
+            live_prices_map = self._collect_marks(held_only=True)
             res = generate_html_report(self.persistence.state, live_prices_map, self.metadata)
-            
-            # Only print log every 60s to keep terminal clean, but update HTML every 5s
-            if self.stats['processed_count'] % 12 == 0: 
+
+            # Throttle the terminal log to ~once a minute. (The old `% 12` gate keyed
+            # off processed_count, which _monitor_loop zeroes every 30s — so it fired
+            # unpredictably, often every tick when the count sat at 0.)
+            now = time.time()
+            if now - self._last_dash_log >= 60:
+                self._last_dash_log = now
                 log.info(res)
 
     async def _monitor_loop(self):
@@ -570,6 +571,11 @@ class LiveTrader:
                         return "ERROR"
                 else:
                     return "ERROR"
+
+                # Record the freshest on-chain trade price for this token. This is
+                # used as a mark fallback (see _mark_price) so a held position is
+                # never stuck marked at its entry price while its book is empty.
+                self.last_price[tid] = price
 
                 trade_obj = {
                     'id': log_item.get('transactionHash'),
@@ -896,7 +902,12 @@ class LiveTrader:
                     and price < 0.40):
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
-                self.seen_market_ids.add(mid)
+                # NOTE: we intentionally do NOT add to seen_market_ids here.
+                # pending_orders/pending_markets are the in-flight guard. The
+                # permanent re-entry ban is applied only once a fill is actually
+                # confirmed (see _attempt_exec). Banning on signal meant a market
+                # that briefly had no liquidity got blacklisted forever despite
+                # never being entered.
                 asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
 
         
@@ -913,6 +924,71 @@ class LiveTrader:
     
 
     # --- EXECUTION HELPERS ---
+
+    def _best_bid(self, token_id):
+        """Highest bid price for a token, or None. Books are float-keyed."""
+        book = self.order_books.get(str(token_id))
+        if not book:
+            return None
+        bids = book.get('bids')
+        if isinstance(bids, dict) and bids:
+            return max(bids.keys())
+        if isinstance(bids, list) and bids:
+            try:
+                return max(float(b[0]) for b in bids)
+            except Exception:
+                return None
+        return None
+
+    def _best_ask(self, token_id):
+        """Lowest ask price for a token, or None. Books are float-keyed."""
+        book = self.order_books.get(str(token_id))
+        if not book:
+            return None
+        asks = book.get('asks')
+        if isinstance(asks, dict) and asks:
+            return min(asks.keys())
+        if isinstance(asks, list) and asks:
+            try:
+                return min(float(a[0]) for a in asks)
+            except Exception:
+                return None
+        return None
+
+    def _mark_price(self, token_id, fallback):
+        """Single source of truth for valuing an open position.
+
+        Order of preference:
+          1. Best bid  — the realizable exit price (conservative, what we could
+             actually sell into right now).
+          2. Last on-chain trade price — covers the case where the book is
+             momentarily empty/stale so the mark doesn't snap back to entry.
+          3. fallback (the position's avg cost) — last resort.
+
+        (If you'd rather mark at fair value, swap step 1 for the bid/ask mid when
+        both sides are present; bid-first is used here to stay conservative.)
+        """
+        bid = self._best_bid(token_id)
+        if bid is not None and bid > 0:
+            return bid
+        lp = self.last_price.get(str(token_id))
+        if lp is not None and lp > 0:
+            return lp
+        return fallback
+
+    def _collect_marks(self, held_only=True):
+        """Build {token_id: mark_price} for mark-to-market. Defaults to held
+        positions only (all that equity/dashboard/reporting actually need)."""
+        marks = {}
+        positions = self.persistence.state["positions"]
+        tokens = positions.keys() if held_only else set(self.order_books.keys())
+        for tid in list(tokens):
+            pos = positions.get(tid)
+            fallback = pos['avg_price'] if pos else 0.0
+            m = self._mark_price(tid, fallback)
+            if m is not None:
+                marks[str(tid)] = m
+        return marks
 
     def _prepare_clean_book(self, token_id):
         """Helper to convert dictionary order books to sorted lists."""
@@ -992,13 +1068,20 @@ class LiveTrader:
 
         is_paper_trading = isinstance(self.broker, PaperBroker)
         virtual_consumption = {}
+        # How often the sweep re-evaluates the book. The old loop idled 5s between
+        # chunks (and 2s on a thin book), so liquidity that appeared and vanished
+        # inside that window was missed. Re-check ~1s by default (configurable).
+        sweep_tick = float(CONFIG.get('sweep_tick', 1.0))
+        # Minimum chunk size to bother executing (gas/dust floor on live). A
+        # sub-floor chunk is still allowed if it would *complete* the target.
+        min_chunk = float(CONFIG.get('min_chunk_usdc', 2.0))
         log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
 
         # 5. Dynamic Sweep Loop
         while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
             clean_book = self._prepare_clean_book(token_id)
             if not clean_book or not clean_book['asks'] or not clean_book['bids']:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(sweep_tick)
                 continue
 
             # ==========================================
@@ -1018,7 +1101,7 @@ class LiveTrader:
                 clean_book['asks'] = adjusted_asks # Broker will now see the depleted book!
 
             if not clean_book['asks']:
-                await asyncio.sleep(2.0) # Wait for new sellers if book is virtually empty
+                await asyncio.sleep(sweep_tick) # Wait for new sellers if book is virtually empty
                 continue
 
             # Calculate Current Spread
@@ -1067,7 +1150,10 @@ class LiveTrader:
                     break
 
             # --- EXECUTE THE CHUNK ---
-            if optimal_chunk_usdc >= 2.0 or optimal_chunk_usdc == remaining_usdc:
+            # Execute if the chunk clears the dust floor, OR if it would finish the
+            # remaining target (so a small final slice isn't skipped indefinitely).
+            completes_target = optimal_chunk_usdc >= (remaining_usdc - 1e-6)
+            if optimal_chunk_usdc >= min_chunk or completes_target:
                 log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
                 
                 market_obj = self.metadata.markets.get(mkt_id)
@@ -1091,7 +1177,11 @@ class LiveTrader:
                 
                 if success is not False:
                     accumulated_usdc += optimal_chunk_usdc
-                    
+                    # We now genuinely hold (or are building) a position in this
+                    # market: apply the permanent re-entry ban here, on a CONFIRMED
+                    # fill, rather than speculatively at signal time. Idempotent.
+                    self.seen_market_ids.add(mkt_id)
+
                     if is_paper_trading:
                         for p_str, amt in planned_consumption.items():
                             virtual_consumption[p_str] = virtual_consumption.get(p_str, 0.0) + amt
@@ -1105,7 +1195,7 @@ class LiveTrader:
             else:
                 pass 
             
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(sweep_tick)
 
         # 6. Timeout handling
         if accumulated_usdc > 0 and accumulated_usdc < trade_size:
@@ -1146,10 +1236,62 @@ class LiveTrader:
         """Generates and prints the institutional report every 5 minutes."""
         while self.running:
             await asyncio.sleep(60)
-            
-            report_str = await asyncio.to_thread(generate_institutional_report)
+
+            # Build a small snapshot in the event loop (thread-safe) so the report,
+            # which runs in a worker thread, never reads the live state dict.
+            positions = self.persistence.state["positions"]
+            marks = self._collect_marks(held_only=True)
+            invested_cost = sum(p['qty'] * p['avg_price'] for p in positions.values())
+            invested_mark = sum(
+                p['qty'] * marks.get(str(tid), p['avg_price'])
+                for tid, p in positions.items()
+            )
+            snapshot = {
+                "open_positions": len(positions),
+                "invested_cost": invested_cost,
+                "invested_mark": invested_mark,
+                "unrealized": invested_mark - invested_cost,
+                "cash": self.persistence.state["cash"],
+            }
+
+            report_str = await asyncio.to_thread(generate_institutional_report, snapshot)
             if report_str:
                 print(f"\n{report_str}\n")
+
+    async def _exit_monitor_loop(self):
+        """Fast take-profit monitor.
+
+        Runs every ~1s (configurable) so exits react to order-book moves promptly
+        instead of waiting on the 60s risk loop. It sells into the BEST BID once it
+        reaches the take-profit level — the best bid is the realizable exit price,
+        so take-profit deliberately uses it rather than the (conservative) mark.
+        """
+        take_profit = float(CONFIG.get('take_profit', 0.95))
+        tick = float(CONFIG.get('exit_tick', 1.0))
+        log.info(f"🎯 Exit Monitor Started | take-profit ≥ ${take_profit:.2f} | tick {tick}s")
+        while self.running:
+            try:
+                for held_tid, pos in list(self.persistence.state["positions"].items()):
+                    best_bid = self._best_bid(held_tid)
+                    if best_bid is None or best_bid < take_profit:
+                        continue
+                    fpmm = pos.get("market_fpmm")
+                    if not fpmm:
+                        continue
+                    if held_tid in self.pending_orders or fpmm in self.pending_markets:
+                        continue
+                    clean_book = self._prepare_clean_book(held_tid)
+                    if not clean_book:
+                        log.warning(f"⏳ Take-profit for {held_tid} (bid ${best_bid:.3f}) "
+                                    f"but order book unavailable; will retry next tick.")
+                        continue
+                    self.pending_orders.add(held_tid)
+                    self.pending_markets.add(fpmm)
+                    log.info(f"🎯 TAKE-PROFIT {held_tid} | Best bid: ${best_bid:.3f}")
+                    asyncio.create_task(self._execute_task(held_tid, fpmm, "SELL", clean_book))
+            except Exception as e:
+                log.error(f"Exit monitor error: {e}")
+            await asyncio.sleep(tick)
 
     async def _risk_monitor_loop(self):
         if not EQUITY_FILE.exists():
@@ -1158,36 +1300,10 @@ class LiveTrader:
                 writer.writerow(["timestamp", "equity", "cash", "invested", "drawdown"])
 
         while self.running:
-            live_prices = {}
-            # [FIX] Correctly parse the Order Book Dictionary
-            for token_id, book in self.order_books.items():
-                bids = book.get('bids', {}) # Get the Dict {'price': 'size'}
-                
-                if bids:
-                    best_price = float(max(bids.keys(), key=lambda x: float(x)))
-                    live_prices[token_id] = best_price
-            
-            # Now live_prices contains FLOATS, so this won't crash
-            # --- Take-profit exit: sell when best bid >= $0.95 ---
-            # Mirrors minitest.py: sell early when the market price reaches the take-profit level.
-            # Order-book best bid is the true expression of the price we can sell into.
-            for held_tid, pos in list(self.persistence.state["positions"].items()):
-                best_bid = live_prices.get(held_tid, 0.0)
-                if best_bid < 0.95:
-                    continue
-                fpmm = pos.get("market_fpmm")
-                if not fpmm:
-                    continue
-                if held_tid in self.pending_orders or fpmm in self.pending_markets:
-                    continue
-                clean_book = self._prepare_clean_book(held_tid)
-                if not clean_book:
-                    log.warning(f"⏳ Take-profit triggered for {held_tid} (bid ${best_bid:.3f}) but order book unavailable; will retry next cycle.")
-                    continue
-                self.pending_orders.add(held_tid)
-                self.pending_markets.add(fpmm)
-                log.info(f"🎯 TAKE-PROFIT {held_tid} | Best bid: ${best_bid:.3f}")
-                asyncio.create_task(self._execute_task(held_tid, fpmm, "SELL", clean_book))
+            # Mark-to-market for held positions via the single shared mark helper
+            # (best bid -> last trade -> avg). Take-profit is handled separately by
+            # the fast _exit_monitor_loop, so this 60s loop only does equity/risk.
+            live_prices = self._collect_marks(held_only=True)
 
             equity = self.persistence.calculate_equity(current_prices=live_prices)
             cash = self.persistence.state["cash"]
