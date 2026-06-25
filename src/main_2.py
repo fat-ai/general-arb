@@ -14,7 +14,7 @@ import pickle
 from datetime import datetime, timezone
 
 # --- MODULE IMPORTS ---
-from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, BAYESIAN_FILE, setup_logging, validate_config
+from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, STATE_FILE, BAYESIAN_FILE, setup_logging, validate_config
 from reporting import generate_institutional_report, generate_html_report
 from broker import PersistenceManager, PaperBroker, LiveBroker
 from data import MarketMetadata, SubscriptionManager, fetch_graph_trades
@@ -124,15 +124,15 @@ class LiveTrader:
 
         # 3. LOAD ALL MARKETS
         print("🧠 Loading Bayesian State from disk...")
-        if STATE_FILE.exists():
-            with open(STATE_FILE, 'rb') as f:
+        if BAYESIAN_FILE.exists():
+            with open(BAYESIAN_FILE, 'rb') as f:
                 checkpoint_data = pickle.load(f)
                 
                 # Handle cases where the checkpoint is wrapped in a 'state' dictionary key
                 self.state = checkpoint_data['state'] if isinstance(checkpoint_data, dict) and 'state' in checkpoint_data else checkpoint_data
             
             # Re-attach massive historical arrays via zero-copy C-level bytes
-            npz_path = STATE_FILE.with_suffix('.npz')
+            npz_path = BAYESIAN_FILE.with_suffix('.npz')
             restore_arrays_from_npz(self.state, npz_path)
             
             log.info(f"✅ Loaded Bayesian state: {self.state.next_user_id} users tracked.")
