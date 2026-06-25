@@ -217,8 +217,19 @@ def generate_html_report(state, live_prices, metadata):
         traceback.print_exc()
         return f"Error: {e}"
 
-def generate_institutional_report():
-    """Generates a professional performance factsheet string."""
+def generate_institutional_report(snapshot=None):
+    """Generates a professional performance factsheet string.
+
+    `snapshot` (optional) is a small dict captured in the event loop and passed
+    in by the caller so this function stays pure / thread-safe (it runs inside
+    asyncio.to_thread). Expected keys:
+        open_positions  : int   number of currently held positions
+        invested_mark   : float marked value of held positions
+        invested_cost   : float cost basis of held positions
+        unrealized      : float invested_mark - invested_cost
+        cash            : float current cash mirror
+    When omitted the report degrades gracefully to the file-derived metrics only.
+    """
     try:
         # --- 1. LOAD EQUITY CURVE ---
         if not EQUITY_FILE.exists():
@@ -238,40 +249,36 @@ def generate_institutional_report():
         df_trades = pd.DataFrame(trades)
 
         # --- 3. CALCULATE RISK METRICS (Time Series) ---
-        if df_eq.empty:
-            return "⏳ Gathering Data..."
-
+        if df_eq.empty: return "⏳ Gathering Data..."
+        
         curr_eq = df_eq['equity'].iloc[-1]
         start_eq = CONFIG['initial_capital']
-        total_ret = (curr_eq - start_eq) / start_eq if start_eq > 0 else 0.0
-
+        total_ret = (curr_eq - start_eq) / start_eq
+        
+        # Resample to Hourly
         df_hourly = df_eq['equity'].resample('1h').last().ffill()
-        returns = df_hourly.pct_change().dropna()   # dropna, not fillna(0): no fake zero-return hours
-
-        ANN = np.sqrt(8760)        # hourly -> annual, crypto 24/7
-        MIN_PERIODS = 24           # need ~1 day of hourly points before these mean anything
-
-        if len(returns) >= MIN_PERIODS and returns.std() > 0:
-            vol_metric = returns.std() * ANN
-            sharpe = (returns.mean() / returns.std()) * ANN
-            # Sortino: downside deviation about the 0 target, over ALL periods.
-            downside = np.sqrt(np.mean(np.minimum(returns.values, 0.0) ** 2))
-            sortino = (returns.mean() / downside) * ANN if downside > 0 else float('nan')
-            risk_ready = True
-        else:
-            vol_metric = sharpe = sortino = float('nan')
-            risk_ready = False
-
+        returns = df_hourly.pct_change().fillna(0)
+        
+        # Annualized Volatility (Crypto 24/7 = 8760 hours/yr)
+        vol_metric = returns.std() * np.sqrt(8760)
+        
+        # Sharpe Ratio
+        sharpe = (returns.mean() / returns.std()) * np.sqrt(8760) if returns.std() > 0 else 0.0
+        
+        # Sortino Ratio
+        neg_ret = returns[returns < 0]
+        downside_std = neg_ret.std()
+        sortino = (returns.mean() / downside_std) * np.sqrt(8760) if downside_std > 0 else 0.0
+        
         rolling_max = df_eq['equity'].cummax()
-        drawdown_series = (df_eq['equity'] - rolling_max) / rolling_max.where(rolling_max > 0)
+        drawdown_series = (df_eq['equity'] - rolling_max) / rolling_max
         max_dd = drawdown_series.min()
-        max_dd = 0.0 if pd.isna(max_dd) else max_dd
 
         # --- 4. CALCULATE EXECUTION METRICS (Event Series) ---
         win_rate, profit_factor, expectancy = 0.0, 0.0, 0.0
         total_closed = 0
 
-        if not df_trades.empty and 'pnl' in df_trades.columns:
+        if not df_trades.empty and 'pnl' in df_trades.columns and 'side' in df_trades.columns:
             # Filter for Closed Trades
             closed = df_trades[df_trades['side'].isin(['SELL', 'REDEEM'])]
             
@@ -292,25 +299,35 @@ def generate_institutional_report():
                 expectancy = (avg_win * win_rate) + (avg_loss * (1 - win_rate))
 
         # --- 5. FORMAT OUTPUT ---
-        def fr(x):  # ratios
-            return "N/A (gathering)" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.2f}"
-        def fp(x):  # percents
-            return "N/A" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.2%}"
-        pf_str = "∞" if profit_factor == float('inf') else f"{profit_factor:.2f}"
-
         data = [
             ["💰 Total Return", f"{total_ret:+.2%}"],
             ["💵 Current Equity", f"${curr_eq:,.2f}"],
-            ["📉 Max Drawdown", fp(max_dd)],
-            ["🌊 Annualized Vol", fp(vol_metric)],
+            ["📉 Max Drawdown", f"{max_dd:.2%}"],
+            ["🌊 Annualized Vol", f"{vol_metric:.2%}"],
             ["-----------------", "-----------------"],
-            ["📊 Sharpe Ratio", fr(sharpe)],
-            ["🛡️ Sortino Ratio", fr(sortino)],
+            ["📊 Sharpe Ratio", f"{sharpe:.2f}"],
+            ["🛡️ Sortino Ratio", f"{sortino:.2f}"],
             ["-----------------", "-----------------"],
+        ]
+
+        # Live portfolio state (open positions). Comes from the caller's snapshot
+        # so we never touch the live state dict from this worker thread.
+        if snapshot is not None:
+            unreal = snapshot.get("unrealized", 0.0)
+            data += [
+                ["📂 Open Positions", f"{snapshot.get('open_positions', 0)}"],
+                ["💼 Invested (mark)", f"${snapshot.get('invested_mark', 0.0):,.2f}"],
+                ["🧾 Cost Basis", f"${snapshot.get('invested_cost', 0.0):,.2f}"],
+                ["📈 Unrealized PnL", f"${unreal:+,.2f}"],
+                ["💵 Cash Available", f"${snapshot.get('cash', 0.0):,.2f}"],
+                ["-----------------", "-----------------"],
+            ]
+
+        data += [
             ["🎲 Closed Trades", f"{total_closed}"],
             ["✅ Win Rate", f"{win_rate:.1%}"],
-            ["⚖️ Profit Factor", pf_str],
-            ["🔮 Expectancy", f"${expectancy:.2f} / trade"],
+            ["⚖️ Profit Factor", f"{profit_factor:.2f}"],
+            ["🔮 Expectancy", f"${expectancy:.2f} / trade"]
         ]
         
         return f"\nINSTITUTIONAL PERFORMANCE REPORT\n{tabulate(data, headers=['Metric', 'Value'], tablefmt='fancy_grid')}"
