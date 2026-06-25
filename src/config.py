@@ -4,6 +4,7 @@ from pathlib import Path
 
 # --- CONSTANTS & PATHS ---
 CACHE_DIR = Path(os.environ.get("SIM_CACHE_DIR", "/app/polymarket_cache"))
+DASHBOARD_PATH = CACHE_DIR / "DB.html"
 EQUITY_FILE = CACHE_DIR / "equity_curve.csv"
 AUDIT_FILE  = CACHE_DIR / "trade_audit.jsonl"
 STATE_FILE  = CACHE_DIR / "paper_state.json"
