@@ -1145,7 +1145,7 @@ class LiveTrader:
     async def _reporting_loop(self):
         """Generates and prints the institutional report every 5 minutes."""
         while self.running:
-            await asyncio.sleep(60) 
+            await asyncio.sleep(60)
             
             report_str = await asyncio.to_thread(generate_institutional_report)
             if report_str:
@@ -1164,13 +1164,8 @@ class LiveTrader:
                 bids = book.get('bids', {}) # Get the Dict {'price': 'size'}
                 
                 if bids:
-                    # 1. Extract keys (prices)
-                    # 2. Convert to float for comparison
-                    # 3. Find Max
                     best_price = float(max(bids.keys(), key=lambda x: float(x)))
                     live_prices[token_id] = best_price
-                else:
-                    live_prices[token_id] = 0.0
             
             # Now live_prices contains FLOATS, so this won't crash
             # --- Take-profit exit: sell when best bid >= $0.95 ---
