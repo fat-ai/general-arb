@@ -385,7 +385,15 @@ def compute_batch_stateless(tokens, prices, tss, market_ends, bet_on_is_yes, val
         invested[i] = inv
         
         # 2. Pack the Historical Integers
-        price_int = max(0, min(1000, int(price * 1000)))
+        # The signal queries each user's history at the EFFECTIVE-side probability
+        # expected_p = (price if buying else 1-price) — i.e. the probability the
+        # user's bet wins (process_trade line ~482). The stored price_int must be on
+        # that same scale, else SELL-derived entries land 1-p away from where they
+        # are queried and (with P_RANGE=±0.10) fall outside the band entirely. The
+        # old code packed the RAW token price, which only matches expected_p for
+        # BUYs; every sell was mis-bucketed. Pack expected_p instead.
+        expected_p = price if is_buying else 1.0 - price
+        price_int = max(0, min(1000, int(expected_p * 1000)))
         ttr_hours = max(1.0, (m_end - ts) / 3600.0)
         log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
         partial_packed[i] = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
@@ -610,9 +618,18 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
     m_pos = state.contract_positions.pop(r_cid)
     n_pos = len(m_pos.user_ids)
 
-    is_yes_win = np.uint32(1 if outcome > 0.5 else 0)
-    is_no_win = np.uint32(1 if outcome <= 0.5 else 0)
+    # `outcome` here is THIS contract's PER-TOKEN resolution (1.0 iff this token
+    # won — see download_data_sql.final_payout). The win-bit written into the
+    # per-user histories must be expressed on the MARKET-level YES scale, because
+    # each market is resolved once per side (yes_cid AND no_cid) and the histories
+    # pool across markets by EFFECTIVE direction. Deriving the bits from the raw
+    # per-token `outcome` made every resolution via the no_cid invert is_yes_win/
+    # is_no_win (and token_won below), corrupting ~half of all history bits and the
+    # first-bet calibration. yes_outcome (computed first) already normalises to the
+    # market YES resolution, so derive the bits from it.
     yes_outcome = outcome if outcome_label == 'yes' else 1.0 - outcome
+    is_yes_win = np.uint32(1 if yes_outcome > 0.5 else 0)
+    is_no_win = np.uint32(1 if yes_outcome <= 0.5 else 0)
     skip_history = (outcome == 0.5)
 
     # Pre-allocate output arrays for Numba
@@ -1769,10 +1786,17 @@ def main():
                             if safe_outcome is None or (isinstance(safe_outcome, float) and math.isnan(safe_outcome)):
                                 safe_outcome = 0.5
 
-                            if p_data['direction'] == "yes":
-                                payout = p_data['contracts'] * safe_outcome
-                            else:
-                                payout = p_data['contracts'] * (1.0 - safe_outcome)
+                            # safe_outcome is the PER-TOKEN resolution of the exact
+                            # contract we hold: markets.parquet 'outcome' is 1.0 iff
+                            # THIS token won, else 0.0 (see download_data_sql.
+                            # final_payout). We hold this token, so a winning share
+                            # pays $1 — for BOTH the index-0 ('yes') and index-1
+                            # ('no') legs. The old branch paid (1 - outcome) for 'no'
+                            # positions, which INVERTED every index-1 win/loss versus
+                            # the live bot (main_2 books a win iff the held token id is
+                            # the winning token). That inversion alone made the
+                            # backtest win rate diverge from production.
+                            payout = p_data['contracts'] * safe_outcome
 
                             profit = payout - p_data['bet_size']
 
