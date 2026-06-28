@@ -26,11 +26,19 @@ FILE_PATH = 'simulation_results.csv'
 CHUNK_SIZE = 200000
 
 # Strategy Parameters  (must mirror sim_strat_5.py / main_2.py entry rule)
-SIGNAL = 0.3                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
+SIGNAL = 0.8                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
 MAX_PRICE = 0.40
 TAKE_PROFIT_PRICE = 0.95     # sell when the HELD token's price hits 0.95
 REQUIRED_CONSECUTIVE_SIGNALS = 5
+
+# Clean-window rule: only bet on markets that RESOLVE within the observed data
+# (end_timestamp <= last trade time in the CSV). Markets still unresolved at the data
+# cutoff are only partially observed — their take-profit can't fire and they'd be
+# force-resolved on a future-known outcome — so excluding them keeps the result honest.
+# Costs one extra single-column scan of the CSV to find the horizon. Set False for the
+# old behaviour (resolve everything at the end).
+REQUIRE_RESOLVED_IN_WINDOW = True
 
 # Your simulation_results.csv is already POST-warmup: the sim only logs rows with
 # ts >= simulation_start_date (data_start + 547d), so the file's first row IS the
@@ -38,6 +46,14 @@ REQUIRED_CONSECUTIVE_SIGNALS = 5
 # equity curve is seeded at the first real trade, so an early date won't dilute the
 # metrics. (Per diagnose_csv.py the data spans 2024-06-11 .. 2025-10-28.)
 START_DATE = '2024-01-01'
+
+# --- OUT-OF-SAMPLE HYGIENE ---
+# When True, only trade markets whose CREATION (start_date) is on/after START_DATE,
+# so the signal is never built on pre-window history and partial-history markets are
+# excluded. Needs the markets parquet for start times; markets whose start can't be
+# found are also excluded while this is on (the sim sources the CSV from that parquet,
+# so coverage should be ~complete — the run prints how many rows were dropped).
+RESTRICT_TO_NEW_MARKETS = True
 
 # Portfolio & Execution Parameters
 INITIAL_BANKROLL = 10000.0
@@ -70,6 +86,8 @@ wins = 0                      # realised wins  (profit > 0), matches the sim's d
 losses = 0                    # realised losses (profit <= 0)
 gross_win = 0.0               # sum of winning profits     (profit factor / avg win)
 gross_loss = 0.0              # sum of |losing profits|    (profit factor / avg loss)
+rows_pre_window = 0           # rows dropped: market started BEFORE START_DATE (stale)
+rows_unknown_start = 0        # rows dropped: market start not found in the parquet
 
 # ---------------------------------------------------------------------------
 # Bucketed breakdowns: by ENTRY PRICE (5c) and by MARKET-LIFE TIMING (deciles),
@@ -172,8 +190,12 @@ data_max_ts = None
 
 print(f"Starting Backtest on {FILE_PATH}...")
 print(f"Strategy: perc_margin > {SIGNAL} | price < ${MAX_PRICE} | var < {MAX_VARIANCE} | "
-      f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital)" | required consecutive signals = {REQUIRED_CONSECUTIVE_SIGNALS})
+      f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital) | consecutive signals required = {REQUIRED_CONSECUTIVE_SIGNALS}")
 print(f"Bankroll: ${INITIAL_BANKROLL} | Size: ${FIXED_SIZE} | Slippage: {MAX_SLIPPAGE_PCT:.0%} (multiplicative)\n")
+
+if RESTRICT_TO_NEW_MARKETS and not cid_start:
+    print("[hygiene] RESTRICT_TO_NEW_MARKETS is ON but no markets parquet was loaded — "
+          "cannot enforce the market-start filter; proceeding WITHOUT it.\n")
 
 # Read the columns we actually need, INCLUDING cid and perc_margin.
 cols = ['timestamp', 'market_id', 'cid', 'bet_on', 'bayesian_prob', 'perc_margin',
@@ -199,6 +221,20 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         _lo = float(chunk['timestamp'].min()); _hi = float(chunk['timestamp'].max())
         data_min_ts = _lo if data_min_ts is None else min(data_min_ts, _lo)
         data_max_ts = _hi if data_max_ts is None else max(data_max_ts, _hi)
+
+    # 1b. OUT-OF-SAMPLE HYGIENE: drop markets that STARTED before START_DATE (or whose
+    #     start is unknown) so we never enter on stale / partial-history signals. The
+    #     trade-timestamp filter above keeps post-START_DATE TRADES; this keeps only
+    #     trades belonging to markets that also OPENED on/after START_DATE.
+    if RESTRICT_TO_NEW_MARKETS and cid_start:
+        _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+        _ms = _norm.map(cid_start)
+        _known = _ms.notna()
+        rows_pre_window    += int((_known & (_ms <  start_timestamp)).sum())
+        rows_unknown_start += int((~_known).sum())
+        chunk = chunk[_known & (_ms >= start_timestamp)].copy()
+        if chunk.empty:
+            continue
 
     # 2. Execution metrics.
     #    is_win == actual_outcome: the CSV's actual_outcome is ALREADY the per-token
@@ -413,6 +449,9 @@ print(f"Total Trades Taken    : {total_trades}")
 print(f"Trades Sold Early     : {early_sells_count}  <-- Closed at TP")
 print(f"Trades Skipped (Cash) : {skipped_cash_trades}")
 print(f"Trades Skipped (Dupe) : {skipped_duplicate_trades}")
+if RESTRICT_TO_NEW_MARKETS and cid_start:
+    print(f"Rows excluded (start) : {rows_pre_window:,} pre-{START_DATE} market start"
+          f" + {rows_unknown_start:,} unknown start")
 print(f"Peak Capital Locked   : ${peak_locked_capital:,.2f}")
 print(f"Total Slippage Paid   : ${total_slippage_paid:,.2f}")
 print("-" * 50)
