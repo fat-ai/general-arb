@@ -26,7 +26,7 @@ FILE_PATH = 'simulation_results.csv'
 CHUNK_SIZE = 200000
 
 # Strategy Parameters  (must mirror sim_strat_5.py / main_2.py entry rule)
-SIGNAL = 0.8                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
+SIGNAL = 0.3                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
 MAX_PRICE = 0.40
 TAKE_PROFIT_PRICE = 0.95     # sell when the HELD token's price hits 0.95
@@ -55,6 +55,14 @@ START_DATE = '2024-01-01'
 # so coverage should be ~complete — the run prints how many rows were dropped).
 RESTRICT_TO_NEW_MARKETS = True
 
+# --- UNRESOLVED POSITIONS AT DATA END ---
+# Positions in markets that resolve AFTER the data ends can't be scored. When True,
+# carry them (don't book a phantom loss) and mark them to market at the last-seen
+# price; they're excluded from win/loss and the buckets, and reported as a separate
+# "live positions" component of final value. When False, revert to booking them at
+# their (zero) outcome, i.e. the old behaviour that produced the fake end drawdown.
+CARRY_UNRESOLVED_AT_MTM = True
+
 # Portfolio & Execution Parameters
 INITIAL_BANKROLL = 10000.0
 FIXED_SIZE = 100.0           # == CONFIG['fixed_size'] in the sim (confirm you ran
@@ -73,6 +81,7 @@ open_positions = {}       # Active positions keyed by CID (the bought token):
                           #   {cid: {'shares','buy_price','payout_at_maturity','market_id'}}
 sold_cids = set()         # cids closed early, to intercept their heap resolution
 signal_counts = {}
+last_price = {}           # cid -> last-seen market price (for MTM of positions still open at data end)
 
 # Metrics Tracking
 total_trades = 0
@@ -190,7 +199,7 @@ data_max_ts = None
 
 print(f"Starting Backtest on {FILE_PATH}...")
 print(f"Strategy: perc_margin > {SIGNAL} | price < ${MAX_PRICE} | var < {MAX_VARIANCE} | "
-      f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital) | consecutive signals required = {REQUIRED_CONSECUTIVE_SIGNALS}")
+      f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital)")
 print(f"Bankroll: ${INITIAL_BANKROLL} | Size: ${FIXED_SIZE} | Slippage: {MAX_SLIPPAGE_PCT:.0%} (multiplicative)\n")
 
 if RESTRICT_TO_NEW_MARKETS and not cid_start:
@@ -254,6 +263,10 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     #    never seen and the streak silently overcounts and fires falsely.
     is_signal = (chunk['perc_margin'] > SIGNAL) & (chunk['variance_v'] < MAX_VARIANCE) & (chunk['price'] < MAX_PRICE)
     is_sell = chunk['price'] >= TAKE_PROFIT_PRICE
+
+    # Last-seen market price per cid across the FULL chunk (before we drop rows for the
+    # streak/TP logic) — used to mark still-open positions to market at the data horizon.
+    _last_px = chunk.groupby('cid')['price'].last().to_dict()
 
     streak_cids = set(chunk.loc[is_signal, 'cid']) | set(signal_counts)
     keep_mask = is_signal | is_sell | chunk['cid'].isin(streak_cids)
@@ -381,24 +394,51 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
             else:
                 skipped_cash_trades += 1
 
+    # After the chunk: refresh the last-seen price of every still-open position, so a
+    # position carried to the data end is marked at its most recent market price.
+    if open_positions:
+        for _cid in open_positions:
+            if _cid in _last_px:
+                last_price[_cid] = _last_px[_cid]
+
 # --- POST-PROCESSING & METRICS ---
-while active_trades:
-    end_ts, cid = heapq.heappop(active_trades)
-    if cid in sold_cids:
-        sold_cids.discard(cid)
-        continue
-    pos = open_positions.pop(cid, None)
-    if pos is None:
-        continue
-    cash += pos['payout_at_maturity']
-    locked_capital -= FIXED_SIZE
-    profit = pos['payout_at_maturity'] - FIXED_SIZE
-    if profit > 0:
-        wins += 1
-    else:
-        losses += 1
-    record_bucket(pos, profit, early=False)
-    portfolio_history.append((end_ts, cash + locked_capital))
+# Anything still open here belongs to a market that resolves AFTER the data ends.
+live_value = 0.0                 # marked-to-market value of the carried (open) positions
+open_positions_count = 0
+open_positions_cost = 0.0        # their cost basis, for reference
+if CARRY_UNRESOLVED_AT_MTM:
+    # Carry them and mark to market at the last-seen price. NOT scored as wins/losses,
+    # NOT added to the buckets — so realized stats reflect only settled trades.
+    for cid, pos in open_positions.items():
+        live_value += pos['shares'] * last_price.get(cid, pos['price'])
+        open_positions_cost += FIXED_SIZE
+        open_positions_count += 1
+    open_positions.clear()
+    active_trades.clear()
+    # Stamp the final equity point at the data horizon, marking the live book to market.
+    if portfolio_history:
+        _final_ts = data_max_ts if data_max_ts is not None else portfolio_history[-1][0]
+        portfolio_history.append((_final_ts, cash + live_value))
+else:
+    # Old behaviour: settle every remaining position at its (zero) outcome — this is what
+    # booked the phantom end-of-data losses and produced the fake terminal drawdown.
+    while active_trades:
+        end_ts, cid = heapq.heappop(active_trades)
+        if cid in sold_cids:
+            sold_cids.discard(cid)
+            continue
+        pos = open_positions.pop(cid, None)
+        if pos is None:
+            continue
+        cash += pos['payout_at_maturity']
+        locked_capital -= FIXED_SIZE
+        profit = pos['payout_at_maturity'] - FIXED_SIZE
+        if profit > 0:
+            wins += 1
+        else:
+            losses += 1
+        record_bucket(pos, profit, early=False)
+        portfolio_history.append((end_ts, cash + locked_capital))
 
 if not portfolio_history:
     print("No trades were taken. Check START_DATE, the CSV columns, and the gates.")
@@ -410,7 +450,9 @@ equity_df = equity_df.sort_values('datetime').drop_duplicates('datetime', keep='
 daily_equity = equity_df['portfolio_value'].resample('1D').last().ffill()
 
 daily_returns = daily_equity.pct_change().dropna()
-final_value = cash
+final_cash = cash
+final_live_value = live_value
+final_value = final_cash + final_live_value
 total_pnl = final_value - INITIAL_BANKROLL
 roi = (total_pnl / INITIAL_BANKROLL) * 100
 
@@ -439,13 +481,19 @@ print("\n" + "=" * 50)
 print("             BACKTEST RESULTS")
 print("=" * 50)
 print(f"Final Portfolio Value : ${final_value:,.2f}")
+if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
+    print(f"  Cash                : ${final_cash:,.2f}")
+    print(f"  Live Positions (MTM): ${final_live_value:,.2f}   "
+          f"({open_positions_count} open, resolve after data end; cost ${open_positions_cost:,.0f})")
 print(f"Total PnL             : ${total_pnl:,.2f}")
 print(f"Total ROI             : {roi:.2f}%")
-print(f"Max Drawdown          : {max_drawdown:.2f}%   (realised equity; open positions held at cost)")
+print(f"Max Drawdown          : {max_drawdown:.2f}%   (intra-run equity at cost; final point at MTM)")
 print(f"Sortino Ratio         : {sortino_ratio:.2f}")
 print(f"Calmar Ratio          : {calmar_ratio:.2f}")
 print("-" * 50)
 print(f"Total Trades Taken    : {total_trades}")
+if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
+    print(f"Open at Data End      : {open_positions_count}   (carried at MTM; excluded from win/loss & buckets)")
 print(f"Trades Sold Early     : {early_sells_count}  <-- Closed at TP")
 print(f"Trades Skipped (Cash) : {skipped_cash_trades}")
 print(f"Trades Skipped (Dupe) : {skipped_duplicate_trades}")
@@ -637,6 +685,9 @@ if ARGS.report:
                 "total_slippage": total_slippage_paid,
                 "gross_win": gross_win,
                 "gross_loss": gross_loss,
+                "final_cash": final_cash,
+                "final_live_value": final_live_value,
+                "open_positions": open_positions_count,
             },
         }
         generate_report(bundle, ARGS.report)
