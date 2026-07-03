@@ -1704,7 +1704,7 @@ def main():
                 # not on a particular yes/no determined by outcome_label.
                 # -------------------------------------------------------
                 mid_for_signal = m['id']
-                if (perc_marg > 0.3
+                if (perc_marg > 0.0
                         and variance_v < 0.15
                         and price < 0.40
                         and mid_for_signal not in seen_market_ids
@@ -1745,9 +1745,10 @@ def main():
                 # -------------------------------------------------------
                 # CSV-LOGGING THROTTLE (unchanged) — keeps file size sane.
                 # -------------------------------------------------------
-                if (abs(price - last_logged_price) >= 0.01
-                        or abs(perc_marg - last_logged_perc_marg) >= 0.01
-                        or (ts - last_logged_ts) >= 3600.0):
+                #if (abs(price - last_logged_price) >= 0.01
+                #        or abs(perc_marg - last_logged_perc_marg) >= 0.01
+                #        or (ts - last_logged_ts) >= 3600.0):
+                if price > 0:
                     m['log_price']     = price
                     m['log_ts']        = ts
                     m['log_perc_marg'] = perc_marg
