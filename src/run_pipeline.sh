@@ -19,28 +19,27 @@ echo "➡️ Step 1: Downloading Data..."
 
 if [ $? -eq 0 ]; then
     echo "✅ Download complete! Moving to Step 2..."
-    echo "➡️ Step 2: Updating Bayesian State..."
-    /usr/local/bin/python /app/daily_update.py
-
+    
+    echo "➡️ Step 2: Repairing Outcomes..."
+    /usr/local/bin/python /app/repair_outcomes.py
+    
     if [ $? -eq 0 ]; then
-        echo "✅ Update complete! Moving to Step 3..."
-        echo "➡️ Step 3: Scoring Wallets..."
-        /usr/local/bin/python /app/wallet_scoring_sql.py
+        echo "✅ Outcomes repaired successfully! Moving to Step 3..."
         
+        echo "➡️ Step 3: Updating Bayesian State..."
+        /usr/local/bin/python /app/daily_update.py
+
         if [ $? -eq 0 ]; then
-            echo "✅ Scoring complete! Moving to Step 4..."
-            echo "➡️ Step 4: Calibrating Fresh Wallets..."
-            /usr/local/bin/python /app/calibrate_fresh_wallets_sql.py
-            
             echo "🎉 Pipeline Complete!"
         else
-            echo "❌ Wallet scoring failed. Halting pipeline."
+            echo "❌ Daily Bayesian update failed. Halting pipeline to protect data integrity."
         fi
     else
-        echo "❌ Daily Bayesian update failed. Halting pipeline to protect data integrity."
+        echo "❌ Repairing outcomes failed. Halting pipeline to protect data integrity."
     fi
 else
     echo "❌ Data download failed. Halting pipeline to protect data integrity."
 fi
 
+# Always clean up the lockfile at the end
 rm -f "$LOCKFILE"
