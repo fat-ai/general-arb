@@ -1540,12 +1540,14 @@ def main():
 
                     for r_cid in resolved_cids:
                         outcome = market_map[r_cid]['outcome']
-                        if outcome is None or (isinstance(outcome, float) and math.isnan(outcome)):
-                            # End passed but no confirmed outcome in the parquet.
-                            # 0.5 routes resolve_market to the exposure-only void
-                            # path (skip_history): no brier, no history, no
-                            # calibration. True 50/50 voids arrive as 0.5 the same
-                            # way once download_data_sql.final_payout emits them.
+                        outcome_confirmed = not (outcome is None or (isinstance(outcome, float) and math.isnan(outcome)))
+                        if not outcome_confirmed:
+                            # End passed but no confirmed outcome in the parquet:
+                            # 0.5 routes resolve_market to the void path with
+                            # brier_on_void=False (exposure release only). CONFIRMED
+                            # 0.5s (true voids, once download_data_sql.final_payout
+                            # emits them) take the same path but score Brier at the
+                            # 0.5 settlement — a void pays $0.50/share, a real outcome.
                             outcome = 0.5
                             unknown_resolved_count += 1
                         outcome_label = market_map[r_cid]['outcome_label']
