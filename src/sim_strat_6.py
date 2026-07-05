@@ -305,7 +305,7 @@ def _merge_sorted_uint32(old, new_sorted, out):
 
 @njit(cache=True)
 def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
-                            is_yes_win, is_no_win, yes_outcome, skip_history,
+                            is_yes_win, is_no_win, yes_outcome, skip_history, brier_on_void,
                             user_exposure, user_brier_sum, user_brier_count,
                             out_yes_uids, out_yes_packed, out_yes_prices, out_yes_errors,
                             out_no_uids, out_no_packed, out_no_prices, out_no_errors):
@@ -344,16 +344,23 @@ def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
                 out_no_errors[no_idx] = (is_no_win - exact_price) ** 2
                 no_idx += 1
     else:
-        # Void / Unknown-outcome Resolution Loop — releases exposure ONLY.
-        # True 50/50 voids and unknown outcomes (coerced to 0.5 by the daily
-        # trigger) carry no information about trader skill. The old branch still
-        # updated brier_sum/count with (p_true - 0.5)^2 here, systematically
-        # penalising confident traders and rewarding fence-sitters across the
-        # entire unresolved cohort — a direct trust/signal corruption. No brier,
-        # no history, no variance: exposure release is the only bookkeeping.
+        # Void / Unknown-outcome Resolution Loop. Exposure release is common to
+        # both (position closed = open risk gone; the win/loss path does the
+        # identical decrement). Brier depends on WHICH case this is:
+        #   * CONFIRMED 50/50 void (brier_on_void=True): a real economic
+        #     settlement — every share of both tokens redeems at $0.50 — so the
+        #     forecast IS scoreable against 0.5. Histories/variance stay skipped
+        #     only because their win-bits are binary and cannot encode a half-win.
+        #   * UNKNOWN outcome (brier_on_void=False): nothing is knowable; the old
+        #     code still charged (p_true - 0.5)^2 here, systematically penalising
+        #     confident traders across the entire unresolved cohort — a direct
+        #     trust/signal corruption. No brier, no history, no variance.
         for i in range(len(user_ids)):
             uid = user_ids[i]
             user_exposure[uid] = max(0.0, user_exposure[uid] - stakes[i])
+            if brier_on_void:
+                user_brier_sum[uid] += (p_trues[i] - yes_outcome) ** 2
+                user_brier_count[uid] += 1
 
     return yes_idx, no_idx
 
@@ -616,7 +623,7 @@ def process_daily_history_merges(state, day_yes_updates, day_no_updates):
 
         state.user_history_no[uid] = out
 
-def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState, day_yes_updates, day_no_updates):
+def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_day, state: BayesianState, day_yes_updates, day_no_updates, outcome_confirmed: bool = True):
     if r_cid not in state.contract_positions:
         return
         
@@ -639,6 +646,9 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
     is_yes_win = np.uint32(1 if yes_outcome > 0.5 else 0)
     is_no_win = np.uint32(1 if yes_outcome <= 0.5 else 0)
     skip_history = (outcome == 0.5)
+    # Confirmed 0.5 = a real 50/50 settlement (both tokens redeem at $0.50):
+    # Brier IS scored against it. Coerced 0.5 (outcome unknown): no scoring.
+    brier_on_void = skip_history and outcome_confirmed
 
     # Pre-allocate output arrays for Numba
     out_yes_uids, out_yes_packed = np.empty(n_pos, dtype=np.uint32), np.empty(n_pos, dtype=np.uint32)
@@ -655,7 +665,7 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
 
     yes_idx, no_idx = _resolve_positions_core(
         v_uids, v_is_yes, v_packed, v_ptrues, v_stakes,
-        is_yes_win, is_no_win, yes_outcome, skip_history,
+        is_yes_win, is_no_win, yes_outcome, skip_history, brier_on_void,
         state.user_exposure, state.user_brier_sum, state.user_brier_count,
         out_yes_uids, out_yes_packed, out_yes_prices, out_yes_errors,
         out_no_uids, out_no_packed, out_no_prices, out_no_errors
@@ -678,11 +688,12 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
     # Handle first bet calibration
     if r_cid in state.first_bets_pending:
         first_bets = state.first_bets_pending.pop(r_cid)
-        # Only confirmed outcomes may teach the cold-start model. Void/unknown
-        # resolutions (skip_history) used to fall through here with token_won
-        # derived from the coerced 0.5 — every token-0 long marked a loser and
-        # every token-1 long a winner, pure noise into calib_y. Pop the pending
-        # entry either way (cleanup); append rows only when the outcome is real.
+        # Binary-outcome resolutions only: calib_y is a 0/1 label, so a 0.5
+        # settlement (true void) has no encoding here and unknown outcomes have
+        # nothing to teach. The old code fell through with token_won derived
+        # from the coerced 0.5 — every token-0 long marked a loser and every
+        # token-1 long a winner, pure noise into calib_y. Pop the pending entry
+        # either way (cleanup); append rows only for decisive outcomes.
         if not skip_history:
             # Label-free: `outcome` IS this token's per-token resolution, so
             # token_won is simply outcome > 0.5. The old label test only worked
@@ -1529,7 +1540,9 @@ def main():
                             unknown_resolved_count += 1
                         outcome_label = market_map[r_cid]['outcome_label']
                         market_map[r_cid]['resolved'] = True
-                        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state, day_yes_updates, day_no_updates)
+                        resolve_market(r_cid, outcome, outcome_label, current_day_ts, state,
+                                       day_yes_updates, day_no_updates,
+                                       outcome_confirmed=outcome_confirmed)
 
                     process_daily_history_merges(state, day_yes_updates, day_no_updates)
                     hist_dirty = True
@@ -1745,9 +1758,6 @@ def main():
                 # -------------------------------------------------------
                 # CSV-LOGGING THROTTLE (unchanged) — keeps file size sane.
                 # -------------------------------------------------------
-                #if (abs(price - last_logged_price) >= 0.01
-                #        or abs(perc_marg - last_logged_perc_marg) >= 0.01
-                #        or (ts - last_logged_ts) >= 3600.0):
                 if price > 0:
                     m['log_price']     = price
                     m['log_ts']        = ts
