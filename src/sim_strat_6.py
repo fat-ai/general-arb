@@ -1729,7 +1729,7 @@ def main():
                 # not on a particular yes/no determined by outcome_label.
                 # -------------------------------------------------------
                 mid_for_signal = m['id']
-                if (perc_marg > 0.3
+                if (perc_marg > 0.0
                         and variance_v < 0.15
                         and price < 0.40
                         and mid_for_signal not in seen_market_ids
