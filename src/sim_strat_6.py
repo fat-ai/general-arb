@@ -1287,17 +1287,27 @@ def main():
     # Warm the daily-resolution kernels
     _merge_sorted_uint32(_dummy_history, _dummy_history, _dummy_history)
 
-    # Warm both branches of _resolve_positions_core (skip_history False AND True)
+    # Warm the three reachable branch combinations of _resolve_positions_core:
+    # decisive (skip_history=False), unknown void (skip=True, brier_on_void=False),
+    # and confirmed 50/50 void (skip=True, brier_on_void=True). Signature is
+    # (..., yes_outcome, skip_history, brier_on_void, exposure, ...).
     _resolve_positions_core(
         _dummy_history, _dummy_int8, _dummy_history, _dummy_f64, _dummy_f64,
-        np.uint32(1), np.uint32(0), 1.0, False,
+        np.uint32(1), np.uint32(0), 1.0, False, False,
         _dummy_f64, _dummy_f64, _dummy_history,
         _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
         _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
     )
     _resolve_positions_core(
         _dummy_history, _dummy_int8, _dummy_history, _dummy_f64, _dummy_f64,
-        np.uint32(1), np.uint32(0), 1.0, True,
+        np.uint32(1), np.uint32(0), 1.0, True, False,
+        _dummy_f64, _dummy_f64, _dummy_history,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
+        _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
+    )
+    _resolve_positions_core(
+        _dummy_history, _dummy_int8, _dummy_history, _dummy_f64, _dummy_f64,
+        np.uint32(1), np.uint32(0), 1.0, True, True,
         _dummy_f64, _dummy_f64, _dummy_history,
         _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
         _dummy_history, _dummy_history, _dummy_f64, _dummy_f64,
@@ -1717,7 +1727,7 @@ def main():
                 # not on a particular yes/no determined by outcome_label.
                 # -------------------------------------------------------
                 mid_for_signal = m['id']
-                if (perc_marg > 0.0
+                if (perc_marg > 0.3
                         and variance_v < 0.15
                         and price < 0.40
                         and mid_for_signal not in seen_market_ids
@@ -1758,7 +1768,9 @@ def main():
                 # -------------------------------------------------------
                 # CSV-LOGGING THROTTLE (unchanged) — keeps file size sane.
                 # -------------------------------------------------------
-                if price > 0:
+                if (abs(price - last_logged_price) >= 0.01
+                        or abs(perc_marg - last_logged_perc_marg) >= 0.01
+                        or (ts - last_logged_ts) >= 3600.0):
                     m['log_price']     = price
                     m['log_ts']        = ts
                     m['log_perc_marg'] = perc_marg
