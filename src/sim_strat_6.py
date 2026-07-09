@@ -1113,13 +1113,27 @@ def main():
         pl.col('market_id').alias('id'),
         pl.col('start_date').cast(pl.String).alias("start_date"),
         pl.col("resolution_timestamp"),
+        pl.col("closed_time"),
+        pl.col("closed"),
+        pl.col("uma_resolution_status"),
         pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
     ])
     
     market_map = {}
     result_map = {}
-    
+
+    # Window-end helper (hoisted out of the per-market loop). Coerces a parquet
+    # datetime / ISO string / epoch to an epoch float, or None if unparseable.
+    def _ts(v):
+        if v is None: return None
+        if hasattr(v, 'timestamp'): return v.timestamp()
+        if isinstance(v, str):
+            try: return pd.to_datetime(v, utc=True).timestamp()
+            except: return None
+        try: return float(v)
+        except (TypeError, ValueError): return None
+
     for market in markets_pl.iter_rows(named=True):
         cid = market['contract_id']
         s_date = market['start_date']
@@ -1130,11 +1144,41 @@ def main():
                     
         elif hasattr(s_date, 'timestamp'):
             s_date = s_date.timestamp()
-                
-        e_date = market['resolution_timestamp']
-        if hasattr(e_date, 'timestamp'):
-            e_date = e_date.timestamp()
-            
+
+        # --- Window-end derivation (R4) ---------------------------------------
+        # The trade-processing gate (line ~1450) discards trades with ts > m['end'],
+        # treating end=None as "no upper bound" (include all trades). We choose 'end'
+        # so that gate keeps every executable trade while excluding only genuine
+        # post-resolution noise. resolution_timestamp (API endDate) is an unreliable
+        # scheduled placeholder -- it can sit before a game even starts, or before the
+        # market's own start_date -- so gating on it silently discards the entire
+        # in-game / post-nominal trading window (validated: 508956 keeps 5/21 trades,
+        # 1020425 keeps 1408/4713). closed_time (=umaEndDate) is the true resolution
+        # moment. Rules, in order:
+        #   1. Market not resolved (closed != True): end = None -> include ALL trades.
+        #      A live market has no post-resolution period; every trade is executable.
+        #   2. Resolved + closed_time valid (>= start_date): end = closed_time.
+        #   3. Resolved + closed_time invalid but resolution_timestamp valid: end = res.
+        #   4. Resolved but both timestamps invalid (corrupt, ~20 mkts): end = None.
+        # Validity = timestamp >= start_date - 1 day (a market can't resolve before it
+        # opens; catches the migration-artifact and broken-placeholder cases).
+        res_ts = _ts(market['resolution_timestamp'])
+        clo_ts = _ts(market['closed_time'])
+        closed_flag = str(market['closed']).strip().lower() in ('true', '1')
+        floor = (s_date - 86400.0) if s_date is not None else None
+        clo_valid = clo_ts is not None and (floor is None or clo_ts >= floor)
+        res_valid = res_ts is not None and (floor is None or res_ts >= floor)
+
+        if not closed_flag:
+            e_date = None                      # (1) open -> include all
+        elif clo_valid:
+            e_date = clo_ts                    # (2) resolved, trust closed_time
+        elif res_valid:
+            e_date = res_ts                    # (3) resolved, fall back to res
+        else:
+            e_date = None                      # (4) corrupt -> include all
+        # ----------------------------------------------------------------------
+
         market_map[cid] = {
             'id': market['id'], 'start': s_date, 'end': e_date,
             'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 
