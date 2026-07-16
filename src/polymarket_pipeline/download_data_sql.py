@@ -164,6 +164,17 @@ class DataFetcher:
                         return float(str(val).replace('"', '').strip())
                     except (TypeError, ValueError):
                         pass
+                # Price-inference fallback: ONLY when the market is actually resolved.
+                # A price >= 0.95 on a still-open market is a near-certain favorite, NOT a
+                # settled outcome -- inferring a winner there prematurely crowns unresolved
+                # markets (the ungated-derivation bug). Authority signal for "resolved":
+                # umaResolutionStatus == 'resolved', OR the market is closed. Without this
+                # gate, long-running near-certain markets get a fake final outcome.
+                status = str(row.get('uma_resolution_status', '') or '').strip().lower()
+                closed_raw = row.get('closed')
+                is_closed = closed_raw is True or str(closed_raw).strip().lower() in ('true', '1')
+                if not (status == 'resolved' or is_closed):
+                    return np.nan   # not resolved -> no outcome yet, leave for a later download
                 prices = row.get('outcomePrices')
                 if prices:
                     try:
@@ -171,6 +182,9 @@ class DataFetcher:
                             prices = json.loads(prices)
                         if isinstance(prices, list):
                             p_floats = [float(p) for p in prices]
+                            # void: a resolved market pinned ~[0.5, 0.5] pays 0.5/0.5
+                            if len(p_floats) >= 2 and all(abs(p - 0.5) <= 0.02 for p in p_floats[:2]):
+                                return 0.5
                             for i, p in enumerate(p_floats):
                                 if p >= 0.95:
                                     return float(i)
@@ -202,9 +216,15 @@ class DataFetcher:
             df['token_outcome_label'] = np.where(df['token_index'] == 0, "Yes", "No")
 
             def final_payout(row):
-                if pd.isna(row['outcome']):
+                oc = row['outcome']
+                if pd.isna(oc):
                     return np.nan
-                winning_idx = int(round(row['outcome']))
+                # Void / tie: a 0.5 market outcome pays 0.5 to BOTH tokens. Do NOT use
+                # int(round(0.5)) -- Python's banker's rounding makes round(0.5)==0, which
+                # would wrongly crown token 0 as the sole winner of a void market.
+                if abs(oc - 0.5) < 1e-9:
+                    return 0.5
+                winning_idx = int(round(oc))
                 return 1.0 if row['token_index'] == winning_idx else 0.0
 
             df['outcome'] = df.apply(final_payout, axis=1)
@@ -439,18 +459,69 @@ class DataFetcher:
         # The mathematically verified V2 OrderFilled Topic Hash
         ORDER_FILLED_TOPIC = "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
 
-        # Helper to bridge Timestamps -> Polygon Block Numbers without an API key
-        def get_block_from_timestamp(ts):
-            for attempt in range(3):
+        # Helper to bridge Timestamps -> Polygon Block Numbers without an API key.
+        # Primary: DefiLlama (one quick attempt). Fallback: binary search over block
+        # headers via our own RPC_URLS -- no third-party dependency, ~27 header calls.
+        # Semantics (both paths): the LAST block with block.timestamp <= ts. Safe for
+        # both segment ends: as a start bound it can only add a small overlap (PK dedup
+        # absorbs it); as an end bound it is exact (later blocks are out of range).
+        def _rpc_block_header(block_param):
+            """eth_getBlockByNumber via RPC_URLS with rotation. Returns (number, ts) or None."""
+            payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBlockByNumber",
+                       "params": [block_param, False]}
+            for i in range(2 * len(RPC_URLS)):
+                url = RPC_URLS[i % len(RPC_URLS)]
                 try:
-                    resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
-                    if resp.status_code == 200:
-                        return resp.json()['height']
-                    time.sleep(2 ** attempt)
-                except Exception as e:
-                    log.warning(f"DefiLlama timeout (attempt {attempt+1}/3): {e}")
-                    
-            log.error(f"❌ Failed to resolve timestamp {ts} to block after 3 attempts.")
+                    r = self.session.post(url, json=payload, timeout=15)
+                    if r.status_code != 200:
+                        continue
+                    res = r.json().get("result")
+                    if isinstance(res, dict) and res.get("number") and res.get("timestamp"):
+                        return int(res["number"], 16), int(res["timestamp"], 16)
+                except Exception:
+                    continue
+            return None
+
+        def _ts_to_block_rpc(ts):
+            """Binary search: last block with timestamp <= ts. None only if RPCs are down."""
+            head = _rpc_block_header("latest")
+            if head is None:
+                return None
+            head_n, head_ts = head
+            if ts >= head_ts:
+                return head_n
+            genesis = _rpc_block_header(hex(1))
+            if genesis is None:
+                return None
+            if ts < genesis[1]:
+                return 1
+            lo, hi = 1, head_n
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                h = _rpc_block_header(hex(mid))
+                if h is None:
+                    return None          # RPC fleet failing mid-search; caller retries next run
+                if h[1] <= ts:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
+
+        def get_block_from_timestamp(ts):
+            # 1) DefiLlama, one quick attempt (fast when healthy)
+            try:
+                resp = self.session.get(f"https://coins.llama.fi/block/polygon/{int(ts)}", timeout=10)
+                if resp.status_code == 200:
+                    return resp.json()['height']
+                log.warning(f"DefiLlama HTTP {resp.status_code}; falling back to RPC binary search.")
+            except Exception as e:
+                log.warning(f"DefiLlama unavailable ({e}); falling back to RPC binary search.")
+            # 2) RPC binary search fallback
+            blk = _ts_to_block_rpc(int(ts))
+            if blk is not None:
+                log.info(f"Resolved ts {ts} -> block {blk} via RPC binary search.")
+                return blk
+            log.error(f"❌ Failed to resolve timestamp {ts} to block (DefiLlama down AND RPC fallback failed).")
             return None
 
         with contextlib.closing(sqlite3.connect(db_file, timeout=30.0)) as conn:
@@ -532,7 +603,7 @@ class DataFetcher:
                 end_block = get_block_from_timestamp(end_ts)
 
                 if not start_block or not end_block:
-                    print("❌ Failed to resolve block numbers via DefiLlama. Skipping segment.")
+                    print("❌ Failed to resolve block numbers (DefiLlama + RPC fallback). Skipping segment.")
                     return 0
 
                 # Ensure chronological order for iterating
