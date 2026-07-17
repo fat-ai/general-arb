@@ -53,6 +53,7 @@ CONFIG = {
     "initial_capital": 10000.0,
     "use_smart_exit": False, 
     "smart_exit_ratio": 0.5,
+    "exclude_hostile_from_scoring": True
 }
 
 # --- LOGGING SETUP ---
