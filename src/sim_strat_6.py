@@ -1123,6 +1123,51 @@ def main():
     market_map = {}
     result_map = {}
 
+    # ---------------------------------------------------------------
+    # HOSTILE-MARKET EXCLUSION FILTER
+    # Frozen 2026-07-16 from loss_patterns.py analysis (run through mid-May 2026).
+    # BET-LEVEL only: these markets still feed user scoring; the strategy just
+    # never bets them (mirrors what main_2.py will do live).
+    # Rule -- trade-time-knowable fields only:
+    #   feesEnabled == true
+    #   OR resolution_source domain in {data.chain.link, binance.com, dotabuff.com, gol.gg}
+    #   OR sports_market_type in {kill_over_under_game, team_totals, tennis_first_set_totals}
+    #   OR 0 < customLiveness <= 3600
+    # Toggle via CONFIG['exclude_hostile_markets'] (default True).
+    # ---------------------------------------------------------------
+    HOSTILE_MARKETS = set()
+    if CONFIG.get('exclude_hostile_markets', True):
+        import pyarrow.parquet as _pq
+        _names = _pq.ParquetFile(MARKETS_PATH).schema.names
+        _cols = [c for c in ['market_id', 'feesEnabled', 'resolution_source',
+                             'sports_market_type', 'customLiveness'] if c in _names]
+        _hm = pl.read_parquet(MARKETS_PATH, columns=_cols)
+        _exprs = []
+        if 'feesEnabled' in _cols:
+            _exprs.append(pl.col('feesEnabled').cast(pl.Utf8).str.to_lowercase()
+                          .is_in(['true', '1']).fill_null(False))
+        if 'resolution_source' in _cols:
+            _exprs.append(pl.col('resolution_source').cast(pl.Utf8).str.to_lowercase()
+                          .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|gol\.gg')
+                          .fill_null(False))
+        if 'sports_market_type' in _cols:
+            _exprs.append(pl.col('sports_market_type').cast(pl.Utf8)
+                          .is_in(['kill_over_under_game', 'team_totals',
+                                  'tennis_first_set_totals']).fill_null(False))
+        if 'customLiveness' in _cols:
+            _cl = pl.col('customLiveness').cast(pl.Float64, strict=False)
+            _exprs.append(((_cl > 0) & (_cl <= 3600)).fill_null(False))
+        if _exprs:
+            _cond = _exprs[0]
+            for _e in _exprs[1:]:
+                _cond = _cond | _e
+            HOSTILE_MARKETS = set(_hm.filter(_cond)['market_id'].to_list())
+        log.info(f"Hostile-market filter ON: {len(HOSTILE_MARKETS):,} markets excluded from betting "
+                 f"({len(_cols)-1}/4 rule fields present in parquet).")
+    else:
+        log.info("Hostile-market filter OFF (CONFIG['exclude_hostile_markets']=False).")
+
+
     # Window-end helper (hoisted out of the per-market loop). Coerces a parquet
     # datetime / ISO string / epoch to an epoch float, or None if unparseable.
     def _ts(v):
@@ -1776,6 +1821,7 @@ def main():
                 if (perc_marg > 0.0
                         and variance_v < 0.15
                         and price < 0.40
+                        and mid_for_signal not in HOSTILE_MARKETS   # frozen exclusion rule
                         and mid_for_signal not in seen_market_ids
                         and cid not in active_portfolio):
 
@@ -1814,7 +1860,7 @@ def main():
                 # -------------------------------------------------------
                 # CSV-LOGGING THROTTLE (unchanged) — keeps file size sane.
                 # -------------------------------------------------------
-                if price > 0:
+                if price > 0.0:
                     m['log_price']     = price
                     m['log_ts']        = ts
                     m['log_perc_marg'] = perc_marg
