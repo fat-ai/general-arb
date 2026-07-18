@@ -16,7 +16,7 @@ _ap.add_argument('--report', nargs='?', const='backtest_report.pdf', default=Non
 ARGS, _ = _ap.parse_known_args()
 
 # --- MEMORY SAFEGUARD ---
-MAX_MEM_GB = 3.0
+MAX_MEM_GB = 8.0
 bytes_limit = int(MAX_MEM_GB * 1024 * 1024 * 1024)
 resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
 print(f"[SAFEGUARD] Memory strictly limited to {MAX_MEM_GB} GB for this run.")
@@ -26,11 +26,15 @@ FILE_PATH = 'simulation_results.csv'
 CHUNK_SIZE = 200000
 
 # Strategy Parameters  (must mirror sim_strat_5.py / main_2.py entry rule)
-SIGNAL = 0.3                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
+SIGNAL = 0.0                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
 MAX_PRICE = 0.40
 TAKE_PROFIT_PRICE = 0.95     # sell when the HELD token's price hits 0.95
-REQUIRED_CONSECUTIVE_SIGNALS = 5
+SIGNAL_MODE = 'consecutive'  # 'consecutive': streak, any non-signal row resets (original behaviour)
+                             # 'cumulative' : count TOTAL qualifying signal rows per token, no reset --
+                             #                tests "more signal" without punishing signal volatility
+REQUIRED_SIGNALS = 1         # signals needed to trade (both modes; 1 = modes identical)
+REQUIRED_CONSECUTIVE_SIGNALS = REQUIRED_SIGNALS  # back-compat alias (report bundle key)
 
 # Clean-window rule: only bet on markets that RESOLVE within the observed data
 # (end_timestamp <= last trade time in the CSV). Markets still unresolved at the data
@@ -45,7 +49,7 @@ REQUIRE_RESOLVED_IN_WINDOW = True
 # warmup boundary. Set this at/before the data start to include everything; the
 # equity curve is seeded at the first real trade, so an early date won't dilute the
 # metrics. (Per diagnose_csv.py the data spans 2024-06-11 .. 2025-10-28.)
-START_DATE = '2024-01-01'
+START_DATE = '2026-03-01'
 
 # --- OUT-OF-SAMPLE HYGIENE ---
 # When True, only trade markets whose CREATION (start_date) is on/after START_DATE,
@@ -62,6 +66,54 @@ RESTRICT_TO_NEW_MARKETS = True
 # "live positions" component of final value. When False, revert to booking them at
 # their (zero) outcome, i.e. the old behaviour that produced the fake end drawdown.
 CARRY_UNRESOLVED_AT_MTM = True
+
+# --- NON-DECLINING PRICE STREAK FILTER ---
+# When True, a row only counts toward the consecutive-signal streak if the token's price
+# is >= its last logged price. Any tick down disqualifies the row and resets the streak;
+# the market is NOT banned — a later streak starts fresh against the post-drop price.
+# Targets entries whose perc_margin crossing was caused by a price collapse rather than
+# by the model. A token's first logged row (no prior price) qualifies. Default False:
+# behaviour is byte-identical to before.
+REQUIRE_NONDECLINING_PRICE = False
+
+# --- NEGRISK (MULTI-OUTCOME) MARKET EXCLUSION ---
+# When True, drop every row belonging to a negRisk market (multi-outcome events such as
+# elections, one market per candidate, coupled by the negRisk adapter). Rationale:
+# multi-leg basket/arb flows in these markets express no directional view but feed the
+# trader-trust signal as if they did, and sum-to-one rebalancing moves prices
+# mechanically. Row-level exclusion: these markets never feed streaks and never consume
+# capital. Only markets whose parquet negRisk flag is explicitly True are excluded
+# (missing/null counts as not negRisk). Default False: behaviour identical to before.
+EXCLUDE_NEGRISK = True
+
+# --- HOSTILE-MARKET FILTER (frozen rule, 2026-07-16) ---
+# Mirrors the sim/main_2.py bet gate: feesEnabled OR resolution_source domain in
+# {data.chain.link, binance.com, dotabuff.com, gol.gg} OR sports_market_type in
+# {kill_over_under_game, team_totals, tennis_first_set_totals} OR 0<customLiveness<=3600.
+# Row-level exclusion like negRisk. Default False: flip ON to mirror the sim's bet gate
+# when replaying a baseline/bets-level CSV; scoring-filtered CSVs contain no hostile rows.
+EXCLUDE_HOSTILE = False
+
+# Rolling report charts: trailing-K-trades window per bucket (report pages only).
+ROLLING_WINDOW_TRADES = 200
+
+# --- PARQUET OUTCOME AUTHORITY ---
+# The CSV's actual_outcome is frozen at sim-generation time and is stale for markets
+# that resolved afterwards (diag_tail found ~20-30% of weekly enders in 2026 carrying
+# outcome 0 on every token — each settled as a guaranteed loss, winners included). The
+# markets parquet is refreshed nightly, so when True it becomes the outcome authority:
+#   cid has parquet outcome == 1            -> actual_outcome := 1.0   (confirmed win)
+#   cid has parquet outcome == 0.5          -> actual_outcome := 0.5   (true void:
+#       every share redeems at $0.50; settles through normal maturity math)
+#   else market has a confirmed winner      -> actual_outcome := 0.0   (confirmed loss)
+#   else (no winner confirmed anywhere)     -> actual_outcome := NaN   (unconfirmed)
+# Unconfirmed positions do NOT settle at maturity: they stay open, are excluded from
+# win/loss and the buckets, and are carried at MTM by the drain — exactly like the
+# post-horizon book. A recorded 0 is never trusted on its own: losses are only inferred
+# from a confirmed sibling winner, so a zero-defaulting source can't manufacture losses.
+# Default True: this is a correctness fix. False reverts to the CSV's outcomes (and to
+# dropping rows whose outcome is blank) for comparison with old runs.
+PARQUET_OUTCOME_AUTHORITY = True
 
 # Portfolio & Execution Parameters
 INITIAL_BANKROLL = 10000.0
@@ -82,6 +134,8 @@ open_positions = {}       # Active positions keyed by CID (the bought token):
 sold_cids = set()         # cids closed early, to intercept their heap resolution
 signal_counts = {}
 last_price = {}           # cid -> last-seen market price (for MTM of positions still open at data end)
+prev_price = {}           # cid -> last logged price, live markets only (REQUIRE_NONDECLINING_PRICE)
+prev_end = {}             # cid -> end_timestamp, to prune resolved markets from prev_price
 
 # Metrics Tracking
 total_trades = 0
@@ -97,6 +151,13 @@ gross_win = 0.0               # sum of winning profits     (profit factor / avg 
 gross_loss = 0.0              # sum of |losing profits|    (profit factor / avg loss)
 rows_pre_window = 0           # rows dropped: market started BEFORE START_DATE (stale)
 rows_unknown_start = 0        # rows dropped: market start not found in the parquet
+rows_negrisk = 0              # rows dropped: negRisk (multi-outcome) market (EXCLUDE_NEGRISK)
+rows_hostile = 0              # rows dropped: hostile market (EXCLUDE_HOSTILE, frozen rule)
+outcome_conflicts = 0         # rows where the CSV outcome disagreed with a confirmed parquet outcome
+rows_void = 0                 # rows settled as true 50/50 voids ($0.50/share at maturity)
+rows_unconfirmed = 0          # rows with no confirmed resolution (carried at MTM if entered)
+unconfirmed_carried = 0       # positions whose maturity passed unconfirmed: left open, not scored
+price_decline_rejects = 0     # signal rows rejected: price below token's last logged price
 
 # ---------------------------------------------------------------------------
 # Bucketed breakdowns: by ENTRY PRICE (5c) and by MARKET-LIFE TIMING (deciles),
@@ -160,6 +221,96 @@ def _load_market_starts():
 
 cid_start = _load_market_starts()
 
+def _load_negrisk_cids():
+    """cids (normalized like cid_start's keys) of markets whose negRisk flag is True."""
+    path = _find_markets_parquet()
+    if path is None:
+        print("[negrisk] EXCLUDE_NEGRISK is ON but no markets parquet found — "
+              "filter DISABLED, all markets kept.")
+        return set()
+    try:
+        mdf = pd.read_parquet(path, columns=['contract_id', 'negRisk'])
+    except Exception as e:
+        print(f"[negrisk] EXCLUDE_NEGRISK is ON but negRisk column unavailable ({e}) — "
+              "filter DISABLED, all markets kept.")
+        return set()
+    neg = mdf['negRisk'].fillna(False).astype(bool)          # only explicit True excludes
+    cids = (mdf.loc[neg, 'contract_id'].astype(str).str.strip()
+            .str.lower().str.replace('0x', '', regex=False))
+    out = set(cids)
+    print(f"[negrisk] Loaded {len(out):,} negRisk tokens from {path} — their rows will be excluded.")
+    return out
+
+negrisk_cids = _load_negrisk_cids() if EXCLUDE_NEGRISK else set()
+
+def _load_hostile_cids():
+    """cids (normalized like cid_start's keys) of markets matching the frozen hostile rule.
+    Tolerant to missing columns: absent fields simply contribute no exclusions."""
+    path = _find_markets_parquet()
+    if path is None:
+        print("[hostile] no markets parquet found -- hostile filter unavailable.")
+        return set()
+    want = ['contract_id', 'feesEnabled', 'resolution_source', 'sports_market_type', 'customLiveness']
+    try:
+        import pyarrow.parquet as _pq
+        names = _pq.ParquetFile(path).schema.names
+        cols = [c for c in want if c in names]
+        mdf = pd.read_parquet(path, columns=cols)
+    except Exception as e:
+        print(f"[hostile] could not read rule columns ({e}) -- hostile filter unavailable.")
+        return set()
+    mask = pd.Series(False, index=mdf.index)
+    if 'feesEnabled' in mdf:
+        mask |= mdf['feesEnabled'].astype(str).str.lower().isin(['true', '1'])
+    if 'resolution_source' in mdf:
+        mask |= (mdf['resolution_source'].astype(str).str.lower()
+                 .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|gol\.gg', regex=True, na=False))
+    if 'sports_market_type' in mdf:
+        mask |= mdf['sports_market_type'].astype(str).isin(
+            ['kill_over_under_game', 'team_totals', 'tennis_first_set_totals'])
+    if 'customLiveness' in mdf:
+        cl = pd.to_numeric(mdf['customLiveness'], errors='coerce')
+        mask |= ((cl > 0) & (cl <= 3600)).fillna(False)
+    cids = (mdf.loc[mask, 'contract_id'].astype(str).str.strip()
+            .str.lower().str.replace('0x', '', regex=False))
+    out = set(cids)
+    print(f"[hostile] Loaded {len(out):,} hostile tokens from {path} (frozen rule) -- "
+          f"{'rows will be excluded.' if EXCLUDE_HOSTILE else 'informational (filter OFF).'}")
+    return out
+
+hostile_cids = _load_hostile_cids() if EXCLUDE_HOSTILE else set()
+
+def _load_outcome_authority():
+    """(winner_cids, resolved_mids) from the parquet's per-token outcome column.
+    winner_cids keyed like cid_start; resolved_mids are stripped market_id strings."""
+    path = _find_markets_parquet()
+    if path is None:
+        print("[outcome] PARQUET_OUTCOME_AUTHORITY is ON but no markets parquet found — "
+              "FALLING BACK to the CSV's (stale) outcomes.")
+        return None
+    try:
+        mdf = pd.read_parquet(path, columns=['contract_id', 'market_id', 'outcome'])
+    except Exception as e:
+        print(f"[outcome] PARQUET_OUTCOME_AUTHORITY is ON but required columns "
+              f"unavailable ({e}) — FALLING BACK to the CSV's (stale) outcomes.")
+        return None
+    _o = pd.to_numeric(mdf['outcome'], errors='coerce')
+    _norm = (mdf['contract_id'].astype(str).str.strip()
+             .str.lower().str.replace('0x', '', regex=False))
+    won = _o == 1.0
+    winner_cids = set(_norm[won])
+    resolved_mids = set(mdf.loc[won, 'market_id'].astype(str).str.strip())
+    void_cids = set(_norm[_o == 0.5])          # true 50/50: every share pays $0.50
+    print(f"[outcome] Parquet is the outcome authority: {len(winner_cids):,} confirmed "
+          f"winner tokens across {len(resolved_mids):,} resolved markets; "
+          f"{len(void_cids):,} void tokens (settle at $0.50/share). Unconfirmed "
+          f"markets are carried at MTM, never scored.")
+    return winner_cids, resolved_mids, void_cids
+
+_auth = _load_outcome_authority() if PARQUET_OUTCOME_AUTHORITY else None
+outcome_authority_ok = _auth is not None
+winner_cids, resolved_mids, void_cids = _auth if _auth else (set(), set(), set())
+
 def _time_idx(bet_ts, end_ts, cid):
     """Decile of market-life elapsed at bet time; N_TIME ('n/a') if unknown."""
     s = cid_start.get(str(cid).strip().lower().replace('0x', ''))
@@ -172,6 +323,8 @@ def _time_idx(bet_ts, end_ts, cid):
     frac = 0.0 if frac < 0 else (1.0 if frac > 1 else frac)
     return min(int(frac * N_TIME), N_TIME - 1)
 
+roll_events = []   # (entry_ts, entry_price, profit, price_idx, time_idx, cid) per CLOSED trade
+
 def record_bucket(pos, profit, early):
     """Tally a closed position into its price bucket AND its (time x price) cell."""
     global gross_win, gross_loss
@@ -181,6 +334,7 @@ def record_bucket(pos, profit, early):
         gross_loss += -profit
     p = _price_idx(pos['price'])
     t = pos['time_idx']
+    roll_events.append((pos.get('entry_ts'), pos['price'], profit, p, t, pos.get('cid')))
     for cell in (buckets[p], grid[t][p]):
         cell['count']      += 1
         cell['sum_price']  += pos['price']
@@ -202,6 +356,20 @@ print(f"Strategy: perc_margin > {SIGNAL} | price < ${MAX_PRICE} | var < {MAX_VAR
       f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital)")
 print(f"Bankroll: ${INITIAL_BANKROLL} | Size: ${FIXED_SIZE} | Slippage: {MAX_SLIPPAGE_PCT:.0%} (multiplicative)\n")
 
+if REQUIRE_NONDECLINING_PRICE:
+    print("Entry filter: every streak row requires price >= token's last logged price "
+          "(REQUIRE_NONDECLINING_PRICE)\n")
+if EXCLUDE_NEGRISK:
+    print("Market filter: negRisk (multi-outcome) markets excluded at row level "
+          "(EXCLUDE_NEGRISK)\n")
+if EXCLUDE_HOSTILE:
+    print("Market filter: HOSTILE markets excluded at row level (frozen rule: fees | "
+          "chain.link/binance/dotabuff/gol.gg | 3 sports types | liveness<=1h)\n")
+print(f"Signal mode: {SIGNAL_MODE} | required signals: {REQUIRED_SIGNALS}\n")
+if PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok:
+    print("Outcome authority: markets parquet — only confirmed winners score; "
+          "unconfirmed markets carried at MTM\n")
+
 if RESTRICT_TO_NEW_MARKETS and not cid_start:
     print("[hygiene] RESTRICT_TO_NEW_MARKETS is ON but no markets parquet was loaded — "
           "cannot enforce the market-start filter; proceeding WITHOUT it.\n")
@@ -209,10 +377,14 @@ if RESTRICT_TO_NEW_MARKETS and not cid_start:
 # Read the columns we actually need, INCLUDING cid and perc_margin.
 cols = ['timestamp', 'market_id', 'cid', 'bet_on', 'bayesian_prob', 'perc_margin',
         'price', 'actual_outcome', 'variance_v', 'end_timestamp']
+# With the parquet as outcome authority, a blank CSV outcome no longer disqualifies a
+# row — the authority decides — so actual_outcome leaves the dropna subset.
+_required = ([c for c in cols if c != 'actual_outcome']
+             if (PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok) else cols)
 
 # --- MAIN EVENT LOOP ---
 for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
-    chunk = chunk.dropna(subset=cols)
+    chunk = chunk.dropna(subset=_required)
 
     # 1. Filter by start date
     chunk = chunk[chunk['timestamp'] >= start_timestamp].copy()
@@ -245,6 +417,40 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         if chunk.empty:
             continue
 
+    # 1c. NEGRISK EXCLUSION: drop every row of multi-outcome (negRisk) markets so they
+    #     never feed streaks, trust signals, or capital. See EXCLUDE_NEGRISK above.
+    if EXCLUDE_NEGRISK and negrisk_cids:
+        _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+        _keep = ~_norm.isin(negrisk_cids)
+        rows_negrisk += int((~_keep).sum())
+        chunk = chunk[_keep].copy()
+        if chunk.empty:
+            continue
+
+    # 1c'. HOSTILE EXCLUSION (frozen rule) -- same row-level mechanics as negRisk.
+    if EXCLUDE_HOSTILE and hostile_cids:
+        _normh = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+        _keeph = ~_normh.isin(hostile_cids)
+        rows_hostile += int((~_keeph).sum())
+        chunk = chunk[_keeph].copy()
+        if chunk.empty:
+            continue
+
+    # 1d. OUTCOME AUTHORITY: replace the CSV's (possibly stale) actual_outcome with the
+    #     parquet's confirmed resolutions. NaN = unconfirmed -> never settles, carried
+    #     at MTM. See PARQUET_OUTCOME_AUTHORITY above.
+    if PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok:
+        _nc = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+        _new = np.where(_nc.isin(winner_cids), 1.0,
+               np.where(_nc.isin(void_cids), 0.5,
+               np.where(chunk['market_id'].str.strip().isin(resolved_mids), 0.0, np.nan)))
+        rows_void += int((_new == 0.5).sum())
+        _csv = pd.to_numeric(chunk['actual_outcome'], errors='coerce')
+        outcome_conflicts += int((~np.isnan(_new) & _csv.notna()
+                                  & (_csv.to_numpy() != _new)).sum())
+        rows_unconfirmed += int(np.isnan(_new).sum())
+        chunk['actual_outcome'] = _new
+
     # 2. Execution metrics.
     #    is_win == actual_outcome: the CSV's actual_outcome is ALREADY the per-token
     #    resolution of the bought token (1.0 iff the token you bought won), so it must
@@ -267,6 +473,21 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     # Last-seen market price per cid across the FULL chunk (before we drop rows for the
     # streak/TP logic) — used to mark still-open positions to market at the data horizon.
     _last_px = chunk.groupby('cid')['price'].last().to_dict()
+
+    if REQUIRE_NONDECLINING_PRICE:
+        # Per-row "price >= token's last logged price", computed over ALL rows (pre
+        # keep_mask). Cross-chunk continuity via prev_price, filled BEFORE updating it.
+        _prev = chunk.groupby('cid')['price'].shift(1)
+        _first = _prev.isna()
+        if _first.any():
+            _prev[_first] = chunk.loc[_first, 'cid'].map(prev_price)
+        chunk['price_ok'] = ~(chunk['price'] < _prev)   # NaN prev (no history) qualifies
+        prev_price.update(_last_px)
+        prev_end.update(chunk.groupby('cid')['end_timestamp'].last().to_dict())
+        _now = chunk['timestamp'].min()
+        for _c in [c for c, e in prev_end.items() if e < _now]:   # market resolved: pop
+            prev_end.pop(_c, None)
+            prev_price.pop(_c, None)
 
     streak_cids = set(chunk.loc[is_signal, 'cid']) | set(signal_counts)
     keep_mask = is_signal | is_sell | chunk['cid'].isin(streak_cids)
@@ -296,9 +517,15 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
                 sold_cids.discard(cid)
                 continue
 
-            pos = open_positions.pop(cid, None)
+            pos = open_positions.get(cid)
             if pos is None:
                 continue
+            if np.isnan(pos['payout_at_maturity']):
+                # Market ended but its resolution is unconfirmed (outcome authority):
+                # leave the position open — the drain carries it at MTM, unscored.
+                unconfirmed_carried += 1
+                continue
+            open_positions.pop(cid)
             cash += pos['payout_at_maturity']
             locked_capital -= FIXED_SIZE
             profit = pos['payout_at_maturity'] - FIXED_SIZE
@@ -339,14 +566,23 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         for row in group.itertuples():
             cid = row.cid
             if row.is_signal:
+                if REQUIRE_NONDECLINING_PRICE and not row.price_ok:
+                    # Price below the token's last logged price: row disqualified.
+                    # consecutive: streak reset (original). cumulative: evidence is
+                    # never erased -- the row just doesn't count.
+                    if SIGNAL_MODE == 'consecutive':
+                        signal_counts.pop(cid, None)
+                    price_decline_rejects += 1
+                    continue
                 # Only track streaks for valid new entries
                 if cid not in open_positions and row.market_id not in seen_market_ids:
                     signal_counts[cid] = signal_counts.get(cid, 0) + 1
-                    if signal_counts[cid] >= REQUIRED_CONSECUTIVE_SIGNALS:
+                    if signal_counts[cid] >= REQUIRED_SIGNALS:
                         valid_buy_rows.append(row)
             else:
-                # The signal dropped; break the streak
-                if cid in signal_counts:
+                # Signal dropped: break the streak (consecutive mode only;
+                # cumulative mode counts total qualifying signals, no reset)
+                if SIGNAL_MODE == 'consecutive' and cid in signal_counts:
                     del signal_counts[cid]
 
         # Sort valid executions by priority
@@ -379,6 +615,8 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
                     'price': row.price,                 
                     'bayesian_prob': row.bayesian_prob, 
                     'time_idx': _time_idx(row.timestamp, row.end_timestamp, row.cid),
+                    'cid': row.cid,
+                    'entry_ts': float(row.timestamp),
                 }
                 
                 # Reset the streak now that we have successfully bought it
@@ -402,7 +640,8 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
                 last_price[_cid] = _last_px[_cid]
 
 # --- POST-PROCESSING & METRICS ---
-# Anything still open here belongs to a market that resolves AFTER the data ends.
+# Anything still open here either resolves AFTER the data ends, or ended without a
+# confirmed resolution (outcome authority) — both are carried at MTM, never scored.
 live_value = 0.0                 # marked-to-market value of the carried (open) positions
 open_positions_count = 0
 open_positions_cost = 0.0        # their cost basis, for reference
@@ -422,6 +661,8 @@ if CARRY_UNRESOLVED_AT_MTM:
 else:
     # Old behaviour: settle every remaining position at its (zero) outcome — this is what
     # booked the phantom end-of-data losses and produced the fake terminal drawdown.
+    # NaN payout (unconfirmed under the outcome authority) counts as 0 here: this mode
+    # exists precisely to reproduce the old loss-booking.
     while active_trades:
         end_ts, cid = heapq.heappop(active_trades)
         if cid in sold_cids:
@@ -430,15 +671,26 @@ else:
         pos = open_positions.pop(cid, None)
         if pos is None:
             continue
-        cash += pos['payout_at_maturity']
+        _payout = pos['payout_at_maturity']
+        _payout = 0.0 if np.isnan(_payout) else _payout
+        cash += _payout
         locked_capital -= FIXED_SIZE
-        profit = pos['payout_at_maturity'] - FIXED_SIZE
+        profit = _payout - FIXED_SIZE
         if profit > 0:
             wins += 1
         else:
             losses += 1
         record_bucket(pos, profit, early=False)
         portfolio_history.append((end_ts, cash + locked_capital))
+    # Positions left open by the unconfirmed-maturity guard already consumed their heap
+    # entry in PHASE 1 — settle them here too (at 0, i.e. the old behaviour).
+    _final_ts = data_max_ts if data_max_ts is not None else 0.0
+    for cid in list(open_positions):
+        pos = open_positions.pop(cid)
+        locked_capital -= FIXED_SIZE
+        losses += 1
+        record_bucket(pos, -FIXED_SIZE, early=False)
+        portfolio_history.append((_final_ts, cash + locked_capital))
 
 if not portfolio_history:
     print("No trades were taken. Check START_DATE, the CSV columns, and the gates.")
@@ -484,7 +736,8 @@ print(f"Final Portfolio Value : ${final_value:,.2f}")
 if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
     print(f"  Cash                : ${final_cash:,.2f}")
     print(f"  Live Positions (MTM): ${final_live_value:,.2f}   "
-          f"({open_positions_count} open, resolve after data end; cost ${open_positions_cost:,.0f})")
+          f"({open_positions_count} open: post-horizon or awaiting confirmed resolution; "
+          f"cost ${open_positions_cost:,.0f})")
 print(f"Total PnL             : ${total_pnl:,.2f}")
 print(f"Total ROI             : {roi:.2f}%")
 print(f"Max Drawdown          : {max_drawdown:.2f}%   (intra-run equity at cost; final point at MTM)")
@@ -493,13 +746,25 @@ print(f"Calmar Ratio          : {calmar_ratio:.2f}")
 print("-" * 50)
 print(f"Total Trades Taken    : {total_trades}")
 if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
-    print(f"Open at Data End      : {open_positions_count}   (carried at MTM; excluded from win/loss & buckets)")
+    _await = (f"; {unconfirmed_carried} ended, awaiting confirmed resolution"
+              if unconfirmed_carried else "")
+    print(f"Open at Data End      : {open_positions_count}   "
+          f"(carried at MTM; excluded from win/loss & buckets{_await})")
 print(f"Trades Sold Early     : {early_sells_count}  <-- Closed at TP")
 print(f"Trades Skipped (Cash) : {skipped_cash_trades}")
 print(f"Trades Skipped (Dupe) : {skipped_duplicate_trades}")
+if REQUIRE_NONDECLINING_PRICE:
+    print(f"Rejected (Price Down) : {price_decline_rejects:,}   (signal rows below token's last price; streak reset)")
 if RESTRICT_TO_NEW_MARKETS and cid_start:
     print(f"Rows excluded (start) : {rows_pre_window:,} pre-{START_DATE} market start"
           f" + {rows_unknown_start:,} unknown start")
+if EXCLUDE_NEGRISK and negrisk_cids:
+    print(f"Rows excl. (negRisk)  : {rows_negrisk:,}   (multi-outcome markets, dropped at row level)")
+if EXCLUDE_HOSTILE:
+    print(f"Rows excl. (hostile)  : {rows_hostile:,}   (frozen-rule markets, dropped at row level)")
+if PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok:
+    print(f"Outcome Authority     : {outcome_conflicts:,} rows corrected (CSV disagreed; parquet wins)"
+          f" | {rows_unconfirmed:,} rows unconfirmed | {rows_void:,} rows void (settle $0.50)")
 print(f"Peak Capital Locked   : ${peak_locked_capital:,.2f}")
 print(f"Total Slippage Paid   : ${total_slippage_paid:,.2f}")
 print("-" * 50)
@@ -658,7 +923,29 @@ if ARGS.report:
     else:
         def _day(ts):
             return pd.to_datetime(ts, unit='s').strftime('%Y-%m-%d') if ts is not None else 'n/a'
+        def _load_market_topics():
+            """cid -> coarse topic label from the question text (report charts only)."""
+            path = _find_markets_parquet()
+            if path is None: return {}
+            try:
+                mdf = pd.read_parquet(path, columns=['contract_id', 'question'])
+            except Exception:
+                return {}
+            q = mdf['question'].astype(str).str.lower()
+            topic = pd.Series('other', index=mdf.index)
+            topic[q.str.contains(r'bitcoin|btc|\beth\b|ethereum|crypto|solana|dogecoin|token', na=False)] = 'crypto'
+            topic[q.str.contains(r'\bvs\.?\b|game|match|nba|nfl|nhl|mlb|o/u|goalscorer|set \d', na=False)] = 'sports'
+            topic[q.str.contains(r'election|president|senate|congress|minister|approval', na=False)] = 'politics'
+            cids = (mdf['contract_id'].astype(str).str.strip().str.lower()
+                    .str.replace('0x', '', regex=False))
+            return dict(zip(cids, topic))
         bundle = {
+            "rolling": {
+                "events": roll_events,
+                "window": ROLLING_WINDOW_TRADES,
+                "cid_topic": _load_market_topics(),
+                "hostile_cids": (hostile_cids if hostile_cids else _load_hostile_cids()),
+            },
             "meta": {
                 "generated_at": datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
                 "data_start": _day(data_min_ts),
@@ -669,6 +956,8 @@ if ARGS.report:
                 "SIGNAL": SIGNAL, "MAX_VARIANCE": MAX_VARIANCE, "MAX_PRICE": MAX_PRICE,
                 "TAKE_PROFIT_PRICE": TAKE_PROFIT_PRICE,
                 "REQUIRED_CONSECUTIVE_SIGNALS": REQUIRED_CONSECUTIVE_SIGNALS,
+                "SIGNAL_MODE": SIGNAL_MODE, "REQUIRED_SIGNALS": REQUIRED_SIGNALS,
+                "EXCLUDE_HOSTILE": EXCLUDE_HOSTILE,
                 "FIXED_SIZE": FIXED_SIZE, "MAX_SLIPPAGE_PCT": MAX_SLIPPAGE_PCT,
                 "INITIAL_BANKROLL": INITIAL_BANKROLL,
             },
