@@ -489,8 +489,13 @@ elif str(FILE_PATH).endswith('.parquet'):
 _required = ([c for c in cols if c != 'actual_outcome']
              if (PARQUET_OUTCOME_AUTHORITY and (ENRICHED or outcome_authority_ok)) else cols)
 # Enriched columns carry MEANINGFUL NaNs (unknown start, unconfirmed outcome) and the
-# flags are never null -- none of them may participate in the dropna gate.
-_required = [c for c in _required if c not in ENRICHED_COLS]
+# flags are never null -- none may participate in the dropna gate. end_timestamp is
+# ALSO a meaningful null (an UNRESOLVED market has no end): dropping on it here re-
+# introduces exactly the unresolved-row loss we removed from the timestamp dropna
+# below, so it must leave the gate too. Only timestamp is truly required (handled
+# by the dedicated dropna a few lines down).
+_required = [c for c in _required if c not in (ENRICHED_COLS + ['end_timestamp'])]
+
 
 # --- MAIN EVENT LOOP ---
 def _assert_plain_dtypes(df, _state={'done': False}):
