@@ -481,8 +481,13 @@ elif str(FILE_PATH).endswith('.parquet'):
     print("[enriched] NOT detected -- legacy per-chunk joins active (SLOW on large replays; "
           "re-run prefilter_sim_csv.py with --markets-parquet).")
 
+# actual_outcome must NOT gate row-dropping whenever outcomes are supplied by the
+# authority -- via the legacy loader (outcome_authority_ok) OR the enriched parquet
+# (ENRICHED, which carries auth_outcome directly). Otherwise dropna(subset=_required)
+# silently strips every UNRESOLVED-market row (null actual_outcome) before the entry
+# gate ever sees it -- which made REQUIRE_RESOLVED_IN_WINDOW=False show ~0 open markets.
 _required = ([c for c in cols if c != 'actual_outcome']
-             if (PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok) else cols)
+             if (PARQUET_OUTCOME_AUTHORITY and (ENRICHED or outcome_authority_ok)) else cols)
 # Enriched columns carry MEANINGFUL NaNs (unknown start, unconfirmed outcome) and the
 # flags are never null -- none of them may participate in the dropna gate.
 _required = [c for c in _required if c not in ENRICHED_COLS]
