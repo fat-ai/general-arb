@@ -36,6 +36,10 @@ REBUILD_MODE = os.environ.get("SIM_REBUILD_MODE") == "1"
 REBUILD_STOP_DAY = int(os.environ.get("SIM_REBUILD_STOP_DAY", "0"))
 
 WARMUP_DAYS = 547
+# Fallback ttr for OPEN markets with NO usable scheduled-end field (last tier of the
+# ttr priority chain). The measured median start->resolution across 1.38M resolved
+# markets, NOT a guessed 24h. Fires rarely (resolution_timestamp covers ~98% of open).
+EMPIRICAL_MEDIAN_TTR_H = 25.9
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
 P_RANGE = 100
@@ -1003,8 +1007,10 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
         if m_end is not None:
             ttr_hours = (m_end - ts) / 3600.0
             if ttr_hours < 1.0: ttr_hours = 1.0
+        elif m['sched_end'] is not None:
+            ttr_hours = max(1.0, (m['sched_end'] - ts) / 3600.0)
         else:
-            ttr_hours = 24.0
+            ttr_hours = EMPIRICAL_MEDIAN_TTR_H
 
         cur_log_ttr = int(math.log(ttr_hours) * 1000)
         if cur_log_ttr > 2097151: cur_log_ttr = 2097151
@@ -1118,6 +1124,12 @@ def main():
         pl.col("uma_resolution_status"),
         pl.col('outcome').cast(pl.Float32),
         pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
+        # Scheduled-end fields for the OPEN-market ttr priority chain (validated
+        # reliability vs actual resolution: eventStartTime |err|<=24h 98%, then
+        # resolution_timestamp 82% @ 98% coverage, then game_start_time for the
+        # sports residual). Cast to String so the shared _ts() parser handles them.
+        pl.col("eventStartTime").cast(pl.String).alias("eventStartTime"),
+        pl.col("game_start_time").cast(pl.String).alias("game_start_time"),
     ])
     
     market_map = {}
@@ -1239,8 +1251,31 @@ def main():
             e_date = None                      # (4) corrupt -> include all
         # ----------------------------------------------------------------------
 
+        # SCHEDULED-END reference for ttr_hours on OPEN markets (where 'end' is None).
+        # Was a flat 24h -- wrong for 61% of markets (true median resolution 25.9h,
+        # p90 325h). Priority chain, each tier validated vs actual resolution, using
+        # the SAME validity floor (>= start_date - 1 day) as the end-date rules above:
+        #   1. eventStartTime      (|err|<=24h 98%, most precise)
+        #   2. resolution_timestamp(|err|<=24h 82%, ~98% coverage -- the workhorse)
+        #   3. game_start_time     (sports residual)
+        #   4. empirical median 25.9h (measured central value, NOT a guessed 24)
+        # Only fires for open markets; resolved markets use 'end' directly and ignore
+        # this. Reuses _ts()/floor so the "before start" pathology can't reappear.
+        evt_ts = _ts(market['eventStartTime'])
+        gst_ts = _ts(market['game_start_time'])
+        evt_valid = evt_ts is not None and (floor is None or evt_ts >= floor)
+        gst_valid = gst_ts is not None and (floor is None or gst_ts >= floor)
+        if evt_valid:
+            sched_end = evt_ts
+        elif res_valid:
+            sched_end = res_ts
+        elif gst_valid:
+            sched_end = gst_ts
+        else:
+            sched_end = None                   # -> caller uses EMPIRICAL_MEDIAN_TTR_H
+
         market_map[cid] = {
-            'id': market['id'], 'start': s_date, 'end': e_date,
+            'id': market['id'], 'start': s_date, 'end': e_date, 'sched_end': sched_end,
             'outcome': market['outcome'], 'outcome_label': market['token_outcome_label'], 
             'volume': 0, 'resolved': False
         }
@@ -1565,7 +1600,16 @@ def main():
                     valid_mask[i] = False
                     continue
 
-                market_ends[i]   = m['end'] if m['end'] is not None else (ts + 86400.0)
+                # ttr reference for the vectorized signal path: real end if resolved,
+                # else the scheduled-end chain, else the empirical median -- kept in
+                # lockstep with the scalar ttr fallback (lines ~1002, ~1820) so the
+                # fast and slow paths never disagree on an open market's ttr.
+                if m['end'] is not None:
+                    market_ends[i] = m['end']
+                elif m['sched_end'] is not None:
+                    market_ends[i] = m['sched_end']
+                else:
+                    market_ends[i] = ts + EMPIRICAL_MEDIAN_TTR_H * 3600.0
                 out_labels[i]    = m['outcome_label']
                 bet_on_is_yes[i] = (out_labels[i] == "yes")
                 m_refs[i]        = m
@@ -1816,7 +1860,13 @@ def main():
                 last_logged_perc_marg = m.get('log_perc_marg',  0.0)
 
                 m_end = m['end']
-                ttr_hours = max(1.0, (m_end - ts) / 3600.0) if m_end is not None else 24.0
+                if m_end is not None:
+                    ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+                elif m['sched_end'] is not None:
+                    # open market: ttr from the validated scheduled-end chain
+                    ttr_hours = max(1.0, (m['sched_end'] - ts) / 3600.0)
+                else:
+                    ttr_hours = EMPIRICAL_MEDIAN_TTR_H   # no scheduled date available
                 direction = 1.0 if eff_yes_bet else -1.0
 
                 if fast_signals is not None:
