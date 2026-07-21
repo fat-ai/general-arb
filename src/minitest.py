@@ -22,7 +22,7 @@ resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
 print(f"[SAFEGUARD] Memory strictly limited to {MAX_MEM_GB} GB for this run.")
 
 # --- CONFIGURATION ---
-FILE_PATH = 'simulation_results.csv'
+FILE_PATH = 'sim_results_enriched.parquet'
 CHUNK_SIZE = 200000
 
 # Strategy Parameters  (must mirror sim_strat_5.py / main_2.py entry rule)
@@ -43,13 +43,19 @@ REQUIRED_CONSECUTIVE_SIGNALS = REQUIRED_SIGNALS  # back-compat alias (report bun
 # Costs one extra single-column scan of the CSV to find the horizon. Set False for the
 # old behaviour (resolve everything at the end).
 REQUIRE_RESOLVED_IN_WINDOW = True
+# ^ Entry gate on markets with NO confirmed outcome (unresolved in the parquet, i.e.
+#   auth_outcome is NaN). True: do NOT enter them -> a clean in-window backtest where
+#   every entered trade is scoreable, and Open at End (MTM) == 0. False: enter them,
+#   lock capital, carry at MTM at the data horizon -> Open at End (MTM) is significant
+#   and end-of-run equity jumps if the signal stayed good. Keyed on has-a-confirmed-
+#   outcome, which is exactly the scoreable/not-scoreable distinction.
 
 # Your simulation_results.csv is already POST-warmup: the sim only logs rows with
 # ts >= simulation_start_date (data_start + 547d), so the file's first row IS the
 # warmup boundary. Set this at/before the data start to include everything; the
 # equity curve is seeded at the first real trade, so an early date won't dilute the
 # metrics. (Per diagnose_csv.py the data spans 2024-06-11 .. 2025-10-28.)
-START_DATE = '2026-03-01'
+START_DATE = '2025-01-01'
 
 # --- OUT-OF-SAMPLE HYGIENE ---
 # When True, only trade markets whose CREATION (start_date) is on/after START_DATE,
@@ -84,7 +90,7 @@ REQUIRE_NONDECLINING_PRICE = False
 # mechanically. Row-level exclusion: these markets never feed streaks and never consume
 # capital. Only markets whose parquet negRisk flag is explicitly True are excluded
 # (missing/null counts as not negRisk). Default False: behaviour identical to before.
-EXCLUDE_NEGRISK = True
+EXCLUDE_NEGRISK = False
 
 # --- HOSTILE-MARKET FILTER (frozen rule, 2026-07-16) ---
 # Mirrors the sim/main_2.py bet gate: feesEnabled OR resolution_source domain in
@@ -92,10 +98,19 @@ EXCLUDE_NEGRISK = True
 # {kill_over_under_game, team_totals, tennis_first_set_totals} OR 0<customLiveness<=3600.
 # Row-level exclusion like negRisk. Default False: flip ON to mirror the sim's bet gate
 # when replaying a baseline/bets-level CSV; scoring-filtered CSVs contain no hostile rows.
-EXCLUDE_HOSTILE = False
+EXCLUDE_HOSTILE = True
 
 # Rolling report charts: trailing-K-trades window per bucket (report pages only).
-ROLLING_WINDOW_TRADES = 200
+ROLLING_WINDOW_TRADES = 2000
+
+# --- PRE-ENTRY PRICE-PATH FEATURES (news-crash diagnostic) ---
+# At each BUY, log the token's recent price path: change over trailing 1h/6h/24h
+# (cents + relative) and drawdown from the trailing-24h max, plus history span.
+# Analysis: price_path_analysis.py (dose-response, time-split, block bootstrap).
+COLLECT_ENTRY_FEATURES = False
+ENTRY_FEATURES_OUT = 'entry_features.csv'
+_PATH_WINDOW_S = 24 * 3600
+_PATH_MAX_PTS = 4096
 
 # --- PARQUET OUTCOME AUTHORITY ---
 # The CSV's actual_outcome is frozen at sim-generation time and is stale for markets
@@ -142,6 +157,7 @@ total_trades = 0
 early_sells_count = 0
 skipped_cash_trades = 0
 skipped_duplicate_trades = 0
+skipped_unresolved = 0        # entries refused: unresolved market + REQUIRE_RESOLVED_IN_WINDOW
 total_slippage_paid = 0.0
 peak_locked_capital = 0.0
 expected_wins_sum = 0.0       # sum of bayesian_prob over entries (model's own forecast)
@@ -220,6 +236,9 @@ def _load_market_starts():
     return starts
 
 cid_start = _load_market_starts()
+# Prebuilt Series for per-chunk mapping: Series.map builds/caches its index ONCE;
+# Series.map(dict) rebuilt an index from the ~3M-key dict EVERY chunk (measured).
+_CID_START_SER = pd.Series(cid_start, dtype='float64') if cid_start else pd.Series(dtype='float64')
 
 def _load_negrisk_cids():
     """cids (normalized like cid_start's keys) of markets whose negRisk flag is True."""
@@ -324,6 +343,42 @@ def _time_idx(bet_ts, end_ts, cid):
     return min(int(frac * N_TIME), N_TIME - 1)
 
 roll_events = []   # (entry_ts, entry_price, profit, price_idx, time_idx, cid) per CLOSED trade
+entry_feat_rows = []   # per CLOSED trade: entry features + outcome (news-crash diagnostic)
+# Per-token price paths in FLAT C-TYPED buffers: 16 bytes/point, zero GC pressure.
+# (v1 used lists of tuples: ~120B/point + billions of heap objects -> OOM at 15GB and
+# a GC-throttled loop. Same lesson as the pandas rounds: no per-row python objects.)
+from array import array as _carr
+import bisect as _bisect
+_paths = {}       # cid -> [array('d') ts, array('d') px]
+_path_last = {}   # cid -> last row ts (idle pruning)
+
+def _path_features(cid, ts, px):
+    """(d1h_c, d6h_c, d24h_c, d1h_r, d6h_r, d24h_r, dd24, span_h, npts).
+    Window-W reference = LAST point at or before ts-W (NaN if history is younger).
+    dd24 = px / max(points in last 24h) - 1."""
+    import math
+    pp = _paths.get(cid)
+    if pp is None or not len(pp[0]):
+        return (float('nan'),)*7 + (0.0, 0)
+    ta, pa = pp
+    out = []
+    for w in (3600.0, 21600.0, 86400.0):
+        i = _bisect.bisect_right(ta, ts - w) - 1
+        out.append(px - pa[i] if i >= 0 else float('nan'))
+    rels = []
+    for c in out:
+        if math.isnan(c):
+            rels.append(float('nan'))
+        else:
+            ref = px - c
+            rels.append(c / ref if ref > 0 else float('nan'))
+    i0 = _bisect.bisect_left(ta, ts - 86400.0)
+    seg = np.frombuffer(pa, dtype='d')[i0:]
+    mx = float(seg.max()) if seg.size else 0.0
+    dd24 = px / mx - 1.0 if mx > 0 else float('nan')
+    span_h = (ts - ta[0]) / 3600.0
+    return (out[0], out[1], out[2], rels[0], rels[1], rels[2], dd24, span_h, len(ta))
+
 
 def record_bucket(pos, profit, early):
     """Tally a closed position into its price bucket AND its (time x price) cell."""
@@ -335,6 +390,9 @@ def record_bucket(pos, profit, early):
     p = _price_idx(pos['price'])
     t = pos['time_idx']
     roll_events.append((pos.get('entry_ts'), pos['price'], profit, p, t, pos.get('cid')))
+    if COLLECT_ENTRY_FEATURES and pos.get('pf') is not None:
+        entry_feat_rows.append((pos.get('entry_ts'), pos.get('cid'), pos.get('market_id'),
+                                pos['price'], profit, int(early)) + pos['pf'])
     for cell in (buckets[p], grid[t][p]):
         cell['count']      += 1
         cell['sum_price']  += pos['price']
@@ -350,6 +408,30 @@ portfolio_history = []
 _seeded = False
 data_min_ts = None            # span of the CSV actually processed (for the report header)
 data_max_ts = None
+
+# HORIZON PRE-PASS. Under REQUIRE_RESOLVED_IN_WINDOW=True we skip entry on markets whose
+# end falls after the data horizon (they'd resolve past the data and carry as open) --
+# but the horizon (max timestamp) isn't known until the stream ends, and the entry
+# decision is mid-stream. So compute it up front: one cheap column read (parquet) or a
+# single-column scan (CSV). Only needed when the gate is on.
+DATA_HORIZON = None
+if REQUIRE_RESOLVED_IN_WINDOW:
+    if str(FILE_PATH).endswith('.parquet'):
+        import pyarrow.parquet as _pqh
+        import pyarrow.compute as _pch
+        _pf = _pqh.ParquetFile(FILE_PATH)
+        _mx = None
+        for _b in _pf.iter_batches(batch_size=1_000_000, columns=['timestamp']):
+            _col = _pch.max(_b.column('timestamp')).as_py()
+            if _col is not None and (_mx is None or _col > _mx):
+                _mx = _col
+        DATA_HORIZON = float(_mx) if _mx is not None else None
+    else:
+        _tcol = pd.read_csv(FILE_PATH, usecols=['timestamp'])['timestamp']
+        _tcol = pd.to_numeric(_tcol, errors='coerce')
+        DATA_HORIZON = float(_tcol.max()) if _tcol.notna().any() else None
+    print(f"[in-window] horizon = {pd.to_datetime(DATA_HORIZON, unit='s') if DATA_HORIZON else 'n/a'} "
+          f"(REQUIRE_RESOLVED_IN_WINDOW=True: skip entry on markets ending after this)")
 
 print(f"Starting Backtest on {FILE_PATH}...")
 print(f"Strategy: perc_margin > {SIGNAL} | price < ${MAX_PRICE} | var < {MAX_VARIANCE} | "
@@ -379,11 +461,80 @@ cols = ['timestamp', 'market_id', 'cid', 'bet_on', 'bayesian_prob', 'perc_margin
         'price', 'actual_outcome', 'variance_v', 'end_timestamp']
 # With the parquet as outcome authority, a blank CSV outcome no longer disqualifies a
 # row — the authority decides — so actual_outcome leaves the dropna subset.
+# ENRICHED FAST PATH: prefilter_sim_csv.py --markets-parquet precomputes every static
+# per-token join as columns. The chunk loop then does ZERO string joins -- pandas
+# materializes multi-million-element sets on EVERY isin call (measured 25-45s/call),
+# which was the dominant cost of the replay across all profiling rounds.
+ENRICHED_COLS = ['market_start', 'negrisk_flag', 'hostile_flag', 'auth_outcome']
+ENRICHED = False
+if str(FILE_PATH).endswith('.parquet'):
+    try:
+        import pyarrow.parquet as _pqchk
+        _names = set(_pqchk.ParquetFile(FILE_PATH).schema.names)
+        ENRICHED = all(c in _names for c in ENRICHED_COLS)
+    except Exception:
+        ENRICHED = False
+if ENRICHED:
+    cols = cols + ENRICHED_COLS
+    print("[enriched] Precomputed join columns detected -- static joins skipped in the loop.")
+elif str(FILE_PATH).endswith('.parquet'):
+    print("[enriched] NOT detected -- legacy per-chunk joins active (SLOW on large replays; "
+          "re-run prefilter_sim_csv.py with --markets-parquet).")
+
 _required = ([c for c in cols if c != 'actual_outcome']
              if (PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok) else cols)
+# Enriched columns carry MEANINGFUL NaNs (unknown start, unconfirmed outcome) and the
+# flags are never null -- none of them may participate in the dropna gate.
+_required = [c for c in _required if c not in ENRICHED_COLS]
 
 # --- MAIN EVENT LOOP ---
-for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
+def _assert_plain_dtypes(df, _state={'done': False}):
+    """HARD GUARD: the hot path is only correct-and-fast on plain numpy dtypes.
+    Arrow-backed string columns silently route isin/map through per-element python
+    fallbacks (measured at ~100% of runtime, twice). Fail LOUDLY instead."""
+    bad = {c: str(df[c].dtype) for c in df.columns if not isinstance(df[c].dtype, np.dtype)}
+    if bad:
+        raise RuntimeError(
+            f"Arrow-backed columns leaked into the hot path: {bad}. "
+            f"(pandas {pd.__version__}) -- wrong/stale minitest.py or an unexpected "
+            f"pandas conversion. This build refuses to run slow silently.")
+    if not _state['done']:
+        print(f"[dtypes] pandas {pd.__version__} | first chunk: "
+              + ", ".join(f"{c}={df[c].dtype}" for c in df.columns))
+        _state['done'] = True
+    return df
+
+
+def _iter_chunks(path, chunksize, usecols):
+    """CSV: classic chunked read. Parquet (from prefilter_sim_csv.py): pyarrow batches
+    -> to_pandas() object-dtype strings, which keeps isin/map on the C hash paths --
+    Arrow-backed string columns turn them into per-element python fallbacks (measured
+    at ~73% of runtime on the 296GB replay)."""
+    if str(path).endswith('.parquet'):
+        import pyarrow.parquet as _pq
+        pf = _pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=chunksize, columns=usecols):
+            # Build the frame from pyarrow's OWN C++ numpy conversion (strings ->
+            # numpy object arrays). Never go through to_pandas(): on pandas>=3 it
+            # materializes Arrow-backed string columns whose isin/map fall back to
+            # per-element python conversion (py-spy: 100% of runtime on the replay).
+            data = {}
+            for _name, _col in zip(batch.schema.names, batch.columns):
+                _arr = _col.to_numpy(zero_copy_only=False)
+                # pandas>=3 RE-INFERS object string arrays back to Arrow-backed 'str'
+                # at DataFrame construction -- explicit dtype=object pins them.
+                data[_name] = pd.Series(_arr, dtype=object) if _arr.dtype == object else pd.Series(_arr)
+            yield _assert_plain_dtypes(pd.DataFrame(data))
+    else:
+        _sd = {c: object for c in ('cid', 'market_id', 'bet_on') if (usecols is None or c in usecols)}
+        for _ch in pd.read_csv(path, chunksize=chunksize, usecols=usecols, dtype=_sd):
+            # Safety net for pandas versions that still hand back extension dtypes:
+            for _c in _ch.columns:
+                if not isinstance(_ch[_c].dtype, np.dtype):
+                    _ch[_c] = np.asarray(_ch[_c])
+            yield _assert_plain_dtypes(_ch)
+
+for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
     chunk = chunk.dropna(subset=_required)
 
     # 1. Filter by start date
@@ -395,7 +546,11 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     chunk['end_timestamp'] = pd.to_numeric(chunk['end_timestamp'], errors='coerce')
     chunk['cid'] = chunk['cid'].astype(str)
     chunk['market_id'] = chunk['market_id'].astype(str)
-    chunk = chunk.dropna(subset=['timestamp', 'end_timestamp'])
+    # Drop only rows with no timestamp (genuinely unusable). A null end_timestamp is
+    # MEANINGFUL -- it marks an unresolved market (sim writes end=None). We keep those
+    # rows so REQUIRE_RESOLVED_IN_WINDOW=False can enter and MTM-carry them; the entry
+    # gate and heap logic below handle the null end explicitly.
+    chunk = chunk.dropna(subset=['timestamp'])
 
     # Track the data span actually processed (pre-gate) for the report header.
     if len(chunk):
@@ -407,9 +562,12 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     #     start is unknown) so we never enter on stale / partial-history signals. The
     #     trade-timestamp filter above keeps post-START_DATE TRADES; this keeps only
     #     trades belonging to markets that also OPENED on/after START_DATE.
-    if RESTRICT_TO_NEW_MARKETS and cid_start:
-        _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
-        _ms = _norm.map(cid_start)
+    if RESTRICT_TO_NEW_MARKETS and (ENRICHED or cid_start):
+        if ENRICHED:
+            _ms = chunk['market_start']
+        else:
+            _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+            _ms = _norm.map(_CID_START_SER)
         _known = _ms.notna()
         rows_pre_window    += int((_known & (_ms <  start_timestamp)).sum())
         rows_unknown_start += int((~_known).sum())
@@ -419,18 +577,24 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
 
     # 1c. NEGRISK EXCLUSION: drop every row of multi-outcome (negRisk) markets so they
     #     never feed streaks, trust signals, or capital. See EXCLUDE_NEGRISK above.
-    if EXCLUDE_NEGRISK and negrisk_cids:
-        _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
-        _keep = ~_norm.isin(negrisk_cids)
+    if EXCLUDE_NEGRISK and (ENRICHED or negrisk_cids):
+        if ENRICHED:
+            _keep = ~chunk['negrisk_flag'].astype(bool)
+        else:
+            _norm = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+            _keep = ~_norm.isin(negrisk_cids)
         rows_negrisk += int((~_keep).sum())
         chunk = chunk[_keep].copy()
         if chunk.empty:
             continue
 
     # 1c'. HOSTILE EXCLUSION (frozen rule) -- same row-level mechanics as negRisk.
-    if EXCLUDE_HOSTILE and hostile_cids:
-        _normh = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
-        _keeph = ~_normh.isin(hostile_cids)
+    if EXCLUDE_HOSTILE and (ENRICHED or hostile_cids):
+        if ENRICHED:
+            _keeph = ~chunk['hostile_flag'].astype(bool)
+        else:
+            _normh = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+            _keeph = ~_normh.isin(hostile_cids)
         rows_hostile += int((~_keeph).sum())
         chunk = chunk[_keeph].copy()
         if chunk.empty:
@@ -439,11 +603,14 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     # 1d. OUTCOME AUTHORITY: replace the CSV's (possibly stale) actual_outcome with the
     #     parquet's confirmed resolutions. NaN = unconfirmed -> never settles, carried
     #     at MTM. See PARQUET_OUTCOME_AUTHORITY above.
-    if PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok:
-        _nc = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
-        _new = np.where(_nc.isin(winner_cids), 1.0,
-               np.where(_nc.isin(void_cids), 0.5,
-               np.where(chunk['market_id'].str.strip().isin(resolved_mids), 0.0, np.nan)))
+    if PARQUET_OUTCOME_AUTHORITY and (ENRICHED or outcome_authority_ok):
+        if ENRICHED:
+            _new = chunk['auth_outcome'].to_numpy(dtype=float)
+        else:
+            _nc = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+            _new = np.where(_nc.isin(winner_cids), 1.0,
+                   np.where(_nc.isin(void_cids), 0.5,
+                   np.where(chunk['market_id'].str.strip().isin(resolved_mids), 0.0, np.nan)))
         rows_void += int((_new == 0.5).sum())
         _csv = pd.to_numeric(chunk['actual_outcome'], errors='coerce')
         outcome_conflicts += int((~np.isnan(_new) & _csv.notna()
@@ -467,6 +634,35 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     #    prior chunk (set(signal_counts)). Snapshotting just signal_counts at chunk start
     #    drops the break rows of freshly-started streaks, so an intra-chunk signal-drop is
     #    never seen and the streak silently overcounts and fires falsely.
+    if COLLECT_ENTRY_FEATURES:
+        # Path update must see ALL rows (crashes start from high prices that never
+        # pass the signal gates), so it runs BEFORE any masking -- as grouped BULK
+        # extends (factorize + stable argsort + frombytes), not per-row python.
+        _codes, _uniq = pd.factorize(chunk['cid'], sort=False)
+        _ordp = np.argsort(_codes, kind='stable')
+        _cs = _codes[_ordp]
+        _tsx = chunk['timestamp'].to_numpy()[_ordp]
+        _pxx = chunk['price'].to_numpy()[_ordp]
+        _bnd = np.flatnonzero(np.diff(_cs)) + 1
+        _starts = np.concatenate(([0], _bnd)); _ends = np.concatenate((_bnd, [len(_cs)]))
+        for _gi in range(len(_starts)):
+            _a, _b = int(_starts[_gi]), int(_ends[_gi])
+            _c = _uniq[_cs[_a]]
+            _pp = _paths.get(_c)
+            if _pp is None:
+                _pp = [_carr('d'), _carr('d')]
+                _paths[_c] = _pp
+            _pp[0].frombytes(_tsx[_a:_b].tobytes())
+            _pp[1].frombytes(_pxx[_a:_b].tobytes())
+            if len(_pp[0]) > 2 * _PATH_MAX_PTS:
+                del _pp[0][:len(_pp[0]) - _PATH_MAX_PTS]
+                del _pp[1][:len(_pp[1]) - _PATH_MAX_PTS]
+            _path_last[_c] = _tsx[_b - 1]
+        _cut = float(chunk['timestamp'].min()) - _PATH_WINDOW_S
+        _dead = [c for c, t in _path_last.items() if t < _cut]
+        for _c in _dead:
+            _paths.pop(_c, None); _path_last.pop(_c, None)
+
     is_signal = (chunk['perc_margin'] > SIGNAL) & (chunk['variance_v'] < MAX_VARIANCE) & (chunk['price'] < MAX_PRICE)
     is_sell = chunk['price'] >= TAKE_PROFIT_PRICE
 
@@ -480,7 +676,10 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         _prev = chunk.groupby('cid')['price'].shift(1)
         _first = _prev.isna()
         if _first.any():
-            _prev[_first] = chunk.loc[_first, 'cid'].map(prev_price)
+            # dict-get over just the first-occurrence rows: O(rows). Series.map(dict)
+            # rebuilds an index from the whole (growing) dict every chunk: O(dict).
+            _sub = chunk.loc[_first, 'cid'].tolist()
+            _prev[_first] = [prev_price.get(c, float('nan')) for c in _sub]
         chunk['price_ok'] = ~(chunk['price'] < _prev)   # NaN prev (no history) qualifies
         prev_price.update(_last_px)
         prev_end.update(chunk.groupby('cid')['end_timestamp'].last().to_dict())
@@ -489,8 +688,16 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
             prev_end.pop(_c, None)
             prev_price.pop(_c, None)
 
-    streak_cids = set(chunk.loc[is_signal, 'cid']) | set(signal_counts)
-    keep_mask = is_signal | is_sell | chunk['cid'].isin(streak_cids)
+    if SIGNAL_MODE == 'cumulative':
+        # Cumulative mode has NO resets, so streak-breaking rows are irrelevant.
+        # Retaining them -- and materializing set(signal_counts), which only grows in
+        # this mode -- made per-chunk cost grow without bound over the run. Signals
+        # and TP-eligible rows are everything phases 2/3 consume (MTM prices are
+        # captured from the full chunk above, before this mask).
+        keep_mask = is_signal | is_sell
+    else:
+        streak_cids = set(chunk.loc[is_signal, 'cid']) | set(signal_counts)
+        keep_mask = is_signal | is_sell | chunk['cid'].isin(streak_cids)
     chunk = chunk[keep_mask].copy()
     if chunk.empty:
         continue
@@ -501,8 +708,30 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
     # 4. Entry priority (only matters when cash-constrained at a single timestamp).
     chunk['priority'] = chunk['perc_margin'] / chunk['variance_v']
 
-    # Process chronologically
-    for ts, group in chunk.groupby('timestamp'):
+    # Process chronologically -- FLAT PASS over numpy arrays in consecutive-equal-
+    # timestamp blocks. Semantically identical to groupby('timestamp') iteration
+    # (stable sort by ts = same cross-group order; within-ts original order kept),
+    # but without building hundreds of thousands of tiny frames + namedtuple classes
+    # per chunk -- py-spy measured that fixed overhead at ~90% of runtime on the
+    # full-history replay.
+    _ord = np.argsort(chunk['timestamp'].to_numpy(), kind='stable')
+    ts_a  = chunk['timestamp'].to_numpy()[_ord]
+    cid_a = chunk['cid'].to_numpy()[_ord]
+    mid_a = chunk['market_id'].to_numpy()[_ord]
+    px_a  = chunk['price'].to_numpy()[_ord]
+    sig_a = chunk['is_signal'].to_numpy()[_ord]
+    pri_a = chunk['priority'].to_numpy()[_ord]
+    out_a = chunk['actual_outcome'].to_numpy()[_ord]
+    end_a = chunk['end_timestamp'].to_numpy()[_ord]
+    bay_a = chunk['bayesian_prob'].to_numpy()[_ord]
+    pok_a = chunk['price_ok'].to_numpy()[_ord] if 'price_ok' in chunk.columns else None
+    _n = len(ts_a)
+    _i = 0
+    while _i < _n:
+        ts = ts_a[_i]
+        _j = _i + 1
+        while _j < _n and ts_a[_j] == ts:
+            _j += 1
 
         if not _seeded:
             portfolio_history.append((ts, INITIAL_BANKROLL))
@@ -522,7 +751,7 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
                 continue
             if np.isnan(pos['payout_at_maturity']):
                 # Market ended but its resolution is unconfirmed (outcome authority):
-                # leave the position open — the drain carries it at MTM, unscored.
+                # leave the position open -- the drain carries it at MTM, unscored.
                 unconfirmed_carried += 1
                 continue
             open_positions.pop(cid)
@@ -540,15 +769,16 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         # Only the HELD token (matched by cid) can trigger its own take-profit.
         # Trigger on the RAW price crossing TAKE_PROFIT_PRICE (matches the sim), then
         # apply the slippage haircut to the actual fill.
-        for row in group.itertuples():
-            if row.cid in open_positions and row.price >= TAKE_PROFIT_PRICE:
-                pos = open_positions.pop(row.cid)
-                sell_exec_price = row.price * (1.0 - MAX_SLIPPAGE_PCT)
+        for _k in range(_i, _j):
+            _cid = cid_a[_k]
+            if _cid in open_positions and px_a[_k] >= TAKE_PROFIT_PRICE:
+                pos = open_positions.pop(_cid)
+                sell_exec_price = px_a[_k] * (1.0 - MAX_SLIPPAGE_PCT)
                 sell_payout = pos['shares'] * sell_exec_price
 
                 cash += sell_payout
                 locked_capital -= FIXED_SIZE
-                sold_cids.add(row.cid)
+                sold_cids.add(_cid)
 
                 profit = sell_payout - FIXED_SIZE
                 if profit > 0:
@@ -558,79 +788,104 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
                 record_bucket(pos, profit, early=True)
 
                 early_sells_count += 1
-                total_slippage_paid += (pos['shares'] * row.price * MAX_SLIPPAGE_PCT)
+                total_slippage_paid += (pos['shares'] * px_a[_k] * MAX_SLIPPAGE_PCT)
                 portfolio_history.append((ts, cash + locked_capital))
 
         # --- PHASE 3: EXECUTE NEW BUYS ---
-        valid_buy_rows = []
-        for row in group.itertuples():
-            cid = row.cid
-            if row.is_signal:
-                if REQUIRE_NONDECLINING_PRICE and not row.price_ok:
+        buy_ks = []
+        for _k in range(_i, _j):
+            _cid = cid_a[_k]
+            if sig_a[_k]:
+                if REQUIRE_NONDECLINING_PRICE and pok_a is not None and not pok_a[_k]:
                     # Price below the token's last logged price: row disqualified.
                     # consecutive: streak reset (original). cumulative: evidence is
                     # never erased -- the row just doesn't count.
                     if SIGNAL_MODE == 'consecutive':
-                        signal_counts.pop(cid, None)
+                        signal_counts.pop(_cid, None)
                     price_decline_rejects += 1
                     continue
                 # Only track streaks for valid new entries
-                if cid not in open_positions and row.market_id not in seen_market_ids:
-                    signal_counts[cid] = signal_counts.get(cid, 0) + 1
-                    if signal_counts[cid] >= REQUIRED_SIGNALS:
-                        valid_buy_rows.append(row)
+                if _cid not in open_positions and mid_a[_k] not in seen_market_ids:
+                    signal_counts[_cid] = signal_counts.get(_cid, 0) + 1
+                    if signal_counts[_cid] >= REQUIRED_SIGNALS:
+                        buy_ks.append(_k)
             else:
                 # Signal dropped: break the streak (consecutive mode only;
                 # cumulative mode counts total qualifying signals, no reset)
-                if SIGNAL_MODE == 'consecutive' and cid in signal_counts:
-                    del signal_counts[cid]
+                if SIGNAL_MODE == 'consecutive' and _cid in signal_counts:
+                    del signal_counts[_cid]
 
-        # Sort valid executions by priority
-        valid_buy_rows.sort(key=lambda x: x.priority, reverse=True)
+        # Sort valid executions by priority (stable: equal priorities keep row order)
+        buy_ks.sort(key=lambda k: pri_a[k], reverse=True)
 
-        for row in valid_buy_rows:
+        for _k in buy_ks:
+            _cid = cid_a[_k]
+            _mid = mid_a[_k]
             # Parent-market permanent re-entry ban
-            if row.market_id in seen_market_ids:
+            if _mid in seen_market_ids:
                 skipped_duplicate_trades += 1
                 continue
             # Don't open the same token twice
-            if row.cid in open_positions:
+            if _cid in open_positions:
                 continue
+
+            # UNRESOLVED-or-LATE GATE. Under REQUIRE_RESOLVED_IN_WINDOW=True, an entered
+            # trade must be BOTH scoreable (known outcome) AND resolve within the data:
+            #   - unresolved (NaN outcome): no confirmed result -> skip
+            #   - end after the data horizon: resolves past the data, would carry open -> skip
+            # Either way, =True => Open at End == 0. =False enters both and carries at MTM.
+            if REQUIRE_RESOLVED_IN_WINDOW:
+                _end = end_a[_k]
+                _late = (DATA_HORIZON is not None) and (not np.isnan(_end)) and (_end > DATA_HORIZON)
+                if np.isnan(out_a[_k]) or np.isnan(_end) or _late:
+                    skipped_unresolved += 1
+                    continue
 
             if cash >= FIXED_SIZE:
                 cash -= FIXED_SIZE
                 locked_capital += FIXED_SIZE
 
-                buy_price = min(0.99, max(0.001, row.price * (1.0 + MAX_SLIPPAGE_PCT)))
+                buy_price = min(0.99, max(0.001, px_a[_k] * (1.0 + MAX_SLIPPAGE_PCT)))
                 shares = FIXED_SIZE / buy_price
-                payout_at_maturity = shares * row.actual_outcome
+                payout_at_maturity = shares * out_a[_k]
 
-                heapq.heappush(active_trades, (row.end_timestamp, row.cid))
-                seen_market_ids.add(row.market_id)
-                open_positions[row.cid] = {
+                # Maturity heap: only markets with a KNOWN end can mature. A null/NaN
+                # end (unresolved market, entered under =False) must NOT go on the heap
+                # -- a NaN key breaks heap ordering and would stall resolution of every
+                # position behind it. Such positions stay in open_positions untouched
+                # until the final MTM sweep, which is exactly the carry we want.
+                _end = end_a[_k]
+                if not np.isnan(_end):
+                    heapq.heappush(active_trades, (_end, _cid))
+                seen_market_ids.add(_mid)
+                open_positions[_cid] = {
                     'shares': shares,
                     'buy_price': buy_price,
                     'payout_at_maturity': payout_at_maturity,
-                    'market_id': row.market_id,
-                    'price': row.price,                 
-                    'bayesian_prob': row.bayesian_prob, 
-                    'time_idx': _time_idx(row.timestamp, row.end_timestamp, row.cid),
-                    'cid': row.cid,
-                    'entry_ts': float(row.timestamp),
+                    'market_id': _mid,
+                    'price': px_a[_k],
+                    'bayesian_prob': bay_a[_k],
+                    'time_idx': _time_idx(ts_a[_k], end_a[_k], _cid),
+                    'cid': _cid,
+                    'entry_ts': float(ts_a[_k]),
+                    'pf': (_path_features(_cid, float(ts_a[_k]), float(px_a[_k]))
+                           if COLLECT_ENTRY_FEATURES else None),
                 }
-                
+
                 # Reset the streak now that we have successfully bought it
-                if row.cid in signal_counts:
-                    del signal_counts[row.cid]
+                if _cid in signal_counts:
+                    del signal_counts[_cid]
 
                 total_trades += 1
-                total_slippage_paid += (shares * row.price * MAX_SLIPPAGE_PCT)
+                total_slippage_paid += (shares * px_a[_k] * MAX_SLIPPAGE_PCT)
                 peak_locked_capital = max(peak_locked_capital, locked_capital)
-                expected_wins_sum += row.bayesian_prob
+                expected_wins_sum += bay_a[_k]
 
                 portfolio_history.append((ts, cash + locked_capital))
             else:
                 skipped_cash_trades += 1
+
+        _i = _j
 
     # After the chunk: refresh the last-seen price of every still-open position, so a
     # position carried to the data end is marked at its most recent market price.
@@ -638,6 +893,38 @@ for chunk in pd.read_csv(FILE_PATH, chunksize=CHUNK_SIZE, usecols=cols):
         for _cid in open_positions:
             if _cid in _last_px:
                 last_price[_cid] = _last_px[_cid]
+
+# --- FINAL MATURITY DRAIN ---
+# The stream's last processed row can be earlier than the true data horizon (e.g. the
+# latest rows belong to markets skipped under =True). A resolved position whose end
+# falls in that gap [last_row, horizon] never saw a ts >= end during the loop, so it
+# was left open. Resolve every such position now, against the horizon, using the SAME
+# logic as Phase 1. Under =True every entered position has end <= horizon, so this
+# drains them all -> Open at End == 0. Under =False, null-end (unresolved) positions
+# were never pushed to the heap, so they are untouched here and correctly carry at MTM.
+_drain_ts = DATA_HORIZON if ('DATA_HORIZON' in dir() and DATA_HORIZON is not None) else data_max_ts
+if _drain_ts is not None:
+    while active_trades and active_trades[0][0] <= _drain_ts:
+        end_ts, cid = heapq.heappop(active_trades)
+        if cid in sold_cids:
+            sold_cids.discard(cid)
+            continue
+        pos = open_positions.get(cid)
+        if pos is None:
+            continue
+        if np.isnan(pos['payout_at_maturity']):
+            unconfirmed_carried += 1
+            continue
+        open_positions.pop(cid)
+        cash += pos['payout_at_maturity']
+        locked_capital -= FIXED_SIZE
+        profit = pos['payout_at_maturity'] - FIXED_SIZE
+        if profit > 0:
+            wins += 1
+        else:
+            losses += 1
+        record_bucket(pos, profit, early=False)
+        portfolio_history.append((end_ts, cash + locked_capital))
 
 # --- POST-PROCESSING & METRICS ---
 # Anything still open here either resolves AFTER the data ends, or ended without a
@@ -745,7 +1032,7 @@ print(f"Sortino Ratio         : {sortino_ratio:.2f}")
 print(f"Calmar Ratio          : {calmar_ratio:.2f}")
 print("-" * 50)
 print(f"Total Trades Taken    : {total_trades}")
-if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
+if CARRY_UNRESOLVED_AT_MTM:
     _await = (f"; {unconfirmed_carried} ended, awaiting confirmed resolution"
               if unconfirmed_carried else "")
     print(f"Open at Data End      : {open_positions_count}   "
@@ -753,6 +1040,9 @@ if CARRY_UNRESOLVED_AT_MTM and open_positions_count > 0:
 print(f"Trades Sold Early     : {early_sells_count}  <-- Closed at TP")
 print(f"Trades Skipped (Cash) : {skipped_cash_trades}")
 print(f"Trades Skipped (Dupe) : {skipped_duplicate_trades}")
+if REQUIRE_RESOLVED_IN_WINDOW:
+    print(f"Skipped (Unresolved)  : {skipped_unresolved:,}   "
+          f"(no confirmed outcome; REQUIRE_RESOLVED_IN_WINDOW=True)")
 if REQUIRE_NONDECLINING_PRICE:
     print(f"Rejected (Price Down) : {price_decline_rejects:,}   (signal rows below token's last price; streak reset)")
 if RESTRICT_TO_NEW_MARKETS and cid_start:
@@ -923,6 +1213,16 @@ if ARGS.report:
     else:
         def _day(ts):
             return pd.to_datetime(ts, unit='s').strftime('%Y-%m-%d') if ts is not None else 'n/a'
+        pass  # (report bundle continues below)
+
+if COLLECT_ENTRY_FEATURES and entry_feat_rows:
+    _fcols = ['entry_ts', 'cid', 'market_id', 'entry_price', 'profit', 'early',
+              'd1h_c', 'd6h_c', 'd24h_c', 'd1h_r', 'd6h_r', 'd24h_r', 'dd24', 'span_h', 'npts']
+    pd.DataFrame(entry_feat_rows, columns=_fcols).to_csv(ENTRY_FEATURES_OUT, index=False)
+    print(f"[features] wrote {len(entry_feat_rows):,} entry-feature rows -> {ENTRY_FEATURES_OUT}")
+
+if ARGS.report:
+    if True:
         def _load_market_topics():
             """cid -> coarse topic label from the question text (report charts only)."""
             path = _find_markets_parquet()
