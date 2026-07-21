@@ -16,7 +16,7 @@ _ap.add_argument('--report', nargs='?', const='backtest_report.pdf', default=Non
 ARGS, _ = _ap.parse_known_args()
 
 # --- MEMORY SAFEGUARD ---
-MAX_MEM_GB = 8.0
+MAX_MEM_GB = 15.0
 bytes_limit = int(MAX_MEM_GB * 1024 * 1024 * 1024)
 resource.setrlimit(resource.RLIMIT_AS, (bytes_limit, bytes_limit))
 print(f"[SAFEGUARD] Memory strictly limited to {MAX_MEM_GB} GB for this run.")
