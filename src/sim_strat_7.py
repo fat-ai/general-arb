@@ -40,6 +40,14 @@ WARMUP_DAYS = 547
 # ttr priority chain). The measured median start->resolution across 1.38M resolved
 # markets, NOT a guessed 24h. Fires rarely (resolution_timestamp covers ~98% of open).
 EMPIRICAL_MEDIAN_TTR_H = 25.9
+# Entry-price ceiling. Was 0.40. Measured marginal PnL per trade by price step on the
+# recent 6 months: 0.10->0.12 = +$1.80 (negligible), 0.12->0.15 = -$6.78,
+# 0.15->0.20 = -$25.32. Edge/price is positive below 10c and negative above; the
+# 20-40c band ran -2.97pp edge and worsening. Cut at 0.10.
+MAX_ENTRY_PRICE = 0.10
+# Contributor sample cap for the decay diagnostics: bound the per-bet cost of
+# summarising a market's posterior evidence base on high-volume markets.
+CONTRIB_SAMPLE = 512
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
 P_RANGE = 100
@@ -1101,7 +1109,28 @@ def main():
         log.info(f"Output file created successfully at {OUTPUT_PATH}")
 
         if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
-        exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction", "price", "slippage", "bet_size", "profit", "roi", "duration_days", "user_score", "impact"]
+        # DECAY DIAGNOSTICS (added 2026-07-23). Everything after "impact" exists to
+        # localise the observed edge decay without needing another regeneration:
+        #   trust_weight     - the triggering wallet's trust score. WAS HARDCODED 0,
+        #                      which silently voided every user_score analysis.
+        #   trigger_trades   - that wallet's lifetime trade count. A market maker or bot
+        #                      runs orders of magnitude more trades than a human, so this
+        #                      is the direct test of the MM/arb taker-pollution theory.
+        #   trigger_brier_n  - that wallet's SCORED history depth (how much evidence the
+        #                      trust score actually rests on).
+        #   bayes_prob / variance_v - the posterior and its dispersion at entry.
+        #   ttr_hours        - horizon at entry. Unlike hold_days this is knowable at
+        #                      trade time, so any rule built on it is live-implementable.
+        #   n_contrib        - trades in this market's posterior = evidence depth.
+        #   contrib_med_trades - median lifetime trade count across contributing wallets
+        #                      (sampled, capped). High => the posterior is being built
+        #                      from bot/MM flow rather than discretionary traders.
+        exec_headers = ["timestamp", "market_id", "verdict", "bet_on", "direction",
+                        "price", "slippage", "bet_size", "profit", "roi", "duration_days",
+                        "user_score", "impact",
+                        "trust_weight", "trigger_trades", "trigger_brier_n",
+                        "bayes_prob", "variance_v", "ttr_hours",
+                        "n_contrib", "contrib_med_trades"]
         with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(exec_headers)
     else:
@@ -1136,15 +1165,46 @@ def main():
     result_map = {}
 
     # ---------------------------------------------------------------
-    # HOSTILE-MARKET EXCLUSION FILTER
-    # Frozen 2026-07-16 from loss_patterns.py analysis (run through mid-May 2026).
-    # BET-LEVEL only: these markets still feed user scoring; the strategy just
-    # never bets them (mirrors what main_2.py will do live).
-    # Rule -- trade-time-knowable fields only:
-    #   feesEnabled == true
-    #   OR resolution_source domain in {data.chain.link, binance.com, dotabuff.com, gol.gg}
-    #   OR sports_market_type in {kill_over_under_game, team_totals, tennis_first_set_totals}
-    #   OR 0 < customLiveness <= 3600
+    # HOSTILE-MARKET EXCLUSION FILTER  --  rule T5, frozen 2026-07-23
+    #
+    # REPLACES the old R1 rule, which DEGENERATED: R1 keyed on feesEnabled, a platform
+    # POLICY FLAG. Polymarket rolled fees out platform-wide and feesEnabled went from
+    # 54% of markets (2026-03) to 98% (2026-04) to 99.6% (2026-07). R1 therefore became
+    # a blanket exclusion, cutting the strategy from ~250k tradeable markets/month to
+    # ~1.7k. Measured monthly exclusion drift: 23.9% -> 97.3% = DEGENERATE.
+    #
+    # RULE S13 = T5 + crypto-keyword clause, with MAX_ENTRY_PRICE = 0.10
+# Contributor sample cap for the decay diagnostics: bound the per-bet cost of
+    # RULE S13 = T5 + crypto-keyword clause, with MAX_ENTRY_PRICE = 0.10.
+    # Measured on the unfiltered book, recent 6 months (2026-01..06):
+    #   baseline unfiltered        -4,791,013 pnl   roi -0.0990
+    #   T5 alone                   +1,917,827       roi +0.0844
+    #   T5 + px<=0.10              +3,279,252       roi +0.2031
+    #   T5 + px<=0.10 + kw_crypto  +3,399,717       roi +0.2220   <-- banked
+    # The NULL-metadata cluster (resolvedBy/submitted_by/umaBond/umaReward all null) was
+    # tested and is 100% REDUNDANT with T5 -- it excluded exactly zero extra trades --
+    # so it is deliberately NOT included.
+    #
+    # T5 uses STRUCTURAL fields only -- what a market IS, not what policy applies to it:
+    #   template_size >= 1000      (question-template factory detector; a normalised
+    #                               question hash appearing in >=1000 markets is a
+    #                               machine-generated series by construction)
+    #   OR resolution_source domain in {data.chain.link, binance.com, dotabuff.com,
+    #                                   gol.gg, hltv.org}
+    #   OR sports_market_type in {kill_over_under_game, team_totals,
+    #                             tennis_first_set_totals, cs2_odd_even_total_rounds,
+    #                             soccer_anytime_goalscorer}
+    #
+    # NO POLICY FLAGS. feesEnabled and customLiveness are both banned as rule inputs --
+    # customLiveness is drifting the same way (2.1% -> 53.2% over the same period).
+    #
+    # Measured on the unfiltered book (671,709 settled trades):
+    #   T5 alone            keeps 51.1%, roi +0.2505, monthly drift 29.0pp = stable
+    #   T5 + price <= 0.10  keeps 34.7%, roi +0.4600; recent 6mo +3,279,252 pnl
+    #   (baseline unfiltered recent 6mo: -4,791,013 pnl)
+    #
+    # Requires market_templates.parquet from template_classifier.py; if absent, the
+    # template clause is skipped and a WARNING is logged (domains+sports still apply).
     # Toggle via CONFIG['exclude_hostile_markets'] (default True).
     # ---------------------------------------------------------------
     HOSTILE_MARKETS = set()
@@ -1152,31 +1212,64 @@ def main():
     if CONFIG.get('exclude_hostile_markets', True):
         import pyarrow.parquet as _pq
         _names = _pq.ParquetFile(MARKETS_PATH).schema.names
-        _cols = [c for c in ['market_id', 'feesEnabled', 'resolution_source',
-                             'sports_market_type', 'customLiveness'] if c in _names]
+        _cols = [c for c in ['market_id', 'resolution_source',
+                             'sports_market_type', 'question'] if c in _names]
         _hm = pl.read_parquet(MARKETS_PATH, columns=_cols)
+        # template_size join (structural factory detector)
+        _tpl_path = SOURCE_DIR / 'market_templates.parquet'
+        _tpl_ok = False
+        try:
+            if _tpl_path.exists():
+                _tpl = (pl.read_parquet(_tpl_path)
+                          .select([pl.col('market_id').cast(pl.Utf8).alias('market_id'),
+                                   pl.col('template_size').cast(pl.Int64)]))
+                _hm = _hm.with_columns(pl.col('market_id').cast(pl.Utf8)).join(
+                    _tpl, on='market_id', how='left')
+                _tpl_ok = True
+        except Exception as _e:
+            log.warning(f"template_size join failed ({_e}); template clause skipped.")
+        if not _tpl_ok:
+            log.warning("market_templates.parquet NOT FOUND -- T5's template clause is "
+                        "INACTIVE. Run template_classifier.py; without it the factory "
+                        "markets that drive most losses will NOT be excluded.")
         _exprs = []
-        if 'feesEnabled' in _cols:
-            _exprs.append(pl.col('feesEnabled').cast(pl.Utf8).str.to_lowercase()
-                          .is_in(['true', '1']).fill_null(False))
+        if _tpl_ok:
+            _exprs.append((pl.col('template_size').cast(pl.Int64, strict=False) >= 1000)
+                          .fill_null(False))
         if 'resolution_source' in _cols:
             _exprs.append(pl.col('resolution_source').cast(pl.Utf8).str.to_lowercase()
-                          .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|gol\.gg')
+                          .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|'
+                                        r'gol\.gg|hltv\.org')
                           .fill_null(False))
         if 'sports_market_type' in _cols:
             _exprs.append(pl.col('sports_market_type').cast(pl.Utf8)
                           .is_in(['kill_over_under_game', 'team_totals',
-                                  'tennis_first_set_totals']).fill_null(False))
-        if 'customLiveness' in _cols:
-            _cl = pl.col('customLiveness').cast(pl.Float64, strict=False)
-            _exprs.append(((_cl > 0) & (_cl <= 3600)).fill_null(False))
+                                  'tennis_first_set_totals', 'cs2_odd_even_total_rounds',
+                                  'soccer_anytime_goalscorer']).fill_null(False))
+        if 'question' in _cols:
+            # Residual crypto markets -- the bespoke ones the template and domain clauses
+            # do NOT catch. Measured marginal on this cohort: +$114.40/trade before 2026,
+            # -$14.39/trade in 2026-01..06. Excluded on the RECENT evidence; revisit if
+            # the reversal reverses. Question text, so no policy-flag drift risk.
+            _exprs.append(pl.col('question').cast(pl.Utf8).str.to_lowercase()
+                          .str.contains(r'bitcoin|btc|\beth\b|ethereum|crypto|solana|'
+                                        r'dogecoin|token')
+                          .fill_null(False))
         if _exprs:
             _cond = _exprs[0]
             for _e in _exprs[1:]:
                 _cond = _cond | _e
             HOSTILE_MARKETS = set(_hm.filter(_cond)['market_id'].to_list())
-        log.info(f"Hostile-market filter ON: {len(HOSTILE_MARKETS):,} markets excluded from betting "
-                 f"({len(_cols)-1}/4 rule fields present in parquet).")
+        _total_mkts = _hm.select(pl.col('market_id').n_unique()).item()
+        _pct = 100.0 * len(HOSTILE_MARKETS) / max(_total_mkts, 1)
+        log.info(f"Hostile-market filter ON (T5): {len(HOSTILE_MARKETS):,} of {_total_mkts:,} "
+                 f"markets excluded from betting = {_pct:.1f}% "
+                 f"(template clause {'ACTIVE' if _tpl_ok else 'INACTIVE'}).")
+        if _pct > 80.0:
+            log.warning(f"!! EXCLUSION COVERAGE {_pct:.1f}% -- a rule flagging >80% of all "
+                        f"markets has stopped discriminating. This is exactly how R1 failed "
+                        f"(feesEnabled went 54%->98% at the fee rollout). INVESTIGATE before "
+                        f"trusting this run.")
         # Optional SIGNAL-LEVEL exclusion (CONFIG['exclude_hostile_from_scoring'], default False):
         # removes hostile-market trades from the ingestion stream entirely, so they never
         # touch user scoring. Same frozen rule, single source of truth: we collect the
@@ -1887,7 +1980,7 @@ def main():
 
                 # -------------------------------------------------------
                 # main_2.py ENTRY RULE (line 858-864):
-                #   perc_marg > 0.3 AND variance_v < 0.15 AND price < 0.40
+                #   perc_marg > 0.3 AND variance_v < 0.15 AND price < MAX_ENTRY_PRICE
                 #   AND market not in seen_market_ids (permanent re-entry ban)
                 # The buy lands on the SIGNAL TOKEN (whichever side fired),
                 # not on a particular yes/no determined by outcome_label.
@@ -1895,7 +1988,7 @@ def main():
                 mid_for_signal = m['id']
                 if (perc_marg > 0.0
                         and variance_v < 0.15
-                        and price < 0.40
+                        and price < MAX_ENTRY_PRICE
                         and mid_for_signal not in HOSTILE_MARKETS   # frozen exclusion rule
                         and mid_for_signal not in seen_market_ids
                         and cid not in active_portfolio):
@@ -1927,9 +2020,27 @@ def main():
                         }
                         result_map['performance']['cash'] -= trade_size
                         seen_market_ids.add(mid_for_signal)        # permanent ban
+                        # --- decay diagnostics ---------------------------------
+                        # Evidence base for this market's posterior. The contributor
+                        # list can be long on high-volume markets, so sample the most
+                        # recent CONTRIB_SAMPLE entries: O(1) bound per bet.
+                        _uids = m_pos.user_ids
+                        _n_contrib = len(_uids)
+                        if _n_contrib:
+                            _samp = _uids[-CONTRIB_SAMPLE:] if _n_contrib > CONTRIB_SAMPLE else _uids
+                            _tt = np.asarray([user_total_trades[u] for u in _samp],
+                                             dtype=np.float64)
+                            _contrib_med = float(np.median(_tt)) if _tt.size else 0.0
+                        else:
+                            _contrib_med = 0.0
                         executions_buffer.append([
                             ts, mid_for_signal, "BOUGHT", out_labels[i], 0,
-                            buy_price, max_slip, trade_size, 0, 0, 0, 0, perc_marg
+                            buy_price, max_slip, trade_size, 0, 0, 0,
+                            float(trust_weight), perc_marg,
+                            float(trust_weight), float(user_total_trades[uid]),
+                            float(user_brier_count[uid]),
+                            float(smooth_prob), float(variance_v), float(ttr_hours),
+                            _n_contrib, _contrib_med
                         ])
 
                 # -------------------------------------------------------
@@ -1971,7 +2082,10 @@ def main():
                     executions_buffer.append([
                         ts, p_data['market_id'], "TAKE_PROFIT", p_data['direction'], 0,
                         sell_price, max_slip, p_data['bet_size'], profit,
-                        profit / p_data['bet_size'], 0, 0, 0
+                        profit / p_data['bet_size'], 0, 0, 0,
+                        # diagnostics are entry-time properties; blank on exit legs
+                        # (loss_patterns.py joins them from the BOUGHT row by market_id)
+                        "", "", "", "", "", "", "", ""
                     ])
                     del active_portfolio[cid]
 
@@ -2026,7 +2140,8 @@ def main():
                             if profit > 0:   result_map['performance']['wins']   += 1
                             elif profit < 0: result_map['performance']['losses'] += 1
 
-                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0])
+                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0,
+                                                      "", "", "", "", "", "", "", ""])
                             cids_to_remove.append(p_cid)
 
                     for c in cids_to_remove: del active_portfolio[c]
