@@ -542,9 +542,26 @@ class DataFetcher:
                     contract_id TEXT,
                     price REAL,
                     size REAL,
-                    side_mult INTEGER
+                    side_mult INTEGER,
+                    maker TEXT
                 )
             ''')
+
+            # MAKER PERSISTENCE (added 2026-07-23). `user` holds the TAKER; the maker was
+            # parsed and discarded, which made it impossible to tell a directional taker
+            # from a market maker crossing the spread to flatten inventory. Measured on a
+            # 24h sample: 53% of taker fills (65% by size) come from wallets that also
+            # make, and 11.8% (14.1% by size) are same-token prior closes -- i.e. the
+            # signal treats inventory management as conviction.
+            # Adding a nullable column is a schema-header-only change in SQLite: O(1),
+            # no row rewrite, no WAL blow-up, safe on the existing ~800GB file.
+            # Historical rows stay NULL; they are covered by the separate maker backfill.
+            _cols_now = {r[1] for r in db_cursor.execute("PRAGMA table_info(trades)")}
+            if 'maker' not in _cols_now:
+                print("🔧 Adding `maker` column to trades (schema-only, instant)...")
+                db_cursor.execute("ALTER TABLE trades ADD COLUMN maker TEXT")
+                conn.commit()
+                print("   done — new rows will carry the maker address.")
             
             existing_high_ts = None
             existing_low_ts = None
@@ -775,15 +792,15 @@ class DataFetcher:
 
                                 out_rows.append((
                                     log_id, ts, val_usdc, val_size * mult,
-                                    taker, str(tid), price, val_size, mult
+                                    taker, str(tid), price, val_size, mult, maker
                                 ))
 
                             if out_rows:
                                 out_rows.sort(key=lambda x: x[0])
                                 
                                 db_conn.executemany("""
-                                    INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult, maker)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, out_rows)
                                 db_conn.commit()
                                 
