@@ -1590,12 +1590,51 @@ def main():
             hostile_scoring_clause = (
                 "WHERE TRIM(CAST(contract_id AS VARCHAR)) NOT IN (SELECT cid FROM hostile_cids)")
 
+        # ---- SCHEMA ADAPTATION (interned wallets) ---------------------------------
+        # The rebuilt DB stores user_id/maker_id INTEGER against a `wallets` table
+        # instead of 42-char TEXT addresses (~100GB saved across ~1.3B rows). Detect
+        # which schema we are attached to and build the projection + exchange filter
+        # accordingly, so ONE version of this file works before and after cutover.
+        # Interning is storage-only: the sim still builds its own dense uid space over
+        # the wallets that survive filtering, so per-user array sizing is unchanged.
+        try:
+            _tcols = {r[0] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='trades'").fetchall()}
+        except Exception:
+            _tcols = set()
+        _INTERNED = 'user_id' in _tcols
+        EXCHANGE_ADDRS = [
+            '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',  # V1 CTF Exchange (binary)
+            '0xc5d563a36ae78145c45a50134d48a1215220f80a',  # V1 NegRisk CTF Exchange
+            '0xe111180000d2663c0091e4f400237545b87b996b',  # V2 CTF Exchange
+            '0xe2222d279d744050d28e00520010520000310f59',  # V2 NegRisk Exchange
+        ]
+        if _INTERNED:
+            # resolve the exchange addresses to ids ONCE; filter on integers
+            _q = ("SELECT wallet_id FROM source_db.wallets WHERE address IN ("
+                  + ",".join("?" * len(EXCHANGE_ADDRS)) + ")")
+            _ex_ids = [r[0] for r in con.execute(_q, EXCHANGE_ADDRS).fetchall()]
+            log.info(f"Interned schema detected: filtering {len(_ex_ids)} exchange "
+                     f"wallet_ids (of {len(EXCHANGE_ADDRS)} addresses)")
+            if len(_ex_ids) < len(EXCHANGE_ADDRS):
+                log.warning("Not every exchange address resolved to a wallet_id -- an "
+                            "exchange that never traded is fine, but verify.")
+            _user_proj = "t.user_id AS user"
+            _user_filter = ("AND (t.user_id IS NULL OR t.user_id NOT IN ("
+                            + ",".join(str(int(i)) for i in _ex_ids) + "))") \
+                           if _ex_ids else ""
+        else:
+            _user_proj = "t.user"
+            _user_filter = ("AND (t.user IS NULL OR lower(t.user) NOT IN ("
+                            + ",".join(f"'{a}'" for a in EXCHANGE_ADDRS) + "))")
+
         query = f"""
             WITH parsed_trades AS (
                 SELECT 
                     t.id, 
                     t.contract_id, 
-                    t.user, 
+                    {_user_proj}, 
                     t.tradeAmount, 
                     t.outcomeTokensAmount, 
                     t.price, 
@@ -1612,12 +1651,7 @@ def main():
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0 
                   AND t.price <= 1.0
-                  AND (t.user IS NULL OR lower(t.user) NOT IN (
-                      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',  -- V1 CTF Exchange (binary)
-                      '0xc5d563a36ae78145c45a50134d48a1215220f80a',  -- V1 NegRisk CTF Exchange (multi-outcome)
-                      '0xe111180000d2663c0091e4f400237545b87b996b',  -- V2 CTF Exchange
-                      '0xe2222d279d744050d28e00520010520000310f59'   -- V2 NegRisk Exchange
-                  ))
+                  {_user_filter}
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
