@@ -562,6 +562,24 @@ class DataFetcher:
                 db_cursor.execute("ALTER TABLE trades ADD COLUMN maker TEXT")
                 conn.commit()
                 print("   done — new rows will carry the maker address.")
+
+            # ---- WALLET INTERNING (schema-adaptive) -------------------------------
+            # The rebuilt DB stores user_id/maker_id INTEGER against a `wallets` table
+            # instead of 42-char TEXT addresses. ALL normalisation goes through
+            # wallet_intern.normalize_address so this script, the V2 downloader, the DB
+            # builder and the sim can never disagree about what an address is.
+            # This script works against BOTH schemas: if `user_id` is absent we write
+            # the legacy TEXT columns, so there is no flag day at cutover.
+            _cols_now = {r[1] for r in db_cursor.execute("PRAGMA table_info(trades)")}
+            INTERNED = 'user_id' in _cols_now
+            WALLETS = None
+            if INTERNED:
+                from wallet_intern import WalletIntern
+                WALLETS = WalletIntern(conn, preload=True)
+                print(f"🔗 Interned schema: {len(WALLETS._a2i):,} wallets preloaded; "
+                      f"addresses will be written as ids.")
+            else:
+                print("🔗 Legacy schema (user/maker TEXT) — writing addresses verbatim.")
             
             existing_high_ts = None
             existing_low_ts = None
@@ -798,10 +816,29 @@ class DataFetcher:
                             if out_rows:
                                 out_rows.sort(key=lambda x: x[0])
                                 
-                                db_conn.executemany("""
-                                    INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult, maker)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """, out_rows)
+                                if INTERNED:
+                                    # Bulk-intern both address columns in ONE pass: new
+                                    # wallets are inserted together, then every row is
+                                    # rewritten with ids. Normalisation is delegated, so
+                                    # case/whitespace/topic-padding can never diverge
+                                    # from what the sim and the builder expect.
+                                    _addrs = [r[4] for r in out_rows] + [r[9] for r in out_rows]
+                                    _ids = WALLETS.get_ids(_addrs)
+                                    _n = len(out_rows)
+                                    out_rows = [
+                                        (r[0], r[1], r[2], r[3], _ids[i], r[5], r[6],
+                                         r[7], r[8], _ids[_n + i])
+                                        for i, r in enumerate(out_rows)
+                                    ]
+                                    db_conn.executemany("""
+                                        INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user_id, contract_id, price, size, side_mult, maker_id)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, out_rows)
+                                else:
+                                    db_conn.executemany("""
+                                        INSERT OR IGNORE INTO trades (id, timestamp, tradeAmount, outcomeTokensAmount, user, contract_id, price, size, side_mult, maker)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, out_rows)
                                 db_conn.commit()
                                 
                                 old_captured = seg_captured
