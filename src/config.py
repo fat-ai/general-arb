@@ -22,7 +22,6 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
 GRAPH_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
 RPC_URLS = [
     "https://polygon.drpc.org",
-    "https://polygon-public.nodies.app/",
     "https://rpc-mainnet.matic.quiknode.pro",
     "https://polygon.api.onfinality.io/public",
     "https://poly.api.pocket.network"
