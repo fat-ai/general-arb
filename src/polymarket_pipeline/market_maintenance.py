@@ -116,75 +116,42 @@ def parse_market_outcome(m):
 
 
 def repair_outcomes(markets_path, session):
-    """Fill outcomes for null/impossible-winner markets under the strict gate using DuckDB."""
+    """Fill outcomes for null/impossible-winner markets using a low-memory streaming architecture."""
     if not os.path.exists(markets_path):
         _log(f"parquet not found: {markets_path}"); return 0
         
-    import duckdb
     import pyarrow as pa
     import pyarrow.parquet as pq
     import numpy as np
-    
+
+    # 1. First Pass: Use DuckDB to efficiently query ONLY the market_ids that need repair
+    import duckdb
     c = duckdb.connect()
+    
+    # Check for required columns
     names = [r[0] for r in c.execute(f"DESCRIBE SELECT * FROM read_parquet('{markets_path}')").fetchall()]
     need = ["contract_id", "market_id", "outcome", "token_outcome_label", "uma_resolution_status"]
     if any(col not in names for col in need):
         _log("parquet lacks required columns; skipping outcome repair"); c.close(); return 0
-        
-    has_src = "outcome_source" in names
-    src_select = "outcome_source" if has_src else "'' AS outcome_source"
-    
-    # 1. Database-Level Extraction: Let DuckDB do the heavy lifting and type conversion
-    query = f"""
-        SELECT 
-            CAST(market_id AS VARCHAR) AS market_id,
-            TRY_CAST(outcome AS DOUBLE) AS outcome,
-            LOWER(TRIM(CAST(token_outcome_label AS VARCHAR))) = 'yes' AS _is_t0,
-            CAST({src_select} AS VARCHAR) AS outcome_source
-        FROM read_parquet('{markets_path}')
-    """
-    
-    # Fetch natively as PyArrow table (virtually 0 memory overhead compared to Pandas)
-    table = c.execute(query).fetch_arrow_table()
-    c.close()
-    
-    # Convert directly to Pandas using category types to compress memory by ~90%
-    df = table.to_pandas(categories=['market_id', 'outcome_source'])
-    
-    n = len(df)
-    df["_pos"] = np.arange(n, dtype=np.int64)
-    old = df["outcome"].to_numpy(dtype=np.float64, na_value=np.nan)
-    new = old.copy()
-    new_src = (df["outcome_source"].astype(object).fillna("").astype(str).to_numpy(dtype=object) if has_src else np.where(np.isnan(old), "", "gamma").astype(object))
 
-    targets = {}
-    for mid, g in df.groupby("market_id", sort=False, observed=True):
-        out = g["outcome"].to_numpy(dtype=np.float64, na_value=np.nan)
-        finite = np.isfinite(out)
-        if finite.any() and np.nanmax(out) == 1.0:
-            continue
-        if finite.all() and np.allclose(out, 0.5):
-            continue
-        pos = g["_pos"].to_numpy()
-        t0 = g["_is_t0"].to_numpy()
-        if not t0.any():
-            t0 = np.zeros(len(g), dtype=bool); t0[0] = True
-        targets[str(mid).strip()] = (pos, t0)
-        
+    has_src = "outcome_source" in names
+    
+    # Find markets where the outcome is null or NaN
+    query = f"""
+        SELECT DISTINCT CAST(market_id AS VARCHAR) 
+        FROM read_parquet('{markets_path}') 
+        WHERE outcome IS NULL OR outcome = 'NaN'
+    """
+    targets = [r[0] for r in c.execute(query).fetchall()]
+    c.close()
+
     if not targets:
         _log("no markets need outcome repair"); return 0
-    _log(f"{len(targets):,} markets need outcome repair; fetching...")
+    _log(f"{len(targets):,} markets need outcome repair; fetching API updates...")
 
+    # 2. Fetch updates from Gamma API for these specific markets
     seen = set()
-
-    def apply(mid, winning, source):
-        pos, t0 = targets[mid]
-        if winning == 0.5:
-            new[pos] = 0.5
-        else:
-            t0_won = (winning == 0.0)
-            new[pos] = np.where(t0, 1.0 if t0_won else 0.0, 0.0 if t0_won else 1.0)
-        new_src[pos] = source
+    market_updates = {} # Maps market_id -> (winning_index, source)
 
     def ingest(m):
         mid = str(m.get('id', '')).strip()
@@ -193,38 +160,80 @@ def repair_outcomes(markets_path, session):
         seen.add(mid)
         w, src = parse_market_outcome(m)
         if src not in ('api_anomalous', 'api_ambiguous', None) and w is not None:
-            apply(mid, w, src)
+            market_updates[mid] = (w, src)
 
     numeric = sorted([m for m in targets if m.isdigit()], key=int, reverse=True)
     batches = [numeric[i:i + ID_BATCH] for i in range(0, len(numeric), ID_BATCH)]
     for closed in ('true', 'false'):
         rem = [m for b in batches for m in b if m not in seen]
-        if not rem:
-            break
+        if not rem: break
         rb = [rem[i:i + ID_BATCH] for i in range(0, len(rem), ID_BATCH)]
         for ids in rb:
             for m in _fetch_ids(session, ids, closed):
                 ingest(m)
             time.sleep(REQUEST_PAUSE)
-            
-    missing = [m for b in batches for m in b if m not in seen]
-    for mid in missing:
-        m = _fetch_single(session, mid)
-        time.sleep(REQUEST_PAUSE)
-        if m is None:
-            continue
-        if str(m.get('id', '')).strip() == mid:
-            seen.add(mid)
-            w, src = parse_market_outcome(m)
-            if src not in ('api_anomalous', 'api_ambiguous', None) and w is not None:
-                apply(mid, w, src)
 
-    changed = int(((np.isnan(old) & ~np.isnan(new)) |
-                   (~np.isnan(old) & ~np.isnan(new) & (old != new))).sum())
-    if changed == 0:
+    if not market_updates:
         _log("no outcomes changed"); return 0
-        
-    _write_outcome(markets_path, new, new_src)
+
+    # 3. Second Pass: Stream the parquet file in batches to apply updates safely
+    _log(f"Applying updates to {len(market_updates):,} markets via streaming...")
+    
+    pf = pq.ParquetFile(markets_path)
+    schema = pf.schema_arrow
+    
+    # Ensure outcome_source exists in our write schema
+    fields = [f for f in schema if f.name != "outcome_source"]
+    schema = pa.schema(fields + [pa.field("outcome_source", pa.string())])
+    
+    tmp = markets_path + ".tmp"
+    writer = pq.ParquetWriter(tmp, schema, compression="zstd")
+    changed = 0
+
+    try:
+        for batch in pf.iter_batches(batch_size=100000):
+            df_chunk = batch.to_pandas()
+            mids = df_chunk['market_id'].astype(str).str.strip().values
+            
+            # Apply updates row by row in this tiny chunk
+            for idx, mid in enumerate(mids):
+                if mid in market_updates:
+                    winning_val, source_val = market_updates[mid]
+                    
+                    if winning_val == 0.5:
+                        df_chunk.at[idx, 'outcome'] = 0.5
+                    else:
+                        is_t0 = str(df_chunk.at[idx, 'token_outcome_label']).strip().lower() == 'yes'
+                        t0_won = (winning_val == 0.0)
+                        df_chunk.at[idx, 'outcome'] = 1.0 if (is_t0 == t0_won) else 0.0
+                    
+                    if has_src or 'outcome_source' in df_chunk:
+                        df_chunk.at[idx, 'outcome_source'] = source_val
+                    changed += 1
+            
+            # If the chunk didn't have outcome_source, add it
+            if 'outcome_source' not in df_chunk:
+                df_chunk['outcome_source'] = ""
+                
+            # Convert back to Arrow and write
+            t = pa.Table.from_pandas(df_chunk, schema=schema, preserve_index=False)
+            writer.write_table(t)
+            
+        writer.close()
+    except Exception as e:
+        writer.close()
+        if os.path.exists(tmp): os.remove(tmp)
+        raise e
+
+    # Atomic replace
+    bak = markets_path + ".bak"
+    try:
+        if os.path.exists(bak): os.remove(bak)
+        os.replace(markets_path, bak)
+    except Exception:
+        pass
+    os.replace(tmp, markets_path)
+
     _log(f"outcome repair: {changed:,} token rows updated")
     return changed
 
