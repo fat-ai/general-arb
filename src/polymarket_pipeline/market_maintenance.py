@@ -136,13 +136,15 @@ def repair_outcomes(markets_path, session):
 
     has_src = "outcome_source" in names
     
-    # Find markets where the outcome is null or NaN
+    # Find markets where the outcome is null or NaN, explicitly ignoring missing market_ids
     query = f"""
         SELECT DISTINCT CAST(market_id AS VARCHAR) 
         FROM read_parquet('{markets_path}') 
-        WHERE outcome IS NULL OR outcome = 'NaN'
+        WHERE (outcome IS NULL OR outcome = 'NaN')
+          AND market_id IS NOT NULL
     """
-    targets = [r[0] for r in c.execute(query).fetchall()]
+    # Add a Python-level safety net to completely drop None or empty string values
+    targets = [r[0] for r in c.execute(query).fetchall() if r[0] and str(r[0]).strip()]
     c.close()
 
     if not targets:
