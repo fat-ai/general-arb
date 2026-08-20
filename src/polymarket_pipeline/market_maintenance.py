@@ -155,7 +155,7 @@ def repair_outcomes(markets_path, session):
     df["_pos"] = np.arange(n, dtype=np.int64)
     old = df["outcome"].to_numpy(dtype=np.float64, na_value=np.nan)
     new = old.copy()
-    new_src = df["outcome_source"].to_numpy(dtype=object) if has_src else np.where(np.isnan(old), "", "gamma").astype(object)
+    new_src = (df["outcome_source"].astype(object).fillna("").astype(str).to_numpy(dtype=object) if has_src else np.where(np.isnan(old), "", "gamma").astype(object))
 
     targets = {}
     for mid, g in df.groupby("market_id", sort=False, observed=True):
