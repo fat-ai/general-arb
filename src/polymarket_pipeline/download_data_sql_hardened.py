@@ -448,20 +448,37 @@ def _api_get(session, url, params=None):
     return None
 
 
-def unknown_market_tokens(conn, markets_path):
+def unknown_market_tokens(db_path, markets_path):
     """Non-collateral asset ids among trades whose contract_id is not in the markets
-    parquet. These are the markets to fetch. Uses duckdb to scan the parquet."""
+    parquet. These are the markets to fetch. Uses duckdb to scan both the parquet and SQLite db."""
     import duckdb
     c = duckdb.connect()
-    mk = set(x[0] for x in c.execute(
-        f"SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) FROM "
-        f"read_parquet('{markets_path}')").fetchall())
+    
+    # Load DuckDB's SQLite extension to read directly from the database file
+    c.execute("INSTALL sqlite;")
+    c.execute("LOAD sqlite;")
+    
+    # Count the total unique markets in the parquet file for our return statement
+    n_mk = c.execute(
+        f"SELECT COUNT(DISTINCT TRIM(CAST(contract_id AS VARCHAR))) "
+        f"FROM read_parquet('{markets_path}')"
+    ).fetchone()[0]
+    
+    # Use DuckDB to filter the SQLite table against the Parquet file internally
+    query = f"""
+        SELECT DISTINCT contract_id 
+        FROM sqlite_scan('{db_path}', 'trades') 
+        WHERE contract_id NOT IN ('0','1')
+        EXCEPT
+        SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) 
+        FROM read_parquet('{markets_path}')
+    """
+    
+    # Only the tiny list of missing IDs gets pulled into Python memory
+    unknown = [r[0] for r in c.execute(query).fetchall()]
     c.close()
-    # contract_ids present in the DB, excluding collateral, not in markets
-    rows = conn.execute(
-        "SELECT DISTINCT contract_id FROM trades WHERE contract_id NOT IN ('0','1')"
-    ).fetchall()
-    return [r[0] for r in rows if r[0] not in mk], len(mk)
+    
+    return unknown, n_mk
 
 
 def resolve_and_append_markets(conn, session, markets_path, unknown):
@@ -615,7 +632,7 @@ def main():
             log("  (outcome-repair/metadata-refresh module not present; skipping)")
 
         # report what is still unjoinable after the sync
-        unknown, n_mk = unknown_market_tokens(conn, a.markets)
+        unknown, n_mk = unknown_market_tokens(a.db, a.markets)
         log(f"  markets parquet now has {n_mk:,} tokens; "
             f"{len(unknown):,} trade tokens still unknown")
 
