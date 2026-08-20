@@ -145,7 +145,7 @@ def repair_outcomes(markets_path, session):
     """
     
     # Fetch natively as PyArrow table (virtually 0 memory overhead compared to Pandas)
-    table = c.execute(query).arrow()
+    table = c.execute(query).fetch_arrow_table()
     c.close()
     
     # Convert directly to Pandas using category types to compress memory by ~90%
