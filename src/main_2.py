@@ -25,12 +25,158 @@ from sim_strat_5 import (
     PRICE_LUT,
     TIME_LUT,
     CACHE_DIR,
-    restore_arrays_from_npz,   
+    restore_arrays_from_npz,
+    AGG_K0,   
     compute_wager_and_p_true,  
     P_RANGE,
     _EMPTY_U32,
 )
-import numpy as np     
+import numpy as np
+from wallet_skill import skill_ratio as _skill_ratio
+
+if CONFIG.get('exclude_hostile_markets'):
+    import polars as pl, hostile_markets as _rule
+    _mk = pl.read_parquet(MARKETS_PATH,
+                          columns=['market_id'] + _rule.required_columns())
+    _cond = _rule.hostile_expr_polars(_mk.columns)
+    if _cond is not None:
+        HOSTILE_MARKETS = set(_mk.filter(_cond)['market_id'].to_list())
+    log.info(f"🚫 Hostile filter ON: {len(HOSTILE_MARKETS):,} markets excluded")
+else:
+    HOSTILE_MARKETS = set()
+
+# --- live/backtest parity switches -----------------------------------------
+# Defaults mirror sim_strat_5 + config.py. Both exist so a live/backtest
+# divergence can be BISECTED rather than argued about.
+LIVE_INGEST_MAKER = True          # B7: sim ingests taker AND maker (UNION ALL)
+LIVE_AGGREGATE_MODE = bool(CONFIG.get('aggregate_mode', True))   # B6
+LIVE_MAX_ENTRY_PRICE = float(CONFIG.get('max_entry_price', 0.10))
+LIVE_SIGNAL_THRESHOLD = float(CONFIG.get('signal_threshold', 0.0))
+LIVE_MAX_VARIANCE = float(CONFIG.get('max_variance', 0.15))
+# --- opposite-signal exit ----------------------------------------------------
+# None | 'close' | 'reverse'. None reproduces today's behaviour exactly.
+LIVE_OPPOSITE_ACTION = CONFIG.get('opposite_action', None)
+# Refuse a reversal into a sibling below this price: below it the position is
+# too small to trade and the payoff arithmetic is dominated by dust quotes.
+LIVE_OPPOSITE_MIN_SIB_PRICE = float(CONFIG.get('opposite_min_sib_price', 0.02))
+# All FOUR, matching sim_strat_5's ingestion filter. main_2 previously checked
+# only the two V2 addresses, and only against the taker.
+EXCHANGE_ADDRESSES = frozenset({
+    "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",   # V1 CTF Exchange
+    "0xc5d563a36ae78145c45a50134d48a1215220f80a",   # V1 NegRisk Exchange
+    "0xe111180000d2663c0091e4f400237545b87b996b",   # V2 CTF Exchange
+    "0xe2222d279d744050d28e00520010520000310f59",   # V2 NegRisk Exchange
+})
+
+# --- wallet index: address -> user_map key, with NO disk access on the hot path
+# Two sorted numpy arrays rather than a dict: 16 bytes per wallet instead of
+# ~150, and np.searchsorted costs microseconds. Built once, in the background.
+_WI_HASH = None          # sorted uint64 hashes of normalised addresses
+_WI_KEY = None           # parallel array of user_map keys (as uint64 wallet ids)
+_WI_READY = False
+_WI_STARTED = False
+
+
+def _wi_hash(addr_bytes):
+    """Stable 64-bit hash. hashlib, NOT python's hash(): PYTHONHASHSEED
+    randomises str hashing per process, so a dict built in one run would not
+    match lookups in the next."""
+    import hashlib
+    return int.from_bytes(hashlib.blake2b(addr_bytes, digest_size=8).digest(),
+                          "big")
+
+
+def _wi_build(state):
+    """Stream the wallets table once and keep ONLY wallets already in
+    state.user_map. Everything else has no history, so resolving it changes
+    nothing about the signal.
+
+    Runs in a daemon thread. Until it finishes the bot uses the address
+    fallback, which is what an unknown wallet gets anyway.
+    """
+    global _WI_HASH, _WI_KEY, _WI_READY
+    import sqlite3
+    import numpy as _np
+    try:
+        from sim_strat_5 import TRADES_PATH
+        t0 = time.time()
+        um = state.user_map
+        log.info(f"🔑 Building wallet index (user_map has {len(um):,} entries)...")
+        conn = sqlite3.connect(f"file:{TRADES_PATH}?mode=ro", uri=True,
+                               check_same_thread=False)
+        conn.execute("PRAGMA query_only = ON")
+        hashes, keys = [], []
+        seen = 0
+        cur = conn.execute("SELECT wallet_id, address FROM wallets")
+        while True:
+            rows = cur.fetchmany(200000)
+            if not rows:
+                break
+            for wid, addr in rows:
+                seen += 1
+                uid = um.get(str(wid))
+                if uid is None or not addr:
+                    continue
+                hashes.append(_wi_hash(addr.encode()))
+                keys.append(uid)
+            if seen % 2000000 == 0:
+                log.info(f"🔑   scanned {seen:,} wallets, kept {len(keys):,}")
+        conn.close()
+        if not hashes:
+            log.warning("🔑 Wallet index EMPTY: no wallet in the DB matches a "
+                        "user_map key. The live signal will be as weak as an "
+                        "empty history -- check that daily_update wrote "
+                        "user_map keyed by str(wallet_id).")
+            _WI_READY = True
+            return
+        h = _np.asarray(hashes, dtype=_np.uint64)
+        k = _np.asarray(keys, dtype=_np.int64)
+        order = _np.argsort(h, kind="stable")
+        _WI_HASH = h[order]
+        _WI_KEY = k[order]
+        _WI_READY = True
+        log.info(f"🔑 Wallet index READY: {len(_WI_HASH):,} wallets of "
+                 f"{seen:,} scanned, {_WI_HASH.nbytes + _WI_KEY.nbytes >> 20} MB, "
+                 f"{time.time()-t0:.0f}s. Hot-path lookups are now in-memory.")
+    except Exception as e:
+        log.error(f"🔑 Wallet index build FAILED ({e}). Falling back to "
+                  f"address keys: known wallets will look brand new.")
+        _WI_READY = True
+
+
+def _wi_start(state):
+    global _WI_STARTED
+    if _WI_STARTED:
+        return
+    _WI_STARTED = True
+    import threading
+    threading.Thread(target=_wi_build, args=(state,), daemon=True,
+                     name="wallet-index").start()
+
+
+def _wallet_key(addr):
+    """user_map key for an address. NEVER touches disk.
+
+    Returns the uid directly when the index knows the address, else the
+    normalised address as a session-local key -- which cannot collide with a
+    decimal wallet-id string.
+    """
+    import numpy as _np
+    try:
+        from wallet_intern import normalize_address
+        n = normalize_address(addr)
+    except Exception:
+        n = str(addr).strip().lower()
+    if n is None:
+        return None
+    if _WI_HASH is None:
+        return n
+    h = _wi_hash(n.encode())
+    i = int(_np.searchsorted(_WI_HASH, _np.uint64(h)))
+    if i < len(_WI_HASH) and int(_WI_HASH[i]) == h:
+        return int(_WI_KEY[i])
+    return n
+     
 import math
 from ws_handler import PolymarketWS
 
@@ -75,6 +221,9 @@ class LiveTrader:
         self.stats = {
             'processed_count': 0,
             'last_trade_time': 'Waiting...',
+            'parked_trades': 0,
+            'parked_dropped': 0,
+            'tokens_resolving': 0,
             'triggers_count': 0,
             'scores': []  
         }
@@ -134,11 +283,40 @@ class LiveTrader:
             # Re-attach massive historical arrays via zero-copy C-level bytes
             npz_path = BAYESIAN_FILE.with_suffix('.npz')
             restore_arrays_from_npz(self.state, npz_path)
+            # C4/C5: slots dataclass -- an unset slot RAISES rather
+            # than returning None, so an old pickle or a missing NPZ
+            # crashes on the first trade. Imported from daily_update
+            # so there is one definition, not two.
+            from daily_update import _heal_state as _hs
+            _hs(self.state)
+            # background: the bot trades immediately and the
+            # index swaps in when ready
+            _wi_start(self.state)
             
             log.info(f"✅ Loaded Bayesian state: {self.state.next_user_id} users tracked.")
         else:
             log.warning("⚠️ No bayesian_state.pkl found! Starting with a blank slate.")
             self.state = BayesianState()
+
+        # F1: without this, state.agg is None and the B6 aggregate block is
+        # skipped SILENTLY -- the bot would trade the per-wallet signal while
+        # appearing to run in aggregate mode. Logged so the mode is visible at
+        # startup rather than assumed.
+        if LIVE_AGGREGATE_MODE:
+            if getattr(self.state, 'agg', None) is None:
+                from market_aggregator import MarketAggregator
+                self.state.agg = MarketAggregator(
+                    m_prior=float(CONFIG.get('agg_m_prior', 5.0)),
+                    rho=float(CONFIG.get('agg_rho', 0.15)))
+                log.info("🧮 Aggregate mode ON: new MarketAggregator created.")
+            else:
+                _st = self.state.agg.stats()
+                log.info(f"🧮 Aggregate mode ON: restored aggregator, "
+                         f"{_st['open_markets']:,} open markets, "
+                         f"{_st['live_entries']:,} contributor entries.")
+        else:
+            log.warning("🧮 Aggregate mode OFF -- trading the per-wallet signal, "
+                        "which is NOT the estimator the backtest validated.")
         
         print("⏳ Fetching Market Metadata...")
         await self.metadata.refresh()
@@ -176,6 +354,48 @@ class LiveTrader:
                 await self.broker.execute_market_order(token_id, "SELL", 0, fpmm, current_book=book)
         finally:
             self.pending_orders.discard(token_id)
+            self.pending_markets.discard(fpmm)
+
+    async def _opposite_task(self, held_tid, fpmm, sib_tid, sib_price, book):
+        """Sell the held token; on a CONFIRMED close, optionally buy the sibling.
+
+        The buy is gated on the token having LEFT persistence.state["positions"].
+        A partial fill leaves it present, so the reversal is refused rather than
+        leaving the bot long both sides of the same market -- a position that
+        can only lose the spread.
+
+        fpmm is held in pending_markets by the caller for the whole operation and
+        released in this function's finally, so nothing else can touch the market
+        between the two legs.
+        """
+        try:
+            await self.broker.execute_market_order(held_tid, "SELL", 0, fpmm,
+                                                   current_book=book)
+            if held_tid in self.persistence.state["positions"]:
+                log.warning(f"↩️ OPPOSITE close of {held_tid} did NOT complete "
+                            f"(partial fill or rejection). Reversal refused -- "
+                            f"the bot will not hold both sides.")
+                return
+            log.info(f"↩️ OPPOSITE close DONE {held_tid} (market {fpmm})")
+            if LIVE_OPPOSITE_ACTION != 'reverse':
+                return
+            if sib_price is None or sib_price < LIVE_OPPOSITE_MIN_SIB_PRICE:
+                log.info(f"↩️ Reversal skipped: sibling {sib_tid} at "
+                         f"{sib_price} is below "
+                         f"{LIVE_OPPOSITE_MIN_SIB_PRICE}")
+                return
+            # swap the token guard, keep the market guard held
+            self.pending_orders.discard(held_tid)
+            self.pending_orders.add(sib_tid)
+            log.info(f"↩️ REVERSING into {sib_tid} @ {sib_price}")
+            # the SAME patient execution every entry uses. It carries its own
+            # position/market guards and adds fpmm to seen_market_ids on fill.
+            await self._attempt_exec(sib_tid, fpmm, signal_price=sib_price)
+        except Exception as e:
+            log.error(f"↩️ Opposite-signal task failed for {held_tid}: {e}")
+        finally:
+            self.pending_orders.discard(held_tid)
+            self.pending_orders.discard(sib_tid)
             self.pending_markets.discard(fpmm)
 
     def _process_snapshot(self, item):
@@ -753,37 +973,136 @@ class LiveTrader:
                 log.info(raw_trade)
                 log.error(f"❌ Processing Error: {e}")
                 
+    # --- unknown-token resolution, OFF the consumer's critical path ---------
+    PARK_MAX_PER_TOKEN = 2000      # trades held per unresolved token
+    RESOLVER_MAX_AGE_S = 1800      # give up on a token after 30 minutes
+    RESOLVER_CONCURRENCY = 8       # simultaneous Gamma fetches
+    RESOLVER_ATTEMPT_TIMEOUT = 10  # per ATTEMPT, not per token
+
+    async def _gamma_session_get(self):
+        """One pooled ClientSession for the process.
+
+        fetch_missing_token created a new session per call: a full DNS+TCP+TLS
+        handshake for every unknown token, no connection reuse, and under load
+        that is what produced the "Connection timeout to host" errors.
+        """
+        if getattr(self, "_gamma_session", None) is None or self._gamma_session.closed:
+            self._gamma_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.RESOLVER_ATTEMPT_TIMEOUT),
+                connector=aiohttp.TCPConnector(limit=self.RESOLVER_CONCURRENCY * 2,
+                                               ttl_dns_cache=300))
+        return self._gamma_session
+
+    def _park_trade(self, token_id, t):
+        """Hold a trade until its market resolves. Returns True if a resolver
+        needs starting for this token."""
+        if not hasattr(self, "_parked"):
+            self._parked, self._resolving = {}, set()
+            self._resolver_sem = asyncio.Semaphore(self.RESOLVER_CONCURRENCY)
+        q = self._parked.setdefault(token_id, [])
+        q.append(t)
+        self.stats['parked_trades'] = sum(len(v) for v in self._parked.values())
+        if len(q) > self.PARK_MAX_PER_TOKEN:
+            # drop the OLDEST: the newest trades are the ones still worth acting
+            # on, and an unbounded list on a pathological token would grow
+            # without limit.
+            n = len(q) - self.PARK_MAX_PER_TOKEN
+            del q[:n]
+            self.stats['parked_dropped'] += n
+        if token_id in self._resolving:
+            return False
+        self._resolving.add(token_id)
+        self.stats['tokens_resolving'] = len(self._resolving)
+        return True
+
+    async def _resolve_token(self, token_id):
+        """Fetch a market in the background and re-inject its parked trades.
+
+        Retries with exponential backoff until RESOLVER_MAX_AGE_S. The consumer
+        never waits on this -- that is the entire point.
+        """
+        t0 = time.time()
+        delay = 2.0
+        try:
+            while self.running and (time.time() - t0) < self.RESOLVER_MAX_AGE_S:
+                async with self._resolver_sem:
+                    try:
+                        session = await self._gamma_session_get()
+                        url = f"{GAMMA_API_URL}?clob_token_ids={token_id}"
+                        async with session.get(url) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                mkts = (data.get('data', [])
+                                        if isinstance(data, dict) else data)
+                                if mkts:
+                                    self.metadata._process_gamma_chunk(mkts)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.debug(f"🔍 resolve {token_id} attempt failed: {e}")
+
+                if self.metadata.token_to_market.get(token_id):
+                    parked = self._parked.pop(token_id, [])
+                    for pt in parked:
+                        self.trade_queue.put_nowait(pt)
+                    log.info(f"🔍 Resolved {token_id} in {time.time()-t0:.1f}s; "
+                             f"re-injected {len(parked):,} parked trades")
+                    return
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+
+            dropped = len(self._parked.pop(token_id, []))
+            log.error(f"💀 Gave up on {token_id} after "
+                      f"{self.RESOLVER_MAX_AGE_S}s; {dropped:,} parked trades "
+                      f"dropped. Gamma has no record of this token.")
+            self.stats['parked_dropped'] += dropped
+        finally:
+            self._resolving.discard(token_id)
+            self.stats['tokens_resolving'] = len(self._resolving)
+            self.stats['parked_trades'] = sum(
+                len(v) for v in getattr(self, "_parked", {}).values())
+
     async def _process_batch(self, trades):
         batch_scores = []
         skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
 
+        # B7: taker AND maker, matching sim_strat_5's UNION ALL. The maker's
+        # side is the OPPOSITE of the taker's -- if the taker bought, the maker
+        # sold -- so is_buy inverts on the maker leg.
+        _legs = []
         for t in trades:
-            
+            _tk = t.get('taker')
+            if _tk and str(_tk).strip().lower() not in EXCHANGE_ADDRESSES:
+                _legs.append((t, _tk, bool(t.get('is_buy'))))
+            if LIVE_INGEST_MAKER:
+                _mk = t.get('maker')
+                # D2: the exchange check now covers the MAKER too, and all four
+                # addresses. Previously only the taker was checked, against two.
+                if _mk and str(_mk).strip().lower() not in EXCHANGE_ADDRESSES:
+                    _legs.append((t, _mk, not bool(t.get('is_buy'))))
+
+        for t, wallet, is_buy in _legs:
+            if not wallet:
+                continue
+
             # 1. Load Normalized Data
-            wallet = t['taker']
             token_id = t['token_id']
             usdc_vol = t['usdc_vol']
             token_vol = t['token_vol']
             price = t['price']
-            is_buy = t['is_buy']
+            # is_buy comes from the leg tuple above, NOT from t: it is inverted
+            # for the maker.
 
             # 2. Calculate execution price & Validate Market
             market = self.metadata.token_to_market.get(token_id)
             if not market:
-                found = await self.metadata.fetch_missing_token(token_id)
-                market = self.metadata.token_to_market.get(token_id)
-                if not market:
-                    retry_count = t.get('retry_count', 0)
-                    if retry_count < 20: 
-                        log.warning(f"⏳ Gamma delay for {token_id}. Re-queueing trade (Attempt {retry_count + 1}/20)...")
-                        t['retry_count'] = retry_count + 1
-                        asyncio.create_task(self._requeue_trade(t, delay=10))
-                    else:
-                        log.error(f"💀 FATAL: Gamma failed to index {token_id} after retries. Trade dropped.")
-                        skipped_counts["no_tokens"] += 1
-                    continue
-                    
-                log.info(f"New market: {market}")
+                # PARK and move on. Awaiting the fetch here is what froze the
+                # consumer for up to 300s per hung request -- the trade is held
+                # and re-injected by _resolve_token when the market arrives.
+                if self._park_trade(token_id, t):
+                    asyncio.create_task(self._resolve_token(token_id))
+                skipped_counts["no_tokens"] += 1
+                continue
 
             mid = market['id']
 
@@ -816,10 +1135,14 @@ class LiveTrader:
             # 7. INGEST TRADE INTO BAYESIAN STATE (Vectorized & Flat)
             # ---------------------------------------------------------
             # String-to-Int Dictionary Mapping to drop string pointer RAM
-            uid = self.state.user_map.get(wallet)
+            # D1: address -> wallet_id -> str(wallet_id), the key space
+            # sim_strat_5 persists. Looking up the raw 0x address missed every
+            # time, giving every wallet an empty history.
+            _wkey = _wallet_key(wallet)
+            uid = self.state.user_map.get(_wkey)
             if uid is None:
                 uid = self.state.next_user_id
-                self.state.user_map[wallet] = uid
+                self.state.user_map[_wkey] = uid
                 self.state.next_user_id += 1
                 self.state.user_history_yes.append(_EMPTY_U32)
                 self.state.user_history_no.append(_EMPTY_U32)
@@ -852,7 +1175,11 @@ class LiveTrader:
             self.state.global_total_peak += new_peak
             
             # 7c. Bit-Packing (Price and TTR into uint32)
-            price_int = max(0, min(1000, int(price * 1000)))
+            # expected_p, not the raw price -- process_trade queries at
+            # int(expected_p*1000), so packing the raw price put every sell
+            # ~0.8 outside its own P_RANGE window.
+            _expected_p = price if is_buy else (1.0 - price)
+            price_int = max(0, min(1000, int(_expected_p * 1000)))
             log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
             packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
             
@@ -881,23 +1208,91 @@ class LiveTrader:
                 price_lut=PRICE_LUT, time_lut=TIME_LUT
             )
             
-            # The percentage margin is exactly equivalent to our normalized_weight/edge
+            # B6: cast this wallet's vote, then read the MARKET aggregate.
+            # sim_strat_5 overwrites smooth_prob/marg/perc_marg with
+            # state.agg.estimate() before its gate, so without this the live bot
+            # trades a different estimator from the one the backtest validated.
+            # observe() BEFORE estimate(), matching the sim: the current trade's
+            # own vote is in the aggregate it is judged against.
+            _agg = getattr(self.state, 'agg', None)
+            if LIVE_AGGREGATE_MODE and _agg is not None:
+                _bc = float(self.state.user_brier_count[uid])
+                if _bc > 0.0:
+                    _bx = float(self.state.user_brier_price_sum[uid])
+                    _bss = (1.0 - float(self.state.user_brier_sum[uid]) / _bx) \
+                        if _bx > 1e-12 else 0.0
+                    _bss *= _bc / (_bc + AGG_K0)
+                    _ratio = _skill_ratio(
+                        float(self.state.user_brier_sum[uid]), _bx,
+                        float(self.state.user_brier_out_sum[uid]), _bc)
+                else:
+                    _bss, _ratio = 0.0, 1.0
+                _tpm = (float(self.state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
+                _agg.observe(token_id, uid, float(smooth_prob), _bc, _bss,
+                             ratio=_ratio, k0=AGG_K0,
+                             conviction=float(fraction),
+                             trades_per_market=_tpm)
+                _exp_p = smooth_prob - marg
+                if _exp_p > 0.0:
+                    _ap, _an, _aw = _agg.estimate(token_id, _exp_p)
+                    smooth_prob = _ap
+                    marg = _ap - _exp_p
+                    perc_marg = marg / _exp_p
+
             normalized_weight = perc_marg
             self.stats['scores'].append(normalized_weight)
             batch_scores.append((abs(normalized_weight), normalized_weight, mid))
 
-            # 9. Entry rule (matches minitest.py backtest):
-            #    edge > 0.3, variance < 0.15, price < 0.40, positive direction only.
-            #    Permanent re-entry ban via seen_market_ids.
+            # 9. Entry rule. B5: thresholds now come from CONFIG, so live and
+            #    backtest read the SAME numbers. price < 0.40 was three
+            #    generations stale -- sim_strat_5 records 0.12->0.15 at
+            #    -$6.78/trade and 0.15->0.20 at -$25.32/trade.
+            # --- OPPOSITE-SIGNAL CLOSE / REVERSE ---
+            # Must precede the seen_market_ids check: that check skips every
+            # market we already hold, which is every market this rule applies to.
+            # Requires the signal to be ACTIONABLE on its own terms -- the same
+            # threshold, variance and price gate an entry would face -- so this
+            # never fires on a row the strategy would have ignored.
+            if (LIVE_OPPOSITE_ACTION
+                    and normalized_weight > LIVE_SIGNAL_THRESHOLD
+                    and variance_v < LIVE_MAX_VARIANCE
+                    and price < LIVE_MAX_ENTRY_PRICE
+                    and mid not in HOSTILE_MARKETS
+                    and token_id not in HOSTILE_MARKETS
+                    and mid not in self.pending_markets
+                    and token_id not in self.persistence.state["positions"]):
+                _held_tid = None
+                for _tid, _p in list(self.persistence.state["positions"].items()):
+                    if _p.get("market_fpmm") == mid and _tid != token_id:
+                        _held_tid = _tid
+                        break
+                if _held_tid and _held_tid not in self.pending_orders:
+                    _obook = self._prepare_clean_book(_held_tid)
+                    if _obook:
+                        self.pending_orders.add(_held_tid)
+                        self.pending_markets.add(mid)
+                        log.info(f"↩️ OPPOSITE SIGNAL on {token_id} @ {price} "
+                                 f"while holding {_held_tid} -- "
+                                 f"{LIVE_OPPOSITE_ACTION}")
+                        asyncio.create_task(self._opposite_task(
+                            _held_tid, mid, token_id, price, _obook))
+                    else:
+                        log.warning(f"↩️ Opposite signal for {_held_tid} but its "
+                                    f"order book is unavailable; skipped.")
+                    continue
+
             if mid in self.seen_market_ids:
                 continue
 
             if token_id in self.pending_orders or mid in self.pending_markets:
                 continue
 
-            if (normalized_weight > 0.3
-                    and variance_v < 0.15
-                    and price < 0.40):
+            if mid in HOSTILE_MARKETS or token_id in HOSTILE_MARKETS:
+                continue
+
+            if (normalized_weight > LIVE_SIGNAL_THRESHOLD
+                    and variance_v < LIVE_MAX_VARIANCE
+                    and price < LIVE_MAX_ENTRY_PRICE):
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
                 # NOTE: we intentionally do NOT add to seen_market_ids here.
