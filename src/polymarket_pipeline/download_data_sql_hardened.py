@@ -448,33 +448,43 @@ def _api_get(session, url, params=None):
     return None
 
 
-def unknown_market_tokens(db_path, markets_path):
+def unknown_market_tokens(conn, markets_path):
     """Non-collateral asset ids among trades whose contract_id is not in the markets
-    parquet. These are the markets to fetch. Uses duckdb to scan both the parquet and SQLite db."""
+    parquet. Uses DuckDB to perform the comparison on disk, avoiding OOM."""
     import duckdb
+    
+    # 1. Fetch the distinct traded tokens from SQLite (this list is relatively small)
+    rows = conn.execute(
+        "SELECT DISTINCT contract_id FROM trades WHERE contract_id NOT IN ('0','1')"
+    ).fetchall()
+    
+    # Safely convert to a list of strings, dropping any empty values
+    traded_tokens = [str(r[0]).strip() for r in rows if r[0] is not None]
+    
+    # 2. Connect to DuckDB and count the total markets for the final log output
     c = duckdb.connect()
-    
-    # Load DuckDB's SQLite extension to read directly from the database file
-    c.execute("INSTALL sqlite;")
-    c.execute("LOAD sqlite;")
-    
-    # Count the total unique markets in the parquet file for our return statement
     n_mk = c.execute(
-        f"SELECT COUNT(DISTINCT TRIM(CAST(contract_id AS VARCHAR))) "
-        f"FROM read_parquet('{markets_path}')"
+        f"SELECT COUNT(DISTINCT TRIM(CAST(contract_id AS VARCHAR))) FROM read_parquet('{markets_path}')"
     ).fetchone()[0]
     
-    # Use DuckDB to filter the SQLite table against the Parquet file internally
+    if not traded_tokens:
+        c.close()
+        return [], n_mk
+        
+    # 3. Create a temporary DuckDB table to hold our traded tokens
+    c.execute("CREATE TEMP TABLE traded_temp (contract_id VARCHAR)")
+    
+    # Insert the small list of traded tokens into the DuckDB engine
+    c.executemany("INSERT INTO traded_temp VALUES (?)", [(t,) for t in traded_tokens])
+    
+    # 4. Let DuckDB's C++ engine compare the small table against the massive Parquet file on disk
     query = f"""
-        SELECT DISTINCT contract_id 
-        FROM sqlite_scan('{db_path}', 'trades') 
-        WHERE contract_id NOT IN ('0','1')
+        SELECT contract_id FROM traded_temp
         EXCEPT
-        SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) 
-        FROM read_parquet('{markets_path}')
+        SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) FROM read_parquet('{markets_path}')
     """
     
-    # Only the tiny list of missing IDs gets pulled into Python memory
+    # Only the truly missing tokens are pulled into Python memory
     unknown = [r[0] for r in c.execute(query).fetchall()]
     c.close()
     
