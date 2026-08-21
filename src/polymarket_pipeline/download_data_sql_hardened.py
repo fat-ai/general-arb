@@ -642,7 +642,7 @@ def main():
             log("  (outcome-repair/metadata-refresh module not present; skipping)")
 
         # report what is still unjoinable after the sync
-        unknown, n_mk = unknown_market_tokens(a.db, a.markets)
+        unknown, n_mk = unknown_market_tokens(conn, a.markets)
         log(f"  markets parquet now has {n_mk:,} tokens; "
             f"{len(unknown):,} trade tokens still unknown")
 
