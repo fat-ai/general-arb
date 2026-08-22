@@ -1552,10 +1552,11 @@ class LiveTrader:
                     test_usdc = optimal_chunk_usdc + take_usdc
                     test_vwap = test_usdc / test_tokens if test_tokens > 0 else 0
                     
-                    if signal_price and test_vwap > 0:
-                        test_slippage = (test_vwap - signal_price) / signal_price
+                    _ref = best_ask if best_ask > 0 else signal_price
+                    if _ref and test_vwap > 0:
+                        test_slippage = (test_vwap - _ref) / _ref
                         total_penalty = test_slippage + spread
-                        absolute_cost_difference = test_vwap - signal_price
+                        absolute_cost_difference = test_vwap - _ref
                         
                         if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
                             break
