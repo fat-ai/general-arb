@@ -1430,7 +1430,7 @@ class LiveTrader:
             # stack depth. Total wait is unchanged: 50 * (10*0.5 + 3.0) = 400s.
             while True:
                 raw_book = self.order_books.get(token_id)
-                if raw_book and raw_book.get('asks') and raw_book.get('bids'):
+                if raw_book and (raw_book.get('asks') or raw_book.get('bids')):
                     break
     
                 if _resubscribe_attempts >= 50:
