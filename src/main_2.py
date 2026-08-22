@@ -1392,7 +1392,7 @@ class LiveTrader:
         bids_dict = raw_book.get('bids', {})
         asks_dict = raw_book.get('asks', {})
 
-        if not bids_dict or not asks_dict:
+        if not bids_dict and not asks_dict:
             return None
 
         # Create Lists: [[price, size], [price, size], ...]
@@ -1486,7 +1486,7 @@ class LiveTrader:
             # 5. Dynamic Sweep Loop
             while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
                 clean_book = self._prepare_clean_book(token_id)
-                if not clean_book or not clean_book['asks'] or not clean_book['bids']:
+                if not clean_book or (not clean_book['asks'] and not clean_book['bids']):
                     await asyncio.sleep(sweep_tick)
                     continue
     
@@ -1511,9 +1511,22 @@ class LiveTrader:
                     continue
     
                 # Calculate Current Spread
-                best_bid = float(clean_book['bids'][0][0])
-                best_ask = float(clean_book['asks'][0][0])
-                spread = (best_ask - best_bid) / best_ask if best_ask > 0 else 0
+                if clean_book['bids']:
+                  best_bid = float(clean_book['bids'][0][0])
+                else:
+                  best_bid = 0.0
+                    
+                if clean_book['asks']:  
+                  best_ask = float(clean_book['asks'][0][0])
+
+                else:
+                    best_ask = 0.0
+
+                if clean_book['bids'] and clean_book['asks']: 
+                  spread = (best_ask - best_bid) / best_ask
+
+                else:
+                  spread = 1.0
     
                 remaining_usdc = trade_size - accumulated_usdc
                 
