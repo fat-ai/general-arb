@@ -271,7 +271,8 @@ class SubscriptionManager:
     def __init__(self, max_subs=400):
         self.max_subs = max_subs
         self.held_tokens = set()
-        self.rolling_tokens = [] 
+        self.rolling_tokens = []
+        self.pinned_tokens = set() 
         self.lock = asyncio.Lock()
         self.dirty = False
 
@@ -298,7 +299,7 @@ class SubscriptionManager:
                 changed = True
                 
         # Prune the oldest tokens if we exceed our safety limit
-        available_slots = self.max_subs - len(self.held_tokens)
+        available_slots = self.max_subs - len(self.held_tokens) - len(self.pinned_tokens)
         if len(self.rolling_tokens) > available_slots:
             self.rolling_tokens = self.rolling_tokens[-available_slots:]
             changed = True
@@ -307,7 +308,25 @@ class SubscriptionManager:
             self.dirty = True
 
     def get_all_subs(self):
-        """Returns the combined list of held and active tokens."""
-        return list(self.held_tokens) + self.rolling_tokens
+        """Held + pinned + rolling. Pinned tokens are mid-execution."""
+        return list(self.held_tokens | self.pinned_tokens) + self.rolling_tokens
+
+    def pin(self, token):
+        """Protect a token from eviction while an execution needs its book.
+
+        resubscribe_single() subscribes on the wire but does not touch this
+        manager, so _subscription_monitor_loop saw the token as unwanted and
+        unsubscribed it on its next pass -- the book never arrived and
+        _attempt_exec retried 50 times. That is the 'Book not yet populated'
+        flood.
+        """
+        if token not in self.pinned_tokens:
+            self.pinned_tokens.add(token)
+            self.dirty = True
+
+    def unpin(self, token):
+        if token in self.pinned_tokens:
+            self.pinned_tokens.discard(token)
+            self.dirty = True
 
 async def fetch_graph_trades(since): return []
