@@ -1161,9 +1161,10 @@ class LiveTrader:
             yes_price = price if is_yes_token else 1.0 - price
 
             # 7a. Math execution (via Numba)
+            _inv = usdc_vol if is_buy else (1.0 - price) * token_vol
             new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
-                yes_price, usdc_vol, 
-                self.state.user_exposure[uid], 
+                yes_price, _inv,
+                self.state.user_exposure[uid],
                 self.state.user_peak[uid],
                 u_trades, current_global_avg, is_effective_yes
             )
