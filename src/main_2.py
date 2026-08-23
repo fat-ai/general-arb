@@ -1536,7 +1536,6 @@ class LiveTrader:
                 
                 optimal_chunk_usdc = 0.0
                 accumulated_tokens_test = 0.0
-                max_allowance = CONFIG['max_allowable_slippage']
                 planned_consumption = {}
 
                 _max_slip = CONFIG.get('max_slippage', 0.05)
@@ -1568,7 +1567,7 @@ class LiveTrader:
                         total_penalty = test_slippage + spread
                         absolute_cost_difference = test_vwap - _ref
                         
-                        if total_penalty > max_slippage and absolute_cost_difference > max_allowance:
+                        if test_vwap > signal_price * (1.0 + max_slippage):
                             break
                     
                     # Lock in this slice
