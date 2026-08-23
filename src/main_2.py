@@ -1621,7 +1621,7 @@ class LiveTrader:
                             return
                     else:
                         log.error(f"❌ Broker rejected the ${optimal_chunk_usdc:.2f} order for {token_id}. Aborting.")
-                        break 
+                       
                 else:
                     pass 
                 
