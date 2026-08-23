@@ -422,6 +422,9 @@ class LiveTrader:
             self.order_books[asset_id]['asks'] = {
                 float(x['price']): float(x['size']) for x in item.get('asks', [])
             }
+            self.order_books[asset_id]['stamp'] = (
+                item.get('hash') or item.get('timestamp')
+            )
 
         except Exception as e:
             log.error(f"Snapshot Error: {e}")
@@ -1478,6 +1481,7 @@ class LiveTrader:
     
             is_paper_trading = isinstance(self.broker, PaperBroker)
             virtual_consumption = {}
+            _last_bk_stamp = None
             # How often the sweep re-evaluates the book. The old loop idled 5s between
             # chunks (and 2s on a thin book), so liquidity that appeared and vanished
             # inside that window was missed. Re-check ~1s by default (configurable).
@@ -1493,7 +1497,11 @@ class LiveTrader:
                 if not clean_book or (not clean_book['asks'] and not clean_book['bids']):
                     await asyncio.sleep(sweep_tick)
                     continue
-    
+                _raw = self.order_books.get(token_id) or {}
+                _stamp = _raw.get('timestamp') or _raw.get('hash')
+                if _stamp != _last_bk_stamp:
+                    virtual_consumption.clear()
+                    _last_bk_stamp = _stamp
                 # ==========================================
                 # Virtually Deplete the Book 
                 # ==========================================
@@ -1614,6 +1622,7 @@ class LiveTrader:
                         if is_paper_trading:
                             for p_str, amt in planned_consumption.items():
                                 virtual_consumption[p_str] = virtual_consumption.get(p_str, 0.0) + amt
+                                
                         
                         if accumulated_usdc >= trade_size:
                             log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
