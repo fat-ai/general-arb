@@ -1295,6 +1295,8 @@ class LiveTrader:
             if (normalized_weight > LIVE_SIGNAL_THRESHOLD
                     and variance_v < LIVE_MAX_VARIANCE
                     and price < LIVE_MAX_ENTRY_PRICE):
+                        
+                self.seen_market_ids.add(mid)
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
                 # NOTE: we intentionally do NOT add to seen_market_ids here.
