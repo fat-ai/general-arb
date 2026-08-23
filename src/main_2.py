@@ -1536,6 +1536,12 @@ class LiveTrader:
                 accumulated_tokens_test = 0.0
                 max_allowance = CONFIG['max_allowable_slippage']
                 planned_consumption = {}
+
+                _max_slip = CONFIG.get('max_slippage', 0.05)
+                if signal_price and best_ask > signal_price * (1.0 + _max_slip):
+                    log.info(f"🛡️ Abandoning {token_id}: best ask {best_ask:.4f} exceeds "
+                    f"signal {signal_price:.4f} + {_max_slip:.0%}")
+                    return
                 
                 for ask_price_str, ask_size_tokens_str in clean_book['asks']:
                     ask_p = float(ask_price_str)
