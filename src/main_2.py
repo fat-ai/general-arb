@@ -1190,20 +1190,21 @@ class LiveTrader:
             m_pos.is_yes.append(1 if is_effective_yes else 0)
             m_pos.packed_data.append(packed)
             m_pos.p_trues.append(p_true)
-            m_pos.stakes.append(usdc_vol)
+            m_pos.stakes.append(_inv)
             
             # 7e. Flattened First Bet Pending Tracker
             if u_trades == 0:
-                if usdc_vol >= 1.0: 
+                _risk_vol = usdc_vol if is_buy else token_vol * (1.0 - price)
+                if _risk_vol >= 1.0:
                     self.state.first_bets_pending[token_id].append(
-                        (uid, math.log1p(usdc_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
+                        (uid, math.log1p(_risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
                     )
 
             # ---------------------------------------------------------
             # 8. EXTRACT BAYESIAN EDGE
             # ---------------------------------------------------------
             smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
-                uid=uid, price=price, stake=usdc_vol, 
+                uid=uid, price=price, stake=_inv, 
                 direction=direction, is_buying=is_buy, 
                 ttr_hours=ttr_hours, state=self.state, 
                 price_lut=PRICE_LUT, time_lut=TIME_LUT
