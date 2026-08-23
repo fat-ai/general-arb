@@ -190,13 +190,18 @@ class MarketMetadata:
                 end_date_str = mkt.get('endDate', '')
                 start_date_str = mkt.get('startDate', '')
                 
-                end_ts = 0
-                if end_date_str:
+                def _iso_ts(v):
+                    if not v:
+                        return None
                     try:
-                        # Convert ISO date (e.g., 2024-11-05T00:00:00Z) to Unix timestamp
-                        end_ts = datetime.fromisoformat(end_date_str.replace('Z', '+00:00')).timestamp()
-                    except:
-                        pass
+                        return datetime.fromisoformat(str(v).replace('Z', '+00:00')).timestamp()
+                    except Exception:
+                        return None
+                
+                end_ts = (_iso_ts(mkt.get('eventStartTime'))
+                          or _iso_ts(mkt.get('game_start_time'))
+                          or _iso_ts(mkt.get('endDate'))
+                          or 0)
 
                 start_ts = 0
                 if start_date_str:
