@@ -25,6 +25,7 @@ from sim_strat_5 import (
     PRICE_LUT,
     TIME_LUT,
     CACHE_DIR,
+    MARKETS_PATH,
     restore_arrays_from_npz,
     AGG_K0,   
     compute_wager_and_p_true,  
