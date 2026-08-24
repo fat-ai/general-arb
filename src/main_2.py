@@ -1141,14 +1141,17 @@ class LiveTrader:
             # D1: address -> wallet_id -> str(wallet_id), the key space
             # sim_strat_5 persists. Looking up the raw 0x address missed every
             # time, giving every wallet an empty history.
-            _wkey = _wallet_key(wallet)
-            uid = self.state.user_map.get(_wkey)
-            if uid is None:
-                uid = self.state.next_user_id
-                self.state.user_map[_wkey] = uid
-                self.state.next_user_id += 1
-                self.state.user_history_yes.append(_EMPTY_U32)
-                self.state.user_history_no.append(_EMPTY_U32)
+            _wk = _wallet_key(wallet)
+            if isinstance(_wk, int):
+                uid = _wk
+            else:
+                uid = self.state.user_map.get(_wk)
+                if uid is None:
+                    uid = self.state.next_user_id
+                    self.state.user_map[_wk] = uid
+                    self.state.next_user_id += 1
+                    self.state.user_history_yes.append(_EMPTY_U32)
+                    self.state.user_history_no.append(_EMPTY_U32)
                 
             u_trades = self.state.user_total_trades[uid]
             if u_trades == 0:
