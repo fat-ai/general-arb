@@ -33,6 +33,7 @@ from sim_strat_5 import (
 )
 import numpy as np
 from wallet_skill import skill_ratio as _skill_ratio
+from wallet_intern import normalize_address
 
 if CONFIG.get('exclude_hostile_markets'):
     import polars as pl, hostile_markets as _rule
@@ -74,8 +75,8 @@ EXCHANGE_ADDRESSES = frozenset({
 _WI_HASH = None          # sorted uint64 hashes of normalised addresses
 _WI_KEY = None           # parallel array of user_map keys (as uint64 wallet ids)
 _WI_READY = False
+_WI_OK = False
 _WI_STARTED = False
-
 
 def _wi_hash(addr_bytes):
     """Stable 64-bit hash. hashlib, NOT python's hash(): PYTHONHASHSEED
@@ -94,7 +95,7 @@ def _wi_build(state):
     Runs in a daemon thread. Until it finishes the bot uses the address
     fallback, which is what an unknown wallet gets anyway.
     """
-    global _WI_HASH, _WI_KEY, _WI_READY
+    global _WI_HASH, _WI_KEY, _WI_READY, WI_OK
     import sqlite3
     import numpy as _np
     try:
@@ -123,10 +124,11 @@ def _wi_build(state):
                 log.info(f"🔑   scanned {seen:,} wallets, kept {len(keys):,}")
         conn.close()
         if not hashes:
-            log.warning("🔑 Wallet index EMPTY: no wallet in the DB matches a "
-                        "user_map key. The live signal will be as weak as an "
-                        "empty history -- check that daily_update wrote "
-                        "user_map keyed by str(wallet_id).")
+            log.critical("🔑 Wallet index EMPTY: no wallet in the DB matches a "
+                         "user_map key. Every wallet would resolve to an empty "
+                         "history and the per-wallet signal would be dead. "
+                         "Check that daily_update wrote user_map keyed by "
+                         "str(wallet_id). REFUSING TO TRADE.")
             _WI_READY = True
             return
         h = _np.asarray(hashes, dtype=_np.uint64)
@@ -134,13 +136,14 @@ def _wi_build(state):
         order = _np.argsort(h, kind="stable")
         _WI_HASH = h[order]
         _WI_KEY = k[order]
+        _WI_OK = True
         _WI_READY = True
         log.info(f"🔑 Wallet index READY: {len(_WI_HASH):,} wallets of "
                  f"{seen:,} scanned, {_WI_HASH.nbytes + _WI_KEY.nbytes >> 20} MB, "
                  f"{time.time()-t0:.0f}s. Hot-path lookups are now in-memory.")
     except Exception as e:
-        log.error(f"🔑 Wallet index build FAILED ({e}). Falling back to "
-                  f"address keys: known wallets will look brand new.")
+        log.critical(f"🔑 Wallet index build FAILED ({e}). The per-wallet signal "
+                     f"cannot be computed. REFUSING TO TRADE.")
         _WI_READY = True
 
 
@@ -155,27 +158,13 @@ def _wi_start(state):
 
 
 def _wallet_key(addr):
-    """user_map key for an address. NEVER touches disk.
-
-    Returns the uid directly when the index knows the address, else the
-    normalised address as a session-local key -- which cannot collide with a
-    decimal wallet-id string.
-    """
     import numpy as _np
     try:
-        from wallet_intern import normalize_address
         n = normalize_address(addr)
     except Exception:
-        n = str(addr).strip().lower()
+        return None          # not a 20-byte address: no history, no vote
     if n is None:
         return None
-    if _WI_HASH is None:
-        return n
-    h = _wi_hash(n.encode())
-    i = int(_np.searchsorted(_WI_HASH, _np.uint64(h)))
-    if i < len(_WI_HASH) and int(_WI_HASH[i]) == h:
-        return int(_WI_KEY[i])
-    return n
      
 import math
 from ws_handler import PolymarketWS
@@ -944,9 +933,19 @@ class LiveTrader:
     # --- SIGNAL LOOPS ---
 
     async def _signal_loop(self):
-        """
-        Polls the internal queue for new trades.
-        """
+        """Polls the internal queue for new trades."""
+        # N0-a: do NOT consume trades until the wallet index is live. Before it
+        # exists _wallet_key returns an ADDRESS, which is not a user_map key, so
+        # every wallet resolves to a fresh empty history -- the dead per-wallet
+        # signal. Trades accumulate in trade_queue meanwhile and are processed in
+        # order once the index lands, so nothing is dropped.
+        if not _WI_READY:
+            log.info("⏸️ Signal loop holding: waiting for the wallet index...")
+            _t0 = time.time()
+            while self.running and not _WI_READY:
+                await asyncio.sleep(0.5)
+            log.info(f"▶️ Signal loop released after {time.time()-_t0:.0f}s "
+                     f"({self.trade_queue.qsize():,} trades buffered).")
         log.info("⚡ Signal Loop: Waiting for Webhook Data...")
         
         while self.running:
@@ -971,6 +970,11 @@ class LiveTrader:
                 }
                 
                 await self._process_batch([trade])
+                if not _WI_OK:
+                    log.critical("🛑 Wallet index unavailable — shutting down rather "
+                                 "than trading a dead signal.")
+                    self.running = False
+                    return
                 
             except Exception as e:
                 log.info(raw_trade)
@@ -1068,7 +1072,9 @@ class LiveTrader:
     async def _process_batch(self, trades):
         batch_scores = []
         skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
-
+        self.stats['hist_hits'] = self.stats.get('hist_hits', 0) + (
+            1 if (len(self.state.user_history_yes[uid]) or len(self.state.user_history_no[uid])) else 0)
+        self.stats['hist_total'] = self.stats.get('hist_total', 0) + 1
         # B7: taker AND maker, matching sim_strat_5's UNION ALL. The maker's
         # side is the OPPOSITE of the taker's -- if the taker bought, the maker
         # sold -- so is_buy inverts on the maker leg.
@@ -1142,11 +1148,17 @@ class LiveTrader:
             # sim_strat_5 persists. Looking up the raw 0x address missed every
             # time, giving every wallet an empty history.
             _wk = _wallet_key(wallet)
+            if _wk is None:
+                skipped_counts["bad_wallet"] = skipped_counts.get("bad_wallet", 0) + 1
+                continue
             if isinstance(_wk, int):
                 uid = _wk
             else:
                 uid = self.state.user_map.get(_wk)
                 if uid is None:
+                    if self.state.next_user_id >= len(self.state.user_total_trades):
+                        skipped_counts["uid_exhausted"] = skipped_counts.get("uid_exhausted", 0) + 1
+                        continue
                     uid = self.state.next_user_id
                     self.state.user_map[_wk] = uid
                     self.state.next_user_id += 1
