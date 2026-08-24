@@ -426,17 +426,19 @@ def main():
     
     if db_attached:
         query = f"""
-            WITH parsed_trades AS (
+            WITH exch AS (
+                SELECT wallet_id FROM source_db.wallets
+                WHERE lower(address) IN (
+                    '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                    '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                    '0xe111180000d2663c0091e4f400237545b87b996b',
+                    '0xe2222d279d744050d28e00520010520000310f59'
+                )
+            ),
+            base AS (
                 SELECT
-                    t.contract_id,
-                    -- CAST, not raw: sys.intern() below needs a str, and this
-                    -- makes the user_map key identical to the one sim_strat_5
-                    -- writes (CAST(t.user_id AS VARCHAR)), so the persisted map
-                    -- is shared rather than two half-populated maps.
-                    CAST(t.user_id AS VARCHAR) AS user,
-                    t.tradeAmount,
-                    t.outcomeTokensAmount,
-                    t.price,
+                    t.id, t.contract_id, t.user_id, t.maker_id,
+                    t.tradeAmount, t.outcomeTokensAmount, t.price,
                     EPOCH(COALESCE(
                         to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
                         TRY_CAST(t.timestamp AS TIMESTAMP)
@@ -449,23 +451,39 @@ def main():
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0
                   AND t.price <= 1.0
-                  AND t.user_id IS NOT NULL
-                  -- exchange wallets resolved through the wallets table, the
-                  -- same construction sim_strat_5 uses. Comparing addresses to
-                  -- an integer column silently excluded nothing.
-                  AND t.user_id NOT IN (
-                      SELECT wallet_id FROM source_db.wallets
-                      WHERE lower(address) IN (
-                          '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-                          '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-                          '0xe111180000d2663c0091e4f400237545b87b996b',
-                          '0xe2222d279d744050d28e00520010520000310f59'
-                      ))
+                  -- NO_COLLATERAL_SIDE (~0.97%): with neither side collateral,
+                  -- derive()'s choice of contract_id is arbitrary and the sign
+                  -- of outcomeTokensAmount is undefined. Dropped from BOTH legs.
+                  AND NOT (CAST(t.maker_asset_id AS VARCHAR) NOT IN ('0','1')
+                       AND CAST(t.taker_asset_id AS VARCHAR) NOT IN ('0','1'))
+            ),
+            parsed_trades AS (
+                SELECT id, contract_id, CAST(user_id AS VARCHAR) AS user,
+                       tradeAmount, outcomeTokensAmount, price, ts
+                FROM base
+                WHERE user_id IS NOT NULL
+                  AND user_id NOT IN (SELECT wallet_id FROM exch)
+
+                UNION ALL
+
+                -- The maker leg is the exact negation of the taker leg:
+                -- outcomeTokensAmount is taker-signed. '-m' keeps the primary
+                -- key distinct so ORDER BY ts, id stays deterministic.
+                SELECT id || '-m' AS id, contract_id,
+                       CAST(maker_id AS VARCHAR) AS user,
+                       tradeAmount, -outcomeTokensAmount AS outcomeTokensAmount,
+                       price, ts
+                FROM base
+                WHERE maker_id IS NOT NULL
+                  AND maker_id NOT IN (SELECT wallet_id FROM exch)
             )
-            SELECT * FROM parsed_trades
+            SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
+            FROM parsed_trades
             WHERE ts IS NOT NULL AND ts > {float(state.last_processed_timestamp)}
-            ORDER BY ts ASC
+            ORDER BY ts ASC, id ASC
         """
+        log.info("Ingestion: MAKER LEG INCLUDED -- expect roughly 2x the rows "
+                 "of a taker-only run.")
         
         trade_count = 0
         max_ts = state.last_processed_timestamp
