@@ -1548,9 +1548,12 @@ class LiveTrader:
 
                 _max_slip = CONFIG.get('max_slippage', 0.05)
                 if signal_price and best_ask > signal_price * (1.0 + _max_slip):
-                    log.info(f"🛡️ Abandoning {token_id}: best ask {best_ask:.4f} exceeds "
-                    f"signal {signal_price:.4f} + {_max_slip:.0%}")
-                    return
+                    if int((time.time() - start_time) / sweep_tick) % 30 == 0:
+                        log.info(f"⏸️ Waiting on {token_id}: best ask "
+                                 f"{best_ask:.4f} > signal {signal_price:.4f} "
+                                 f"+ {_max_slip:.0%}")
+                    await asyncio.sleep(sweep_tick)
+                    continue
                 
                 for ask_price_str, ask_size_tokens_str in clean_book['asks']:
                     ask_p = float(ask_price_str)
@@ -1628,7 +1631,9 @@ class LiveTrader:
                             log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
                             return
                     else:
-                        log.error(f"❌ Broker rejected the ${optimal_chunk_usdc:.2f} order for {token_id}. Aborting.")
+                        if int((time.time() - start_time) / sweep_tick) % 30 == 0:
+                            log.info(f"⏸️ Broker rejected ${optimal_chunk_usdc:.2f} "
+                                     f"for {token_id}; waiting for better liquidity.")
                        
                 else:
                     pass 
