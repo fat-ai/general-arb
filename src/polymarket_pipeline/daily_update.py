@@ -1,3 +1,5 @@
+from wallet_skill import skill_ratio as _skill_ratio
+from sim_strat_5 import AGG_K0
 import os
 import pickle
 import logging
@@ -38,6 +40,39 @@ log = logging.getLogger("Updater")
 STATE_FILE = CACHE_DIR / "bayesian_state.pkl"
 SCORES_FILE = CACHE_DIR / "user_scores.csv"
 MARKETS_PATH = CACHE_DIR / MARKETS_FILE
+
+def _heal_state(state):
+    """C4/C5 -- BayesianState is @dataclass(slots=True), so a slot that was never
+    assigned RAISES AttributeError on read rather than returning None. Two ways
+    that happens: a pickle written before `agg` existed, and a missing NPZ,
+    which makes restore_arrays_from_npz return early leaving the array slots
+    unset. Either one crashes on the first trade.
+
+    Called after every load path. Cheap, idempotent, and it fails loudly if the
+    sizes are wrong rather than papering over a genuinely corrupt state."""
+    import numpy as _np
+    if not hasattr(state, 'agg') or getattr(state, 'agg', None) is None:
+        state.agg = None
+    n = None
+    for nm in ('user_exposure', 'user_total_trades', 'user_brier_sum'):
+        a = getattr(state, nm, None)
+        if a is not None and getattr(a, 'size', 0):
+            n = a.size
+            break
+    if n is None:
+        return state
+    for nm, dt in (('user_brier_price_sum', _np.float64),
+                   ('user_brier_out_sum', _np.float64),
+                   ('user_brier_sum', _np.float64),
+                   ('user_brier_count', _np.uint32),
+                   ('user_exposure', _np.float64),
+                   ('user_peak', _np.float64),
+                   ('user_total_trades', _np.uint32)):
+        a = getattr(state, nm, None)
+        if a is None or getattr(a, 'size', 0) != n:
+            setattr(state, nm, _np.zeros(n, dtype=dt))
+    return state
+
 
 def load_state() -> BayesianState:
     """Loads the lightweight dictionary from Pickle and heavy s from NPZ."""
@@ -83,6 +118,7 @@ def load_state() -> BayesianState:
             # Re-attach massive historical arrays via zero-copy C-level bytes
             npz_path = STATE_FILE.with_suffix('.npz')
             restore_arrays_from_npz(state, npz_path)
+            _heal_state(state)
             
             return state
         except Exception as e:
@@ -144,7 +180,12 @@ def save_state(state: BayesianState):
         calib_X=calib_X_arr, calib_y=calib_y_arr, calib_dates=calib_dates_arr,
         user_exposure=state.user_exposure, user_peak=state.user_peak,
         user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
-        user_brier_count=state.user_brier_count
+        user_brier_count=state.user_brier_count,
+        # Omitting these two made restore_arrays_from_npz substitute zeros, which
+        # pins trust_multiplier at 1.0 and skill_ratio at 1.0 for every wallet --
+        # the whole Brier skill mechanism silently inert.
+        user_brier_price_sum=getattr(state, 'user_brier_price_sum', np.zeros(0)),
+        user_brier_out_sum=getattr(state, 'user_brier_out_sum', np.zeros(0))
     )
     
     # 2. Strip large arrays from state object
@@ -158,6 +199,10 @@ def save_state(state: BayesianState):
     state.user_total_trades = np.empty(0)
     state.user_brier_sum = np.empty(0)
     state.user_brier_count = np.empty(0)
+    restore_brier_price = getattr(state, 'user_brier_price_sum', None)
+    restore_brier_out = getattr(state, 'user_brier_out_sum', None)
+    state.user_brier_price_sum = np.empty(0)
+    state.user_brier_out_sum = np.empty(0)
     state.user_history_yes = []
     state.user_history_no = []
 
@@ -186,6 +231,10 @@ def save_state(state: BayesianState):
     state.user_total_trades = restore_total_trades
     state.user_brier_sum = restore_brier_sum
     state.user_brier_count = restore_brier_count
+    if restore_brier_price is not None:
+        state.user_brier_price_sum = restore_brier_price
+    if restore_brier_out is not None:
+        state.user_brier_out_sum = restore_brier_out
 
 def export_dashboard_scores(state: BayesianState):
     """Exports a human-readable CSV of wallet Brier scores from flat memory arrays."""
@@ -312,13 +361,32 @@ def main():
         process_daily_history_merges(state, day_yes_updates, day_no_updates)
         log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
         
-    # 4. Process Orphans (clean up markets that never resolved but are old)
+    # 4. Process Orphans -- F3: through resolve_market, NOT pop().
+    #
+    # pop() discarded the position without decrementing user_exposure or
+    # user_peak, so exposure ratcheted upward forever for every wallet in a
+    # market that never resolved. global_total_peak inflates ->
+    # current_global_avg inflates -> w_shrunk rises -> fraction falls ->
+    # p_true collapses toward the price for EVERY wallet. Silent global decay.
+    #
+    # sim_strat_5 coerces an unknown outcome to 0.5 with
+    # outcome_confirmed=False, which releases exposure while keeping the
+    # unscoreable outcome out of the Brier accumulators. Same here.
+    _orphan_yes = defaultdict(list)
+    _orphan_no = defaultdict(list)
     for o_cid in orphan_cids:
-        state.contract_positions.pop(o_cid, None)
+        try:
+            resolve_market(o_cid, 0.5, "unknown", current_day_ts, state,
+                           _orphan_yes, _orphan_no, outcome_confirmed=False)
+        except Exception as e:
+            log.warning(f"orphan {o_cid} could not be resolved cleanly ({e}); "
+                        f"falling back to pop()")
+            state.contract_positions.pop(o_cid, None)
         state.first_bets_pending.pop(o_cid, None)
-        
+
     if orphan_cids:
-        log.info(f"🗑️ Purged {len(orphan_cids)} orphaned markets from the Bayesian State.")
+        log.info(f"🗑️ Released {len(orphan_cids)} orphaned markets "
+                 f"(exposure returned, outcomes unscored).")
         
     # ==========================================
     # 2. INGEST NEW TRADES (DELTA)
@@ -356,14 +424,18 @@ def main():
     if db_attached:
         query = f"""
             WITH parsed_trades AS (
-                SELECT 
-                    t.contract_id, 
-                    t.user, 
-                    t.tradeAmount, 
-                    t.outcomeTokensAmount, 
-                    t.price, 
+                SELECT
+                    t.contract_id,
+                    -- CAST, not raw: sys.intern() below needs a str, and this
+                    -- makes the user_map key identical to the one sim_strat_5
+                    -- writes (CAST(t.user_id AS VARCHAR)), so the persisted map
+                    -- is shared rather than two half-populated maps.
+                    CAST(t.user_id AS VARCHAR) AS user,
+                    t.tradeAmount,
+                    t.outcomeTokensAmount,
+                    t.price,
                     EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
+                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
                         TRY_CAST(t.timestamp AS TIMESTAMP)
                     )) AS ts
                 FROM source_db.trades t
@@ -372,14 +444,20 @@ def main():
                     FROM read_parquet('{MARKETS_PATH}')
                 ) m ON t.contract_id = m.clean_cid
                 WHERE t.timestamp IS NOT NULL
-                  AND t.price >= 0.0 
+                  AND t.price >= 0.0
                   AND t.price <= 1.0
-                  AND (t.user IS NULL OR lower(t.user) NOT IN (
-                      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',  -- V1 CTF Exchange (binary)
-                      '0xc5d563a36ae78145c45a50134d48a1215220f80a',  -- V1 NegRisk CTF Exchange (multi-outcome)
-                      '0xe111180000d2663c0091e4f400237545b87b996b',  -- V2 CTF Exchange
-                      '0xe2222d279d744050d28e00520010520000310f59'   -- V2 NegRisk Exchange
-                  ))
+                  AND t.user_id IS NOT NULL
+                  -- exchange wallets resolved through the wallets table, the
+                  -- same construction sim_strat_5 uses. Comparing addresses to
+                  -- an integer column silently excluded nothing.
+                  AND t.user_id NOT IN (
+                      SELECT wallet_id FROM source_db.wallets
+                      WHERE lower(address) IN (
+                          '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                          '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                          '0xe111180000d2663c0091e4f400237545b87b996b',
+                          '0xe2222d279d744050d28e00520010520000310f59'
+                      ))
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL AND ts > {float(state.last_processed_timestamp)}
@@ -429,7 +507,12 @@ def main():
                     
                     # 1. Invested Amount & Bit-Packing
                     invested = price * qty if is_buying else (1.0 - price) * qty
-                    price_int = max(0, min(1000, int(price * 1000)))
+                    # expected_p, NOT the raw price. process_trade queries at
+                    # int(expected_p*1000); packing the raw price put every SELL
+                    # ~0.8 away from its own query window (P_RANGE = 100), so
+                    # sells contributed nothing AND were written mis-bucketed.
+                    expected_p = price if is_buying else (1.0 - price)
+                    price_int = max(0, min(1000, int(expected_p * 1000)))
                     m_end = m['end'] if m['end'] is not None else (ts + 86400.0)
                     ttr_hours = max(1.0, (m_end - ts) / 3600.0)
                     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
@@ -472,6 +555,31 @@ def main():
                     state.user_total_trades[uid] = new_n
                     state.global_total_peak += new_peak
                     
+                    # F2: cast this wallet's vote into the market aggregate.
+                    # resolve_market already calls state.agg.release(); without
+                    # a matching observe() the aggregator is drained every cycle
+                    # and converges to empty, at which point estimate() returns
+                    # the price, margin is 0 and the bot stops firing silently.
+                    # Same call and arguments as sim_strat_5's trade loop.
+                    _agg = getattr(state, 'agg', None)
+                    if _agg is not None:
+                        _bc = float(state.user_brier_count[uid])
+                        if _bc > 0.0:
+                            _bx = float(state.user_brier_price_sum[uid])
+                            _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
+                                if _bx > 1e-12 else 0.0
+                            _bss *= _bc / (_bc + AGG_K0)
+                            _ratio = _skill_ratio(
+                                float(state.user_brier_sum[uid]), _bx,
+                                float(state.user_brier_out_sum[uid]), _bc)
+                        else:
+                            _bss, _ratio = 0.0, 1.0
+                        _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
+                        _agg.observe(cid, uid, float(p_true), _bc, _bss,
+                                     ratio=_ratio, k0=AGG_K0,
+                                     conviction=float(fraction),
+                                     trades_per_market=_tpm)
+
                     # 6. Contract Trackers Updates
                     m_pos = state.contract_positions[cid]
                     m_pos.user_ids.append(uid)
