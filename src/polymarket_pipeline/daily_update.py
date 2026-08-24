@@ -561,6 +561,12 @@ def main():
                     # and converges to empty, at which point estimate() returns
                     # the price, margin is 0 and the bot stops firing silently.
                     # Same call and arguments as sim_strat_5's trade loop.
+                    direction = 1.0 if is_effective_yes else -1.0
+                    smooth_prob, marg, perc_marg, variance_v, trust_w = process_trade(
+                        uid=uid, price=price, stake=invested,
+                        direction=direction, is_buying=is_buying,
+                        ttr_hours=ttr_hours, state=state,
+                        price_lut=PRICE_LUT, time_lut=TIME_LUT)
                     _agg = getattr(state, 'agg', None)
                     if _agg is not None:
                         _bc = float(state.user_brier_count[uid])
@@ -575,7 +581,7 @@ def main():
                         else:
                             _bss, _ratio = 0.0, 1.0
                         _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
-                        _agg.observe(cid, uid, float(p_true), _bc, _bss,
+                        _agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
                                      ratio=_ratio, k0=AGG_K0,
                                      conviction=float(fraction),
                                      trades_per_market=_tpm)
