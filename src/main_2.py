@@ -1317,15 +1317,7 @@ class LiveTrader:
                 self.seen_market_ids.add(mid)
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
-                # NOTE: we intentionally do NOT add to seen_market_ids here.
-                # pending_orders/pending_markets are the in-flight guard. The
-                # permanent re-entry ban is applied only once a fill is actually
-                # confirmed (see _attempt_exec). Banning on signal meant a market
-                # that briefly had no liquidity got blacklisted forever despite
-                # never being entered.
                 asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
-
-        
 
         # End of Batch Summary
         if batch_scores:
