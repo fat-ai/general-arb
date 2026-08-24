@@ -25,6 +25,9 @@ from sim_strat_5 import (
     compute_wager_and_p_true,
     restore_arrays_from_npz,
     _hist_sidecar_paths,
+    process_trade,          
+    PRICE_LUT,
+    TIME_LUT, 
     CACHE_DIR, 
     MARKETS_FILE, 
     TRADES_PATH,
@@ -618,6 +621,9 @@ def main():
                 
             ingestion_success = True
 
+        except (NameError, AttributeError, ImportError) as e:
+            log.critical(f"❌ Ingestion aborted on a programming error: {e}")
+            raise
         except Exception as e:
             log.error(f"❌ Trade ingestion pipeline failed: {e}")
             
