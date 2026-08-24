@@ -498,7 +498,7 @@ def main():
                 if not rows: break
                 
                 for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts = row
+                    raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
                     if ts is None: continue
                     
                     # --- Day-level progress (rows arrive ordered by ts ASC) ---
