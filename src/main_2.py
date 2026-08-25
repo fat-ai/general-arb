@@ -35,7 +35,7 @@ from sim_strat_5 import (
 import numpy as np
 from wallet_skill import skill_ratio as _skill_ratio
 from wallet_intern import normalize_address
-
+from market_time import ttr_hours as mt_ttr_hours
 if CONFIG.get('exclude_hostile_markets'):
     import polars as pl, hostile_markets as _rule
     _mk = pl.read_parquet(MARKETS_PATH,
@@ -1140,11 +1140,18 @@ class LiveTrader:
 
             mid = market['id']
 
+            # N2 (by design, mirrors minitest.RESTRICT_TO_NEW_MARKETS): only
+            # trade markets created after this run began, so a signal is acted
+            # on the first time it fires and never when stale.
             if market.get('start_timestamp', 0) < self.start_time:
                 skipped_counts["old"] += 1
                 continue
 
-            if market.get('end_timestamp', 0) < time.time():
+            # N5: end_timestamp is None for an OPEN market -- no upper bound.
+            # The old `market.get('end_timestamp', 0) < time.time()` treated a
+            # missing/open end as 0 and discarded the market as expired.
+            _end = market.get('end_timestamp')
+            if _end is not None and _end < time.time():
                 skipped_counts["expired"] += 1
                 continue
 
@@ -1152,18 +1159,20 @@ class LiveTrader:
 
             # Direction Logic
             is_yes_token = (token_id == list(market['tokens'].values())[0])
-            
+
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
             else:
                 direction = -1.0 if is_buy else 1.0
-                
+
             # 6. Format Datetimes for State Ingestion
 
             bet_on = "yes" if is_yes_token else "no"
-            
-            # Ensure time-to-resolution is at least 1 hour
-            ttr_hours = max(1.0, (market['end_timestamp'] - t['timestamp']) / 3600.0)
+
+            # N5: the sim's chain (end -> sched_end -> 25.9h median), replacing
+            # a bare subtraction against a resolution_timestamp-only end.
+            ttr_hours = mt_ttr_hours(t['timestamp'], _end,
+                                     market.get('sched_end_timestamp'))
 
             # ---------------------------------------------------------
             # 7. INGEST TRADE INTO BAYESIAN STATE (Vectorized & Flat)
