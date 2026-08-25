@@ -96,7 +96,7 @@ def _wi_build(state):
     Runs in a daemon thread. Until it finishes the bot uses the address
     fallback, which is what an unknown wallet gets anyway.
     """
-    global _WI_HASH, _WI_KEY, _WI_READY, WI_OK
+    global _WI_HASH, _WI_KEY, _WI_READY, _WI_OK
     import sqlite3
     import numpy as _np
     try:
@@ -159,6 +159,13 @@ def _wi_start(state):
 
 
 def _wallet_key(addr):
+    """user_map key for an address. NEVER touches disk.
+
+    Returns the uid directly (int) when the index knows the address, else the
+    normalised address (str) as a session-local key -- which cannot collide with
+    a decimal wallet-id string. Returns None when the input is not a 20-byte
+    address, in which case the caller skips the trade.
+    """
     import numpy as _np
     try:
         n = normalize_address(addr)
@@ -166,6 +173,13 @@ def _wallet_key(addr):
         return None          # not a 20-byte address: no history, no vote
     if n is None:
         return None
+    if _WI_HASH is None:
+        return n             # index not built yet -- _signal_loop gates on this
+    h = _wi_hash(n.encode())
+    i = int(_np.searchsorted(_WI_HASH, _np.uint64(h)))
+    if i < len(_WI_HASH) and int(_WI_HASH[i]) == h:
+        return int(_WI_KEY[i])
+    return n                 # genuinely unknown wallet: no history
      
 import math
 from ws_handler import PolymarketWS
@@ -945,14 +959,29 @@ class LiveTrader:
             _t0 = time.time()
             while self.running and not _WI_READY:
                 await asyncio.sleep(0.5)
-            log.info(f"▶️ Signal loop released after {time.time()-_t0:.0f}s "
-                     f"({self.trade_queue.qsize():,} trades buffered).")
+            if self.running:
+                log.info(f"▶️ Signal loop released after {time.time()-_t0:.0f}s "
+                         f"({self.trade_queue.qsize():,} trades buffered).")
+
+        # Shutting down while we waited: exit quietly, this is not an index failure.
+        if not self.running:
+            return
+
+        # N0-b: the index finished but did not build (empty table, or the build
+        # threw). _wallet_key would fall back to the address on every lookup,
+        # which is not a user_map key -- i.e. the dead signal again, silently.
+        # Checked ONCE here, before the first trade, not per-trade inside the loop.
+        if not _WI_OK:
+            log.critical("🛑 Wallet index unavailable — shutting down rather "
+                         "than trading a dead signal.")
+            self.running = False
+            return
+
         log.info("⚡ Signal Loop: Waiting for Webhook Data...")
-        
+
         while self.running:
             raw_trade = await self.trade_queue.get()
-         #   print(f"🔍 TRACE_QUEUE: Keys={list(raw_trade.keys())}")
-            
+
             try:
                 self.stats['last_trade_time'] = time.strftime('%H:%M:%S')
 
@@ -969,14 +998,9 @@ class LiveTrader:
                     'is_buy': raw_trade.get('is_buy'),
                     'retry_count': raw_trade.get('retry_count', 0),
                 }
-                
+
                 await self._process_batch([trade])
-                if not _WI_OK:
-                    log.critical("🛑 Wallet index unavailable — shutting down rather "
-                                 "than trading a dead signal.")
-                    self.running = False
-                    return
-                
+
             except Exception as e:
                 log.info(raw_trade)
                 log.error(f"❌ Processing Error: {e}")
