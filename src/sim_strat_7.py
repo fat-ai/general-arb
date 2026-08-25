@@ -10,6 +10,9 @@ import gc
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
+import hostile_markets
+from market_aggregator import MarketAggregator
+from wallet_skill import skill_ratio as _skill_ratio
 import math
 from config import TRADES_FILE, MARKETS_FILE, SIGNAL_FILE, CONFIG, CACHE_DIR
 import shutil
@@ -48,6 +51,21 @@ MAX_ENTRY_PRICE = 0.10
 # Contributor sample cap for the decay diagnostics: bound the per-bet cost of
 # summarising a market's posterior evidence base on high-volume markets.
 CONTRIB_SAMPLE = 512
+
+# --- corrected estimator -------------------------------------------------
+# AGGREGATE_MODE False keeps the single-wallet trigger, so the ESS and skill
+# fixes can be measured WITHOUT the architectural change. True routes the
+# trigger through the weighted market aggregate.
+AGGREGATE_MODE = bool(CONFIG.get('aggregate_mode', True))
+# Inter-wallet correlation. Every wallet sees the same price, so their views
+# share a common component that averaging never cancels; the effective count
+# saturates at 1/rho. wallet_skill.fit_rho() estimates this from data.
+AGG_RHO = float(CONFIG.get('agg_rho', 0.15))
+# Empirical-Bayes shrinkage for the skill score: how many settled markets before
+# a wallet's measured skill is believed. wallet_skill.fit_k0() estimates it.
+AGG_K0 = float(CONFIG.get('agg_k0', 50.0))
+# Prior strength on the market price inside the aggregate.
+AGG_M_PRIOR = float(CONFIG.get('agg_m_prior', 5.0))
 MAX_BET = 10000
 MAX_SLIPPAGE = 0.2
 P_RANGE = 100
@@ -86,6 +104,16 @@ class BayesianState:
     user_total_trades: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.uint32))
     user_brier_sum: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
     user_brier_count: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.uint32))
+    # Brier of the MARKET PRICE on the same trades: the reference forecast for
+    # the skill score. Without it, raw Brier is dominated by price level --
+    # E[brier] = p(1-p) is 0.029 at 3c and 0.250 at 50c for identical skill.
+    user_brier_price_sum: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
+    # Sum of outcomes over the wallet's settled markets. Gives o_bar, hence the
+    # irreducible term o_bar*(1-o_bar) that must be removed from both Briers
+    # before they say anything about skill -- at these prices it is ~98% of the
+    # Brier, which is why the raw skill score was uselessly small.
+    user_brier_out_sum: np.ndarray = field(default_factory=lambda: np.zeros(MAX_USERS, dtype=np.float64))
+    agg: object = None          # MarketAggregator; built in main()
 
     # 2. Pre-allocated arrays for user trade histories
     user_history_yes: list = field(default_factory=list)
@@ -143,7 +171,7 @@ for i in range(TIME_LUT_SIZE):
 def compute_signals_parallel(
         order,
         is_yes_dir, primary_pi, opposing_pi, cur_log_ttr,
-        expected_p, price, stake, ttr_hours, V, brier_s, brier_c,
+        expected_p, price, stake, ttr_hours, V, brier_s, brier_c, brier_px, k0,
         yes_flat, no_flat, yes_start, yes_end, no_start, no_end,
         logit, price_lut, time_lut, p_range,
         out_prob, out_marg, out_perc, out_trust):
@@ -165,7 +193,8 @@ def compute_signals_parallel(
         sp, mg, pm, tm = _process_trade_core(
             primary, opposing, primary_pi[i], opposing_pi[i], cur_log_ttr[i],
             expected_p[i], price[i], stake[i], ttr_hours[i], V[i],
-            brier_s[i], brier_c[i], logit, price_lut, time_lut, p_range)
+            brier_s[i], brier_c[i], brier_px[i], k0,
+            logit, price_lut, time_lut, p_range)
         out_prob[i] = sp; out_marg[i] = mg; out_perc[i] = pm; out_trust[i] = tm
 
 @njit(cache=True)
@@ -316,6 +345,52 @@ def _merge_sorted_uint32(old, new_sorted, out):
         k += 1
 
 @njit(cache=True)
+def _accumulate_brier_by_wallet(user_ids, is_yes, packed_data, p_trues, stakes,
+                                yes_outcome, user_brier_sum,
+                                user_brier_price_sum, user_brier_out_sum,
+                                user_brier_count):
+    """ONE Brier observation per wallet per market, plus the price baseline.
+
+    Groups by wallet with argsort -- O(n log n) once per market, not per trade --
+    and takes each wallet's STAKE-WEIGHTED average implied probability and
+    stake-weighted average YES-frame price.
+
+    p_true is already on the YES frame (it is scored against yes_outcome), so
+    the price must be too: a NO bet at q is a YES price of 1-q. Getting that
+    backwards would silently invert the reference forecast."""
+    n = len(user_ids)
+    if n == 0:
+        return
+    order = np.argsort(user_ids)
+    i = 0
+    while i < n:
+        j = i
+        uid = user_ids[order[i]]
+        sw = 0.0
+        sp = 0.0
+        spx = 0.0
+        while j < n and user_ids[order[j]] == uid:
+            k = order[j]
+            s = stakes[k]
+            if s <= 0.0:
+                s = 1e-9
+            price_yes = (packed_data[k] >> 22) / 1000.0
+            if not is_yes[k]:
+                price_yes = 1.0 - price_yes
+            sw += s
+            sp += s * p_trues[k]
+            spx += s * price_yes
+            j += 1
+        p_bar = sp / sw
+        px_bar = spx / sw
+        user_brier_sum[uid] += (p_bar - yes_outcome) ** 2
+        user_brier_price_sum[uid] += (px_bar - yes_outcome) ** 2
+        user_brier_out_sum[uid] += yes_outcome
+        user_brier_count[uid] += 1
+        i = j
+
+
+@njit(cache=True)
 def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
                             is_yes_win, is_no_win, yes_outcome, skip_history, brier_on_void,
                             user_exposure, user_brier_sum, user_brier_count,
@@ -337,8 +412,8 @@ def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
             is_yes_bet = is_yes[i]
 
             user_exposure[uid] = max(0.0, user_exposure[uid] - stake)
-            user_brier_sum[uid] += (p_true - yes_outcome) ** 2
-            user_brier_count[uid] += 1
+            # Brier moved to _accumulate_brier_by_wallet: ONE observation per
+            # wallet, not per trade (8.0x inflation measured).
 
             packed = packed_data[i]
             exact_price = (packed >> 22) / 1000.0
@@ -370,9 +445,7 @@ def _resolve_positions_core(user_ids, is_yes, packed_data, p_trues, stakes,
         for i in range(len(user_ids)):
             uid = user_ids[i]
             user_exposure[uid] = max(0.0, user_exposure[uid] - stakes[i])
-            if brier_on_void:
-                user_brier_sum[uid] += (p_trues[i] - yes_outcome) ** 2
-                user_brier_count[uid] += 1
+            # void brier is also handled once per wallet, by the caller
 
     return yes_idx, no_idx
 
@@ -464,14 +537,26 @@ def _process_trade_core(
     expected_p, price, stake, ttr_hours,
     V,
     brier_sum_uid, brier_count_uid,
+    brier_price_sum_uid, k0,
     logit_params,
     price_lut, time_lut, p_range
 ):
     if brier_count_uid > 0:
-        mean_brier = brier_sum_uid / brier_count_uid
-        confidence_penalty = 0.5 / math.sqrt(brier_count_uid)
-        bs_ucb = min(1.0, mean_brier + confidence_penalty)
-        trust_multiplier = 1.0 / (bs_ucb + 0.01)
+        # Brier SKILL score against the price. Exactly 0 at every price level
+        # for a wallet that merely matches the price, so the base-rate artifact
+        # is gone at the root. Shrunk by ess/(ess+k0) -- James-Stein -- which
+        # replaces 0.5/sqrt(N): that double-counted the Beta prior's shrinkage,
+        # and 1/(x+0.01) was hypersensitive near zero with a ceiling of 100.
+        # Bounded by 1.0: reliability may REMOVE evidence, never create it.
+        if brier_price_sum_uid > 1e-12:
+            bss = 1.0 - (brier_sum_uid / brier_price_sum_uid)
+        else:
+            bss = 0.0
+        bss_shrunk = bss * (brier_count_uid / (brier_count_uid + k0))
+        if bss_shrunk >= 0.0:
+            trust_multiplier = 1.0
+        else:
+            trust_multiplier = max(0.05, 1.0 / (1.0 - bss_shrunk))
     else:
         if len(logit_params) != 4:
             trust_multiplier = 1.33
@@ -543,6 +628,7 @@ def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
         expected_p, price, stake, ttr_hours,
         V,
         state.user_brier_sum[uid], state.user_brier_count[uid],
+        state.user_brier_price_sum[uid], AGG_K0,
         logit_params,
         price_lut, time_lut, P_RANGE
     )
@@ -683,18 +769,45 @@ def resolve_market(r_cid: str, outcome: float, outcome_label: str, current_sim_d
         out_no_uids, out_no_packed, out_no_prices, out_no_errors
     )
 
+    # ONE brier observation per wallet for this market. Runs for confirmed
+    # outcomes, and for a confirmed 50/50 void where the forecast is genuinely
+    # scoreable against 0.5 -- matching the old brier_on_void semantics.
+    if (not skip_history) or brier_on_void:
+        _accumulate_brier_by_wallet(
+            v_uids, v_is_yes, v_packed, v_ptrues, v_stakes, yes_outcome,
+            state.user_brier_sum, state.user_brier_price_sum,
+            state.user_brier_out_sum, state.user_brier_count)
+
+    # Release this market's aggregator entries and recycle its slot.
+    if state.agg is not None and len(v_uids):
+        state.agg.release(r_cid, set(v_uids.tolist()))
+
     if yes_idx > 0:
             state.daily_variance_yes.extend(zip(out_yes_prices[:yes_idx].tolist(), out_yes_errors[:yes_idx].tolist()))
             uids_l   = out_yes_uids[:yes_idx].tolist()
             packed_l = out_yes_packed[:yes_idx].tolist()
+            # ONE history entry per wallet per market, keeping its LAST view.
+            # The per-trade version had the same defect as the old brier count:
+            # every trade in a market shares one outcome, so 8 entries (the
+            # measured fills-per-wallet-market rate) inflated n1/n2 in the Beta
+            # posterior 8x. It also made fast_numba_scan's cost grow with a
+            # wallet's own trade count -- quadratic in activity, and the maker
+            # leg doubled every array. One change fixes the double-counting AND
+            # the slowdown.
+            _seen = {}
             for u, p in zip(uids_l, packed_l):
+                _seen[u] = p
+            for u, p in _seen.items():
                 day_yes_updates[u].append(p)
 
     if no_idx > 0:
             state.daily_variance_no.extend(zip(out_no_prices[:no_idx].tolist(), out_no_errors[:no_idx].tolist()))
             uids_l   = out_no_uids[:no_idx].tolist()
             packed_l = out_no_packed[:no_idx].tolist()
+            _seen = {}
             for u, p in zip(uids_l, packed_l):
+                _seen[u] = p
+            for u, p in _seen.items():
                 day_no_updates[u].append(p)
 
     # Handle first bet calibration
@@ -842,6 +955,8 @@ def save_checkpoint(ckpt_path: Path, state, active_portfolio, result_map,
             user_exposure=state.user_exposure, user_peak=state.user_peak,
             user_total_trades=state.user_total_trades, user_brier_sum=state.user_brier_sum,
             user_brier_count=state.user_brier_count,
+            user_brier_price_sum=state.user_brier_price_sum,
+            user_brier_out_sum=state.user_brier_out_sum,
         )
     os.replace(tmp_npz, npz_path)
 
@@ -855,6 +970,10 @@ def save_checkpoint(ckpt_path: Path, state, active_portfolio, result_map,
     state.user_total_trades = np.empty(0)
     state.user_brier_sum = np.empty(0)
     state.user_brier_count = np.empty(0)
+    restore_brier_price = state.user_brier_price_sum
+    state.user_brier_price_sum = np.empty(0)
+    restore_brier_out = state.user_brier_out_sum
+    state.user_brier_out_sum = np.empty(0)
     state.user_history_yes = []
     state.user_history_no = []
 
@@ -884,6 +1003,8 @@ def save_checkpoint(ckpt_path: Path, state, active_portfolio, result_map,
     state.user_total_trades = restore_total_trades
     state.user_brier_sum = restore_brier_sum
     state.user_brier_count = restore_brier_count
+    state.user_brier_price_sum = restore_brier_price
+    state.user_brier_out_sum = restore_brier_out
 
     log.info("✅ Checkpoint saved (memmap sidecars + NPZ + PKL).")
 
@@ -947,6 +1068,19 @@ def restore_arrays_from_npz(state, npz_path: Path):
         state.user_total_trades = data['user_total_trades'].copy()
         state.user_brier_sum = data['user_brier_sum'].copy()
         state.user_brier_count = data['user_brier_count'].copy()
+        # Older checkpoints predate the price baseline. Resuming from one leaves
+        # every wallet at BSS 0 (reliability 1.0) until its markets resolve
+        # again: degraded, but never wrong-signed.
+        if 'user_brier_price_sum' in data:
+            state.user_brier_price_sum = data['user_brier_price_sum'].copy()
+        else:
+            log.warning("checkpoint predates user_brier_price_sum; skill scores "
+                        "rebuild from scratch as markets resolve.")
+            state.user_brier_price_sum = np.zeros_like(state.user_brier_sum)
+        if 'user_brier_out_sum' in data:
+            state.user_brier_out_sum = data['user_brier_out_sum'].copy()
+        else:
+            state.user_brier_out_sum = np.zeros_like(state.user_brier_sum)
 
 def build_flat_histories(state):
     """Concatenate all per-user histories into global flat arrays + offsets, once.
@@ -982,13 +1116,14 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              price_lut, time_lut, p_range):
     user_map = state.user_map
     bsum, bcnt = state.user_brier_sum, state.user_brier_count
+    bpx = state.user_brier_price_sum
     ay, by, cy = state.poly_coeffs_yes
     an, bn, cn = state.poly_coeffs_no
     logit = state.logit_model_params if state.logit_model_params is not None else _EMPTY_F64
     sim_start = simulation_start_date
 
     ys_l = []; ye_l = []; ns_l = []; ne_l = []
-    uid_l = []
+    uid_l = []; bx_l = []
 
     out_prob = np.zeros(num_rows); out_marg = np.zeros(num_rows)
     out_perc = np.zeros(num_rows); out_V = np.zeros(num_rows); out_trust = np.zeros(num_rows)
@@ -1054,11 +1189,13 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
 
         bs = 0.0 if uid is None else bsum[uid]
         bc = 0   if uid is None else bcnt[uid]
+        bx = 0.0 if uid is None else bpx[uid]
 
         elig_idx.append(i); isyes_l.append(eff_yes)
         ppi_l.append(ppi); opi_l.append(opi); clt_l.append(cur_log_ttr)
         ep_l.append(expected_p); pr_l.append(price); st_l.append(stake)
         ttr_l.append(ttr_hours); V_l.append(V); bs_l.append(bs); bc_l.append(bc)
+        bx_l.append(bx)
         ys_l.append(ys); ye_l.append(ye); ns_l.append(ns); ne_l.append(ne)
         uid_l.append(uid if uid is not None else -1)
         out_V[i] = V
@@ -1071,6 +1208,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     ppi = np.array(ppi_l, np.int64); opi = np.array(opi_l, np.int64); clt = np.array(clt_l, np.int64)
     ep = np.array(ep_l); pr = np.array(pr_l); st = np.array(st_l)
     ttr = np.array(ttr_l); Vv = np.array(V_l); bs = np.array(bs_l); bc = np.array(bc_l, np.uint32)
+    bx = np.array(bx_l)
     ys = np.array(ys_l, np.int64); ye = np.array(ye_l, np.int64)
     ns = np.array(ns_l, np.int64); ne = np.array(ne_l, np.int64)
 
@@ -1082,6 +1220,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     cp = np.zeros(n); cm = np.zeros(n); cpe = np.zeros(n); ct = np.zeros(n)
     compute_signals_parallel(order,
                              isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
+                             bx, AGG_K0,
                              yes_flat, no_flat, ys, ye, ns, ne,
                              logit, price_lut, time_lut, p_range, cp, cm, cpe, ct)
 
@@ -1101,7 +1240,21 @@ def main():
             "timestamp", "market_id", "cid", "bet_on", 
             "price", "ttr_hours", "bayesian_prob", "margin", "perc_margin", 
             "variance_v", "volume", "wallet_id", "brier_count", "trust_weight",
-            "end_timestamp", "actual_outcome"
+            "end_timestamp", "actual_outcome",
+            # Added 2026-08-08 so minitest can sweep contributor thresholds
+            # WITHOUT another sim run. All three are exact over every
+            # contributor, not the 512-sample the executions diagnostics use --
+            # once anything gates on them, sampling would not reproduce.
+            #   c_n     - contributors to this market's posterior
+            #   c_conv  - their mean reverse-Kelly bet fraction. D7 showed
+            #             conviction is the strongest per-trade signal found
+            #             (19x on edge, monotone, holding within a quarter);
+            #             this asks whether it holds for CONTRIBUTORS too.
+            #   c_tpm   - their mean trades-per-market. Separates BREADTH from
+            #             CHURN, which contrib_med_trades conflates: 20,000
+            #             trades over 20,000 markets is a broad bettor, 20,000
+            #             over 200 is churning, and those are opposite.
+            "c_n", "c_conv", "c_tpm"
         ]
         with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -1111,6 +1264,12 @@ def main():
         if EXECUTIONS_PATH.exists(): EXECUTIONS_PATH.unlink()
         # DECAY DIAGNOSTICS (added 2026-07-23). Everything after "impact" exists to
         # localise the observed edge decay without needing another regeneration:
+        #   user_score       - REPURPOSED 2026-08-08: now the reverse-Kelly bet
+        #                      FRACTION (bet as a share of effective bankroll).
+        #                      It previously duplicated trust_weight exactly and
+        #                      carried no information. Cross-tab realised edge
+        #                      against this to test whether conviction predicts
+        #                      profit -- the question conviction weighting rests on.
         #   trust_weight     - the triggering wallet's trust score. WAS HARDCODED 0,
         #                      which silently voided every user_score analysis.
         #   trigger_trades   - that wallet's lifetime trade count. A market maker or bot
@@ -1130,7 +1289,23 @@ def main():
                         "user_score", "impact",
                         "trust_weight", "trigger_trades", "trigger_brier_n",
                         "bayes_prob", "variance_v", "ttr_hours",
-                        "n_contrib", "contrib_med_trades"]
+                        "n_contrib", "contrib_med_trades",
+                        # Added 2026-08-08. Both are computed at the trigger and
+                        # were previously discarded, so this costs nothing.
+                        #   agg_sum_w   - the market's total (correlation-
+                        #                 discounted) contributor weight. ESS
+                        #                 only ever RISES, so sum_w rises through
+                        #                 the run and the price prior's share
+                        #                 collapses (20% at sum_w 20, 0.02% at
+                        #                 20,000). If margins inflate over time
+                        #                 while contributor counts stay flat,
+                        #                 unbounded weight growth is the cause
+                        #                 rather than composition.
+                        #   skill_ratio - the triggering wallet's forecast-
+                        #                 variance advantage over the price.
+                        #                 Never yet validated against realised
+                        #                 edge; log before gating on it.
+                        "agg_sum_w", "skill_ratio"]
         with open(EXECUTIONS_PATH, mode='w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(exec_headers)
     else:
@@ -1167,104 +1342,32 @@ def main():
     # ---------------------------------------------------------------
     # HOSTILE-MARKET EXCLUSION FILTER  --  rule T5, frozen 2026-07-23
     #
-    # REPLACES the old R1 rule, which DEGENERATED: R1 keyed on feesEnabled, a platform
-    # POLICY FLAG. Polymarket rolled fees out platform-wide and feesEnabled went from
-    # 54% of markets (2026-03) to 98% (2026-04) to 99.6% (2026-07). R1 therefore became
-    # a blanket exclusion, cutting the strategy from ~250k tradeable markets/month to
-    # ~1.7k. Measured monthly exclusion drift: 23.9% -> 97.3% = DEGENERATE.
-    #
-    # RULE S13 = T5 + crypto-keyword clause, with MAX_ENTRY_PRICE = 0.10
-# Contributor sample cap for the decay diagnostics: bound the per-bet cost of
-    # RULE S13 = T5 + crypto-keyword clause, with MAX_ENTRY_PRICE = 0.10.
-    # Measured on the unfiltered book, recent 6 months (2026-01..06):
-    #   baseline unfiltered        -4,791,013 pnl   roi -0.0990
-    #   T5 alone                   +1,917,827       roi +0.0844
-    #   T5 + px<=0.10              +3,279,252       roi +0.2031
-    #   T5 + px<=0.10 + kw_crypto  +3,399,717       roi +0.2220   <-- banked
-    # The NULL-metadata cluster (resolvedBy/submitted_by/umaBond/umaReward all null) was
-    # tested and is 100% REDUNDANT with T5 -- it excluded exactly zero extra trades --
-    # so it is deliberately NOT included.
-    #
-    # T5 uses STRUCTURAL fields only -- what a market IS, not what policy applies to it:
-    #   template_size >= 1000      (question-template factory detector; a normalised
-    #                               question hash appearing in >=1000 markets is a
-    #                               machine-generated series by construction)
-    #   OR resolution_source domain in {data.chain.link, binance.com, dotabuff.com,
-    #                                   gol.gg, hltv.org}
-    #   OR sports_market_type in {kill_over_under_game, team_totals,
-    #                             tennis_first_set_totals, cs2_odd_even_total_rounds,
-    #                             soccer_anytime_goalscorer}
-    #
-    # NO POLICY FLAGS. feesEnabled and customLiveness are both banned as rule inputs --
-    # customLiveness is drifting the same way (2.1% -> 53.2% over the same period).
-    #
-    # Measured on the unfiltered book (671,709 settled trades):
-    #   T5 alone            keeps 51.1%, roi +0.2505, monthly drift 29.0pp = stable
-    #   T5 + price <= 0.10  keeps 34.7%, roi +0.4600; recent 6mo +3,279,252 pnl
-    #   (baseline unfiltered recent 6mo: -4,791,013 pnl)
-    #
-    # Requires market_templates.parquet from template_classifier.py; if absent, the
-    # template clause is skipped and a WARNING is logged (domains+sports still apply).
-    # Toggle via CONFIG['exclude_hostile_markets'] (default True).
-    # ---------------------------------------------------------------
+    # Rule lives in hostile_markets.py -- see that file for the measured
+    # evidence behind every entry. Nothing rule-shaped belongs here.
     HOSTILE_MARKETS = set()
     HOSTILE_CIDS_TBL = None
     if CONFIG.get('exclude_hostile_markets', True):
         import pyarrow.parquet as _pq
         _names = _pq.ParquetFile(MARKETS_PATH).schema.names
-        _cols = [c for c in ['market_id', 'resolution_source',
-                             'sports_market_type', 'question'] if c in _names]
+        # SINGLE SOURCE OF TRUTH: hostile_markets.py, shared with minitest.py.
+        # The rule that used to live here excluded markets the 2026-08 report
+        # measures as PROFITABLE -- hltv.org (+2,024,942), gol.gg (+782,749),
+        # and the chain.link DOMAIN match sweeping in bnb/hype/doge
+        # (+1,657,042). It also named three sports types absent from all 269
+        # tested buckets, and a crypto keyword that contains those profitable
+        # feeds. The template_size clause is UNMEASURED and stays off until it
+        # has evidence; set include_template_clause=True to restore it.
+        _cols = [c for c in (['market_id'] + hostile_markets.required_columns())
+                 if c in _names]
         _hm = pl.read_parquet(MARKETS_PATH, columns=_cols)
-        # template_size join (structural factory detector)
-        _tpl_path = SOURCE_DIR / 'market_templates.parquet'
-        _tpl_ok = False
-        try:
-            if _tpl_path.exists():
-                _tpl = (pl.read_parquet(_tpl_path)
-                          .select([pl.col('market_id').cast(pl.Utf8).alias('market_id'),
-                                   pl.col('template_size').cast(pl.Int64)]))
-                _hm = _hm.with_columns(pl.col('market_id').cast(pl.Utf8)).join(
-                    _tpl, on='market_id', how='left')
-                _tpl_ok = True
-        except Exception as _e:
-            log.warning(f"template_size join failed ({_e}); template clause skipped.")
-        if not _tpl_ok:
-            log.warning("market_templates.parquet NOT FOUND -- T5's template clause is "
-                        "INACTIVE. Run template_classifier.py; without it the factory "
-                        "markets that drive most losses will NOT be excluded.")
-        _exprs = []
-        if _tpl_ok:
-            _exprs.append((pl.col('template_size').cast(pl.Int64, strict=False) >= 1000)
-                          .fill_null(False))
-        if 'resolution_source' in _cols:
-            _exprs.append(pl.col('resolution_source').cast(pl.Utf8).str.to_lowercase()
-                          .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|'
-                                        r'gol\.gg|hltv\.org')
-                          .fill_null(False))
-        if 'sports_market_type' in _cols:
-            _exprs.append(pl.col('sports_market_type').cast(pl.Utf8)
-                          .is_in(['kill_over_under_game', 'team_totals',
-                                  'tennis_first_set_totals', 'cs2_odd_even_total_rounds',
-                                  'soccer_anytime_goalscorer']).fill_null(False))
-        if 'question' in _cols:
-            # Residual crypto markets -- the bespoke ones the template and domain clauses
-            # do NOT catch. Measured marginal on this cohort: +$114.40/trade before 2026,
-            # -$14.39/trade in 2026-01..06. Excluded on the RECENT evidence; revisit if
-            # the reversal reverses. Question text, so no policy-flag drift risk.
-            _exprs.append(pl.col('question').cast(pl.Utf8).str.to_lowercase()
-                          .str.contains(r'bitcoin|btc|\beth\b|ethereum|crypto|solana|'
-                                        r'dogecoin|token')
-                          .fill_null(False))
-        if _exprs:
-            _cond = _exprs[0]
-            for _e in _exprs[1:]:
-                _cond = _cond | _e
+        _cond = hostile_markets.hostile_expr_polars(_cols)
+        if _cond is not None:
             HOSTILE_MARKETS = set(_hm.filter(_cond)['market_id'].to_list())
         _total_mkts = _hm.select(pl.col('market_id').n_unique()).item()
         _pct = 100.0 * len(HOSTILE_MARKETS) / max(_total_mkts, 1)
-        log.info(f"Hostile-market filter ON (T5): {len(HOSTILE_MARKETS):,} of {_total_mkts:,} "
-                 f"markets excluded from betting = {_pct:.1f}% "
-                 f"(template clause {'ACTIVE' if _tpl_ok else 'INACTIVE'}).")
+        log.info(f"Hostile-market filter ON: {len(HOSTILE_MARKETS):,} of "
+                 f"{_total_mkts:,} markets excluded from betting = {_pct:.1f}% "
+                 f"(rule: hostile_markets.py)")
         if _pct > 80.0:
             log.warning(f"!! EXCLUSION COVERAGE {_pct:.1f}% -- a rule flagging >80% of all "
                         f"markets has stopped discriminating. This is exactly how R1 failed "
@@ -1411,6 +1514,7 @@ def main():
     # ==========================================
     if not is_resuming:            
         state = BayesianState()
+        state.agg = MarketAggregator(m_prior=AGG_M_PRIOR, rho=AGG_RHO)
         active_portfolio = {}
         resume_data_start = None
         resume_sim_start = None
@@ -1509,11 +1613,13 @@ def main():
     # Warm both branches of _process_trade_core (cold-start logit path AND warm-Brier path)
     _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
                         0.5, 0.5, 100.0, 50.0, 0.25,
-                        np.float64(0.2), np.uint32(1), _dummy_logit,
+                        np.float64(0.2), np.uint32(1),
+                        np.float64(0.25), np.float64(50.0), _dummy_logit,
                         PRICE_LUT, TIME_LUT, P_RANGE)
     _process_trade_core(_dummy_history, _dummy_history, 500, 500, 500,
                         0.5, 0.5, 100.0, 50.0, 0.25,
-                        np.float64(0.0), np.uint32(0), _dummy_logit,
+                        np.float64(0.0), np.uint32(0),
+                        np.float64(0.0), np.float64(50.0), _dummy_logit,
                         PRICE_LUT, TIME_LUT, P_RANGE)
 
     # Warm the daily-resolution kernels
@@ -1550,6 +1656,7 @@ def main():
         _i1,
         np.zeros(1, np.bool_), _i1, _i1, _i1,
         _f1, _f1, _f1, _f1, _f1, _f1, np.zeros(1, np.uint32),
+        _f1, np.float64(50.0),
         _df, _df, _i1, _i1, _i1, _i1,
         _EMPTY_F64, PRICE_LUT, TIME_LUT, P_RANGE, _f1, _f1, _f1, _f1)
   
@@ -1590,74 +1697,87 @@ def main():
             hostile_scoring_clause = (
                 "WHERE TRIM(CAST(contract_id AS VARCHAR)) NOT IN (SELECT cid FROM hostile_cids)")
 
-        # ---- SCHEMA ADAPTATION (interned wallets) ---------------------------------
-        # The rebuilt DB stores user_id/maker_id INTEGER against a `wallets` table
-        # instead of 42-char TEXT addresses (~100GB saved across ~1.3B rows). Detect
-        # which schema we are attached to and build the projection + exchange filter
-        # accordingly, so ONE version of this file works before and after cutover.
-        # Interning is storage-only: the sim still builds its own dense uid space over
-        # the wallets that survive filtering, so per-user array sizing is unchanged.
-        try:
-            _tcols = {r[0] for r in con.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name='trades'").fetchall()}
-        except Exception:
-            _tcols = set()
-        _INTERNED = 'user_id' in _tcols
-        EXCHANGE_ADDRS = [
-            '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',  # V1 CTF Exchange (binary)
-            '0xc5d563a36ae78145c45a50134d48a1215220f80a',  # V1 NegRisk CTF Exchange
-            '0xe111180000d2663c0091e4f400237545b87b996b',  # V2 CTF Exchange
-            '0xe2222d279d744050d28e00520010520000310f59',  # V2 NegRisk Exchange
-        ]
-        if _INTERNED:
-            # resolve the exchange addresses to ids ONCE; filter on integers
-            _q = ("SELECT wallet_id FROM source_db.wallets WHERE address IN ("
-                  + ",".join("?" * len(EXCHANGE_ADDRS)) + ")")
-            _ex_ids = [r[0] for r in con.execute(_q, EXCHANGE_ADDRS).fetchall()]
-            log.info(f"Interned schema detected: filtering {len(_ex_ids)} exchange "
-                     f"wallet_ids (of {len(EXCHANGE_ADDRS)} addresses)")
-            if len(_ex_ids) < len(EXCHANGE_ADDRS):
-                log.warning("Not every exchange address resolved to a wallet_id -- an "
-                            "exchange that never traded is fine, but verify.")
-            _user_proj = "t.user_id AS user"
-            _user_filter = ("AND (t.user_id IS NULL OR t.user_id NOT IN ("
-                            + ",".join(str(int(i)) for i in _ex_ids) + "))") \
-                           if _ex_ids else ""
-        else:
-            _user_proj = "t.user"
-            _user_filter = ("AND (t.user IS NULL OR lower(t.user) NOT IN ("
-                            + ",".join(f"'{a}'" for a in EXCHANGE_ADDRS) + "))")
-
-        query = f"""
-            WITH parsed_trades AS (
-                SELECT 
-                    t.id, 
-                    t.contract_id, 
-                    {_user_proj}, 
-                    t.tradeAmount, 
-                    t.outcomeTokensAmount, 
-                    t.price, 
-                    EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)), 
-                        TRY_CAST(t.timestamp AS TIMESTAMP)
-                    )) AS ts
-                FROM source_db.trades t
-                INNER JOIN (
+        # ------------------------------------------------------------------
+        # INTERNED SCHEMA + MAKER LEG.
+        #
+        # gamma_trades.db stores wallets as integer ids (user_id / maker_id), not
+        # text addresses. The previous query selected t.user, which no longer
+        # exists, and filtered exchanges by comparing addresses to that column.
+        #
+        # `user` stays a STRING in the projection: line ~1765 calls
+        # sys.intern(users_col[i]), which raises TypeError on an int.
+        #
+        # The maker leg is the exact negation of the taker leg --
+        # outcomeTokensAmount is taker-signed (derive(): the maker gives
+        # collateral -> mult = -1). '-m' on the id keeps the primary key distinct
+        # so the final ORDER BY ts, id stays deterministic between runs.
+        #
+        # NO_COLLATERAL_SIDE rows are dropped from both legs (~0.97%): with
+        # neither side collateral, derive()'s choice of contract_id is arbitrary
+        # and the sign is undefined.
+        # ------------------------------------------------------------------
+        _exch = """(SELECT wallet_id FROM source_db.wallets WHERE lower(address) IN (
+                      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                      '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                      '0xe111180000d2663c0091e4f400237545b87b996b',
+                      '0xe2222d279d744050d28e00520010520000310f59'))"""
+        _ok_coll = """AND NOT (CAST(t.maker_asset_id AS VARCHAR) NOT IN ('0','1')
+                           AND CAST(t.taker_asset_id AS VARCHAR) NOT IN ('0','1'))"""
+        _mkt_join = f"""INNER JOIN (
                     SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
                     FROM read_parquet('{MARKETS_PATH}')
                     {hostile_scoring_clause}
-                ) m ON t.contract_id = m.clean_cid
+                ) m ON t.contract_id = m.clean_cid"""
+        _ts_expr = """EPOCH(COALESCE(
+                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
+                        TRY_CAST(t.timestamp AS TIMESTAMP)
+                    ))"""
+
+        query = f"""
+            WITH parsed_trades AS (
+                SELECT
+                    t.id,
+                    t.contract_id,
+                    CAST(t.user_id AS VARCHAR) AS user,
+                    t.tradeAmount,
+                    t.outcomeTokensAmount,
+                    t.price,
+                    {_ts_expr} AS ts
+                FROM source_db.trades t
+                {_mkt_join}
                 WHERE t.timestamp IS NOT NULL
-                  AND t.price >= 0.0 
+                  AND t.price >= 0.0
                   AND t.price <= 1.0
-                  {_user_filter}
+                  AND t.user_id IS NOT NULL
+                  AND t.user_id NOT IN {_exch}
+                  {_ok_coll}
+
+                UNION ALL
+
+                SELECT
+                    t.id || '-m' AS id,
+                    t.contract_id,
+                    CAST(t.maker_id AS VARCHAR) AS user,
+                    t.tradeAmount,
+                    -t.outcomeTokensAmount AS outcomeTokensAmount,
+                    t.price,
+                    {_ts_expr} AS ts
+                FROM source_db.trades t
+                {_mkt_join}
+                WHERE t.timestamp IS NOT NULL
+                  AND t.price >= 0.0
+                  AND t.price <= 1.0
+                  AND t.maker_id IS NOT NULL
+                  AND t.maker_id NOT IN {_exch}
+                  {_ok_coll}
             )
             SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL
               AND ts >= {state.last_processed_timestamp}
             ORDER BY ts ASC, id ASC
         """
+        log.info("Ingestion: interned schema (user_id/maker_id), MAKER LEG "
+                 "INCLUDED -- expect roughly 2x the rows of a taker-only run.")
             
         cursor = con.execute(query)
         record_batch_reader = cursor.fetch_record_batch(rows_per_batch=10000)
@@ -2020,6 +2140,59 @@ def main():
                 # not on a particular yes/no determined by outcome_label.
                 # -------------------------------------------------------
                 mid_for_signal = m['id']
+                # Defaults: the aggregate block below is skipped when there is
+                # no aggregator or no uid, and both values are logged either way.
+                _agg_sum_w = 0.0
+                _agg_ratio = 1.0
+                _c_n, _c_conv, _c_tpm = 0, 0.0, 0.0
+
+                # ONE weighted vote per wallet per market: a later trade by the
+                # same wallet REPLACES its earlier view rather than adding a
+                # second. This is what removes the contributor-frequency effect
+                # (16.7x to 87.8x worse realised edge at the highest frequency).
+                #
+                # expected_p is not in scope here but is recoverable exactly:
+                # marg = smooth_prob - expected_p by construction.
+                if state.agg is not None and uid is not None:
+                    _exp_p = smooth_prob - marg
+                    _bc = float(user_brier_count[uid])
+                    if _bc > 0.0:
+                        _bx = float(state.user_brier_price_sum[uid])
+                        _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
+                            if _bx > 1e-12 else 0.0
+                        _bss *= _bc / (_bc + AGG_K0)
+                    else:
+                        _bss = 0.0
+                    # Forecast-variance advantage over the price, irreducible
+                    # term removed. ratio <= 1 means no demonstrated edge, which
+                    # yields weight 0: the prior IS the price, so such a wallet
+                    # adds nothing. This is what stops a market maker with
+                    # 100,000 settled markets from dominating every aggregate.
+                    _ratio = _skill_ratio(
+                        float(state.user_brier_sum[uid]),
+                        float(state.user_brier_price_sum[uid]),
+                        float(state.user_brier_out_sum[uid]), _bc)
+                    # CONVICTION: the reverse-Kelly bet fraction. p_true =
+                    # price + fraction*(1-price), so as fraction -> 0 the
+                    # wallet's stated view converges on the price, which is
+                    # already the prior. Such a vote says nothing new yet still
+                    # occupies the denominator and drags the aggregate back
+                    # toward the price, suppressing high-conviction wallets.
+                    # Applies at ANY experience level, including a first trade.
+                    _tpm = (float(user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
+                    _agg_ratio = _ratio
+                    state.agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
+                                      ratio=_ratio, k0=AGG_K0,
+                                      conviction=float(wager_fraction),
+                                      trades_per_market=_tpm)
+                    _c_n, _c_conv, _c_tpm = state.agg.contributor_stats(cid)
+                    if AGGREGATE_MODE and _exp_p > 0.0:
+                        _ap, _an, _aw = state.agg.estimate(cid, _exp_p)
+                        _agg_sum_w = _aw
+                        smooth_prob = _ap
+                        marg = _ap - _exp_p
+                        perc_marg = marg / _exp_p
+
                 if (perc_marg > 0.0
                         and variance_v < 0.15
                         and price < MAX_ENTRY_PRICE
@@ -2070,11 +2243,12 @@ def main():
                         executions_buffer.append([
                             ts, mid_for_signal, "BOUGHT", out_labels[i], 0,
                             buy_price, max_slip, trade_size, 0, 0, 0,
-                            float(trust_weight), perc_marg,
+                            float(wager_fraction), perc_marg,
                             float(trust_weight), float(user_total_trades[uid]),
                             float(user_brier_count[uid]),
                             float(smooth_prob), float(variance_v), float(ttr_hours),
-                            _n_contrib, _contrib_med
+                            _n_contrib, _contrib_med,
+                            float(_agg_sum_w), float(_agg_ratio)
                         ])
 
                 # -------------------------------------------------------
@@ -2089,7 +2263,8 @@ def main():
                         ts, m['id'], cid, out_labels[i], price, ttr_hours,
                         smooth_prob, marg, perc_marg, variance_v, m['volume'],
                         user, user_brier_count[uid], trust_weight,
-                        m_end, m['outcome']
+                        m_end, m['outcome'],
+                        _c_n, round(_c_conv, 5), round(_c_tpm, 2)
                     ])
 
                     if len(results_buffer) >= 10000:
@@ -2116,7 +2291,7 @@ def main():
                     executions_buffer.append([
                         ts, p_data['market_id'], "TAKE_PROFIT", p_data['direction'], 0,
                         sell_price, max_slip, p_data['bet_size'], profit,
-                        profit / p_data['bet_size'], 0, 0, 0,
+                        profit / p_data['bet_size'], 0, 0, 0, "", "",
                         # diagnostics are entry-time properties; blank on exit legs
                         # (loss_patterns.py joins them from the BOUGHT row by market_id)
                         "", "", "", "", "", "", "", ""
@@ -2174,7 +2349,7 @@ def main():
                             if profit > 0:   result_map['performance']['wins']   += 1
                             elif profit < 0: result_map['performance']['losses'] += 1
 
-                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0,
+                            executions_buffer.append([ts, mid, "RESOLVED", p_data['direction'], 0, 1.0, 0, p_data['bet_size'], profit, profit/p_data['bet_size'], 0, 0, 0, "", "",
                                                       "", "", "", "", "", "", "", ""])
                             cids_to_remove.append(p_cid)
 
