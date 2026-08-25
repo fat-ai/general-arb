@@ -1002,8 +1002,8 @@ class LiveTrader:
                 await self._process_batch([trade])
 
             except Exception as e:
-                log.info(raw_trade)
-                log.error(f"❌ Processing Error: {e}")
+                log.error(f"❌ Processing Error: {e}\n{traceback.format_exc()}")
+                log.error(f"   offending trade: {raw_trade}")
                 
     # --- unknown-token resolution, OFF the consumer's critical path ---------
     PARK_MAX_PER_TOKEN = 2000      # trades held per unresolved token
@@ -1097,9 +1097,6 @@ class LiveTrader:
     async def _process_batch(self, trades):
         batch_scores = []
         skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
-        self.stats['hist_hits'] = self.stats.get('hist_hits', 0) + (
-            1 if (len(self.state.user_history_yes[uid]) or len(self.state.user_history_no[uid])) else 0)
-        self.stats['hist_total'] = self.stats.get('hist_total', 0) + 1
         # B7: taker AND maker, matching sim_strat_5's UNION ALL. The maker's
         # side is the OPPOSITE of the taker's -- if the taker bought, the maker
         # sold -- so is_buy inverts on the maker leg.
@@ -1198,7 +1195,17 @@ class LiveTrader:
                     self.state.next_user_id += 1
                     self.state.user_history_yes.append(_EMPTY_U32)
                     self.state.user_history_no.append(_EMPTY_U32)
-                
+
+            # N0 verification: share of processed legs whose wallet resolved to a
+            # NON-EMPTY history. Pre-fix this was exactly 0.000 -- every wallet
+            # looked new, so smoothed_win_rate collapsed to expected_p and the
+            # per-wallet signal was dead. Must be materially above zero now.
+            # Placed HERE, inside the leg loop, because uid is only bound above.
+            self.stats['hist_total'] = self.stats.get('hist_total', 0) + 1
+            if (len(self.state.user_history_yes[uid])
+                    or len(self.state.user_history_no[uid])):
+                self.stats['hist_hits'] = self.stats.get('hist_hits', 0) + 1
+
             u_trades = self.state.user_total_trades[uid]
             if u_trades == 0:
                 self.state.global_user_count += 1
