@@ -33,6 +33,7 @@ from sim_strat_5 import (
     TRADES_PATH,
     _EMPTY_U32,
 )
+from market_time import derive_window, in_window, ttr_hours as mt_ttr_hours
 
 __main__.MarketPositions = MarketPositions
 __main__.BayesianState = BayesianState
@@ -264,56 +265,60 @@ def export_dashboard_scores(state: BayesianState):
         log.error(f"⚠️ Failed to export dashboard scores: {e}")
 
 def load_markets() -> dict:
-    """Loads market metadata via Polars with optimized memory mapping."""
+    """Loads market metadata via Polars with optimized memory mapping.
+
+    N5: window and ttr now come from market_time.derive_window, the same
+    derivation sim_strat_5 uses (verified identical over 5,445,454 markets).
+    Previously this set 'end' = resolution_timestamp for EVERY market, which
+    the sim documents as an unreliable scheduled placeholder -- gating trades
+    on it discarded the entire in-game window (validated: 508956 kept 5/21
+    trades). 'end' is now None for OPEN markets, meaning no upper bound.
+    """
     log.info("📂 Loading Market Metadata...")
-    
-    # Define only the columns we actually need to read from disk
-    cols_to_read = [
-        'contract_id', 'market_id', 'outcome', 
-        'token_outcome_label', 'resolution_timestamp', 'start_date'
-    ]
-    
-    # Use scan_parquet for lazy evaluation, select only needed columns, then collect
+
+    # Column casts mirror sim_strat_5:1321-1337 exactly. The casts are
+    # behaviour-neutral on this schema (verified) but are kept so the two
+    # readers cannot drift if the parquet dtypes ever change.
     markets_pl = pl.scan_parquet(MARKETS_PATH).select([
-        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-        pl.col('market_id').alias('id'),
-        pl.col('outcome').cast(pl.Float32),
-        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
-        pl.col('resolution_timestamp'),
-        pl.col('start_date')
+        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),   # 0
+        pl.col('market_id').alias('id'),                                                    # 1
+        pl.col('outcome').cast(pl.Float32),                                                 # 2
+        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),                 # 3
+        pl.col('resolution_timestamp'),                                                     # 4
+        pl.col('start_date').cast(pl.String).alias('start_date'),                           # 5
+        pl.col('closed_time'),                                                              # 6
+        pl.col('closed'),                                                                   # 7
+        pl.col('eventStartTime').cast(pl.String).alias('eventStartTime'),                   # 8
+        pl.col('game_start_time').cast(pl.String).alias('game_start_time'),                 # 9
     ]).collect()
-    
+
     market_map = {}
-    
-    # Use raw tuples (iter_rows) instead of named=True to prevent instantiating 2.2 million temporary dicts
+
+    # Raw tuples (not named=True) to avoid instantiating millions of temp dicts.
     for row in markets_pl.iter_rows():
-        if not row[0]: continue # Skip if contract_id is null after processing
+        if not row[0]:
+            continue                              # null contract_id after cleaning
         cid = sys.intern(row[0])
-        
-        # Parse Start Date safely
-        s_date = row[5]
-        if isinstance(s_date, str):
-            try: 
-                s_date = pd.to_datetime(s_date, utc=True).timestamp()
-            except Exception: 
-                s_date = None
-        elif hasattr(s_date, 'timestamp'):
-            s_date = s_date.timestamp()
-            
-        # Parse End Date safely
-        e_date = row[4]
-        if hasattr(e_date, 'timestamp'):
-            e_date = e_date.timestamp()
-            
+
+        s_date, e_date, sched_end = derive_window(
+            start_date=row[5],
+            resolution_timestamp=row[4],
+            closed_time=row[6],
+            closed=row[7],
+            event_start_time=row[8],
+            game_start_time=row[9],
+        )
+
         market_map[cid] = {
-            'id': row[1], 
-            'start': s_date, 
-            'end': e_date,
-            'outcome': row[2], 
-            # Use sys.intern to share memory for repetitive strings like "yes" and "no"
-            'outcome_label': sys.intern(row[3]) if row[3] else None 
+            'id': row[1],
+            'start': s_date,
+            'end': e_date,                        # None = OPEN, no upper bound
+            'sched_end': sched_end,               # ttr reference for open markets
+            'outcome': row[2],
+            # sys.intern shares memory for repetitive strings like "yes"/"no"
+            'outcome_label': sys.intern(row[3]) if row[3] else None,
         }
-        
+
     return market_map
     
 def main():
@@ -339,15 +344,19 @@ def main():
     # 2. Single pass through tracked contracts
     for cid in tracked_cids:
         m = market_map.get(cid)
-        
+
         if m is not None:
             outcome = m['outcome']
             # Safe check: Must not be None, and must not be NaN
             if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
                 cids_to_resolve.append(cid)
-            # Check if orphaned/expired beyond cutoff
-            elif m['end'] is not None and m['end'] < orphan_cutoff_ts:
-                orphan_cids.append(cid)
+            else:
+                # N5: 'end' is None for OPEN markets, so it can no longer stand
+                # alone here -- an open market would never age out. Fall back to
+                # the scheduled end so a stuck market is still reclaimed.
+                _ref = m['end'] if m['end'] is not None else m['sched_end']
+                if _ref is not None and _ref < orphan_cutoff_ts:
+                    orphan_cids.append(cid)
         else:
             # If it is completely missing from market_map, it is dead/orphaned
             orphan_cids.append(cid)
@@ -515,17 +524,19 @@ def main():
                     
                     cid = sys.intern(str(raw_cid))
                     user = sys.intern(str(raw_user))
-                        
+
                     m = market_map.get(cid)
                     if not m: continue
-                    if m['start'] is not None and ts < m['start']: continue
-                    if m['end'] is not None and ts > m['end']: continue
-                    
+                    # N5: end=None means OPEN -> no upper bound. The old
+                    # `ts > resolution_timestamp` gate discarded the whole
+                    # in-game trading window (sim_strat_5:1416-1432).
+                    if not in_window(ts, m['start'], m['end']): continue
+
                     qty = abs(tokens)
                     is_buying = (tokens > 0)
                     bet_on = m['outcome_label']
                     is_yes = (bet_on == "yes")
-                    
+
                     # 1. Invested Amount & Bit-Packing
                     invested = price * qty if is_buying else (1.0 - price) * qty
                     # expected_p, NOT the raw price. process_trade queries at
@@ -534,8 +545,11 @@ def main():
                     # sells contributed nothing AND were written mis-bucketed.
                     expected_p = price if is_buying else (1.0 - price)
                     price_int = max(0, min(1000, int(expected_p * 1000)))
-                    m_end = m['end'] if m['end'] is not None else (ts + 86400.0)
-                    ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+                    # N5: the sim's chain (end -> sched_end -> 25.9h median).
+                    # The old `m['end'] or ts + 86400` was a flat 24h guess the
+                    # sim replaced with the measured median; a flat 24 is wrong
+                    # for 61% of markets.
+                    ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
                     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
                     packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
                     
