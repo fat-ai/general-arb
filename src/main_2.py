@@ -1731,7 +1731,7 @@ class LiveTrader:
                     market_obj = self.metadata.markets.get(mkt_id)
                     
                     # 1. Grab the expiration timestamp (default to 0 if not found)
-                    expiration_ts = market_obj.get('end_timestamp', 0.0) if market_obj else 0.0
+                    expiration_ts = (market_obj.get('end_timestamp') or 0.0) if market_obj else 0.0
                     
                     if market_obj:
                         market_tokens = [str(t) for t in market_obj['tokens'].values()]
