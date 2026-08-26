@@ -426,9 +426,15 @@ class LiveTrader:
             self.order_books[asset_id]['asks'] = {
                 float(x['price']): float(x['size']) for x in item.get('asks', [])
             }
+            # 'stamp' identifies the book VERSION (used to reset a patient exec's
+            # virtual consumption). 'recv' is local wall-clock receipt time, used
+            # for the staleness guard in _prepare_clean_book. Both must exist:
+            # _attempt_exec previously read 'timestamp'/'hash', which were never
+            # written, so its reset never fired.
             self.order_books[asset_id]['stamp'] = (
-                item.get('hash') or item.get('timestamp')
+                item.get('hash') or item.get('timestamp') or time.time()
             )
+            self.order_books[asset_id]['recv'] = time.time()
 
         except Exception as e:
             log.error(f"Snapshot Error: {e}")
@@ -462,6 +468,14 @@ class LiveTrader:
                 else:
                     book_side[p] = s
 
+            # A delta refreshes the book: bump both the version and the receipt
+            # time so the staleness guard and the virtual-consumption reset see it.
+            if changes:
+                self.order_books[asset_id]['recv'] = time.time()
+                self.order_books[asset_id]['stamp'] = (
+                    item.get('hash') or item.get('timestamp') or time.time()
+                )
+
         except Exception as e:
             log.error(f"Update Error: {e}")
 
@@ -491,6 +505,11 @@ class LiveTrader:
                         
                     if to_unsubscribe:
                         self.ws_client.unsubscribe(to_unsubscribe)
+                        # Drop the cached book. Without this the last snapshot
+                        # lives forever and _prepare_clean_book keeps quoting a
+                        # market we no longer receive updates for.
+                        for _t in to_unsubscribe:
+                            self.order_books.pop(str(_t), None)
                 
                 # Update our local memory of what the WS is doing
                 currently_subscribed = desired_list
@@ -553,7 +572,12 @@ class LiveTrader:
                     f"Last: {last_seen} | "
                     f"🏆 Top Scores: [{top_scores_str}] | "
                     f"🎯 Triggers: {triggers} | "
-                    f"Queue Size: {q_size}"
+                    f"Queue Size: {q_size} | "
+                    f"buy/sell: {self.stats.get('n_buy', 0)}/{self.stats.get('n_sell', 0)} | "
+                    f"noColl: {self.stats.get('skipped_no_collateral', 0)} "
+                    f"bothColl: {self.stats.get('skipped_both_collateral', 0)} | "
+                    f"staleBook: {self.stats.get('stale_book_rejects', 0)} | "
+                    f"hist: {self.stats.get('hist_hits', 0)}/{self.stats.get('hist_total', 0)}"
                 )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
@@ -854,7 +878,9 @@ class LiveTrader:
                     'is_buy': is_buy,
                     'retry_count': 0
                 }
-
+                
+                self.stats['n_buy' if is_buy else 'n_sell'] = \
+                    self.stats.get('n_buy' if is_buy else 'n_sell', 0) + 1
                 await self.trade_queue.put(trade_obj)
                 self.stats['processed_count'] += 1
                 return "TRADE"
@@ -1479,9 +1505,23 @@ class LiveTrader:
         return marks
 
     def _prepare_clean_book(self, token_id):
-        """Helper to convert dictionary order books to sorted lists."""
+        """Helper to convert dictionary order books to sorted lists.
+
+        Returns None for a STALE book. Previously any snapshot was served
+        regardless of age, so an unsubscribed token's frozen book was quoted
+        indefinitely -- the bot waited on a wide ask that no longer existed,
+        then filled in a burst the instant a fresh snapshot finally arrived.
+        Returning None routes the caller into its existing resubscribe path,
+        which is what should happen when we have no current view of a market.
+        """
         raw_book = self.order_books.get(str(token_id))
         if not raw_book:
+            return None
+
+        max_age = float(CONFIG.get('book_max_age_s', 120.0))
+        recv = raw_book.get('recv')
+        if recv is None or (time.time() - recv) > max_age:
+            self.stats['stale_book_rejects'] = self.stats.get('stale_book_rejects', 0) + 1
             return None
 
         bids_dict = raw_book.get('bids', {})
@@ -1497,7 +1537,7 @@ class LiveTrader:
         # Sort: Bids = Highest First, Asks = Lowest First
         sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
         sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
-        
+
         return {'bids': sorted_bids, 'asks': sorted_asks}
 
     async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
@@ -1586,7 +1626,11 @@ class LiveTrader:
                     await asyncio.sleep(sweep_tick)
                     continue
                 _raw = self.order_books.get(token_id) or {}
-                _stamp = _raw.get('timestamp') or _raw.get('hash')
+                # 'stamp' is the key _process_snapshot/_process_update actually
+                # write. This read 'timestamp'/'hash', which are never set, so
+                # _stamp was always None and the reset never fired -- the task's
+                # virtual book only ever depleted, never replenished.
+                _stamp = _raw.get('stamp')
                 if _stamp != _last_bk_stamp:
                     virtual_consumption.clear()
                     _last_bk_stamp = _stamp
