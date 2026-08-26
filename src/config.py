@@ -57,7 +57,8 @@ CONFIG = {
     "opposite_min_sib_price": 0.00,
     "max_entry_price": 0.25,
     "signal_threshold": 0.1,
-    "max_variance": 0.15
+    "max_variance": 0.15,
+    "book_max_age_s": 120.0
 }
 
 # --- LOGGING SETUP ---
