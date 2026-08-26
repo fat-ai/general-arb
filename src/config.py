@@ -58,7 +58,6 @@ CONFIG = {
     "max_entry_price": 0.25,
     "signal_threshold": 0.1,
     "max_variance": 0.15,
-    "book_max_age_s": 120.0,
     "exec_post_end_grace_s": 300.0
 }
 
