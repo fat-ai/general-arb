@@ -217,12 +217,15 @@ class LiveTrader:
        
         self.order_books: Dict[str, Dict] = {}
         self.ws_queue = asyncio.Queue()
-        # Wall-clock receipt of the last WS message of any kind. Book freshness is
-        # a CONNECTION property, not a per-token one: a quiet market's book is
-        # correct even with no updates for minutes, but every book is suspect once
-        # the socket is dead. Books for unsubscribed tokens are deleted outright
-        # in _subscription_monitor_loop, so this is the only remaining staleness.
+        # Wall-clock receipt of the last WS message of any kind. Diagnostic only:
+        # book freshness is judged against ws_client.connected_since, not against
+        # this, because a quiet market's book is correct however long it has been
+        # still. Kept because a growing gap here is a useful early warning.
         self.last_ws_msg_ts = 0.0
+        # token_id -> {filled, target, started, reason} for every LIVE patient
+        # execution. Surfaced in the 30s report so a stalled task is visible
+        # instead of having to be inferred from an absence of log lines.
+        self.exec_status = {}
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.pending_markets: Set[str] = set()
