@@ -34,14 +34,28 @@ class PolymarketWS:
 
     def on_open(self, ws):
         log.info("⚡ Websocket Connected.")
-        
+
         if self.assets_ids:
-            payload = {"operation": "subscribe", "assets_ids": list(self.assets_ids)}
-            try:
-                ws.send(json.dumps(payload))
-                log.info(f"🔄 Auto-resubscribed to {len(self.assets_ids)} tracked assets")
-            except Exception as e:
-                log.error(f"Failed to resubscribe on open: {e}")
+            # Batch the resubscribe. assets_ids grows monotonically (subscribe()
+            # and resubscribe_single() both add, and pins are never released), so
+            # a single frame listing every asset can exceed the server's max frame
+            # size -- which fails silently or drops the connection, producing the
+            # exact reconnect loop this is meant to recover from.
+            ids = list(self.assets_ids)
+            batch = 500
+            sent = 0
+            for i in range(0, len(ids), batch):
+                chunk = ids[i:i + batch]
+                payload = {"operation": "subscribe", "assets_ids": chunk}
+                try:
+                    ws.send(json.dumps(payload))
+                    sent += len(chunk)
+                    time.sleep(0.05)
+                except Exception as e:
+                    log.error(f"Failed to resubscribe batch at {i}: {e}")
+                    break
+            log.info(f"🔄 Auto-resubscribed to {sent} of {len(ids)} tracked assets "
+                     f"in {(sent + batch - 1) // batch} batches")
         else:
             log.info("💤 WS Idle (No assets to subscribe to yet)")
         
@@ -86,6 +100,7 @@ class PolymarketWS:
 
     def _keep_alive_loop(self):
         while self.running:
+            _t0 = time.time()
             try:
                 self.ws = WebSocketApp(
                     self.url,
@@ -94,12 +109,18 @@ class PolymarketWS:
                     on_close=self.on_close,
                     on_open=self.on_open
                 )
-                self.ws.run_forever()
+                # ping_interval is REQUIRED. Without it websocket-client sends no
+                # ping frames and the CLOB closes the connection on idle -- three
+                # consecutive 125s lifetimes in the 2026-08-25 run. Each drop
+                # freezes every order book until the reconnect snapshot flood,
+                # which is what produced burst fills on stale prices.
+                self.ws.run_forever(ping_interval=10, ping_timeout=5)
             except Exception as e:
                 log.error(f"WS Loop Crashed: {e}")
-            
+
             if self.running:
-                log.info("🔄 Auto-reconnecting WS in 2s...")
+                log.warning(f"🔄 WS session lasted {time.time() - _t0:.0f}s. "
+                            f"Auto-reconnecting in 2s...")
                 time.sleep(2)
 
     def start_thread(self):
