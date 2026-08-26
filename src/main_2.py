@@ -216,6 +216,12 @@ class LiveTrader:
        
         self.order_books: Dict[str, Dict] = {}
         self.ws_queue = asyncio.Queue()
+        # Wall-clock receipt of the last WS message of any kind. Book freshness is
+        # a CONNECTION property, not a per-token one: a quiet market's book is
+        # correct even with no updates for minutes, but every book is suspect once
+        # the socket is dead. Books for unsubscribed tokens are deleted outright
+        # in _subscription_monitor_loop, so this is the only remaining staleness.
+        self.last_ws_msg_ts = 0.0
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.pending_markets: Set[str] = set()
@@ -596,18 +602,19 @@ class LiveTrader:
             msg = await self.ws_queue.get()
             try:
                 if not msg: continue
+                self.last_ws_msg_ts = time.time()
                 try: data = json.loads(msg)
                 except: continue
 
                 items = data if isinstance(data, list) else [data]
                 for item in items:
                     event_type = item.get("event_type", "")
-                    
+
                     if event_type == "book":
                         self._process_snapshot(item)
                     elif event_type == "price_change":
                         self._process_update(item)
-                        
+
             except Exception as e:
                 log.error(f"WS Error: {e}")
             finally:
@@ -1507,20 +1514,19 @@ class LiveTrader:
     def _prepare_clean_book(self, token_id):
         """Helper to convert dictionary order books to sorted lists.
 
-        Returns None for a STALE book. Previously any snapshot was served
-        regardless of age, so an unsubscribed token's frozen book was quoted
-        indefinitely -- the bot waited on a wide ask that no longer existed,
-        then filled in a burst the instant a fresh snapshot finally arrived.
-        Returning None routes the caller into its existing resubscribe path,
-        which is what should happen when we have no current view of a market.
+        Returns None when the WEBSOCKET is stale, not when an individual book is
+        quiet. An illiquid market can go many minutes without a price_change and
+        its book is still correct; rejecting on per-book age silently stalled
+        every patient execution at the top of its sweep loop. Ghost books for
+        unsubscribed tokens are removed in _subscription_monitor_loop, so a dead
+        socket is the only remaining way to hold a book we cannot trust.
         """
         raw_book = self.order_books.get(str(token_id))
         if not raw_book:
             return None
 
-        max_age = float(CONFIG.get('book_max_age_s', 120.0))
-        recv = raw_book.get('recv')
-        if recv is None or (time.time() - recv) > max_age:
+        max_age = float(CONFIG.get('ws_max_silence_s', 120.0))
+        if self.last_ws_msg_ts and (time.time() - self.last_ws_msg_ts) > max_age:
             self.stats['stale_book_rejects'] = self.stats.get('stale_book_rejects', 0) + 1
             return None
 
