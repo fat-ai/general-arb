@@ -14,12 +14,18 @@ class PolymarketWS:
             self.url = f"{base}/ws/market"
         else:
             self.url = base
-            
+
         self.assets_ids = set(assets_ids) if assets_ids else set()
         self.on_message_callback = on_message_callback
         self.ws = None
         self.wst = None
         self.running = True
+        # Wall-clock time the CURRENT session opened, or None while disconnected.
+        # Consumers use it to tell whether a cached order book predates this
+        # session and may therefore have missed deltas. Written from the WS
+        # thread and read from the event loop; a float/None assignment is atomic
+        # under the GIL, so no lock is needed.
+        self.connected_since = None
 
     def on_message(self, ws, message):
         if self.on_message_callback:
@@ -30,17 +36,19 @@ class PolymarketWS:
         log.warning(f"WS Connection State: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
+        self.connected_since = None
         log.warning(f"WS Closed ({close_status_code}).")
 
     def on_open(self, ws):
+        self.connected_since = time.time()
         log.info("⚡ Websocket Connected.")
 
         if self.assets_ids:
             # Batch the resubscribe. assets_ids grows monotonically (subscribe()
-            # and resubscribe_single() both add, and pins are never released), so
-            # a single frame listing every asset can exceed the server's max frame
-            # size -- which fails silently or drops the connection, producing the
-            # exact reconnect loop this is meant to recover from.
+            # and resubscribe_single() both add), so a single frame listing every
+            # asset can exceed the server's max frame size -- which fails silently
+            # or drops the connection, producing the reconnect loop this is meant
+            # to recover from.
             ids = list(self.assets_ids)
             batch = 500
             sent = 0
@@ -54,8 +62,7 @@ class PolymarketWS:
                 except Exception as e:
                     log.error(f"Failed to resubscribe batch at {i}: {e}")
                     break
-            log.info(f"🔄 Auto-resubscribed to {sent} of {len(ids)} tracked assets "
-                     f"in {(sent + batch - 1) // batch} batches")
+            log.info(f"🔄 Auto-resubscribed to {sent} of {len(ids)} tracked assets")
         else:
             log.info("💤 WS Idle (No assets to subscribe to yet)")
         
