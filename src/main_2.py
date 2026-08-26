@@ -12,6 +12,7 @@ import aiohttp
 import copy
 import pickle
 from datetime import datetime, timezone
+from collections import Counter
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, STATE_FILE, BAYESIAN_FILE, setup_logging, validate_config
@@ -573,6 +574,19 @@ class LiveTrader:
 
             # 3. Create the Log Message
             if count > 0 or q_size > 0:
+                _ex = list(self.exec_status.values())
+                if _ex:
+                    _now = time.time()
+                    _fill = sum(e['filled'] for e in _ex)
+                    _targ = sum(e['target'] for e in _ex)
+                    _oldest = (_now - min(e['started'] for e in _ex)) / 60.0
+                    _reasons = Counter(e['reason'] for e in _ex).most_common(2)
+                    _exec_str = (f"{len(_ex)} live, ${_fill:.0f}/${_targ:.0f}, "
+                                 f"oldest {_oldest:.0f}m, "
+                                 + ", ".join(f"{r}×{n}" for r, n in _reasons))
+                else:
+                    _exec_str = "none"
+
                 log.info(
                     f"📊 REPORT (30s): Analyzed {count} trades | "
                     f"Last: {last_seen} | "
@@ -582,8 +596,10 @@ class LiveTrader:
                     f"buy/sell: {self.stats.get('n_buy', 0)}/{self.stats.get('n_sell', 0)} | "
                     f"noColl: {self.stats.get('skipped_no_collateral', 0)} "
                     f"bothColl: {self.stats.get('skipped_both_collateral', 0)} | "
-                    f"staleBook: {self.stats.get('stale_book_rejects', 0)} | "
-                    f"hist: {self.stats.get('hist_hits', 0)}/{self.stats.get('hist_total', 0)}"
+                    f"bookRej: down {self.stats.get('book_reject_ws_down', 0)} "
+                    f"preSess {self.stats.get('book_reject_pre_session', 0)} | "
+                    f"hist: {self.stats.get('hist_hits', 0)}/{self.stats.get('hist_total', 0)} | "
+                    f"⚙️ exec: {_exec_str}"
                 )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
@@ -1514,20 +1530,29 @@ class LiveTrader:
     def _prepare_clean_book(self, token_id):
         """Helper to convert dictionary order books to sorted lists.
 
-        Returns None when the WEBSOCKET is stale, not when an individual book is
-        quiet. An illiquid market can go many minutes without a price_change and
-        its book is still correct; rejecting on per-book age silently stalled
-        every patient execution at the top of its sweep loop. Ghost books for
-        unsubscribed tokens are removed in _subscription_monitor_loop, so a dead
-        socket is the only remaining way to hold a book we cannot trust.
+        Rejects a book only when we cannot vouch for it: the socket is down, or
+        the book was received before the CURRENT session opened and may have
+        missed deltas during the gap. There is deliberately no age threshold --
+        a quiet market's book is correct however long it has been still, and an
+        earlier per-book timeout silently stalled every patient execution at the
+        top of its sweep loop. Ghost books for unsubscribed tokens are removed
+        outright in _subscription_monitor_loop.
+
+        On reconnect, on_open resubscribes and the server returns a fresh
+        snapshot per asset, so books become valid again within seconds.
         """
         raw_book = self.order_books.get(str(token_id))
         if not raw_book:
             return None
 
-        max_age = float(CONFIG.get('ws_max_silence_s', 120.0))
-        if self.last_ws_msg_ts and (time.time() - self.last_ws_msg_ts) > max_age:
-            self.stats['stale_book_rejects'] = self.stats.get('stale_book_rejects', 0) + 1
+        session_start = getattr(self.ws_client, 'connected_since', None)
+        if session_start is None:
+            self.stats['book_reject_ws_down'] = self.stats.get('book_reject_ws_down', 0) + 1
+            return None
+
+        recv = raw_book.get('recv')
+        if recv is None or recv < session_start:
+            self.stats['book_reject_pre_session'] = self.stats.get('book_reject_pre_session', 0) + 1
             return None
 
         bids_dict = raw_book.get('bids', {})
@@ -1625,10 +1650,34 @@ class LiveTrader:
             min_chunk = float(CONFIG.get('min_chunk_usdc', 2.0))
             log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
     
-            # 5. Dynamic Sweep Loop
+             # 5. Dynamic Sweep Loop
+            _post_end_grace = float(CONFIG.get('exec_post_end_grace_s', 300.0))
+            _reason = "starting"
             while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
+                self.exec_status[token_id] = {
+                    'filled': accumulated_usdc, 'target': trade_size,
+                    'started': start_time, 'reason': _reason,
+                }
+
+                # Abort once the market is over. The loop previously ran the full
+                # exec_timeout regardless, so it kept sweeping books for markets
+                # that had already reached their end. end_timestamp is None while
+                # a market is open, so fall back to the scheduled end.
+                _mo = self.metadata.markets.get(mkt_id) or {}
+                _horizon = _mo.get('end_timestamp')
+                if _horizon is None:
+                    _horizon = _mo.get('sched_end_timestamp')
+                if _horizon is not None and time.time() > (_horizon + _post_end_grace):
+                    log.info(f"⌛ Abandoning exec for {token_id}: market {mkt_id} "
+                             f"ended {(time.time() - _horizon) / 60:.0f} min ago "
+                             f"(filled ${accumulated_usdc:.2f} of ${trade_size:.2f})")
+                    self.stats['exec_abandoned_ended'] = \
+                        self.stats.get('exec_abandoned_ended', 0) + 1
+                    break
+
                 clean_book = self._prepare_clean_book(token_id)
                 if not clean_book or (not clean_book['asks'] and not clean_book['bids']):
+                    _reason = "no usable book"
                     await asyncio.sleep(sweep_tick)
                     continue
                 _raw = self.order_books.get(token_id) or {}
@@ -1640,6 +1689,7 @@ class LiveTrader:
                 if _stamp != _last_bk_stamp:
                     virtual_consumption.clear()
                     _last_bk_stamp = _stamp
+                _reason = "sweeping"
                 # ==========================================
                 # Virtually Deplete the Book 
                 # ==========================================
@@ -1690,6 +1740,7 @@ class LiveTrader:
                         log.info(f"⏸️ Waiting on {token_id}: best ask "
                                  f"{best_ask:.4f} > signal {signal_price:.4f} "
                                  f"+ {_max_slip:.0%}")
+                    _reason = f"ask {best_ask:.4f} > {signal_price:.4f}+{_max_slip:.0%}"
                     await asyncio.sleep(sweep_tick)
                     continue
                 
@@ -1785,6 +1836,7 @@ class LiveTrader:
                 log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the requirements.")
         finally:
             self.sub_manager.unpin(token_id)
+            self.exec_status.pop(token_id, None)
             
     async def _requeue_trade(self, trade_obj, delay=10):
         """
