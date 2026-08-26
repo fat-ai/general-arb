@@ -35,6 +35,7 @@ USDC_ADDRESS = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174"
 # Adjust these values to tune the strategy risk profile
 CONFIG = {
     "live_trading": os.environ.get("LIVE_TRADING", "false").lower() == "true",
+    "aggregate_mode": True,
     "splash_threshold": 5.0,
     "decay_factor": 0.95,
     "sizing_mode": "fixed",
@@ -42,16 +43,21 @@ CONFIG = {
     "use_percentage_staking": False,
     "percentage_stake": 0.01,
     "stop_loss": 0.99,
-    "take_profit": 1000.0,
+    "take_profit": 0.95,
     "max_ws_subs": 100000,
-    "max_positions": 1000,
-    "max_slippage": 0.25,
-    "exec_timeout": 43200,
+    "max_positions": 1000000,
+    "max_slippage": 0.1,
+    "exec_timeout": 86400,
     "max_drawdown": 0.50,
     "initial_capital": 10000.0,
     "use_smart_exit": False, 
     "smart_exit_ratio": 0.5,
-    "exclude_hostile_from_scoring": True
+    "exclude_hostile_markets": False,
+    "opposite_action": "reverse",
+    "opposite_min_sib_price": 0.00,
+    "max_entry_price": 0.25,
+    "signal_threshold": 0.1,
+    "max_variance": 0.15
 }
 
 # --- LOGGING SETUP ---
@@ -62,13 +68,19 @@ def setup_logging(log_level=logging.INFO):
         tuple: (main_logger, audit_logger)
     """
     # 1. Main Application Logger
+    #
+    # force=True is REQUIRED. sim_strat_5.py:73 and daily_update.py:40 both call
+    # logging.basicConfig at import time, and basicConfig is a silent no-op once
+    # the root logger has handlers -- so without force the FileHandler below is
+    # never installed and paper_trader.log stays empty while stdout still works.
     logging.basicConfig(
         level=log_level,
         format='%(asctime)s - [PaperGold] - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler("paper_trader.log"),
             logging.StreamHandler()
-        ]
+        ],
+        force=True
     )
     log = logging.getLogger("PaperGold")
 
@@ -76,10 +88,13 @@ def setup_logging(log_level=logging.INFO):
     audit_log = logging.getLogger("TradeAudit")
     audit_log.setLevel(logging.INFO)
     audit_log.propagate = False
-    
-    audit_handler = logging.FileHandler(AUDIT_FILE)
-    audit_handler.setFormatter(logging.Formatter('%(message)s'))
-    audit_log.addHandler(audit_handler)
+
+    # Idempotent: repeated setup_logging() calls would otherwise stack handlers
+    # and write every trade to the audit file N times.
+    if not audit_log.handlers:
+        audit_handler = logging.FileHandler(AUDIT_FILE)
+        audit_handler.setFormatter(logging.Formatter('%(message)s'))
+        audit_log.addHandler(audit_handler)
 
     return log, audit_log
 
