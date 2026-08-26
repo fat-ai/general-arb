@@ -753,14 +753,24 @@ class LiveTrader:
             maker = "0x" + topics[2][-40:]
             taker = "0x" + topics[3][-40:]
             
+            # Collateral asset ids, verbatim from download_data_sql_hardened.py.
+            # BOTH "0" and "1" are collateral -- testing only against 0 misreads
+            # every leg with asset id 1 as a token.
+            _COLLATERAL = ("0", "1")
+
             EXCHANGE_CONTRACTS = [
                 "0xE111180000d2663C0091e4f400237545B87B996B",
                 "0xe2222d279d744050d28e00520010520000310F59"
             ]
-            
-            # Drop if taker is the exchange contract to prevent double-counting
+
+            # Drop if EITHER side is the exchange contract. The downloader checks
+            # both (`maker.lower() in EXCH_SET or taker.lower() in EXCH_SET`);
+            # this checked only the taker, so exchange-maker fills were ingested
+            # here but never by the pipeline the sim was built on.
             lower_exchanges = [addr.lower() for addr in EXCHANGE_CONTRACTS]
-            if maker == taker or taker.lower() in lower_exchanges:
+            if (maker == taker
+                    or taker.lower() in lower_exchanges
+                    or maker.lower() in lower_exchanges):
                 return "IGNORED"
 
             data_hex = log_item.get('data', '0x')
@@ -769,23 +779,53 @@ class LiveTrader:
 
             # V2 Data Payload has 7 chunks minimum
             if len(chunks) >= 7:
-                tid = str(int(chunks[1], 16))
+                # ch[0]=makerAssetId ch[1]=takerAssetId ch[2]=makerAmountFilled
+                # ch[3]=takerAmountFilled -- confirmed against
+                # download_data_sql_hardened.parse_log_to_row.
+                mk_asset = str(int(chunks[0], 16))
+                tk_asset = str(int(chunks[1], 16))
                 makerAmount = int(chunks[2], 16)
                 takerAmount = int(chunks[3], 16)
 
-                # PURE MATH VALIDATION LOGIC
+                mk_coll = mk_asset in _COLLATERAL
+                tk_coll = tk_asset in _COLLATERAL
+
+                # The contract is whichever leg is NOT collateral. Previously this
+                # took chunks[1] unconditionally, so every taker BUY (taker pays
+                # collateral -> takerAssetId 0) produced tid "0" and was mangled.
+                if mk_coll and not tk_coll:
+                    tid = tk_asset
+                elif tk_coll and not mk_coll:
+                    tid = mk_asset
+                elif not tk_coll and not mk_coll:
+                    # NO_COLLATERAL_SIDE (~0.97%): neither leg is collateral, so
+                    # the contract choice is arbitrary and the sign of the size is
+                    # undefined. sim_strat_5 and daily_update both exclude these;
+                    # here they became fabricated low prices in the entry band.
+                    self.stats['skipped_no_collateral'] = \
+                        self.stats.get('skipped_no_collateral', 0) + 1
+                    return "IGNORED"
+                else:
+                    # BOTH_COLLATERAL: cid would be "0"/"1", which no market join
+                    # can match. Dropped downstream by the sim's INNER JOIN; drop
+                    # it explicitly here so it is counted rather than silent.
+                    self.stats['skipped_both_collateral'] = \
+                        self.stats.get('skipped_both_collateral', 0) + 1
+                    return "IGNORED"
+
+                # Side and price from AMOUNTS, verbatim from derive(): the
+                # collateral leg is always the smaller number because a share is
+                # worth less than a dollar. mult=+1 (taker buys) <-> ma > ta,
+                # which is the sign convention sim_strat_5 reads as tokens > 0.
                 if makerAmount < takerAmount:
-                    # Maker pays USDC, Taker pays Shares -> Taker is SELLING
                     val_usdc = float(makerAmount) / 1e6
                     val_size = float(takerAmount) / 1e6
                     is_buy = False
                 elif makerAmount > takerAmount:
-                    # Maker pays Shares, Taker pays USDC -> Taker is BUYING
                     val_usdc = float(takerAmount) / 1e6
                     val_size = float(makerAmount) / 1e6
                     is_buy = True
                 else:
-                    # Exact $1.00 resolution boundary trade
                     val_usdc = float(makerAmount) / 1e6
                     val_size = float(takerAmount) / 1e6
                     is_buy = True
@@ -814,7 +854,7 @@ class LiveTrader:
                     'is_buy': is_buy,
                     'retry_count': 0
                 }
-                
+
                 await self.trade_queue.put(trade_obj)
                 self.stats['processed_count'] += 1
                 return "TRADE"
