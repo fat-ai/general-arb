@@ -1240,7 +1240,20 @@ class LiveTrader:
             _end = market.get('end_timestamp')
 
             # Direction Logic
-            is_yes_token = (token_id == list(market['tokens'].values())[0])
+            # The outcome LABEL is authoritative, matching sim_strat_5:1861
+            # (bet_on_is_yes[i] = out_labels[i] == "yes"). Dict position is a
+            # fallback only: it is arbitrary whenever token_outcome_label was
+            # missing and data.py keyed the token by index, which was inert
+            # while those markets were skipped outright but is load-bearing now
+            # that they feed wallet histories. A multi-outcome market whose
+            # labels are team names yields False for every token, which is the
+            # same answer the simulator gives.
+            _lbl = market.get('token_labels', {}).get(token_id)
+            if _lbl is not None:
+                is_yes_token = (_lbl == "yes")
+            else:
+                self.stats['side_by_position'] = self.stats.get('side_by_position', 0) + 1
+                is_yes_token = (token_id == list(market['tokens'].values())[0])
 
             if is_yes_token:
                 direction = 1.0 if is_buy else -1.0
