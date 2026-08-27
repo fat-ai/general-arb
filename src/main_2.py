@@ -1235,24 +1235,9 @@ class LiveTrader:
                 continue
 
             mid = market['id']
-
             _mstart = market.get('start_timestamp', 0)
-            if not _mstart:
-                skipped_counts["no_start_date"] = skipped_counts.get("no_start_date", 0) + 1
-                continue
-            if _mstart < self.start_time:
-                skipped_counts["old"] = skipped_counts.get("old", 0) + 1
-                continue
-
             # N5: end_timestamp is None for an OPEN market -- no upper bound.
-            # The old `market.get('end_timestamp', 0) < time.time()` treated a
-            # missing/open end as 0 and discarded the market as expired.
             _end = market.get('end_timestamp')
-            if _end is not None and _end < time.time():
-                skipped_counts["expired"] += 1
-                continue
-
-            self.sub_manager.add_active(list(market['tokens'].values()))
 
             # Direction Logic
             is_yes_token = (token_id == list(market['tokens'].values())[0])
@@ -1262,8 +1247,6 @@ class LiveTrader:
             else:
                 direction = -1.0 if is_buy else 1.0
 
-            # 6. Format Datetimes for State Ingestion
-
             bet_on = "yes" if is_yes_token else "no"
 
             # N5: the sim's chain (end -> sched_end -> 25.9h median), replacing
@@ -1271,8 +1254,17 @@ class LiveTrader:
             ttr_hours = mt_ttr_hours(t['timestamp'], _end,
                                      market.get('sched_end_timestamp'))
 
-            # ---------------------------------------------------------
-            # 7. INGEST TRADE INTO BAYESIAN STATE (Vectorized & Flat)
+            # =========================================================
+            # SECTION B -- INGEST INTO BAYESIAN STATE. RUNS FOR EVERY
+            # TRADE WITH A KNOWN TOKEN, REGARDLESS OF TRADABILITY.
+            # =========================================================
+            # sim_strat_5 runs uid assignment, per-user metrics,
+            # contract_positions and first_bets_pending BEFORE its start gate
+            # (:2092, which the comment at :2097-2100 confirms sits in section C,
+            # signals only). So the simulator LEARNS from markets it will never
+            # trade -- including the ~40% of rows with no Gamma metadata.
+            # main_2 previously gated first and never ingested them, so the live
+            # wallet histories were built from strictly less data than the sim's.
             # ---------------------------------------------------------
             # String-to-Int Dictionary Mapping to drop string pointer RAM
             # D1: address -> wallet_id -> str(wallet_id), the key space
@@ -1296,11 +1288,10 @@ class LiveTrader:
                     self.state.user_history_yes.append(_EMPTY_U32)
                     self.state.user_history_no.append(_EMPTY_U32)
 
-            # N0 verification: share of processed legs whose wallet resolved to a
+            # N0 verification: share of INGESTED legs whose wallet resolved to a
             # NON-EMPTY history. Pre-fix this was exactly 0.000 -- every wallet
             # looked new, so smoothed_win_rate collapsed to expected_p and the
-            # per-wallet signal was dead. Must be materially above zero now.
-            # Placed HERE, inside the leg loop, because uid is only bound above.
+            # per-wallet signal was dead. Must be materially above zero.
             self.stats['hist_total'] = self.stats.get('hist_total', 0) + 1
             if (len(self.state.user_history_yes[uid])
                     or len(self.state.user_history_no[uid])):
@@ -1311,15 +1302,15 @@ class LiveTrader:
                 self.state.global_user_count += 1
             else:
                 self.state.global_total_peak -= self.state.user_peak[uid]
-                
+
             current_global_avg = (self.state.global_total_peak / self.state.global_user_count) if self.state.global_user_count > 0 else 100.0
-            
+
             eff_dir = 1.0 if is_buy else -1.0
             if not is_yes_token: eff_dir *= -1.0
             is_effective_yes = bool(eff_dir > 0)
             yes_price = price if is_yes_token else 1.0 - price
 
-            # 7a. Math execution (via Numba)
+            # B1. Math execution (via Numba)
             _inv = usdc_vol if is_buy else (1.0 - price) * token_vol
             new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
                 yes_price, _inv,
@@ -1327,14 +1318,14 @@ class LiveTrader:
                 self.state.user_peak[uid],
                 u_trades, current_global_avg, is_effective_yes
             )
-            
-            # 7b. Direct Write-Back to NumPy Arrays
+
+            # B2. Direct Write-Back to NumPy Arrays
             self.state.user_exposure[uid] = new_exp
             self.state.user_peak[uid] = new_peak
             self.state.user_total_trades[uid] = new_n
             self.state.global_total_peak += new_peak
-            
-            # 7c. Bit-Packing (Price and TTR into uint32)
+
+            # B3. Bit-Packing (Price and TTR into uint32)
             # expected_p, not the raw price -- process_trade queries at
             # int(expected_p*1000), so packing the raw price put every sell
             # ~0.8 outside its own P_RANGE window.
@@ -1342,16 +1333,16 @@ class LiveTrader:
             price_int = max(0, min(1000, int(_expected_p * 1000)))
             log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
             packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
-            
-            # 7d. Contract Trackers Updates
+
+            # B4. Contract Trackers Updates
             m_pos = self.state.contract_positions[token_id]
             m_pos.user_ids.append(uid)
             m_pos.is_yes.append(1 if is_effective_yes else 0)
             m_pos.packed_data.append(packed)
             m_pos.p_trues.append(p_true)
             m_pos.stakes.append(_inv)
-            
-            # 7e. Flattened First Bet Pending Tracker
+
+            # B5. Flattened First Bet Pending Tracker
             if u_trades == 0:
                 _risk_vol = usdc_vol if is_buy else token_vol * (1.0 - price)
                 if _risk_vol >= 1.0:
@@ -1359,16 +1350,42 @@ class LiveTrader:
                         (uid, math.log1p(_risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buy, math.log1p(ttr_hours))
                     )
 
+            # =========================================================
+            # SECTION C -- SIGNAL. GATED, exactly as sim_strat_5:2092-2093.
+            # Everything above has already run for this trade.
+            # =========================================================
+            # N2 (by design, mirrors minitest.RESTRICT_TO_NEW_MARKETS): only
+            # trade markets created after this run began. start_timestamp is 0
+            # when start_date was null -- ~40% of parquet rows, which carry no
+            # Gamma metadata at all. Those are permanently untradeable, matching
+            # the sim's `m['start'] is None` clause, but they now CONTRIBUTE to
+            # wallet histories above, which is the parity this reorder restores.
+            if not _mstart:
+                skipped_counts["no_start_date"] = skipped_counts.get("no_start_date", 0) + 1
+                continue
+            if _mstart < self.start_time:
+                skipped_counts["old"] = skipped_counts.get("old", 0) + 1
+                continue
+            if _end is not None and _end < time.time():
+                skipped_counts["expired"] += 1
+                continue
+
+            # Only subscribe to books for markets we can actually trade --
+            # subscribing to the untradeable cohort would inflate assets_ids and
+            # push the WS past the point where it silently stalls.
+            self.sub_manager.add_active(list(market['tokens'].values()))
+            self.stats['sig_evaluated'] = self.stats.get('sig_evaluated', 0) + 1
+
             # ---------------------------------------------------------
-            # 8. EXTRACT BAYESIAN EDGE
+            # C1. EXTRACT BAYESIAN EDGE
             # ---------------------------------------------------------
             smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
-                uid=uid, price=price, stake=_inv, 
-                direction=direction, is_buying=is_buy, 
-                ttr_hours=ttr_hours, state=self.state, 
+                uid=uid, price=price, stake=_inv,
+                direction=direction, is_buying=is_buy,
+                ttr_hours=ttr_hours, state=self.state,
                 price_lut=PRICE_LUT, time_lut=TIME_LUT
             )
-            
+
             # B6: cast this wallet's vote, then read the MARKET aggregate.
             # sim_strat_5 overwrites smooth_prob/marg/perc_marg with
             # state.agg.estimate() before its gate, so without this the live bot
@@ -1404,10 +1421,8 @@ class LiveTrader:
             self.stats['scores'].append(normalized_weight)
             batch_scores.append((abs(normalized_weight), normalized_weight, mid))
 
-            # 9. Entry rule. B5: thresholds now come from CONFIG, so live and
-            #    backtest read the SAME numbers. price < 0.40 was three
-            #    generations stale -- sim_strat_5 records 0.12->0.15 at
-            #    -$6.78/trade and 0.15->0.20 at -$25.32/trade.
+            # C2. Entry rule. B5: thresholds now come from CONFIG, so live and
+            #    backtest read the SAME numbers.
             # --- OPPOSITE-SIGNAL CLOSE / REVERSE ---
             # Must precede the seen_market_ids check: that check skips every
             # market we already hold, which is every market this rule applies to.
@@ -1454,7 +1469,7 @@ class LiveTrader:
             if (normalized_weight > LIVE_SIGNAL_THRESHOLD
                     and variance_v < LIVE_MAX_VARIANCE
                     and price < LIVE_MAX_ENTRY_PRICE):
-                        
+
                 self.seen_market_ids.add(mid)
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
