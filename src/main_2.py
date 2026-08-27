@@ -13,6 +13,7 @@ import copy
 import pickle
 from datetime import datetime, timezone
 from collections import Counter
+from clob_rest import ClobRest
 
 # --- MODULE IMPORTS ---
 from config import CONFIG, WS_URL, USDC_ADDRESS, GAMMA_API_URL, EQUITY_FILE, STATE_FILE, BAYESIAN_FILE, setup_logging, validate_config
@@ -226,6 +227,7 @@ class LiveTrader:
         # execution. Surfaced in the 30s report so a stalled task is visible
         # instead of having to be inferred from an absence of log lines.
         self.exec_status = {}
+        self.rest = ClobRest(max_concurrent=int(CONFIG.get('rest_max_concurrent', 8)))
         self.seen_trade_ids: Set[str] = set()
         self.pending_orders: Set[str] = set()
         self.pending_markets: Set[str] = set()
@@ -610,7 +612,13 @@ class LiveTrader:
                     f"📈 coverage {_cov:.2f}% of {_seen:,} | skips: "
                     + " ".join(f"{k}={v:,}" for k, v in sorted(_sk.items()) if v)
                     + f" | ⚙️ exec: {_exec_str}"
-                )
+                    f"ws: {json.dumps(self.ws_client.pool_stats()['by_health'])} "
+                    f"deg {self.ws_client.pool_stats()['degraded_tokens']} | "
+                    f"rest: {self.rest.stats['calls']} calls "
+                    f"{self.rest.stats['errors']} err | "
+                    f"drift {self.stats.get('book_drift', 0)} "
+                    f"failover {self.stats.get('rest_failover', 0)} | "
+                    )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
             
@@ -1567,21 +1575,24 @@ class LiveTrader:
         return marks
 
     def _prepare_clean_book(self, token_id):
-        """Helper to convert dictionary order books to sorted lists.
+        """The WEBSOCKET view of the book, or None when we cannot vouch for it.
 
-        Rejects a book only when we cannot vouch for it: the socket is down, or
-        the book was received before the CURRENT session opened and may have
-        missed deltas during the gap. There is deliberately no age threshold --
-        a quiet market's book is correct however long it has been still, and an
-        earlier per-book timeout silently stalled every patient execution at the
-        top of its sweep loop. Ghost books for unsubscribed tokens are removed
-        outright in _subscription_monitor_loop.
-
-        On reconnect, on_open resubscribes and the server returns a fresh
-        snapshot per asset, so books become valid again within seconds.
+        Three rejection cases, all structural rather than time-based:
+          - the token's shard is down, or degraded after repeated silent freezes
+          - the book predates the current session, so deltas may have been missed
+          - the book is empty
+        There is no age threshold: a quiet market's book is correct however long
+        it has been still. Freezes are caught per SHARD in ws_handler, where 150
+        simultaneously silent tokens is unambiguous, rather than per token where
+        silence is normal.
         """
         raw_book = self.order_books.get(str(token_id))
         if not raw_book:
+            return None
+
+        health = self.ws_client.token_health(str(token_id))
+        if health in ("down", "degraded", "frozen"):
+            self.stats[f'book_reject_{health}'] = self.stats.get(f'book_reject_{health}', 0) + 1
             return None
 
         session_start = getattr(self.ws_client, 'connected_since', None)
@@ -1596,19 +1607,63 @@ class LiveTrader:
 
         bids_dict = raw_book.get('bids', {})
         asks_dict = raw_book.get('asks', {})
-
         if not bids_dict and not asks_dict:
             return None
 
-        # Create Lists: [[price, size], [price, size], ...]
-        bids_list = [[p, s] for p, s in bids_dict.items()]
-        asks_list = [[p, s] for p, s in asks_dict.items()]
-
-        # Sort: Bids = Highest First, Asks = Lowest First
-        sorted_bids = sorted(bids_list, key=lambda x: float(x[0]), reverse=True)
-        sorted_asks = sorted(asks_list, key=lambda x: float(x[0]))
-
+        sorted_bids = sorted([[p, s] for p, s in bids_dict.items()],
+                             key=lambda x: float(x[0]), reverse=True)
+        sorted_asks = sorted([[p, s] for p, s in asks_dict.items()],
+                             key=lambda x: float(x[0]))
         return {'bids': sorted_bids, 'asks': sorted_asks}
+
+    async def _book_for_action(self, token_id, verify=True):
+        """The book to ACT on. Websocket first; REST when WS cannot vouch, and
+        as a confirmation before committing.
+
+        Parts 3 and 4 of the price-integrity design. The websocket cannot report
+        its own silent freeze (issue #292: connection open, PONGs answered, zero
+        book data for hours, reconnect ineffective, REST correct throughout), so
+        no order is placed on a WS price alone.
+        """
+        ws_book = self._prepare_clean_book(token_id)
+
+        # Part 4 -- degradation. No usable WS view: go straight to REST.
+        if ws_book is None:
+            self.stats['rest_failover'] = self.stats.get('rest_failover', 0) + 1
+            return await self.rest.get_book(token_id)
+
+        if not verify or not CONFIG.get('verify_book_before_action', True):
+            return ws_book
+
+        # Part 3 -- verification. One call, one token, at the moment of action.
+        rb = await self.rest.get_book(token_id)
+        if rb is None:
+            return ws_book                      # REST unavailable: WS stands
+
+        def _top(b, side):
+            lv = b.get(side) or []
+            return float(lv[0][0]) if lv else None
+
+        w_ask, r_ask = _top(ws_book, 'asks'), _top(rb, 'asks')
+        w_bid, r_bid = _top(ws_book, 'bids'), _top(rb, 'bids')
+        tol = float(CONFIG.get('book_verify_tol', 0.005))
+
+        drift = False
+        if (w_ask is None) != (r_ask is None) or \
+           (w_ask is not None and abs(w_ask - r_ask) > tol):
+            drift = True
+        if (w_bid is None) != (r_bid is None) or \
+           (w_bid is not None and abs(w_bid - r_bid) > tol):
+            drift = True
+
+        if drift:
+            self.stats['book_drift'] = self.stats.get('book_drift', 0) + 1
+            log.warning(f"📕 Book drift {token_id[:12]}…: WS ask={w_ask} bid={w_bid} "
+                        f"vs REST ask={r_ask} bid={r_bid} "
+                        f"(health={self.ws_client.token_health(str(token_id))}) "
+                        f"-- using REST")
+            return rb
+        return ws_book
 
     async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
         token_id = str(token_id)
@@ -1698,23 +1753,23 @@ class LiveTrader:
                     'started': start_time, 'reason': _reason,
                 }
 
-                # Abort once the market is over. The loop previously ran the full
-                # exec_timeout regardless, so it kept sweeping books for markets
-                # that had already reached their end. end_timestamp is None while
-                # a market is open, so fall back to the scheduled end.
+                # Abort only on a CONFIRMED close. end_timestamp is non-None only
+                # when derive_window saw closed=true, so this matches the entry
+                # gate exactly. It must NOT fall back to sched_end: for sports
+                # that resolves to eventStartTime -- the kickoff -- so an in-play
+                # market looked "ended" the moment the game began, and every
+                # in-play execution was aborted on the spot.
                 _mo = self.metadata.markets.get(mkt_id) or {}
                 _horizon = _mo.get('end_timestamp')
-                if _horizon is None:
-                    _horizon = _mo.get('sched_end_timestamp')
                 if _horizon is not None and time.time() > (_horizon + _post_end_grace):
                     log.info(f"⌛ Abandoning exec for {token_id}: market {mkt_id} "
-                             f"ended {(time.time() - _horizon) / 60:.0f} min ago "
+                             f"closed {(time.time() - _horizon) / 60:.0f} min ago "
                              f"(filled ${accumulated_usdc:.2f} of ${trade_size:.2f})")
                     self.stats['exec_abandoned_ended'] = \
                         self.stats.get('exec_abandoned_ended', 0) + 1
                     break
 
-                clean_book = self._prepare_clean_book(token_id)
+                clean_book = await self._book_for_action(token_id)
                 if not clean_book or (not clean_book['asks'] and not clean_book['bids']):
                     _reason = "no usable book"
                     await asyncio.sleep(sweep_tick)
@@ -1954,7 +2009,7 @@ class LiveTrader:
                         continue
                     if held_tid in self.pending_orders or fpmm in self.pending_markets:
                         continue
-                    clean_book = self._prepare_clean_book(held_tid)
+                    clean_book = await self._book_for_action(held_tid)
                     if not clean_book:
                         log.warning(f"⏳ Take-profit for {held_tid} (bid ${best_bid:.3f}) "
                                     f"but order book unavailable; will retry next tick.")
