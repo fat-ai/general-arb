@@ -58,7 +58,11 @@ CONFIG = {
     "max_entry_price": 0.25,
     "signal_threshold": 0.1,
     "max_variance": 0.15,
-    "exec_post_end_grace_s": 300.0
+    "exec_post_end_grace_s": 300.0,
+    "ws_max_per_conn": 150,
+    "rest_max_concurrent": 8,
+    "verify_book_before_action": True,
+    "book_verify_tol": 0.005
 }
 
 # --- LOGGING SETUP ---
