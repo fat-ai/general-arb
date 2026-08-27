@@ -590,6 +590,11 @@ class LiveTrader:
                 else:
                     _exec_str = "none"
 
+                _sk = self.stats.get('skips', {})
+                _evald = self.stats.get('hist_total', 0)
+                _seen = _evald + sum(_sk.values())
+                _cov = (100.0 * _evald / _seen) if _seen else 0.0
+
                 log.info(
                     f"📊 REPORT (30s): Analyzed {count} trades | "
                     f"Last: {last_seen} | "
@@ -601,8 +606,10 @@ class LiveTrader:
                     f"bothColl: {self.stats.get('skipped_both_collateral', 0)} | "
                     f"bookRej: down {self.stats.get('book_reject_ws_down', 0)} "
                     f"preSess {self.stats.get('book_reject_pre_session', 0)} | "
-                    f"hist: {self.stats.get('hist_hits', 0)}/{self.stats.get('hist_total', 0)} | "
-                    f"⚙️ exec: {_exec_str}"
+                    f"hist: {self.stats.get('hist_hits', 0)}/{_evald} | "
+                    f"📈 coverage {_cov:.2f}% of {_seen:,} | skips: "
+                    + " ".join(f"{k}={v:,}" for k, v in sorted(_sk.items()) if v)
+                    + f" | ⚙️ exec: {_exec_str}"
                 )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
@@ -1188,7 +1195,7 @@ class LiveTrader:
 
     async def _process_batch(self, trades):
         batch_scores = []
-        skipped_counts = {"expired": 0, "no_tokens": 0, "old": 0}
+        skipped_counts = self.stats.setdefault('skips', {"expired": 0, "no_tokens": 0, "old": 0})
         # B7: taker AND maker, matching sim_strat_5's UNION ALL. The maker's
         # side is the OPPOSITE of the taker's -- if the taker bought, the maker
         # sold -- so is_buy inverts on the maker leg.
@@ -1229,11 +1236,12 @@ class LiveTrader:
 
             mid = market['id']
 
-            # N2 (by design, mirrors minitest.RESTRICT_TO_NEW_MARKETS): only
-            # trade markets created after this run began, so a signal is acted
-            # on the first time it fires and never when stale.
-            if market.get('start_timestamp', 0) < self.start_time:
-                skipped_counts["old"] += 1
+            _mstart = market.get('start_timestamp', 0)
+            if not _mstart:
+                skipped_counts["no_start_date"] = skipped_counts.get("no_start_date", 0) + 1
+                continue
+            if _mstart < self.start_time:
+                skipped_counts["old"] = skipped_counts.get("old", 0) + 1
                 continue
 
             # N5: end_timestamp is None for an OPEN market -- no upper bound.
@@ -1458,8 +1466,8 @@ class LiveTrader:
             top_3 = batch_scores[:3]
             msg_parts = [f"Mkt {item[2]}..: {item[1]:.1f}" for item in top_3]
   #          log.info(f"📊 Batch Heat: {' | '.join(msg_parts)}")
-  #      else:
-  #          log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
+        else:
+            log.info(f"❄️ Batch Ignored. Skips: {json.dumps(skipped_counts)}")
             
     
 
