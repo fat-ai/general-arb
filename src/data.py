@@ -70,6 +70,7 @@ class MarketMetadata:
             legacy_tokens = ('clobTokenIds' in available)
             highest_id = 0
             synthetic = 0
+            unlabelled = 0
 
             for batch in pf.iter_batches(batch_size=50000, columns=wanted):
                 col = batch.to_pydict()
@@ -87,19 +88,17 @@ class MarketMetadata:
                         # the auto-generated markets Gamma has no record of.
                         # Previously they were dropped here, so their tokens never
                         # entered token_to_market and every one of their trades
-                        # died at the no_tokens gate (~2.6% of live skips).
+                        # died at the no_tokens gate.
                         #
                         # sim_strat_5 does NOT drop them: its start gate (:2092)
                         # sits in section C (signals), AFTER section B has already
                         # ingested the trade into wallet histories. So the sim
                         # LEARNS from this cohort and merely never trades it.
-                        # Falling back to condition_id restores that parity.
                         #
                         # They stay untradeable here too: start_date is null for
                         # these rows, so start_timestamp is 0 and the N2 gate in
                         # _process_batch rejects them as no_start_date. Do NOT
-                        # synthesise a start -- that would make them tradeable and
-                        # break parity in the other direction.
+                        # synthesise a start -- that would make them tradeable.
                         if raw_id is not None:
                             mid = str(raw_id).lower()
                             try:
@@ -112,9 +111,6 @@ class MarketMetadata:
                             mid = f"c:{str(raw_cond).lower()}"
                             synthetic += 1
                         elif raw_tok:
-                            # Last resort: no market_id and no condition_id. Keyed
-                            # per token, so the two legs of the market will not be
-                            # paired -- acceptable because these can never trade.
                             mid = f"t:{str(raw_tok)}"
                             synthetic += 1
                         else:
@@ -135,6 +131,13 @@ class MarketMetadata:
                                 "id": mid,
                                 "condition_id": str(raw_cond or '').lower(),
                                 "tokens": {},
+                                # token_id -> outcome label, lowercased. The
+                                # AUTHORITATIVE side, mirroring sim_strat_5's
+                                # bet_on_is_yes = (m['outcome_label'] == "yes").
+                                # Inferring the side from dict position breaks
+                                # whenever a label is missing and the token is
+                                # keyed by index instead.
+                                "token_labels": {},
                                 "active": bool(_c('active')) if _c('active') is not None else True,
                                 "question": str(_c('question') or 'Unknown'),
                                 "start_timestamp": _s if _s is not None else 0,
@@ -149,13 +152,20 @@ class MarketMetadata:
                             outcomes = json.loads(o_raw) if isinstance(o_raw, str) else (o_raw or [])
                             token_ids = json.loads(t_raw) if isinstance(t_raw, str) else (t_raw or [])
                             for outcome, t_id in zip(outcomes, token_ids):
-                                market_obj["tokens"][str(outcome).lower()] = str(t_id)
+                                lbl = str(outcome).strip().lower()
+                                market_obj["tokens"][lbl] = str(t_id)
+                                market_obj["token_labels"][str(t_id)] = lbl
                                 self.token_to_market[str(t_id)] = market_obj
                         else:
                             if raw_tok:
-                                label = str(_c('token_outcome_label') or '').lower()
-                                market_obj["tokens"][label or str(len(market_obj["tokens"]))] = str(raw_tok)
-                                self.token_to_market[str(raw_tok)] = market_obj
+                                lbl = str(_c('token_outcome_label') or '').strip().lower()
+                                tid = str(raw_tok)
+                                market_obj["tokens"][lbl or str(len(market_obj["tokens"]))] = tid
+                                if lbl:
+                                    market_obj["token_labels"][tid] = lbl
+                                else:
+                                    unlabelled += 1
+                                self.token_to_market[tid] = market_obj
                     except Exception:
                         continue
 
@@ -166,7 +176,8 @@ class MarketMetadata:
 
             self.highest_known_id = highest_id
             logger.info(f"✅ Loaded {len(self.markets)} markets from Parquet "
-                        f"({synthetic:,} keyed by condition/token fallback). "
+                        f"({synthetic:,} keyed by condition/token fallback, "
+                        f"{unlabelled:,} tokens with no outcome label). "
                         f"High-water mark ID: {self.highest_known_id}")
         except Exception as e:
             logger.error(f"❌ Failed to load Parquet cache: {e}")
@@ -223,9 +234,6 @@ class MarketMetadata:
                 cid = mkt.get('conditionId').lower()
 
                 # N5: same derivation as the parquet path and the simulator.
-                # The old inline chain here (eventStartTime -> game_start_time ->
-                # endDate -> 0) was a FOURTH variant, and it disagreed with the
-                # parquet path loaded in the same process.
                 _s, _e, _se = derive_window(
                     start_date=mkt.get('startDate'),
                     resolution_timestamp=mkt.get('endDate'),
@@ -243,14 +251,18 @@ class MarketMetadata:
                     token_ids = json.loads(token_ids)
 
                 tokens = {}
+                token_labels = {}
                 for outcome, token_id in zip(outcomes, token_ids):
-                    tokens[str(outcome).lower()] = str(token_id)
+                    lbl = str(outcome).strip().lower()
+                    tokens[lbl] = str(token_id)
+                    token_labels[str(token_id)] = lbl
 
                 if mid not in self.markets:
                     market_obj = {
                         "id": mid,
                         "condition_id": cid,
                         "tokens": tokens,
+                        "token_labels": token_labels,
                         "active": True,
                         "question": mkt.get('question'),
                         "start_timestamp": _s if _s is not None else 0,
@@ -262,6 +274,7 @@ class MarketMetadata:
                 else:
                     market_obj = self.markets[mid]
                     market_obj["tokens"].update(tokens)
+                    market_obj.setdefault("token_labels", {}).update(token_labels)
 
                 for t_id in tokens.values():
                     self.token_to_market[t_id] = market_obj
