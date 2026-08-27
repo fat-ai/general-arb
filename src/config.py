@@ -78,7 +78,7 @@ def setup_logging(log_level=logging.INFO):
         level=log_level,
         format='%(asctime)s - [PaperGold] - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("paper_trader.log"),
+            logging.FileHandler(CACHE_DIR / "paper_trader.log"),
             logging.StreamHandler()
         ],
         force=True
