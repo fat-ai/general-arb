@@ -53,14 +53,12 @@ class MarketMetadata:
             wanted = [c for c in [
                 'market_id', 'condition_id', 'question', 'active',
                 'start_date', 'resolution_timestamp',
-                # N5: the sim's window/ttr chain needs all of these. Reading
-                # resolution_timestamp alone is what produced a third,
-                # incompatible derivation here.
+                # N5: the sim's window/ttr chain needs all of these.
                 'closed_time', 'closed', 'eventStartTime', 'game_start_time',
                 'contract_id', 'token_outcome_label', 'outcomes', 'clobTokenIds',
             ] if c in available]
-            if 'market_id' not in available:
-                logger.error(f"❌ Parquet missing 'market_id'. Columns: {sorted(available)}")
+            if 'contract_id' not in available and 'clobTokenIds' not in available:
+                logger.error(f"❌ Parquet has no token column. Columns: {sorted(available)}")
                 return
 
             missing_time = [c for c in ('closed_time', 'closed', 'eventStartTime',
@@ -69,10 +67,10 @@ class MarketMetadata:
                 logger.warning(f"⚠️ Parquet lacks {missing_time}: ttr will fall back "
                                f"to a lower tier than the simulator uses.")
 
-            legacy_tokens = ('clobTokenIds' in available)  # old schema = token-id arrays per row
+            legacy_tokens = ('clobTokenIds' in available)
             highest_id = 0
+            synthetic = 0
 
-            # Stream in chunks so we never hold the whole ~140-col file in RAM.
             for batch in pf.iter_batches(batch_size=50000, columns=wanted):
                 col = batch.to_pydict()
                 for i in range(batch.num_rows):
@@ -80,16 +78,47 @@ class MarketMetadata:
                         def _c(key):
                             return (col.get(key) or [None] * batch.num_rows)[i]
 
-                        raw_id = col['market_id'][i]
-                        if raw_id is None:
+                        raw_id = _c('market_id')
+                        raw_cond = _c('condition_id')
+                        raw_tok = _c('contract_id')
+
+                        # 40.7% of rows carry NO Gamma metadata -- market_id,
+                        # question, outcomes and the rest are all null. These are
+                        # the auto-generated markets Gamma has no record of.
+                        # Previously they were dropped here, so their tokens never
+                        # entered token_to_market and every one of their trades
+                        # died at the no_tokens gate (~2.6% of live skips).
+                        #
+                        # sim_strat_5 does NOT drop them: its start gate (:2092)
+                        # sits in section C (signals), AFTER section B has already
+                        # ingested the trade into wallet histories. So the sim
+                        # LEARNS from this cohort and merely never trades it.
+                        # Falling back to condition_id restores that parity.
+                        #
+                        # They stay untradeable here too: start_date is null for
+                        # these rows, so start_timestamp is 0 and the N2 gate in
+                        # _process_batch rejects them as no_start_date. Do NOT
+                        # synthesise a start -- that would make them tradeable and
+                        # break parity in the other direction.
+                        if raw_id is not None:
+                            mid = str(raw_id).lower()
+                            try:
+                                numeric_id = int(raw_id)
+                                if numeric_id > highest_id:
+                                    highest_id = numeric_id
+                            except (ValueError, TypeError):
+                                pass
+                        elif raw_cond:
+                            mid = f"c:{str(raw_cond).lower()}"
+                            synthetic += 1
+                        elif raw_tok:
+                            # Last resort: no market_id and no condition_id. Keyed
+                            # per token, so the two legs of the market will not be
+                            # paired -- acceptable because these can never trade.
+                            mid = f"t:{str(raw_tok)}"
+                            synthetic += 1
+                        else:
                             continue
-                        mid = str(raw_id).lower()
-                        try:
-                            numeric_id = int(raw_id)
-                            if numeric_id > highest_id:
-                                highest_id = numeric_id
-                        except (ValueError, TypeError):
-                            pass
 
                         if mid not in self.markets:
                             # N5: single source of truth, identical to the sim.
@@ -104,7 +133,7 @@ class MarketMetadata:
                                 game_start_time=_c('game_start_time'))
                             self.markets[mid] = {
                                 "id": mid,
-                                "condition_id": str(_c('condition_id') or '').lower(),
+                                "condition_id": str(raw_cond or '').lower(),
                                 "tokens": {},
                                 "active": bool(_c('active')) if _c('active') is not None else True,
                                 "question": str(_c('question') or 'Unknown'),
@@ -123,11 +152,10 @@ class MarketMetadata:
                                 market_obj["tokens"][str(outcome).lower()] = str(t_id)
                                 self.token_to_market[str(t_id)] = market_obj
                         else:
-                            tid = _c('contract_id')
-                            if tid:
+                            if raw_tok:
                                 label = str(_c('token_outcome_label') or '').lower()
-                                market_obj["tokens"][label or str(len(market_obj["tokens"]))] = str(tid)
-                                self.token_to_market[str(tid)] = market_obj
+                                market_obj["tokens"][label or str(len(market_obj["tokens"]))] = str(raw_tok)
+                                self.token_to_market[str(raw_tok)] = market_obj
                     except Exception:
                         continue
 
@@ -137,7 +165,8 @@ class MarketMetadata:
                     m["tokens"] = {"yes": tk["yes"], **{k: v for k, v in tk.items() if k != "yes"}}
 
             self.highest_known_id = highest_id
-            logger.info(f"✅ Loaded {len(self.markets)} markets from Parquet. "
+            logger.info(f"✅ Loaded {len(self.markets)} markets from Parquet "
+                        f"({synthetic:,} keyed by condition/token fallback). "
                         f"High-water mark ID: {self.highest_known_id}")
         except Exception as e:
             logger.error(f"❌ Failed to load Parquet cache: {e}")
