@@ -30,6 +30,7 @@ SIGNAL = 0.1                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
 MAX_PRICE = 0.25
 MIN_ABS_MARGIN = 0.05
+OPPOSING_MAX_MARGIN = -0.05
 # Contributor gates.
 MAX_CONTRIB = None            # None disables. c_n = contributors to the posterior
 MAX_TPM = None                 # trigger trades-per-market; None = off. >=50 removes
@@ -181,6 +182,9 @@ prev_end = {}             # cid -> end_timestamp, to prune resolved markets from
 mid_tokens = {}                 # market_id -> {cid}: how many tokens we have SEEN.
                                 # Used only by the opposite-signal rule, to keep
                                 # 1 - p_sib to markets where it is exact.
+signal_counts = {}
+last_price = {}           # cid -> last-seen market price (for MTM of positions still open at data end)
+latest_margins = {}       # NEW: cid -> last-seen perc_margin (to check opposing side)
 
 # Metrics Tracking
 total_trades = 0
@@ -833,7 +837,9 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
     # Last-seen market price per cid across the FULL chunk (before we drop rows for the
     # streak/TP logic) — used to mark still-open positions to market at the data horizon.
     _last_px = chunk.groupby('cid')['price'].last().to_dict()
-
+    if 'perc_margin' in chunk.columns:
+        latest_margins.update(chunk.groupby('cid')['perc_margin'].last().to_dict())
+      
     if REQUIRE_NONDECLINING_PRICE:
         # Per-row "price >= token's last logged price", computed over ALL rows (pre
         # keep_mask). Cross-chunk continuity via prev_price, filled BEFORE updating it.
@@ -1091,6 +1097,16 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
             # Don't open the same token twice
             if _cid in open_positions:
                 continue
+
+            # Find all known tokens in this market, exclude the one we want to buy
+            siblings = [c for c in mid_tokens.get(_mid, set()) if c != _cid]
+            if len(siblings) == 1: # Ensure it is a binary market
+                sib_cid = siblings[0]
+                sib_margin = latest_margins.get(sib_cid, 0.0)
+                
+                # If the opposing token's margin is higher than our required negative threshold, reject the trade
+                if sib_margin > OPPOSING_MAX_MARGIN:
+                    continue
 
             # UNRESOLVED-or-LATE GATE. Under REQUIRE_RESOLVED_IN_WINDOW=True, an entered
             # trade must be BOTH scoreable (known outcome) AND resolve within the data:
