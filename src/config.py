@@ -64,7 +64,8 @@ CONFIG = {
     "rest_max_concurrent": 8,
     "verify_book_before_action": True,
     "book_verify_tol": 0.005,
-    "limit_expiry_s": 600.0
+    "limit_expiry_s": 600.0,
+    "min_chunk_usdc": 2.0
 }
 
 # --- LOGGING SETUP ---
