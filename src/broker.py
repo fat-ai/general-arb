@@ -6,7 +6,7 @@ import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple, Optional
-
+import math
 # Import configuration and constants
 from config import CONFIG, STATE_FILE
 
@@ -21,7 +21,16 @@ audit_log = logging.getLogger("TradeAudit")
 #  the right (neg-risk) adapter — so the bot configures no addresses here.
 # --------------------------------------------------------------------------- #
 
-
+# Buy limits must round DOWN to a valid tick: rounding up would pay more than
+# our own limit and silently widen the slippage we are modelling. On a 0.02
+# signal with a 0.01 tick, 0.021 floors to 0.02 -- the 5% allowance vanishes
+# entirely in the cheap band this strategy trades, which is a real interaction
+# worth measuring rather than assuming away.
+def floor_to_tick(price: float, tick: float) -> float:
+    if not tick or tick <= 0:
+        tick = 0.01
+    return max(tick, math.floor(float(price) / tick) * tick)
+    
 class PersistenceManager:
     """
     Manages the persistent state of the account (cash, positions, equity).
@@ -98,6 +107,7 @@ class BaseBroker:
     def __init__(self, persistence: PersistenceManager):
         self.pm = persistence
         self.lock = asyncio.Lock()
+        self.open_limits = {} 
 
     # ---- to be implemented by subclasses ------------------------------- #
     async def _fill(self, side: str, calc_amount: float, book: Dict,
@@ -127,7 +137,9 @@ class BaseBroker:
     # ---- the shared order lifecycle ------------------------------------ #
     async def execute_market_order(self, token_id: str, side: str,
                                    usdc_amount: float, fpmm_id: str,
-                                   current_book: Dict, expiration_ts: float = 0.0) -> bool:
+                                   current_book: Dict, expiration_ts: float = 0.0,
+                                   signal_ts: float = None,
+                                   signal_price: float = None) -> bool:
         if not current_book:
             log.warning(f"❌ Execution failed: No Order Book data for {token_id}")
             return False
@@ -241,10 +253,112 @@ class BaseBroker:
             audit_log.info(json.dumps({
                 "ts": time.time(), "side": side, "token": token_id,
                 "price": vwap_price, "qty": filled_qty, "equity": equity,
-                "fpmm": fpmm_id, "pnl": realized_pnl if side == "SELL" else 0.0
+                "fpmm": fpmm_id, "pnl": realized_pnl if side == "SELL" else 0.0,
+                "signal_ts": signal_ts, "signal_price": signal_price,
+                "fill_latency_s": (time.time() - signal_ts) if signal_ts else None,
+                "order_kind": "market",
             }))
             return True
 
+    async def place_limit_order(self, token_id: str, usdc_amount: float,
+                                limit_price: float, fpmm_id: str,
+                                tick: float = 0.01, expiration_ts: float = 0.0,
+                                signal_ts: float = None,
+                                signal_price: float = None,
+                                book: Dict = None):
+        """Rest a BUY limit. Returns an order id, or None.
+
+        For fleeting liquidity a resting order is strictly faster than any
+        polling loop: the match happens at the venue, so our round-trip is off
+        the critical path. It is also the faithful reading of minitest, which
+        fills at trade_price x (1 + slippage) -- a MAKER price. The trade that
+        generates our signal IS the ask being lifted, so sweeping for that same
+        price afterwards chases liquidity the signal itself consumed.
+        """
+        px = floor_to_tick(limit_price, tick)
+        if not (self.MIN_BUY_PRICE <= px <= self.MAX_BUY_PRICE):
+            log.warning(f"🛡️ Limit rejected for {token_id}: {px:.4f} out of bounds")
+            return None
+        if px <= 0 or usdc_amount <= 0:
+            return None
+
+        async with self.lock:
+            if self.pm.state["cash"] < float(usdc_amount):
+                log.warning(f"❌ Limit rejected {token_id}: insufficient cash "
+                            f"(need ${usdc_amount:.2f})")
+                return None
+
+        oid = await self._submit_limit(token_id, usdc_amount, px, expiration_ts, book)
+        if oid:
+            self.open_limits[oid] = {
+                "token_id": str(token_id), "fpmm_id": fpmm_id, "price": px,
+                "remaining_usdc": float(usdc_amount), "placed_at": time.time(),
+                "expires_at": (time.time() + expiration_ts) if expiration_ts else 0.0,
+                "signal_ts": signal_ts, "signal_price": signal_price,
+            }
+            log.info(f"📌 Resting BUY {token_id[:12]}… ${usdc_amount:.2f} @ {px:.4f} "
+                     f"(tick {tick}, expires {expiration_ts:.0f}s)")
+        return oid
+
+    async def _submit_limit(self, token_id, usdc_amount, price, expiration_ts, book):
+        raise NotImplementedError
+
+    async def cancel_limit_order(self, order_id, reason="cancelled"):
+        rec = self.open_limits.pop(order_id, None)
+        if not rec:
+            return False
+        await self._cancel_limit(order_id)
+        log.info(f"🗑️ Limit {reason}: {rec['token_id'][:12]}… "
+                 f"${rec['remaining_usdc']:.2f} @ {rec['price']:.4f}")
+        return True
+
+    async def _cancel_limit(self, order_id):
+        return True
+
+    async def expire_limits(self):
+        now = time.time()
+        for oid, rec in list(self.open_limits.items()):
+            if rec["expires_at"] and now > rec["expires_at"]:
+                await self.cancel_limit_order(oid, reason="expired")
+
+    async def _apply_buy_fill(self, token_id, fpmm_id, price, qty,
+                              expiration_ts=0.0, signal_ts=None,
+                              signal_price=None, order_kind="limit"):
+        """Cash, position and audit bookkeeping for a BUY. Shared by the market
+        path and the resting-limit path so the two cannot drift apart."""
+        async with self.lock:
+            state = self.pm.state
+            cost = float(qty) * float(price)
+            if state["cash"] < cost:
+                log.warning(f"❌ {order_kind} fill rejected {token_id}: cash short")
+                return False
+            state["cash"] -= cost
+            pos = state["positions"].get(token_id, {
+                "qty": 0.0, "avg_price": 0.0, "market_fpmm": fpmm_id,
+                "opened_at": time.time(), "market_end": expiration_ts})
+            prev = pos["qty"] * pos["avg_price"]
+            pos["qty"] += float(qty)
+            pos["avg_price"] = (prev + cost) / pos["qty"]
+            pos["market_fpmm"] = fpmm_id
+            state["positions"][token_id] = pos
+
+            equity = self.pm.calculate_equity()
+            if equity > state.get("highest_equity", 0):
+                state["highest_equity"] = equity
+            await self.pm.save_async()
+
+            audit_log.info(json.dumps({
+                "ts": time.time(), "side": "BUY", "token": token_id,
+                "price": float(price), "qty": float(qty), "equity": equity,
+                "fpmm": fpmm_id, "pnl": 0.0,
+                "signal_ts": signal_ts, "signal_price": signal_price,
+                "fill_latency_s": (time.time() - signal_ts) if signal_ts else None,
+                "order_kind": order_kind,
+            }))
+            log.info(f"🟢 BUY {qty:.2f} {token_id} @ {price:.3f} | "
+                     f"Cost: ${cost:.2f} | {order_kind}")
+            return True
+            
     async def redeem_position(self, token_id, payout_price,
                               condition_id=None, neg_risk=False, outcome_index=None):
         async with self.lock:
@@ -285,7 +399,74 @@ class BaseBroker:
 #  PAPER BROKER — fill = simulated VWAP walk of the local order book.
 # ======================================================================== #
 class PaperBroker(BaseBroker):
+    def __init__(self):
+        self._next_limit_id = 1
+        self._queue_ahead = {}
+        
     is_paper = True
+
+    async def _submit_limit(self, token_id, usdc_amount, price, expiration_ts, book):
+        """Register a simulated resting order.
+
+        QUEUE MODEL: we sit behind whatever is already resting at our exact
+        price when we submit. Bids at BETTER prices are irrelevant -- under
+        price-time priority a sell only reaches our level once everything above
+        it is gone, and a trade printing AT our price proves it already has.
+
+        Simplifications, both stated rather than hidden: orders that join our
+        level after us are ignored (optimistic), and the whole model assumes we
+        see every trade. So paper fill rates are an UPPER BOUND. That is the
+        right shape for comparing against minitest, which assumes 100%.
+        """
+        oid = f"paper-{self._next_limit_id}"
+        self._next_limit_id += 1
+        ahead = 0.0
+        for px, sz in (book or {}).get("bids", []):
+            if abs(float(px) - float(price)) < 1e-9:
+                ahead += float(sz)
+        self._queue_ahead[oid] = ahead
+        return oid
+
+    async def _cancel_limit(self, order_id):
+        self._queue_ahead.pop(order_id, None)
+        return True
+
+    async def on_trade(self, token_id, price, size, is_buy):
+        """Match an observed on-chain trade against our resting BUYs.
+
+        A taker SELL printing at or below our limit reached our price level. It
+        consumes the queue ahead of us first; the remainder fills us.
+        """
+        if is_buy or not self.open_limits:
+            return
+        token_id = str(token_id)
+        remaining_size = float(size)
+        for oid, rec in list(self.open_limits.items()):
+            if remaining_size <= 0:
+                break
+            if rec["token_id"] != token_id or float(price) > rec["price"]:
+                continue
+            ahead = self._queue_ahead.get(oid, 0.0)
+            if ahead > 0:
+                eaten = min(ahead, remaining_size)
+                self._queue_ahead[oid] = ahead - eaten
+                remaining_size -= eaten
+                if remaining_size <= 0:
+                    break
+            fill_qty = min(remaining_size, rec["remaining_usdc"] / rec["price"])
+            if fill_qty <= 0:
+                continue
+            ok = await self._apply_buy_fill(
+                token_id, rec["fpmm_id"], rec["price"], fill_qty,
+                signal_ts=rec.get("signal_ts"), signal_price=rec.get("signal_price"),
+                order_kind="limit")
+            if not ok:
+                continue
+            remaining_size -= fill_qty
+            rec["remaining_usdc"] -= fill_qty * rec["price"]
+            if rec["remaining_usdc"] <= 0.01:
+                self.open_limits.pop(oid, None)
+                self._queue_ahead.pop(oid, None)
 
     def calculate_vwap_execution(self, side: str, amount: float, book: Dict) -> Tuple[float, float]:
         """Walks the order book to calculate the simulated fill price."""
@@ -403,6 +584,32 @@ class LiveBroker(BaseBroker):
         log.info(f"✅ LiveBroker authenticated. deposit wallet (funder): {self.funder} "
                  f"(type={self.wallet_type}, gasless_ready={gasless})")
 
+    async def _submit_limit(self, token_id, usdc_amount, price, expiration_ts, book):
+        kwargs = dict(token_id=str(token_id), side="BUY",
+                      amount=float(usdc_amount), price=float(price),
+                      order_type="GTD" if expiration_ts else "GTC")
+        if expiration_ts:
+            kwargs["expiration"] = int(time.time() + expiration_ts)
+        try:
+            order = await asyncio.to_thread(lambda: self.client.place_order(**kwargs))
+        except Exception as e:
+            log.error(f"Live limit submission failed for {token_id}: {e}")
+            return None
+        if not getattr(order, "ok", False):
+            log.error(f"❌ Live limit rejected {token_id}: "
+                      f"code={getattr(order, 'code', '?')} "
+                      f"msg={getattr(order, 'message', order)}")
+            return None
+        return getattr(order, "order_id", None)
+
+    async def _cancel_limit(self, order_id):
+        try:
+            await asyncio.to_thread(lambda: self.client.cancel(order_id))
+            return True
+        except Exception as e:
+            log.error(f"Live cancel failed for {order_id}: {e}")
+            return False
+            
     # ---- fill parsing -------------------------------------------------- #
     def _avg_qty_from_order(self, order, side: str) -> Tuple[float, float]:
         """Return (avg_price, filled_qty) from an AcceptedOrder.
