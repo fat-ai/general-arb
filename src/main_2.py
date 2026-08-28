@@ -618,6 +618,9 @@ class LiveTrader:
                     f"{self.rest.stats['errors']} err | "
                     f"drift {self.stats.get('book_drift', 0)} "
                     f"failover {self.stats.get('rest_failover', 0)} | "
+                    f"limits: {len(getattr(self.broker, 'open_limits', {}))} live, "
+                    f"{self.stats.get('limits_placed', 0)} placed, "
+                    f"{self.stats.get('sweep_fills', 0)} swept | "
                     )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
@@ -1504,7 +1507,7 @@ class LiveTrader:
                 self.seen_market_ids.add(mid)
                 self.pending_orders.add(token_id)
                 self.pending_markets.add(mid)
-                asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price))
+                asyncio.create_task(self._execute_task(token_id, mid, "BUY", None, signal_price=price, signal_ts=time.time()))
 
         # End of Batch Summary
         if batch_scores:
@@ -1675,7 +1678,7 @@ class LiveTrader:
             return rb
         return ws_book
 
-    async def _sweep_once(self, token_id, mkt_id, signal_price, remaining_usdc):
+    async def _sweep_once(self, token_id, mkt_id, signal_price, remaining_usdc, signal_ts=None):
         """Take ALL qualifying liquidity in a single pass. Returns USDC filled.
 
         Replaces the 1 Hz chunked polling loop for the initial attempt. A market
@@ -1687,6 +1690,11 @@ class LiveTrader:
         MAX_SHARDS x ws_max_per_conn tokens and cannot cover the universe, so a
         WS book is a hint about what changed, not a price to trade on.
         """
+        ok = await self.broker.execute_market_order(
+            token_id, "BUY", take, mkt_id,
+            current_book=book, expiration_ts=0.0,
+            signal_ts=signal_ts, signal_price=signal_price)
+        
         book = await self.rest.get_book(token_id)
         if not book or not book.get('asks'):
             return 0.0
@@ -1724,269 +1732,114 @@ class LiveTrader:
         self.stats['sweep_rejects'] = self.stats.get('sweep_rejects', 0) + 1
         return 0.0
 
-    async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
+        async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None,
+                            _retries=0, _resubscribe_attempts=0,
+                            signal_price=None, signal_ts=None):
+        """Sweep once, then rest. No polling.
+
+        The old shape waited up to 400s for a WS snapshot, then chunked the book
+        at 1 Hz. Both are wrong for this strategy: the trade that produced our
+        signal IS the ask being lifted, so the liquidity we want either exists
+        now or must be waited for AT THE VENUE. A 1 Hz loop cannot see a book
+        that changes in milliseconds, and a resting order does not need to --
+        the match happens in London without our round-trip on the path.
+
+        Resting at signal x (1 + max_slippage) is also the faithful reading of
+        minitest, which fills at trade_price x 1.05: a MAKER price.
+
+        _retries / _resubscribe_attempts are retained for call-site compatibility
+        and unused -- there is no book-wait to retry.
+        """
         token_id = str(token_id)
         self.sub_manager.pin(token_id)
         try:
-            # 1. Position Guard
+            # 1. Position guards
             if token_id in self.persistence.state["positions"]:
                 return
-    
             for pos_data in self.persistence.state["positions"].values():
                 if pos_data.get("market_fpmm") == mkt_id:
-                    log.info(f"🛡️ Market Guard: Already hold a position in market {mkt_id}... Skipping.")
+                    log.info(f"🛡️ Market Guard: Already hold a position in market "
+                             f"{mkt_id}... Skipping.")
                     return
-    
-            # 2. Wait for Initial Liquidity
-            #
-            # ITERATIVE, not recursive. This retried by calling itself, and the two
-            # counters NESTED: 50 resubscribe attempts, each spawning up to 10
-            # _retries frames = 500 deep before the limits bite, plus coroutine
-            # machinery, against Python's 1000-frame default. Any token whose book
-            # stayed empty crashed the task with RecursionError.
-            #
-            # Same counters, same sleeps, same limits, same log lines -- constant
-            # stack depth. Total wait is unchanged: 50 * (10*0.5 + 3.0) = 400s.
-            while True:
-                raw_book = self.order_books.get(token_id)
-                if raw_book and (raw_book.get('asks') or raw_book.get('bids')):
-                    break
-    
-                if _resubscribe_attempts >= 50:
-                    log.error(f"❌ Aborting execution for {token_id}. Book never populated after multiple resubscribe attempts.")
+            # A resting order IS a commitment of capital to this token. Without
+            # this, a second signal while the first order rests would double up.
+            for _rec in getattr(self.broker, 'open_limits', {}).values():
+                if _rec["token_id"] == token_id or _rec["fpmm_id"] == mkt_id:
+                    log.info(f"🛡️ Limit Guard: already resting on {mkt_id}. Skipping.")
                     return
-    
-                if _retries >= 10:
-                    log.info(f"🔄 Re-subscribing for missing snapshot: {token_id}")
-                    self.ws_client.resubscribe_single(token_id)
-                    await asyncio.sleep(3.0)
-                    _retries = 0
-                    _resubscribe_attempts += 1
-                    continue
-    
-                log.info(f"⏳ Book not yet populated for {token_id}, requeueing...")
-                await asyncio.sleep(0.5)
-                _retries += 1
-                    
-            # 3. Determine Total Target Trade Size
-            trade_size = CONFIG['fixed_size'] 
-            available_cash = self.persistence.state["cash"]
-            
+
+            # 2. Opposing-side guard -- never hold both legs of one market.
+            market_obj = self.metadata.markets.get(mkt_id)
+            if market_obj:
+                market_tokens = [str(t) for t in market_obj['tokens'].values()]
+                for held_token in self.persistence.state["positions"].keys():
+                    if str(held_token) in market_tokens and str(held_token) != token_id:
+                        log.critical(f"🛡️ Opposing side ({held_token}) already held! "
+                                     f"Aborting exec for {token_id}.")
+                        return
+
+            # 3. Size
+            trade_size = CONFIG['fixed_size']
             if CONFIG.get('use_percentage_staking'):
                 try:
-                    total_equity = self.persistence.calculate_equity()
-                    calculated_stake = total_equity * CONFIG['percentage_stake']
-                    trade_size = max(2.0, calculated_stake)    
+                    trade_size = max(2.0, self.persistence.calculate_equity()
+                                     * CONFIG['percentage_stake'])
                 except Exception as e:
                     log.error(f"Sizing Failed: {e}")
                     trade_size = CONFIG['fixed_size']
-    
-            if trade_size > available_cash:
-                        log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
-                        return
-                
-            # 4. Patient Execution Window Setup
-            max_duration = CONFIG.get('exec_timeout', 300) 
-            max_slippage = CONFIG.get('max_slippage', 0.05)
-            start_time = time.time()
-            accumulated_usdc = 0.0
-    
-            is_paper_trading = isinstance(self.broker, PaperBroker)
-            virtual_consumption = {}
-            _last_bk_stamp = None
-            # How often the sweep re-evaluates the book. The old loop idled 5s between
-            # chunks (and 2s on a thin book), so liquidity that appeared and vanished
-            # inside that window was missed. Re-check ~1s by default (configurable).
-            sweep_tick = float(CONFIG.get('sweep_tick', 1.0))
-            # Minimum chunk size to bother executing (gas/dust floor on live). A
-            # sub-floor chunk is still allowed if it would *complete* the target.
-            min_chunk = float(CONFIG.get('min_chunk_usdc', 2.0))
-            log.info(f"⏳ Patient Exec Started: {token_id} | Target: ${trade_size:.2f} | Timeout: {max_duration}s")
-    
-             # 5. Dynamic Sweep Loop
-            _post_end_grace = float(CONFIG.get('exec_post_end_grace_s', 300.0))
-            _reason = "starting"
-            while accumulated_usdc < trade_size and (time.time() - start_time) < max_duration:
-                self.exec_status[token_id] = {
-                    'filled': accumulated_usdc, 'target': trade_size,
-                    'started': start_time, 'reason': _reason,
-                }
+            if trade_size > self.persistence.state["cash"]:
+                log.warning(f"⚠️ Insufficient Cash. Need ${trade_size:.2f}")
+                return
+            if not signal_price or signal_price <= 0:
+                log.warning(f"❌ No signal price for {token_id}; cannot bound entry.")
+                return
 
-                # Abort only on a CONFIRMED close. end_timestamp is non-None only
-                # when derive_window saw closed=true, so this matches the entry
-                # gate exactly. It must NOT fall back to sched_end: for sports
-                # that resolves to eventStartTime -- the kickoff -- so an in-play
-                # market looked "ended" the moment the game began, and every
-                # in-play execution was aborted on the spot.
-                _mo = self.metadata.markets.get(mkt_id) or {}
-                _horizon = _mo.get('end_timestamp')
-                if _horizon is not None and time.time() > (_horizon + _post_end_grace):
-                    log.info(f"⌛ Abandoning exec for {token_id}: market {mkt_id} "
-                             f"closed {(time.time() - _horizon) / 60:.0f} min ago "
-                             f"(filled ${accumulated_usdc:.2f} of ${trade_size:.2f})")
-                    self.stats['exec_abandoned_ended'] = \
-                        self.stats.get('exec_abandoned_ended', 0) + 1
-                    break
+            max_slippage = float(CONFIG.get('max_slippage', 0.05))
+            limit_px = float(signal_price) * (1.0 + max_slippage)
+            tick = float((market_obj or {}).get('tick_size') or 0.01)
+            expiration_ts = (market_obj.get('end_timestamp') or 0.0) if market_obj else 0.0
 
-                clean_book = await self._book_for_action(token_id)
-                if not clean_book or (not clean_book['asks'] and not clean_book['bids']):
-                    _reason = "no usable book"
-                    await asyncio.sleep(sweep_tick)
-                    continue
-                _raw = self.order_books.get(token_id) or {}
-                # 'stamp' is the key _process_snapshot/_process_update actually
-                # write. This read 'timestamp'/'hash', which are never set, so
-                # _stamp was always None and the reset never fired -- the task's
-                # virtual book only ever depleted, never replenished.
-                _stamp = _raw.get('stamp')
-                if _stamp != _last_bk_stamp:
-                    virtual_consumption.clear()
-                    _last_bk_stamp = _stamp
-                _reason = "sweeping"
-                # ==========================================
-                # Virtually Deplete the Book 
-                # ==========================================
-                if is_paper_trading:
-                    adjusted_asks = []
-                    for p_str, s_str in clean_book['asks']:
-                        p_float = float(p_str)
-                        raw_level_usdc = float(s_str) * p_float
-                        eaten = virtual_consumption.get(p_str, 0.0)
-                        
-                        left_usdc = max(0.0, raw_level_usdc - eaten)
-                        if left_usdc > 0.001:  # Keep level only if liquidity remains
-                            adjusted_asks.append([p_str, str(left_usdc / p_float)])
-                            
-                    clean_book['asks'] = adjusted_asks # Broker will now see the depleted book!
-    
-                if not clean_book['asks']:
-                    await asyncio.sleep(sweep_tick) # Wait for new sellers if book is virtually empty
-                    continue
-    
-                # Calculate Current Spread
-                if clean_book['bids']:
-                  best_bid = float(clean_book['bids'][0][0])
-                else:
-                  best_bid = 0.0
-                    
-                if clean_book['asks']:  
-                  best_ask = float(clean_book['asks'][0][0])
+            self.exec_status[token_id] = {
+                'filled': 0.0, 'target': trade_size,
+                'started': time.time(), 'reason': 'sweeping',
+            }
 
-                else:
-                    best_ask = 0.0
+            # 4. ONE-SHOT SWEEP -- take everything already resting at or under
+            #    our price, in a single order, immediately.
+            filled = await self._sweep_once(token_id, mkt_id, signal_price,
+                                            trade_size, signal_ts=signal_ts)
+            if filled > 0:
+                # Committed: apply the permanent re-entry ban on a real fill.
+                self.seen_market_ids.add(mkt_id)
+            remaining = trade_size - filled
+            if remaining < float(CONFIG.get('min_chunk_usdc', 2.0)):
+                log.info(f"✅ Target acquired for {token_id} in one sweep: ${filled:.2f}")
+                return
 
-                if clean_book['bids'] and clean_book['asks']: 
-                  spread = (best_ask - best_bid) / best_ask
+            # 5. REST THE REMAINDER. floor_to_tick happens inside
+            #    place_limit_order: a BUY limit must round DOWN, or we would pay
+            #    above our own limit. On a 0.02 signal with a 0.01 tick that
+            #    floors straight back to 0.02 and the allowance disappears --
+            #    expected in this price band, and worth watching rather than
+            #    working around.
+            self.exec_status[token_id]['reason'] = 'resting'
+            self.exec_status[token_id]['filled'] = filled
+            oid = await self.broker.place_limit_order(
+                token_id, remaining, limit_px, mkt_id,
+                tick=tick,
+                expiration_ts=float(CONFIG.get('limit_expiry_s', 600.0)),
+                signal_ts=signal_ts, signal_price=signal_price,
+                book=await self.rest.get_book(token_id))
 
-                else:
-                  spread = 1.0
-    
-                remaining_usdc = trade_size - accumulated_usdc
-                
-                optimal_chunk_usdc = 0.0
-                accumulated_tokens_test = 0.0
-                planned_consumption = {}
-
-                _max_slip = CONFIG.get('max_slippage', 0.05)
-                if signal_price and best_ask > signal_price * (1.0 + _max_slip):
-                    if int((time.time() - start_time) / sweep_tick) % 30 == 0:
-                        log.info(f"⏸️ Waiting on {token_id}: best ask "
-                                 f"{best_ask:.4f} > signal {signal_price:.4f} "
-                                 f"+ {_max_slip:.0%}")
-                    _reason = f"ask {best_ask:.4f} > {signal_price:.4f}+{_max_slip:.0%}"
-                    await asyncio.sleep(sweep_tick)
-                    continue
-                
-                for ask_price_str, ask_size_tokens_str in clean_book['asks']:
-                    ask_p = float(ask_price_str)
-                    level_usdc = float(ask_size_tokens_str) * ask_p
-                    
-                    # Only take what we still need
-                    budget_left_in_chunk = remaining_usdc - optimal_chunk_usdc
-                    take_usdc = min(level_usdc, budget_left_in_chunk)
-                    if take_usdc <= 0:
-                        break
-                        
-                    take_tokens = take_usdc / ask_p
-                    
-                    # Test the VWAP
-                    test_tokens = accumulated_tokens_test + take_tokens
-                    test_usdc = optimal_chunk_usdc + take_usdc
-                    test_vwap = test_usdc / test_tokens if test_tokens > 0 else 0
-                    
-                    _ref = best_ask if best_ask > 0 else signal_price
-                    if _ref and test_vwap > 0:
-                        test_slippage = (test_vwap - _ref) / _ref
-                        total_penalty = test_slippage + spread
-                        absolute_cost_difference = test_vwap - _ref
-                        
-                        if test_vwap > signal_price * (1.0 + max_slippage):
-                            break
-                    
-                    # Lock in this slice
-                    optimal_chunk_usdc += take_usdc
-                    accumulated_tokens_test += take_tokens
-                    planned_consumption[ask_price_str] = take_usdc 
-                    
-                    if optimal_chunk_usdc >= remaining_usdc:
-                        break
-    
-                # --- EXECUTE THE CHUNK ---
-                # Execute if the chunk clears the dust floor, OR if it would finish the
-                # remaining target (so a small final slice isn't skipped indefinitely).
-                completes_target = optimal_chunk_usdc >= (remaining_usdc - 1e-6)
-                if optimal_chunk_usdc >= min_chunk or completes_target:
-                    log.info(f"🛒 Sweeping partial fill: ${optimal_chunk_usdc:.2f} / remaining ${remaining_usdc:.2f} for {token_id}")
-                    
-                    market_obj = self.metadata.markets.get(mkt_id)
-                    
-                    # 1. Grab the expiration timestamp (default to 0 if not found)
-                    expiration_ts = (market_obj.get('end_timestamp') or 0.0) if market_obj else 0.0
-                    
-                    if market_obj:
-                        market_tokens = [str(t) for t in market_obj['tokens'].values()]
-                        for held_token in self.persistence.state["positions"].keys():
-                            # If we hold a token in this market, and it is NOT the one we are currently buying
-                            if str(held_token) in market_tokens and str(held_token) != str(token_id):
-                                log.critical(f"🛡️ Async Guard: Opposing side ({held_token}) already held! Aborting sweep for {token_id}.")
-                                return
-                                
-                    # 2. Pass expiration_ts to the broker
-                    success = await self.broker.execute_market_order(
-                        token_id, "BUY", optimal_chunk_usdc, mkt_id, 
-                        current_book=clean_book, expiration_ts=expiration_ts
-                    )
-                    
-                    if success is not False:
-                        accumulated_usdc += optimal_chunk_usdc
-                        # We now genuinely hold (or are building) a position in this
-                        # market: apply the permanent re-entry ban here, on a CONFIRMED
-                        # fill, rather than speculatively at signal time. Idempotent.
-                        self.seen_market_ids.add(mkt_id)
-    
-                        if is_paper_trading:
-                            for p_str, amt in planned_consumption.items():
-                                virtual_consumption[p_str] = virtual_consumption.get(p_str, 0.0) + amt
-                                
-                        
-                        if accumulated_usdc >= trade_size:
-                            log.info(f"✅ Target acquired for {token_id}. Total filled: ${accumulated_usdc:.2f}")
-                            return
-                    else:
-                        if int((time.time() - start_time) / sweep_tick) % 30 == 0:
-                            log.info(f"⏸️ Broker rejected ${optimal_chunk_usdc:.2f} "
-                                     f"for {token_id}; waiting for better liquidity.")
-                       
-                else:
-                    pass 
-                
-                await asyncio.sleep(sweep_tick)
-    
-            # 6. Timeout handling
-            if accumulated_usdc > 0 and accumulated_usdc < trade_size:
-                log.warning(f"⏰ Execution timeout for {token_id}. Total filled: ${accumulated_usdc:.2f} / ${trade_size:.2f}.")
-            elif accumulated_usdc == 0:
-                log.warning(f"❌ Execution timeout for {token_id}. No liquidity met the requirements.")
+            if oid:
+                # A resting order is our one attempt at this market, filled or
+                # not -- matching minitest's single entry per market.
+                self.seen_market_ids.add(mkt_id)
+                self.stats['limits_placed'] = self.stats.get('limits_placed', 0) + 1
+            else:
+                log.warning(f"❌ Could not rest ${remaining:.2f} on {token_id} "
+                            f"@ {limit_px:.4f} (tick {tick})")
+                self.stats['limits_rejected'] = self.stats.get('limits_rejected', 0) + 1
         finally:
             self.sub_manager.unpin(token_id)
             self.exec_status.pop(token_id, None)
