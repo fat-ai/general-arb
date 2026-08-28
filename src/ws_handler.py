@@ -10,7 +10,7 @@ log = logging.getLogger("PaperGold")
 # froze at 250/conn; NautilusTrader uses 200 as a self-chosen reliability bound.
 # Polymarket publishes no cap, so this is deliberately well under both.
 DEFAULT_MAX_PER_CONN = 150
-
+MAX_SHARDS = 5
 # A shard holding >=1 token that delivers NO book/price_change for this long,
 # while its PINGs are still being answered, is FROZEN. Per-shard, not per-token:
 # one quiet market is normal, 150 simultaneously quiet is not. That distinction
@@ -223,29 +223,44 @@ class PolymarketWS:
         for s in self.shards:
             if len(s.assets) < self.max_per_conn:
                 return s
+        if len(self.shards) >= MAX_SHARDS:
+            # Pool is full. Return None so subscribe() can decline and count it,
+            # rather than opening a connection the venue will silently starve.
+            # SubscriptionManager already knows how to evict (held > pinned >
+            # rolling); give it a budget that matches reality and it will.
+            return None
         s = _Shard(len(self.shards), self.url, self.on_message_callback)
         self.shards.append(s)
         if self.running:
             s.start()
-        log.info(f"➕ WS shard {s.idx} opened (pool size {len(self.shards)})")
+        log.info(f"➕ WS shard {s.idx} opened (pool {len(self.shards)}/{MAX_SHARDS})")
         return s
 
     def subscribe(self, assets_ids):
         if not assets_ids:
             return
-        added = 0
+        added = declined = 0
         with self._lock:
             for tid in assets_ids:
                 tid = str(tid)
                 if tid in self.token_shard:
                     continue
                 s = self._shard_for_new()
+                if s is None:
+                    declined += 1
+                    continue
                 s.add([tid])
                 self.token_shard[tid] = s.idx
                 added += 1
         if added:
             log.info(f"➕ WS subscribed to {added} new assets "
                      f"({len(self.token_shard)} total, {len(self.shards)} shards)")
+        if declined:
+            self.n_declined = getattr(self, 'n_declined', 0) + declined
+            log.warning(f"🚧 WS pool FULL: declined {declined} subscriptions "
+                        f"({self.n_declined} cumulative). Those tokens are "
+                        f"REST-only. Capacity is {MAX_SHARDS}×{self.max_per_conn}"
+                        f"={MAX_SHARDS * self.max_per_conn}.")
 
     def unsubscribe(self, assets_ids):
         if not assets_ids:
