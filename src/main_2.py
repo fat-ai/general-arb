@@ -1710,7 +1710,7 @@ class LiveTrader:
         if qualifying <= 0.0:
             return 0.0
 
-        cash = float(self.persistence.state['performance']['cash'])
+        cash = float(self.persistence.state["cash"])
         take = min(float(remaining_usdc), qualifying, cash)
         if take < float(CONFIG.get('min_chunk_usdc', 2.0)):
             return 0.0
