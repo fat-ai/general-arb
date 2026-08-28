@@ -56,6 +56,7 @@ class MarketMetadata:
                 # N5: the sim's window/ttr chain needs all of these.
                 'closed_time', 'closed', 'eventStartTime', 'game_start_time',
                 'contract_id', 'token_outcome_label', 'outcomes', 'clobTokenIds',
+                'orderPriceMinTickSize'
             ] if c in available]
             if 'contract_id' not in available and 'clobTokenIds' not in available:
                 logger.error(f"❌ Parquet has no token column. Columns: {sorted(available)}")
@@ -137,6 +138,7 @@ class MarketMetadata:
                                 # Inferring the side from dict position breaks
                                 # whenever a label is missing and the token is
                                 # keyed by index instead.
+                                "tick_size": float(_c('orderPriceMinTickSize') or 0.01),
                                 "token_labels": {},
                                 "active": bool(_c('active')) if _c('active') is not None else True,
                                 "question": str(_c('question') or 'Unknown'),
@@ -262,6 +264,7 @@ class MarketMetadata:
                         "id": mid,
                         "condition_id": cid,
                         "tokens": tokens,
+                        "tick_size": float(mkt.get('orderPriceMinTickSize') or 0.01),
                         "token_labels": token_labels,
                         "active": True,
                         "question": mkt.get('question'),
