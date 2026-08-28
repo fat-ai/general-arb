@@ -29,6 +29,7 @@ CHUNK_SIZE = 200000
 SIGNAL = 0.1                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
 MAX_PRICE = 0.25
+MIN_ABS_MARGIN = 0.05
 # Contributor gates.
 MAX_CONTRIB = None            # None disables. c_n = contributors to the posterior
 MAX_TPM = None                 # trigger trades-per-market; None = off. >=50 removes
@@ -534,7 +535,7 @@ if REQUIRE_RESOLVED_IN_WINDOW:
           f"(REQUIRE_RESOLVED_IN_WINDOW=True: skip entry on markets ending after this)")
 
 print(f"Starting Backtest on {FILE_PATH}...")
-print(f"Strategy: perc_margin > {SIGNAL} | price < ${MAX_PRICE} | var < {MAX_VARIANCE} | "
+print(f"Strategy: perc_margin > {SIGNAL} | abs_margin >= {MIN_ABS_MARGIN} | price < ${MAX_PRICE} | var < {MAX_VARIANCE} | "
       f"TP >= ${TAKE_PROFIT_PRICE} (Recycle Capital)")
 print(f"Bankroll: ${INITIAL_BANKROLL} | Size: ${FIXED_SIZE} | Slippage: {MAX_SLIPPAGE_PCT:.0%} (multiplicative)\n")
 
@@ -809,7 +810,7 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
         for _c in _dead:
             _paths.pop(_c, None); _path_last.pop(_c, None)
 
-    is_signal = (chunk['perc_margin'] > SIGNAL) & (chunk['variance_v'] < MAX_VARIANCE) & (chunk['price'] < MAX_PRICE)
+    is_signal = (chunk['perc_margin'] > SIGNAL) & (chunk['variance_v'] < MAX_VARIANCE) & (chunk['price'] < MAX_PRICE) & ((chunk['bayesian_prob'] - chunk['price']) >= MIN_ABS_MARGIN)
     # Contributor gates. Pure ENTRY conditions -- they change no state, so
     # applying them here is equivalent to applying them in sim_strat_5, and no
     # sim rerun is needed to evaluate them.
