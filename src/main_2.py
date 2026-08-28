@@ -1201,9 +1201,21 @@ class LiveTrader:
             self.stats['parked_trades'] = sum(
                 len(v) for v in getattr(self, "_parked", {}).values())
 
+    async def on_trade(self, token_id, price, size, is_buy):
+        return
+
     async def _process_batch(self, trades):
         batch_scores = []
         skipped_counts = self.stats.setdefault('skips', {"expired": 0, "no_tokens": 0, "old": 0})
+        # Match observed trades against resting BUY limits before anything else.
+        # Iterates TRADES, not legs -- a leg loop would double-count every fill.
+        if getattr(self.broker, 'open_limits', None):
+            for _t in trades:
+                try:
+                    await self.broker.on_trade(_t['token_id'], _t['price'],
+                                               _t['token_vol'], _t['is_buy'])
+                except Exception as _e:
+                    log.error(f"Resting-order match failed: {_e}")
         # B7: taker AND maker, matching sim_strat_5's UNION ALL. The maker's
         # side is the OPPOSITE of the taker's -- if the taker bought, the maker
         # sold -- so is_buy inverts on the maker leg.
