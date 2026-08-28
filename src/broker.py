@@ -405,11 +405,16 @@ class BaseBroker:
 #  PAPER BROKER — fill = simulated VWAP walk of the local order book.
 # ======================================================================== #
 class PaperBroker(BaseBroker):
-    def __init__(self):
-        self._next_limit_id = 1
-        self._queue_ahead = {}
-        
     is_paper = True
+
+    def __init__(self, persistence: PersistenceManager):
+        # super() sets pm, lock and open_limits. Without it the broker has no
+        # persistence handle and no resting-order registry.
+        super().__init__(persistence)
+        self._next_limit_id = 1
+        # order_id -> size resting AHEAD of us at our exact price when we
+        # submitted. Consumed before any of our own quantity fills.
+        self._queue_ahead = {}
 
     async def _submit_limit(self, token_id, usdc_amount, price, expiration_ts, book):
         """Register a simulated resting order.
