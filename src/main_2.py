@@ -361,11 +361,11 @@ class LiveTrader:
             asyncio.get_running_loop().stop()
         except: pass
 
-    async def _execute_task(self, token_id, fpmm, side, book, signal_price=None):
+    async def _execute_task(self, token_id, fpmm, side, book, signal_price=None, signal_ts=None):
         """Helper to run trades in background and release lock."""
         try:
             if side == "BUY":
-                await self._attempt_exec(token_id, fpmm, signal_price=signal_price)
+                await self._attempt_exec(token_id, fpmm, signal_price=signal_price, signal_ts=signal_ts)
             else:
                 await self.broker.execute_market_order(token_id, "SELL", 0, fpmm, current_book=book)
         finally:
