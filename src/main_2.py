@@ -1665,6 +1665,55 @@ class LiveTrader:
             return rb
         return ws_book
 
+    async def _sweep_once(self, token_id, mkt_id, signal_price, remaining_usdc):
+        """Take ALL qualifying liquidity in a single pass. Returns USDC filled.
+
+        Replaces the 1 Hz chunked polling loop for the initial attempt. A market
+        whose liquidity exists for a few hundred milliseconds is invisible to a
+        one-tick-per-second loop, and the trade that produced our signal is
+        itself the ask being lifted -- so speed at t=0 is the whole game.
+
+        Ground truth is CLOB REST, never the websocket: the pool covers at most
+        MAX_SHARDS x ws_max_per_conn tokens and cannot cover the universe, so a
+        WS book is a hint about what changed, not a price to trade on.
+        """
+        book = await self.rest.get_book(token_id)
+        if not book or not book.get('asks'):
+            return 0.0
+
+        limit_px = float(signal_price) * (1.0 + float(CONFIG.get('max_slippage', 0.05)))
+
+        # Everything at or under the limit, in price order. No size threshold:
+        # any volume that satisfies the price requirement qualifies.
+        qualifying = 0.0
+        depth = 0
+        for px, sz in book['asks']:
+            if float(px) > limit_px:
+                break
+            qualifying += float(px) * float(sz)
+            depth += 1
+        if qualifying <= 0.0:
+            return 0.0
+
+        cash = float(self.persistence.state['performance']['cash'])
+        take = min(float(remaining_usdc), qualifying, cash)
+        if take < float(CONFIG.get('min_chunk_usdc', 2.0)):
+            return 0.0
+
+        ok = await self.broker.execute_market_order(
+            token_id, "BUY", take, mkt_id,
+            current_book=book, expiration_ts=0.0,
+            signal_ts=None, signal_price=signal_price)
+
+        if ok:
+            self.stats['sweep_fills'] = self.stats.get('sweep_fills', 0) + 1
+            log.info(f"⚡ Swept {token_id[:12]}…: ${take:.2f} across {depth} "
+                     f"level(s) ≤ {limit_px:.4f} (book offered ${qualifying:.2f})")
+            return take
+
+        self.stats['sweep_rejects'] = self.stats.get('sweep_rejects', 0) + 1
+        return 0.0
+
     async def _attempt_exec(self, token_id, mkt_id, reset_tracker_key=None, _retries=0, _resubscribe_attempts=0, signal_price=None):
         token_id = str(token_id)
         self.sub_manager.pin(token_id)
