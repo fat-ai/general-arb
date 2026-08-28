@@ -26,11 +26,38 @@ FILE_PATH = 'sim_results_enriched.parquet'
 CHUNK_SIZE = 200000
 
 # Strategy Parameters  (must mirror sim_strat_5.py / main_2.py entry rule)
-SIGNAL = 0.0                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
+SIGNAL = 0.1                 # gate on perc_margin > SIGNAL  (NOT absolute edge)
 MAX_VARIANCE = 0.15
-MAX_PRICE = 0.40
+MAX_PRICE = 0.25
+# Contributor gates.
+MAX_CONTRIB = None            # None disables. c_n = contributors to the posterior
+MAX_TPM = None                 # trigger trades-per-market; None = off. >=50 removes
+                             # 6.50% of trades and -1,457,418, but its overlap
+                             # with MAX_CONTRIB is unmeasured -- enable only after
+                             # the c_n gate alone has been measured.
 TAKE_PROFIT_PRICE = 0.95     # sell when the HELD token's price hits 0.95
-SIGNAL_MODE = 'consecutive'  # 'consecutive': streak, any non-signal row resets (original behaviour)
+
+# --- opposite-signal exit ----------------------------------------------------
+# None | 'close' | 'reverse'.  None reproduces today's behaviour exactly.
+OPPOSITE_ACTION = 'reverse'
+# 1 - p_sib is the held token's price only in a TWO-token market. Neg-risk
+# events with many outcomes break that identity.
+OPPOSITE_REQUIRE_BINARY = False
+# Refuse a reversal into a sibling below this price. The offline study's 6.8bn
+# came almost entirely from sub-cent siblings -- dust and stale quotes -- where
+# 1/p_sib diverges. Ignored when OPPOSITE_ACTION == 'close'.
+OPPOSITE_MIN_SIB_PRICE = 0.00
+# Also enter the sibling when the market was already exited at TAKE-PROFIT.
+# Nothing is being reversed there -- the position is closed -- so this is a
+# targeted relaxation of the re-entry ban, and a fresh directional bet.
+OPPOSITE_REVERSE_AFTER_TP = True
+tp_exited_mids = {}          # market_id -> the cid we exited, for one-shot use
+opposite_after_tp = 0
+
+opposite_closes = 0
+opposite_reversals = 0
+opposite_reversal_pnl = 0.0
+SIGNAL_MODE = 'cumulative'  # 'consecutive': streak, any non-signal row resets (original behaviour)
                              # 'cumulative' : count TOTAL qualifying signal rows per token, no reset --
                              #                tests "more signal" without punishing signal volatility
 REQUIRED_SIGNALS = 1         # signals needed to trade (both modes; 1 = modes identical)
@@ -42,7 +69,7 @@ REQUIRED_CONSECUTIVE_SIGNALS = REQUIRED_SIGNALS  # back-compat alias (report bun
 # force-resolved on a future-known outcome — so excluding them keeps the result honest.
 # Costs one extra single-column scan of the CSV to find the horizon. Set False for the
 # old behaviour (resolve everything at the end).
-REQUIRE_RESOLVED_IN_WINDOW = True
+REQUIRE_RESOLVED_IN_WINDOW = False
 # ^ Entry gate on markets with NO confirmed outcome (unresolved in the parquet, i.e.
 #   auth_outcome is NaN). True: do NOT enter them -> a clean in-window backtest where
 #   every entered trade is scoreable, and Open at End (MTM) == 0. False: enter them,
@@ -55,7 +82,7 @@ REQUIRE_RESOLVED_IN_WINDOW = True
 # warmup boundary. Set this at/before the data start to include everything; the
 # equity curve is seeded at the first real trade, so an early date won't dilute the
 # metrics. (Per diagnose_csv.py the data spans 2024-06-11 .. 2025-10-28.)
-START_DATE = '2025-01-01'
+START_DATE = '2026-03-01'
 
 # --- OUT-OF-SAMPLE HYGIENE ---
 # When True, only trade markets whose CREATION (start_date) is on/after START_DATE,
@@ -93,12 +120,11 @@ REQUIRE_NONDECLINING_PRICE = False
 EXCLUDE_NEGRISK = False
 
 # --- HOSTILE-MARKET FILTER (frozen rule, 2026-07-16) ---
-# Mirrors the sim/main_2.py bet gate: feesEnabled OR resolution_source domain in
-# {data.chain.link, binance.com, dotabuff.com, gol.gg} OR sports_market_type in
-# {kill_over_under_game, team_totals, tennis_first_set_totals} OR 0<customLiveness<=3600.
+# Rule imported from hostile_markets.py, shared with sim_strat_5.py so the two
+# cannot drift. See that file for the measured evidence behind every entry.
 # Row-level exclusion like negRisk. Default False: flip ON to mirror the sim's bet gate
 # when replaying a baseline/bets-level CSV; scoring-filtered CSVs contain no hostile rows.
-EXCLUDE_HOSTILE = True
+EXCLUDE_HOSTILE = False
 
 # Rolling report charts: trailing-K-trades window per bucket (report pages only).
 ROLLING_WINDOW_TRADES = 2000
@@ -107,7 +133,7 @@ ROLLING_WINDOW_TRADES = 2000
 # At each BUY, log the token's recent price path: change over trailing 1h/6h/24h
 # (cents + relative) and drawdown from the trailing-24h max, plus history span.
 # Analysis: price_path_analysis.py (dose-response, time-split, block bootstrap).
-COLLECT_ENTRY_FEATURES = False
+COLLECT_ENTRY_FEATURES = False     # per-trade output; see PER_TRADE_OUT
 ENTRY_FEATURES_OUT = 'entry_features.csv'
 _PATH_WINDOW_S = 24 * 3600
 _PATH_MAX_PTS = 4096
@@ -151,6 +177,9 @@ signal_counts = {}
 last_price = {}           # cid -> last-seen market price (for MTM of positions still open at data end)
 prev_price = {}           # cid -> last logged price, live markets only (REQUIRE_NONDECLINING_PRICE)
 prev_end = {}             # cid -> end_timestamp, to prune resolved markets from prev_price
+mid_tokens = {}                 # market_id -> {cid}: how many tokens we have SEEN.
+                                # Used only by the opposite-signal rule, to keep
+                                # 1 - p_sib to markets where it is exact.
 
 # Metrics Tracking
 total_trades = 0
@@ -262,6 +291,14 @@ def _load_negrisk_cids():
 
 negrisk_cids = _load_negrisk_cids() if EXCLUDE_NEGRISK else set()
 
+import hostile_markets
+
+# Tier 2 is the seven buckets under 100k and under n=2,100 (-464,042 total,
+# 0.9% of baseline). 269 buckets at 95% CI implies ~13 false positives from the
+# CI alone, and that is precisely this size range. Off unless a holdout confirms.
+EXCLUDE_HOSTILE_TIER2 = False
+
+
 def _load_hostile_cids():
     """cids (normalized like cid_start's keys) of markets matching the frozen hostile rule.
     Tolerant to missing columns: absent fields simply contribute no exclusions."""
@@ -269,7 +306,7 @@ def _load_hostile_cids():
     if path is None:
         print("[hostile] no markets parquet found -- hostile filter unavailable.")
         return set()
-    want = ['contract_id', 'feesEnabled', 'resolution_source', 'sports_market_type', 'customLiveness']
+    want = ['contract_id'] + hostile_markets.required_columns()
     try:
         import pyarrow.parquet as _pq
         names = _pq.ParquetFile(path).schema.names
@@ -278,18 +315,11 @@ def _load_hostile_cids():
     except Exception as e:
         print(f"[hostile] could not read rule columns ({e}) -- hostile filter unavailable.")
         return set()
-    mask = pd.Series(False, index=mdf.index)
-    if 'feesEnabled' in mdf:
-        mask |= mdf['feesEnabled'].astype(str).str.lower().isin(['true', '1'])
-    if 'resolution_source' in mdf:
-        mask |= (mdf['resolution_source'].astype(str).str.lower()
-                 .str.contains(r'data\.chain\.link|binance\.com|dotabuff\.com|gol\.gg', regex=True, na=False))
-    if 'sports_market_type' in mdf:
-        mask |= mdf['sports_market_type'].astype(str).isin(
-            ['kill_over_under_game', 'team_totals', 'tennis_first_set_totals'])
-    if 'customLiveness' in mdf:
-        cl = pd.to_numeric(mdf['customLiveness'], errors='coerce')
-        mask |= ((cl > 0) & (cl <= 3600)).fillna(False)
+    # SINGLE SOURCE OF TRUTH: hostile_markets.py, shared with sim_strat_5.py.
+    # The rule that used to live here excluded markets the 2026-08 report
+    # measures as PROFITABLE -- gol.gg (+782,749) and the chain.link DOMAIN
+    # match, which swept in bnb/hype/doge (+1,657,042 between them).
+    mask = hostile_markets.hostile_mask_pandas(mdf, include_tier2=EXCLUDE_HOSTILE_TIER2)
     cids = (mdf.loc[mask, 'contract_id'].astype(str).str.strip()
             .str.lower().str.replace('0x', '', regex=False))
     out = set(cids)
@@ -380,8 +410,13 @@ def _path_features(cid, ts, px):
     return (out[0], out[1], out[2], rels[0], rels[1], rels[2], dd24, span_h, len(ta))
 
 
-def record_bucket(pos, profit, early):
-    """Tally a closed position into its price bucket AND its (time x price) cell."""
+def record_bucket(pos, profit, early, exit_reason='resolve', exit_price=None):
+    """Tally a closed position into its price bucket AND its (time x price) cell.
+
+    exit_reason distinguishes the three routes, which `early` alone cannot:
+    take_profit and opposite_close are BOTH early exits, and conflating them
+    made a 'close' run unreadable against the take-profit behaviour beside it.
+    """
     global gross_win, gross_loss
     if profit > 0:
         gross_win += profit
@@ -390,9 +425,20 @@ def record_bucket(pos, profit, early):
     p = _price_idx(pos['price'])
     t = pos['time_idx']
     roll_events.append((pos.get('entry_ts'), pos['price'], profit, p, t, pos.get('cid')))
-    if COLLECT_ENTRY_FEATURES and pos.get('pf') is not None:
-        entry_feat_rows.append((pos.get('entry_ts'), pos.get('cid'), pos.get('market_id'),
-                                pos['price'], profit, int(early)) + pos['pf'])
+    if COLLECT_ENTRY_FEATURES:
+        # EVERY closed trade. The old `pos.get('pf') is not None` condition
+        # captured only trades that happened to have price-path features, which
+        # is a biased subset -- path features need prior price history, so it
+        # silently excluded early and thin markets.
+        _pf = pos.get('pf') or (None,) * 9
+        entry_feat_rows.append(
+            (pos.get('entry_ts'), pos.get('cid'), pos.get('market_id'),
+             pos['price'], profit, int(early),
+             pos.get('bayesian_prob'), pos.get('perc_margin'),
+             pos.get('variance_v'), pos.get('c_n'), pos.get('c_conv'),
+             pos.get('c_tpm'), pos.get('time_idx'),
+             exit_reason, int(bool(pos.get('is_reversal'))), exit_price)
+            + tuple(_pf))
     for cell in (buckets[p], grid[t][p]):
         cell['count']      += 1
         cell['sum_price']  += pos['price']
@@ -400,6 +446,60 @@ def record_bucket(pos, profit, early):
         cell['sum_profit'] += profit
         if profit > 0: cell['wins']  += 1
         if early:      cell['early'] += 1
+
+def _enter_reversal(sib_cid, mid, k):
+    """Open a position on `sib_cid` at its price on row k, staked FIXED_SIZE.
+
+    Called from BOTH the reverse-an-open-position path and the
+    reverse-after-take-profit path. Written once so the two cannot drift.
+
+    Returns True if a position was opened. Refuses when the sibling is below
+    OPPOSITE_MIN_SIB_PRICE (where 1/p diverges and no size could be traded
+    anyway), when cash is short, or when the outcome is unknown.
+
+    minitest's state is module-level, so the mutated counters are declared
+    global and the per-chunk arrays are read directly.
+    """
+    global cash, locked_capital, opposite_reversals, total_slippage_paid
+    if sib_cid in open_positions:
+        return False
+    p_sib = px_a[k]
+    if p_sib < OPPOSITE_MIN_SIB_PRICE or cash < FIXED_SIZE:
+        return False
+    if np.isnan(out_a[k]):
+        return False
+    buy_exec = min(0.99, max(0.001, p_sib * (1.0 + MAX_SLIPPAGE_PCT)))
+    shares = FIXED_SIZE / buy_exec
+    cash -= FIXED_SIZE
+    locked_capital += FIXED_SIZE
+    open_positions[sib_cid] = {
+        'shares': shares,
+        'buy_price': buy_exec,
+        'payout_at_maturity': shares * out_a[k],
+        'market_id': mid,
+        'price': p_sib,
+        'bayesian_prob': bay_a[k],
+        'time_idx': _time_idx(ts_a[k], end_a[k], sib_cid),
+        'cid': sib_cid,
+        'entry_ts': float(ts_a[k]),
+        'is_reversal': True,
+        'perc_margin': _feat(pm_a, k),
+        'variance_v': _feat(vv_a, k),
+        'c_n': _feat(cn_a, k),
+        'c_conv': _feat(cc_a, k),
+        'c_tpm': _feat(ct_a, k),
+        'pf': (_path_features(sib_cid, float(ts_a[k]), float(p_sib))
+               if COLLECT_ENTRY_FEATURES else None),
+    }
+    # NaN end must not go on the heap: it breaks heap ordering and stalls every
+    # position behind it. Same guard the buy path uses.
+    if not np.isnan(end_a[k]):
+        heapq.heappush(active_trades, (end_a[k], sib_cid))
+    seen_market_ids.add(mid)
+    opposite_reversals += 1
+    total_slippage_paid += shares * p_sib * MAX_SLIPPAGE_PCT
+    return True
+
 
 # Equity curve tracking — seeded LAZILY at the first real trade so a long flat
 # pre-data stretch can't distort the risk metrics.
@@ -446,7 +546,7 @@ if EXCLUDE_NEGRISK:
           "(EXCLUDE_NEGRISK)\n")
 if EXCLUDE_HOSTILE:
     print("Market filter: HOSTILE markets excluded at row level (frozen rule: fees | "
-          "chain.link/binance/dotabuff/gol.gg | 3 sports types | liveness<=1h)\n")
+          "see hostile_markets.py)\n")
 print(f"Signal mode: {SIGNAL_MODE} | required signals: {REQUIRED_SIGNALS}\n")
 if PARQUET_OUTCOME_AUTHORITY and outcome_authority_ok:
     print("Outcome authority: markets parquet — only confirmed winners score; "
@@ -459,13 +559,35 @@ if RESTRICT_TO_NEW_MARKETS and not cid_start:
 # Read the columns we actually need, INCLUDING cid and perc_margin.
 cols = ['timestamp', 'market_id', 'cid', 'bet_on', 'bayesian_prob', 'perc_margin',
         'price', 'actual_outcome', 'variance_v', 'end_timestamp']
+# Contributor columns, added to prefilter_sim_csv.py's COLS/SCHEMA. Appended
+# conditionally so an older parquet without them still loads.
+_CONTRIB_COLS = ['c_n', 'c_conv', 'c_tpm']
+# Counted and reported: a large null population inside a gate would otherwise
+# silently change which rows are compared between runs.
+_gate_null_cn = 0
+_gate_null_tpm = 0
+
+
+def _feat(arr, k):
+    """arr[k] as a float, or None when the column is absent or unparseable.
+    Keeps the per-trade file writable against an older enriched parquet."""
+    if arr is None:
+        return None
+    try:
+        v = float(arr[k])
+    except (TypeError, ValueError):
+        return None
+    return None if v != v else v
 # With the parquet as outcome authority, a blank CSV outcome no longer disqualifies a
 # row — the authority decides — so actual_outcome leaves the dropna subset.
 # ENRICHED FAST PATH: prefilter_sim_csv.py --markets-parquet precomputes every static
 # per-token join as columns. The chunk loop then does ZERO string joins -- pandas
 # materializes multi-million-element sets on EVERY isin call (measured 25-45s/call),
 # which was the dominant cost of the replay across all profiling rounds.
-ENRICHED_COLS = ['market_start', 'negrisk_flag', 'hostile_flag', 'auth_outcome']
+# hostile_flag deliberately absent: the filter now uses hostile_cids from
+# hostile_markets.py at run time, so the parquet's baked-in flag is ignored
+# and the rule can change without regenerating anything.
+ENRICHED_COLS = ['market_start', 'negrisk_flag', 'auth_outcome']
 ENRICHED = False
 if str(FILE_PATH).endswith('.parquet'):
     try:
@@ -474,6 +596,24 @@ if str(FILE_PATH).endswith('.parquet'):
         ENRICHED = all(c in _names for c in ENRICHED_COLS)
     except Exception:
         ENRICHED = False
+# Contributor columns, if the parquet carries them. Appended BEFORE the dropna
+# subset is computed, and excluded from it below -- c_n is null for rows written
+# before the aggregator saw any contributor, and letting it gate row-dropping
+# would silently strip them.
+_HAVE_CONTRIB = []
+if str(FILE_PATH).endswith('.parquet'):
+    try:
+        _HAVE_CONTRIB = [c for c in _CONTRIB_COLS if c in _names]
+    except NameError:
+        _HAVE_CONTRIB = []
+if _HAVE_CONTRIB:
+    cols = cols + _HAVE_CONTRIB
+    print(f"[contrib] gating columns available: {_HAVE_CONTRIB}")
+elif MAX_CONTRIB is not None or MAX_TPM is not None:
+    print("[contrib] WARNING: MAX_CONTRIB/MAX_TPM are set but the parquet has "
+          "none of " + str(_CONTRIB_COLS) + " -- the gates will NOT be applied. "
+          "Re-run prefilter_sim_csv.py with those columns in COLS and SCHEMA.")
+
 if ENRICHED:
     cols = cols + ENRICHED_COLS
     print("[enriched] Precomputed join columns detected -- static joins skipped in the loop.")
@@ -489,13 +629,8 @@ elif str(FILE_PATH).endswith('.parquet'):
 _required = ([c for c in cols if c != 'actual_outcome']
              if (PARQUET_OUTCOME_AUTHORITY and (ENRICHED or outcome_authority_ok)) else cols)
 # Enriched columns carry MEANINGFUL NaNs (unknown start, unconfirmed outcome) and the
-# flags are never null -- none may participate in the dropna gate. end_timestamp is
-# ALSO a meaningful null (an UNRESOLVED market has no end): dropping on it here re-
-# introduces exactly the unresolved-row loss we removed from the timestamp dropna
-# below, so it must leave the gate too. Only timestamp is truly required (handled
-# by the dedicated dropna a few lines down).
-_required = [c for c in _required if c not in (ENRICHED_COLS + ['end_timestamp'])]
-
+# flags are never null -- none of them may participate in the dropna gate.
+_required = [c for c in _required if c not in ENRICHED_COLS + _CONTRIB_COLS]
 
 # --- MAIN EVENT LOOP ---
 def _assert_plain_dtypes(df, _state={'done': False}):
@@ -599,12 +734,13 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
             continue
 
     # 1c'. HOSTILE EXCLUSION (frozen rule) -- same row-level mechanics as negRisk.
-    if EXCLUDE_HOSTILE and (ENRICHED or hostile_cids):
-        if ENRICHED:
-            _keeph = ~chunk['hostile_flag'].astype(bool)
-        else:
-            _normh = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
-            _keeph = ~_normh.isin(hostile_cids)
+    if EXCLUDE_HOSTILE and hostile_cids:
+        # ALWAYS hostile_cids, never the parquet's hostile_flag. That flag was
+        # baked in by prefilter_sim_csv.py under ITS rule, so using it meant the
+        # filter could not be changed without regenerating the parquet, and it
+        # silently applied a different rule from the one in this file.
+        _normh = chunk['cid'].str.strip().str.lower().str.replace('0x', '', regex=False)
+        _keeph = ~_normh.isin(hostile_cids)
         rows_hostile += int((~_keeph).sum())
         chunk = chunk[_keeph].copy()
         if chunk.empty:
@@ -674,6 +810,23 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
             _paths.pop(_c, None); _path_last.pop(_c, None)
 
     is_signal = (chunk['perc_margin'] > SIGNAL) & (chunk['variance_v'] < MAX_VARIANCE) & (chunk['price'] < MAX_PRICE)
+    # Contributor gates. Pure ENTRY conditions -- they change no state, so
+    # applying them here is equivalent to applying them in sim_strat_5, and no
+    # sim rerun is needed to evaluate them.
+    # to_numeric: c_tpm arrives as an object column (the prefilter SCHEMA
+    # declares c_n but not c_tpm), so a bare `<` raises TypeError.
+    #
+    # .fillna(-1): NaN < X is False, so a missing value would DROP the row.
+    # That silently turns a value filter into a data-availability filter and
+    # makes two runs differ by more than the stated rule. Nulls PASS.
+    if MAX_CONTRIB is not None and 'c_n' in chunk.columns:
+        _cn = pd.to_numeric(chunk['c_n'], errors='coerce')
+        _gate_null_cn += int(_cn.isna().sum())
+        is_signal &= (_cn.fillna(-1.0) < MAX_CONTRIB)
+    if MAX_TPM is not None and 'c_tpm' in chunk.columns:
+        _ct = pd.to_numeric(chunk['c_tpm'], errors='coerce')
+        _gate_null_tpm += int(_ct.isna().sum())
+        is_signal &= (_ct.fillna(-1.0) < MAX_TPM)
     is_sell = chunk['price'] >= TAKE_PROFIT_PRICE
 
     # Last-seen market price per cid across the FULL chunk (before we drop rows for the
@@ -730,11 +883,23 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
     mid_a = chunk['market_id'].to_numpy()[_ord]
     px_a  = chunk['price'].to_numpy()[_ord]
     sig_a = chunk['is_signal'].to_numpy()[_ord]
+    if OPPOSITE_ACTION:
+        # every token seen for a market, not just the ones traded
+        for _c, _m in zip(cid_a, mid_a):
+            # setdefault, so no collections import is needed
+            mid_tokens.setdefault(_m, set()).add(_c)
     pri_a = chunk['priority'].to_numpy()[_ord]
     out_a = chunk['actual_outcome'].to_numpy()[_ord]
     end_a = chunk['end_timestamp'].to_numpy()[_ord]
     bay_a = chunk['bayesian_prob'].to_numpy()[_ord]
     pok_a = chunk['price_ok'].to_numpy()[_ord] if 'price_ok' in chunk.columns else None
+    # Same optional-column idiom as pok_a above. None when the parquet lacks the
+    # column, so an older enriched file still runs and simply writes nulls.
+    pm_a = chunk['perc_margin'].to_numpy()[_ord] if 'perc_margin' in chunk.columns else None
+    vv_a = chunk['variance_v'].to_numpy()[_ord] if 'variance_v' in chunk.columns else None
+    cn_a = chunk['c_n'].to_numpy()[_ord] if 'c_n' in chunk.columns else None
+    cc_a = chunk['c_conv'].to_numpy()[_ord] if 'c_conv' in chunk.columns else None
+    ct_a = chunk['c_tpm'].to_numpy()[_ord] if 'c_tpm' in chunk.columns else None
     _n = len(ts_a)
     _i = 0
     while _i < _n:
@@ -772,7 +937,12 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
                 wins += 1
             else:
                 losses += 1
-            record_bucket(pos, profit, early=False)
+            # exit_price at maturity is the token's own outcome: 1.0 per share
+            # if it won, 0.0 if it lost. That is the honest per-share value,
+            # not an inference from profit.
+            record_bucket(pos, profit, early=False, exit_reason='resolve',
+                          exit_price=(pos['payout_at_maturity'] / pos['shares']
+                                      if pos.get('shares') else None))
             portfolio_history.append((end_ts, cash + locked_capital))
 
         # --- PHASE 2: EXECUTE EARLY SELLS FIRST (frees cash immediately) ---
@@ -795,11 +965,93 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
                     wins += 1
                 else:
                     losses += 1
-                record_bucket(pos, profit, early=True)
+                record_bucket(pos, profit, early=True,
+                              exit_reason='take_profit',
+                              exit_price=sell_exec_price)
 
                 early_sells_count += 1
+                if OPPOSITE_ACTION == 'reverse' and OPPOSITE_REVERSE_AFTER_TP:
+                    # remembered so an opposite signal LATER in this market can
+                    # still enter the sibling, even though nothing is held
+                    tp_exited_mids[pos['market_id']] = _cid
                 total_slippage_paid += (pos['shares'] * px_a[_k] * MAX_SLIPPAGE_PCT)
                 portfolio_history.append((ts, cash + locked_capital))
+
+        # --- PHASE 2b: OPPOSITE-SIGNAL CLOSE / REVERSE ---
+        # Runs after take-profit and before new buys, so a slot freed here
+        # behaves exactly as a take-profit-freed slot does.
+        if OPPOSITE_ACTION:
+            for _k in range(_i, _j):
+                if not sig_a[_k]:
+                    continue                      # must be an ACTIONABLE signal
+                _sib_cid = cid_a[_k]
+                _mid = mid_a[_k]
+                if _sib_cid in open_positions:
+                    continue                      # this is the held token itself
+                # the held token of this market, if we have one
+                _held = None
+                for _hc in mid_tokens.get(_mid, ()):
+                    if _hc != _sib_cid and _hc in open_positions:
+                        _held = _hc
+                        break
+                if _held is None:
+                    continue
+                if OPPOSITE_REQUIRE_BINARY and len(mid_tokens.get(_mid, ())) != 2:
+                    continue
+                _p_sib = px_a[_k]
+                # held price via the binary complement, then the SAME slippage
+                # haircut the take-profit path applies
+                _held_px = 1.0 - _p_sib
+                if _held_px <= 0.0:
+                    continue
+                pos = open_positions.pop(_held)
+                _sell_exec = _held_px * (1.0 - MAX_SLIPPAGE_PCT)
+                _sell_payout = pos['shares'] * _sell_exec
+                cash += _sell_payout
+                locked_capital -= FIXED_SIZE
+                sold_cids.add(_held)
+                profit = _sell_payout - FIXED_SIZE
+                if profit > 0:
+                    wins += 1
+                else:
+                    losses += 1
+                record_bucket(pos, profit, early=True,
+                              exit_reason='opposite_close',
+                              exit_price=_sell_exec)
+                # early_sells_count was NOT incremented here while cell['early']
+                # WAS, so the headline early-sell figure disagreed with the
+                # bucket counts. Both now count an opposite close as an early
+                # exit, and exit_reason keeps the two routes separable.
+                early_sells_count += 1
+                total_slippage_paid += pos['shares'] * _held_px * MAX_SLIPPAGE_PCT
+                opposite_closes += 1
+
+                if OPPOSITE_ACTION == 'reverse':
+                    _enter_reversal(_sib_cid, _mid, _k)
+                portfolio_history.append((ts, cash + locked_capital))
+
+        # --- PHASE 2c: OPPOSITE SIGNAL AFTER A TAKE-PROFIT EXIT ---
+        # Nothing is held, so nothing is closed: this ENTERS the sibling in a
+        # market already exited at take-profit. A relaxation of the re-entry
+        # ban, not a reversal. One shot -- the market is discarded from
+        # tp_exited_mids whether or not the entry succeeds, so a refused entry
+        # cannot be retried on the next signal.
+        if OPPOSITE_ACTION == 'reverse' and OPPOSITE_REVERSE_AFTER_TP:
+            for _k in range(_i, _j):
+                if not sig_a[_k]:
+                    continue
+                _sib_cid = cid_a[_k]
+                _mid = mid_a[_k]
+                if _mid not in tp_exited_mids:
+                    continue
+                if _sib_cid == tp_exited_mids[_mid]:
+                    continue                  # the token we already held
+                if OPPOSITE_REQUIRE_BINARY and len(mid_tokens.get(_mid, ())) != 2:
+                    continue
+                del tp_exited_mids[_mid]
+                if _enter_reversal(_sib_cid, _mid, _k):
+                    opposite_after_tp += 1
+                    portfolio_history.append((ts, cash + locked_capital))
 
         # --- PHASE 3: EXECUTE NEW BUYS ---
         buy_ks = []
@@ -878,6 +1130,13 @@ for chunk in _iter_chunks(FILE_PATH, CHUNK_SIZE, cols):
                     'time_idx': _time_idx(ts_a[_k], end_a[_k], _cid),
                     'cid': _cid,
                     'entry_ts': float(ts_a[_k]),
+                    # every candidate gating variable, captured AT ENTRY so the
+                    # per-trade file can be partitioned any way we like offline
+                    'perc_margin': _feat(pm_a, _k),
+                    'variance_v': _feat(vv_a, _k),
+                    'c_n': _feat(cn_a, _k),
+                    'c_conv': _feat(cc_a, _k),
+                    'c_tpm': _feat(ct_a, _k),
                     'pf': (_path_features(_cid, float(ts_a[_k]), float(px_a[_k]))
                            if COLLECT_ENTRY_FEATURES else None),
                 }
@@ -933,7 +1192,9 @@ if _drain_ts is not None:
             wins += 1
         else:
             losses += 1
-        record_bucket(pos, profit, early=False)
+        record_bucket(pos, profit, early=False, exit_reason='resolve',
+                      exit_price=(pos['payout_at_maturity'] / pos['shares']
+                                  if pos.get('shares') else None))
         portfolio_history.append((end_ts, cash + locked_capital))
 
 # --- POST-PROCESSING & METRICS ---
@@ -977,7 +1238,9 @@ else:
             wins += 1
         else:
             losses += 1
-        record_bucket(pos, profit, early=False)
+        record_bucket(pos, profit, early=False, exit_reason='resolve',
+                      exit_price=(pos['payout_at_maturity'] / pos['shares']
+                                  if pos.get('shares') else None))
         portfolio_history.append((end_ts, cash + locked_capital))
     # Positions left open by the unconfirmed-maturity guard already consumed their heap
     # entry in PHASE 1 — settle them here too (at 0, i.e. the old behaviour).
@@ -986,7 +1249,8 @@ else:
         pos = open_positions.pop(cid)
         locked_capital -= FIXED_SIZE
         losses += 1
-        record_bucket(pos, -FIXED_SIZE, early=False)
+        record_bucket(pos, -FIXED_SIZE, early=False,
+                      exit_reason='unconfirmed_writeoff', exit_price=0.0)
         portfolio_history.append((_final_ts, cash + locked_capital))
 
 if not portfolio_history:
@@ -1227,9 +1491,56 @@ if ARGS.report:
 
 if COLLECT_ENTRY_FEATURES and entry_feat_rows:
     _fcols = ['entry_ts', 'cid', 'market_id', 'entry_price', 'profit', 'early',
+              'bayesian_prob', 'perc_margin', 'variance_v',
+              'c_n', 'c_conv', 'c_tpm', 'time_idx',
+              'exit_reason', 'is_reversal', 'exit_price',
               'd1h_c', 'd6h_c', 'd24h_c', 'd1h_r', 'd6h_r', 'd24h_r', 'dd24', 'span_h', 'npts']
-    pd.DataFrame(entry_feat_rows, columns=_fcols).to_csv(ENTRY_FEATURES_OUT, index=False)
+    _df_feat = pd.DataFrame(entry_feat_rows, columns=_fcols)
+    _df_feat.to_csv(ENTRY_FEATURES_OUT, index=False)
+    # The parameter set that produced this file, written beside it. Every
+    # comparison in this project that went wrong went wrong because the analysis
+    # population differed from the one being reasoned about; this makes that
+    # impossible to get wrong silently.
+    import json as _json
+    _hdr = {'SIGNAL': SIGNAL, 'MAX_PRICE': MAX_PRICE,
+            'MAX_VARIANCE': MAX_VARIANCE, 'SIGNAL_MODE': SIGNAL_MODE,
+            'REQUIRED_SIGNALS': REQUIRED_SIGNALS,
+            'TAKE_PROFIT_PRICE': TAKE_PROFIT_PRICE,
+            'MAX_CONTRIB': MAX_CONTRIB, 'MAX_TPM': MAX_TPM,
+            'FILE_PATH': str(FILE_PATH),
+            'trades': int(len(_df_feat)),
+            'total_profit': float(_df_feat['profit'].sum()),
+            'gate_null_c_n': _gate_null_cn, 'gate_null_c_tpm': _gate_null_tpm}
+    with open(str(ENTRY_FEATURES_OUT) + '.meta.json', 'w') as _f:
+        _json.dump(_hdr, _f, indent=2)
+    print(f"[features] run header -> {ENTRY_FEATURES_OUT}.meta.json")
+    if _gate_null_cn or _gate_null_tpm:
+        print(f"[features] rows with a NULL gating value (these PASSED the "
+              f"gate): c_n {_gate_null_cn:,}, c_tpm {_gate_null_tpm:,}")
     print(f"[features] wrote {len(entry_feat_rows):,} entry-feature rows -> {ENTRY_FEATURES_OUT}")
+if OPPOSITE_ACTION:
+    print(f"[opposite] action={OPPOSITE_ACTION} binary_only={OPPOSITE_REQUIRE_BINARY} "
+          f"min_sib_price={OPPOSITE_MIN_SIB_PRICE}")
+    print(f"[opposite] closed {opposite_closes:,} positions on an opposite signal; "
+          f"opened {opposite_reversals:,} reversals")
+    if OPPOSITE_ACTION == 'reverse' and OPPOSITE_REVERSE_AFTER_TP:
+        print(f"[opposite] of those, {opposite_after_tp:,} were entered AFTER a "
+              f"take-profit exit -- nothing was held, so these are fresh "
+              f"directional bets, not flips")
+    if entry_feat_rows:
+        _er = {}
+        for _r in entry_feat_rows:
+            _er[_r[13]] = _er.get(_r[13], 0) + 1
+        print(f"[opposite] exits by reason: {_er}")
+        _rev = sum(1 for _r in entry_feat_rows if _r[14])
+        print(f"[opposite] {_rev:,} of {len(entry_feat_rows):,} closed positions "
+              f"were opened by a reversal. NOTE: a closed-then-reversed position "
+              f"contributes TWO closed trades, so the realized win rate here is "
+              f"not directly comparable with a baseline run's.")
+    if OPPOSITE_ACTION == 'reverse' and opposite_reversals == 0 and opposite_closes:
+        print("[opposite] WARNING: every reversal was refused. Either the sibling "
+              "price was below OPPOSITE_MIN_SIB_PRICE or cash was short -- the run "
+              "is therefore equivalent to 'close', not 'reverse'.")
 
 if ARGS.report:
     if True:
