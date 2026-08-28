@@ -2059,6 +2059,10 @@ class LiveTrader:
         log.info(f"🎯 Exit Monitor Started | take-profit ≥ ${take_profit:.2f} | tick {tick}s")
         while self.running:
             try:
+                # 10-minute GTD expiry. A resting order that fills long after the
+                # signal is filling because the price CRASHED to meet us, which is
+                # the adverse-selection case. Bounding the window bounds that.
+                await self.broker.expire_limits()
                 for held_tid, pos in list(self.persistence.state["positions"].items()):
                     best_bid = self._best_bid(held_tid)
                     if best_bid is None or best_bid < take_profit:
