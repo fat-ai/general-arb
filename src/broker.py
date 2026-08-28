@@ -312,6 +312,12 @@ class BaseBroker:
                  f"${rec['remaining_usdc']:.2f} @ {rec['price']:.4f}")
         return True
 
+    async def on_trade(self, token_id, price, size, is_buy):
+        """Match an observed trade against resting limits. No-op by default:
+        LiveBroker's resting orders are matched by the venue, so only
+        PaperBroker simulates it."""
+        return
+
     async def _cancel_limit(self, order_id):
         return True
 
