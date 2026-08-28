@@ -1201,8 +1201,6 @@ class LiveTrader:
             self.stats['parked_trades'] = sum(
                 len(v) for v in getattr(self, "_parked", {}).values())
 
-    async def on_trade(self, token_id, price, size, is_buy):
-        return
 
     async def _process_batch(self, trades):
         batch_scores = []
