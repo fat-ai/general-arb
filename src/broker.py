@@ -26,10 +26,18 @@ audit_log = logging.getLogger("TradeAudit")
 # signal with a 0.01 tick, 0.021 floors to 0.02 -- the 5% allowance vanishes
 # entirely in the cheap band this strategy trades, which is a real interaction
 # worth measuring rather than assuming away.
-def floor_to_tick(price: float, tick: float) -> float:
+def floor_to_tick(price: float, tick: float):
+    """Floor a BUY limit to a valid tick, or None if it cannot be expressed.
+
+    Returns None rather than clamping. The previous max(tick, ...) guard turned
+    an inexpressible price into a full-tick price -- at a 0.001 signal on a 0.01
+    tick that rested at 10x the signal, which is not the order we intended and
+    is outside any slippage bound we would accept.
+    """
     if not tick or tick <= 0:
         tick = 0.01
-    return max(tick, math.floor(float(price) / tick) * tick)
+    px = math.floor(float(price) / tick) * tick
+    return px if px >= tick else None
     
 class PersistenceManager:
     """
@@ -276,6 +284,10 @@ class BaseBroker:
         price afterwards chases liquidity the signal itself consumed.
         """
         px = floor_to_tick(limit_price, tick)
+        if px is None:
+            log.info(f"🚫 Limit inexpressible for {token_id[:12]}…: "
+                     f"{limit_price:.5f} < tick {tick}. Skipping.")
+            return None
         if not (self.MIN_BUY_PRICE <= px <= self.MAX_BUY_PRICE):
             log.warning(f"🛡️ Limit rejected for {token_id}: {px:.4f} out of bounds")
             return None
