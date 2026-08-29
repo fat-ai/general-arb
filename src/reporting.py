@@ -236,7 +236,7 @@ def generate_institutional_report(snapshot=None):
         df_eq = pd.read_csv(EQUITY_FILE)
         df_eq['timestamp'] = pd.to_datetime(df_eq['timestamp'], unit='s')
         df_eq.set_index('timestamp', inplace=True)
-        
+
         # --- 2. LOAD TRADE LEDGER ---
         trades = []
         if AUDIT_FILE.exists():
@@ -248,53 +248,72 @@ def generate_institutional_report(snapshot=None):
 
         # --- 3. CALCULATE RISK METRICS (Time Series) ---
         if df_eq.empty: return "⏳ Gathering Data..."
-        
+
         curr_eq = df_eq['equity'].iloc[-1]
         start_eq = CONFIG['initial_capital']
         total_ret = (curr_eq - start_eq) / start_eq
-        
+
         # Resample to Hourly
         df_hourly = df_eq['equity'].resample('1h').last().ffill()
         returns = df_hourly.pct_change().fillna(0)
-        
+        n_periods = int(returns.shape[0])
+
         # Annualized Volatility (Crypto 24/7 = 8760 hours/yr)
         vol_metric = returns.std() * np.sqrt(8760)
-        
+
         # Sharpe Ratio
         sharpe = (returns.mean() / returns.std()) * np.sqrt(8760) if returns.std() > 0 else 0.0
-        
+
         # Sortino Ratio
         neg_ret = returns[returns < 0]
         downside_std = neg_ret.std()
         sortino = (returns.mean() / downside_std) * np.sqrt(8760) if downside_std > 0 else 0.0
-        
+
         rolling_max = df_eq['equity'].cummax()
         drawdown_series = (df_eq['equity'] - rolling_max) / rolling_max
         max_dd = drawdown_series.min()
 
-        # --- 4. CALCULATE EXECUTION METRICS (Event Series) ---
+        # --- 4. CALCULATE EXECUTION METRICS ---
+        #
+        # AGGREGATED BY POSITION, NOT BY EXIT EVENT. A winning position is
+        # unwound in many partial sells as the exit monitor works a thin bid
+        # book -- one winner here produced 65 SELL rows -- while a loser exits
+        # in exactly ONE redemption. Counting events therefore multiplies
+        # winners and not losers: 263 events showed a 26.6% win rate where the
+        # 198 underlying positions were 3.0%. Money-weighted figures (profit
+        # factor, net) are unaffected either way; COUNTS are not.
         win_rate, profit_factor, expectancy = 0.0, 0.0, 0.0
-        total_closed = 0
+        total_closed = n_events = n_wins = 0
+        net_pnl = 0.0
+        top_share = None
 
-        if not df_trades.empty and 'pnl' in df_trades.columns and 'side' in df_trades.columns:
-            # Filter for Closed Trades
+        if (not df_trades.empty and 'pnl' in df_trades.columns
+                and 'side' in df_trades.columns and 'token' in df_trades.columns):
             closed = df_trades[df_trades['side'].isin(['SELL', 'REDEEM'])]
-            
+
             if not closed.empty:
-                total_closed = len(closed)
-                wins = closed[closed['pnl'] > 0]
-                losses = closed[closed['pnl'] <= 0]
-                
-                win_rate = len(wins) / total_closed if total_closed > 0 else 0
-                
-                gross_win = wins['pnl'].sum()
-                gross_loss = abs(losses['pnl'].sum())
+                n_events = len(closed)
+                pos_pnl = closed.groupby('token')['pnl'].sum()
+
+                total_closed = int(pos_pnl.shape[0])
+                wins = pos_pnl[pos_pnl > 0]
+                losses = pos_pnl[pos_pnl <= 0]
+                n_wins = int(wins.shape[0])
+
+                win_rate = n_wins / total_closed if total_closed > 0 else 0.0
+
+                gross_win = float(wins.sum())
+                gross_loss = abs(float(losses.sum()))
                 profit_factor = gross_win / gross_loss if gross_loss > 0 else float('inf')
-                
-                avg_win = wins['pnl'].mean() if not wins.empty else 0
-                avg_loss = losses['pnl'].mean() if not losses.empty else 0
-                
-                expectancy = (avg_win * win_rate) + (avg_loss * (1 - win_rate))
+
+                net_pnl = float(pos_pnl.sum())
+                expectancy = net_pnl / total_closed if total_closed > 0 else 0.0
+
+                # Concentration. With a fat-tailed payoff a single position can
+                # exceed total net, in which case every other metric on this
+                # table describes one draw rather than a strategy.
+                if not wins.empty and abs(net_pnl) > 1e-9:
+                    top_share = float(wins.max()) / net_pnl
 
         # --- 5. FORMAT OUTPUT ---
         data = [
@@ -303,8 +322,8 @@ def generate_institutional_report(snapshot=None):
             ["📉 Max Drawdown", f"{max_dd:.2%}"],
             ["🌊 Annualized Vol", f"{vol_metric:.2%}"],
             ["-----------------", "-----------------"],
-            ["📊 Sharpe Ratio", f"{sharpe:.2f}"],
-            ["🛡️ Sortino Ratio", f"{sortino:.2f}"],
+            ["📊 Sharpe Ratio", f"{sharpe:.2f} (n={n_periods}h)"],
+            ["🛡️ Sortino Ratio", f"{sortino:.2f} (n={n_periods}h)"],
             ["-----------------", "-----------------"],
         ]
 
@@ -322,12 +341,15 @@ def generate_institutional_report(snapshot=None):
             ]
 
         data += [
-            ["🎲 Closed Trades", f"{total_closed}"],
-            ["✅ Win Rate", f"{win_rate:.1%}"],
+            ["🎲 Closed Positions", f"{total_closed}  ({n_events} exit fills)"],
+            ["✅ Win Rate", f"{win_rate:.1%}  ({n_wins} of {total_closed})"],
             ["⚖️ Profit Factor", f"{profit_factor:.2f}"],
-            ["🔮 Expectancy", f"${expectancy:.2f} / trade"]
+            ["🔮 Expectancy", f"${expectancy:.2f} / position"],
+            ["💵 Realized PnL", f"${net_pnl:+,.2f}"],
         ]
-        
+        if top_share is not None:
+            data += [["🎯 Largest Winner", f"{top_share:.0%} of net"]]
+
         return f"\nINSTITUTIONAL PERFORMANCE REPORT\n{tabulate(data, headers=['Metric', 'Value'], tablefmt='fancy_grid')}"
 
     except Exception as e:
