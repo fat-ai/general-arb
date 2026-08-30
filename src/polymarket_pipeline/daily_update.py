@@ -23,17 +23,16 @@ from sim_strat_5 import (
     process_daily_history_merges,
     calibrate_models, 
     compute_wager_and_p_true,
+    process_trade,         
+    PRICE_LUT,            
+    TIME_LUT, 
     restore_arrays_from_npz,
     _hist_sidecar_paths,
-    process_trade,          
-    PRICE_LUT,
-    TIME_LUT, 
     CACHE_DIR, 
     MARKETS_FILE, 
     TRADES_PATH,
     _EMPTY_U32,
 )
-from market_time import derive_window, in_window, ttr_hours as mt_ttr_hours
 
 __main__.MarketPositions = MarketPositions
 __main__.BayesianState = BayesianState
@@ -265,60 +264,56 @@ def export_dashboard_scores(state: BayesianState):
         log.error(f"⚠️ Failed to export dashboard scores: {e}")
 
 def load_markets() -> dict:
-    """Loads market metadata via Polars with optimized memory mapping.
-
-    N5: window and ttr now come from market_time.derive_window, the same
-    derivation sim_strat_5 uses (verified identical over 5,445,454 markets).
-    Previously this set 'end' = resolution_timestamp for EVERY market, which
-    the sim documents as an unreliable scheduled placeholder -- gating trades
-    on it discarded the entire in-game window (validated: 508956 kept 5/21
-    trades). 'end' is now None for OPEN markets, meaning no upper bound.
-    """
+    """Loads market metadata via Polars with optimized memory mapping."""
     log.info("📂 Loading Market Metadata...")
-
-    # Column casts mirror sim_strat_5:1321-1337 exactly. The casts are
-    # behaviour-neutral on this schema (verified) but are kept so the two
-    # readers cannot drift if the parquet dtypes ever change.
+    
+    # Define only the columns we actually need to read from disk
+    cols_to_read = [
+        'contract_id', 'market_id', 'outcome', 
+        'token_outcome_label', 'resolution_timestamp', 'start_date'
+    ]
+    
+    # Use scan_parquet for lazy evaluation, select only needed columns, then collect
     markets_pl = pl.scan_parquet(MARKETS_PATH).select([
-        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),   # 0
-        pl.col('market_id').alias('id'),                                                    # 1
-        pl.col('outcome').cast(pl.Float32),                                                 # 2
-        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),                 # 3
-        pl.col('resolution_timestamp'),                                                     # 4
-        pl.col('start_date').cast(pl.String).alias('start_date'),                           # 5
-        pl.col('closed_time'),                                                              # 6
-        pl.col('closed'),                                                                   # 7
-        pl.col('eventStartTime').cast(pl.String).alias('eventStartTime'),                   # 8
-        pl.col('game_start_time').cast(pl.String).alias('game_start_time'),                 # 9
+        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
+        pl.col('market_id').alias('id'),
+        pl.col('outcome').cast(pl.Float32),
+        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
+        pl.col('resolution_timestamp'),
+        pl.col('start_date')
     ]).collect()
-
+    
     market_map = {}
-
-    # Raw tuples (not named=True) to avoid instantiating millions of temp dicts.
+    
+    # Use raw tuples (iter_rows) instead of named=True to prevent instantiating 2.2 million temporary dicts
     for row in markets_pl.iter_rows():
-        if not row[0]:
-            continue                              # null contract_id after cleaning
+        if not row[0]: continue # Skip if contract_id is null after processing
         cid = sys.intern(row[0])
-
-        s_date, e_date, sched_end = derive_window(
-            start_date=row[5],
-            resolution_timestamp=row[4],
-            closed_time=row[6],
-            closed=row[7],
-            event_start_time=row[8],
-            game_start_time=row[9],
-        )
-
+        
+        # Parse Start Date safely
+        s_date = row[5]
+        if isinstance(s_date, str):
+            try: 
+                s_date = pd.to_datetime(s_date, utc=True).timestamp()
+            except Exception: 
+                s_date = None
+        elif hasattr(s_date, 'timestamp'):
+            s_date = s_date.timestamp()
+            
+        # Parse End Date safely
+        e_date = row[4]
+        if hasattr(e_date, 'timestamp'):
+            e_date = e_date.timestamp()
+            
         market_map[cid] = {
-            'id': row[1],
-            'start': s_date,
-            'end': e_date,                        # None = OPEN, no upper bound
-            'sched_end': sched_end,               # ttr reference for open markets
-            'outcome': row[2],
-            # sys.intern shares memory for repetitive strings like "yes"/"no"
-            'outcome_label': sys.intern(row[3]) if row[3] else None,
+            'id': row[1], 
+            'start': s_date, 
+            'end': e_date,
+            'outcome': row[2], 
+            # Use sys.intern to share memory for repetitive strings like "yes" and "no"
+            'outcome_label': sys.intern(row[3]) if row[3] else None 
         }
-
+        
     return market_map
     
 def main():
@@ -344,19 +339,15 @@ def main():
     # 2. Single pass through tracked contracts
     for cid in tracked_cids:
         m = market_map.get(cid)
-
+        
         if m is not None:
             outcome = m['outcome']
             # Safe check: Must not be None, and must not be NaN
             if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
                 cids_to_resolve.append(cid)
-            else:
-                # N5: 'end' is None for OPEN markets, so it can no longer stand
-                # alone here -- an open market would never age out. Fall back to
-                # the scheduled end so a stuck market is still reclaimed.
-                _ref = m['end'] if m['end'] is not None else m['sched_end']
-                if _ref is not None and _ref < orphan_cutoff_ts:
-                    orphan_cids.append(cid)
+            # Check if orphaned/expired beyond cutoff
+            elif m['end'] is not None and m['end'] < orphan_cutoff_ts:
+                orphan_cids.append(cid)
         else:
             # If it is completely missing from market_map, it is dead/orphaned
             orphan_cids.append(cid)
@@ -435,19 +426,17 @@ def main():
     
     if db_attached:
         query = f"""
-            WITH exch AS (
-                SELECT wallet_id FROM source_db.wallets
-                WHERE lower(address) IN (
-                    '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-                    '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-                    '0xe111180000d2663c0091e4f400237545b87b996b',
-                    '0xe2222d279d744050d28e00520010520000310f59'
-                )
-            ),
-            base AS (
+            WITH parsed_trades AS (
                 SELECT
-                    t.id, t.contract_id, t.user_id, t.maker_id,
-                    t.tradeAmount, t.outcomeTokensAmount, t.price,
+                    t.contract_id,
+                    -- CAST, not raw: sys.intern() below needs a str, and this
+                    -- makes the user_map key identical to the one sim_strat_5
+                    -- writes (CAST(t.user_id AS VARCHAR)), so the persisted map
+                    -- is shared rather than two half-populated maps.
+                    CAST(t.user_id AS VARCHAR) AS user,
+                    t.tradeAmount,
+                    t.outcomeTokensAmount,
+                    t.price,
                     EPOCH(COALESCE(
                         to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
                         TRY_CAST(t.timestamp AS TIMESTAMP)
@@ -460,39 +449,23 @@ def main():
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0
                   AND t.price <= 1.0
-                  -- NO_COLLATERAL_SIDE (~0.97%): with neither side collateral,
-                  -- derive()'s choice of contract_id is arbitrary and the sign
-                  -- of outcomeTokensAmount is undefined. Dropped from BOTH legs.
-                  AND NOT (CAST(t.maker_asset_id AS VARCHAR) NOT IN ('0','1')
-                       AND CAST(t.taker_asset_id AS VARCHAR) NOT IN ('0','1'))
-            ),
-            parsed_trades AS (
-                SELECT id, contract_id, CAST(user_id AS VARCHAR) AS user,
-                       tradeAmount, outcomeTokensAmount, price, ts
-                FROM base
-                WHERE user_id IS NOT NULL
-                  AND user_id NOT IN (SELECT wallet_id FROM exch)
-
-                UNION ALL
-
-                -- The maker leg is the exact negation of the taker leg:
-                -- outcomeTokensAmount is taker-signed. '-m' keeps the primary
-                -- key distinct so ORDER BY ts, id stays deterministic.
-                SELECT id || '-m' AS id, contract_id,
-                       CAST(maker_id AS VARCHAR) AS user,
-                       tradeAmount, -outcomeTokensAmount AS outcomeTokensAmount,
-                       price, ts
-                FROM base
-                WHERE maker_id IS NOT NULL
-                  AND maker_id NOT IN (SELECT wallet_id FROM exch)
+                  AND t.user_id IS NOT NULL
+                  -- exchange wallets resolved through the wallets table, the
+                  -- same construction sim_strat_5 uses. Comparing addresses to
+                  -- an integer column silently excluded nothing.
+                  AND t.user_id NOT IN (
+                      SELECT wallet_id FROM source_db.wallets
+                      WHERE lower(address) IN (
+                          '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                          '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                          '0xe111180000d2663c0091e4f400237545b87b996b',
+                          '0xe2222d279d744050d28e00520010520000310f59'
+                      ))
             )
-            SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
-            FROM parsed_trades
+            SELECT * FROM parsed_trades
             WHERE ts IS NOT NULL AND ts > {float(state.last_processed_timestamp)}
-            ORDER BY ts ASC, id ASC
+            ORDER BY ts ASC
         """
-        log.info("Ingestion: MAKER LEG INCLUDED -- expect roughly 2x the rows "
-                 "of a taker-only run.")
         
         trade_count = 0
         max_ts = state.last_processed_timestamp
@@ -507,7 +480,7 @@ def main():
                 if not rows: break
                 
                 for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
+                    raw_cid, raw_user, amount, tokens, price, ts = row
                     if ts is None: continue
                     
                     # --- Day-level progress (rows arrive ordered by ts ASC) ---
@@ -524,19 +497,17 @@ def main():
                     
                     cid = sys.intern(str(raw_cid))
                     user = sys.intern(str(raw_user))
-
+                        
                     m = market_map.get(cid)
                     if not m: continue
-                    # N5: end=None means OPEN -> no upper bound. The old
-                    # `ts > resolution_timestamp` gate discarded the whole
-                    # in-game trading window (sim_strat_5:1416-1432).
-                    if not in_window(ts, m['start'], m['end']): continue
-
+                    if m['start'] is not None and ts < m['start']: continue
+                    if m['end'] is not None and ts > m['end']: continue
+                    
                     qty = abs(tokens)
                     is_buying = (tokens > 0)
                     bet_on = m['outcome_label']
                     is_yes = (bet_on == "yes")
-
+                    
                     # 1. Invested Amount & Bit-Packing
                     invested = price * qty if is_buying else (1.0 - price) * qty
                     # expected_p, NOT the raw price. process_trade queries at
@@ -545,11 +516,8 @@ def main():
                     # sells contributed nothing AND were written mis-bucketed.
                     expected_p = price if is_buying else (1.0 - price)
                     price_int = max(0, min(1000, int(expected_p * 1000)))
-                    # N5: the sim's chain (end -> sched_end -> 25.9h median).
-                    # The old `m['end'] or ts + 86400` was a flat 24h guess the
-                    # sim replaced with the measured median; a flat 24 is wrong
-                    # for 61% of markets.
-                    ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
+                    m_end = m['end'] if m['end'] is not None else (ts + 86400.0)
+                    ttr_hours = max(1.0, (m_end - ts) / 3600.0)
                     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
                     packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
                     
@@ -595,13 +563,29 @@ def main():
                     # a matching observe() the aggregator is drained every cycle
                     # and converges to empty, at which point estimate() returns
                     # the price, margin is 0 and the bot stops firing silently.
-                    # Same call and arguments as sim_strat_5's trade loop.
+                    #
+                    # The vote MUST be smooth_prob, matching sim_strat_5:2184.
+                    # p_true = price + fraction*(1-price) is the reverse-Kelly
+                    # probability implied by BET SIZE relative to bankroll -- a
+                    # monotone function of how much a wallet staked, carrying no
+                    # information about whether it was right, and on the P(YES)
+                    # frame rather than the effective-side frame the estimate is
+                    # judged on. observe() is one-vote-per-wallet WITH
+                    # REPLACEMENT, so this nightly pass overwrites every correct
+                    # vote main_2 wrote, and the trigger reads the result
+                    # (sim_strat_5:2189-2194 overwrites perc_marg with
+                    # agg.estimate before the entry gate).
+                    #
+                    # process_trade BEFORE the m_pos append, matching the sim:
+                    # the wallet's own current trade must not be in its own
+                    # history when the scan runs.
                     direction = 1.0 if is_effective_yes else -1.0
-                    smooth_prob, marg, perc_marg, variance_v, trust_w = process_trade(
+                    smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
                         uid=uid, price=price, stake=invested,
                         direction=direction, is_buying=is_buying,
                         ttr_hours=ttr_hours, state=state,
                         price_lut=PRICE_LUT, time_lut=TIME_LUT)
+
                     _agg = getattr(state, 'agg', None)
                     if _agg is not None:
                         _bc = float(state.user_brier_count[uid])
@@ -650,12 +634,29 @@ def main():
                 log.info(f"✅ Successfully ingested {trade_count} new trades into the Bayesian state.")
             else:
                 log.info("💤 No new trades found since last run.")
+
+            # Guard against this fix disappearing again. p_true is bounded below
+            # by the price and rises with bet size, so a healthy aggregate mean
+            # sits near the traded price band; a poisoned one clusters high.
+            if trade_count > 0 and getattr(state, 'agg', None) is not None:
+                _t = state.agg.tbl
+                _live = (_t.keys != 0) & (_t.keys != 1)
+                if _live.any():
+                    _w = _t.w[_live].astype('float64')
+                    _ok = _w > 1e-12
+                    if _ok.any():
+                        _mean_view = float((_t.wp[_live][_ok] / _w[_ok]).mean())
+                        log.info(f"🧮 Aggregate mean contributor view: {_mean_view:.4f} "
+                                 f"over {int(_ok.sum()):,} entries")
+                        if _mean_view > 0.5:
+                            log.critical(
+                                f"🚨 Aggregate mean view {_mean_view:.4f} > 0.5. "
+                                f"Expected near the traded price band. This is the "
+                                f"signature of observe() being fed p_true instead "
+                                f"of smooth_prob (N1).")
                 
             ingestion_success = True
 
-        except (NameError, AttributeError, ImportError) as e:
-            log.critical(f"❌ Ingestion aborted on a programming error: {e}")
-            raise
         except Exception as e:
             log.error(f"❌ Trade ingestion pipeline failed: {e}")
             
