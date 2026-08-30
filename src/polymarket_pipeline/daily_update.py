@@ -17,6 +17,7 @@ import time
 import __main__
 from collections import defaultdict
 from sim_strat_5 import (
+    AGG_K0,
     BayesianState, 
     MarketPositions,
     resolve_market, 
@@ -26,6 +27,7 @@ from sim_strat_5 import (
     process_trade,         
     PRICE_LUT,            
     TIME_LUT, 
+    _skill_ratio,
     restore_arrays_from_npz,
     _hist_sidecar_paths,
     CACHE_DIR, 
