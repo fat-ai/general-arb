@@ -1,5 +1,3 @@
-from wallet_skill import skill_ratio as _skill_ratio
-from sim_strat_5 import AGG_K0
 import os
 import pickle
 import logging
@@ -16,6 +14,7 @@ import time
 
 import __main__
 from collections import defaultdict
+from market_time import derive_window, in_window, ttr_hours as mt_ttr_hours
 from sim_strat_5 import (
     AGG_K0,
     BayesianState, 
@@ -266,56 +265,46 @@ def export_dashboard_scores(state: BayesianState):
         log.error(f"⚠️ Failed to export dashboard scores: {e}")
 
 def load_markets() -> dict:
-    """Loads market metadata via Polars with optimized memory mapping."""
+    """Loads market metadata via Polars with optimized memory mapping.
+
+    N5: window and ttr come from market_time.derive_window -- the same
+    derivation sim_strat_5 uses, verified identical over 5,445,454 markets.
+    This previously set 'end' = resolution_timestamp for EVERY market, an
+    unreliable scheduled placeholder: gating on it discarded the whole in-game
+    trading window (validated: 508956 kept 5/21 trades).
+    """
     log.info("📂 Loading Market Metadata...")
-    
-    # Define only the columns we actually need to read from disk
-    cols_to_read = [
-        'contract_id', 'market_id', 'outcome', 
-        'token_outcome_label', 'resolution_timestamp', 'start_date'
-    ]
-    
-    # Use scan_parquet for lazy evaluation, select only needed columns, then collect
+
     markets_pl = pl.scan_parquet(MARKETS_PATH).select([
-        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),
-        pl.col('market_id').alias('id'),
-        pl.col('outcome').cast(pl.Float32),
-        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),
-        pl.col('resolution_timestamp'),
-        pl.col('start_date')
+        pl.col('contract_id').str.strip_chars().str.to_lowercase().str.replace("0x", ""),   # 0
+        pl.col('market_id').alias('id'),                                                    # 1
+        pl.col('outcome').cast(pl.Float32),                                                 # 2
+        pl.col('token_outcome_label').str.strip_chars().str.to_lowercase(),                 # 3
+        pl.col('resolution_timestamp'),                                                     # 4
+        pl.col('start_date').cast(pl.String).alias('start_date'),                           # 5
+        pl.col('closed_time'),                                                              # 6
+        pl.col('closed'),                                                                   # 7
+        pl.col('eventStartTime').cast(pl.String).alias('eventStartTime'),                   # 8
+        pl.col('game_start_time').cast(pl.String).alias('game_start_time'),                 # 9
     ]).collect()
-    
+
     market_map = {}
-    
-    # Use raw tuples (iter_rows) instead of named=True to prevent instantiating 2.2 million temporary dicts
     for row in markets_pl.iter_rows():
-        if not row[0]: continue # Skip if contract_id is null after processing
+        if not row[0]:
+            continue
         cid = sys.intern(row[0])
-        
-        # Parse Start Date safely
-        s_date = row[5]
-        if isinstance(s_date, str):
-            try: 
-                s_date = pd.to_datetime(s_date, utc=True).timestamp()
-            except Exception: 
-                s_date = None
-        elif hasattr(s_date, 'timestamp'):
-            s_date = s_date.timestamp()
-            
-        # Parse End Date safely
-        e_date = row[4]
-        if hasattr(e_date, 'timestamp'):
-            e_date = e_date.timestamp()
-            
+        s_date, e_date, sched_end = derive_window(
+            start_date=row[5], resolution_timestamp=row[4],
+            closed_time=row[6], closed=row[7],
+            event_start_time=row[8], game_start_time=row[9])
         market_map[cid] = {
-            'id': row[1], 
-            'start': s_date, 
-            'end': e_date,
-            'outcome': row[2], 
-            # Use sys.intern to share memory for repetitive strings like "yes" and "no"
-            'outcome_label': sys.intern(row[3]) if row[3] else None 
+            'id': row[1],
+            'start': s_date,
+            'end': e_date,              # None = OPEN, no upper bound
+            'sched_end': sched_end,     # ttr reference for open markets
+            'outcome': row[2],
+            'outcome_label': sys.intern(row[3]) if row[3] else None,
         }
-        
     return market_map
     
 def main():
@@ -347,9 +336,10 @@ def main():
             # Safe check: Must not be None, and must not be NaN
             if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
                 cids_to_resolve.append(cid)
-            # Check if orphaned/expired beyond cutoff
-            elif m['end'] is not None and m['end'] < orphan_cutoff_ts:
-                orphan_cids.append(cid)
+            else:
+                _ref = m['end'] if m['end'] is not None else m['sched_end']
+                if _ref is not None and _ref < orphan_cutoff_ts:
+                    orphan_cids.append(cid)
         else:
             # If it is completely missing from market_map, it is dead/orphaned
             orphan_cids.append(cid)
@@ -502,24 +492,31 @@ def main():
                         
                     m = market_map.get(cid)
                     if not m: continue
-                    if m['start'] is not None and ts < m['start']: continue
-                    if m['end'] is not None and ts > m['end']: continue
-                    
+                    # N5: end=None means OPEN -> no upper bound. The old
+                    # `ts > resolution_timestamp` gate discarded the entire
+                    # in-game window (sim_strat_5:1416-1432).
+                    if not in_window(ts, m['start'], m['end']): continue
+
                     qty = abs(tokens)
                     is_buying = (tokens > 0)
                     bet_on = m['outcome_label']
                     is_yes = (bet_on == "yes")
-                    
+
                     # 1. Invested Amount & Bit-Packing
                     invested = price * qty if is_buying else (1.0 - price) * qty
                     # expected_p, NOT the raw price. process_trade queries at
                     # int(expected_p*1000); packing the raw price put every SELL
-                    # ~0.8 away from its own query window (P_RANGE = 100), so
-                    # sells contributed nothing AND were written mis-bucketed.
+                    # ~0.8 away from its own query window (P_RANGE = 100).
                     expected_p = price if is_buying else (1.0 - price)
                     price_int = max(0, min(1000, int(expected_p * 1000)))
-                    m_end = m['end'] if m['end'] is not None else (ts + 86400.0)
-                    ttr_hours = max(1.0, (m_end - ts) / 3600.0)
+                    # N5: end -> sched_end -> 25.9h measured median, matching
+                    # sim_strat_5:1854-1859. The old flat `ts + 86400` guess was
+                    # wrong for 61% of markets, and ttr sets BOTH the packed
+                    # history bucket and process_trade's scan window -- at
+                    # TIME_HALF_LIFE=91 a 2x ttr error is ~7 half-lives, so the
+                    # scan weight collapses to ~0.008 and the wallet's own
+                    # evidence becomes invisible.
+                    ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
                     log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
                     packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
                     
@@ -637,9 +634,13 @@ def main():
             else:
                 log.info("💤 No new trades found since last run.")
 
-            # Guard against this fix disappearing again. p_true is bounded below
-            # by the price and rises with bet size, so a healthy aggregate mean
-            # sits near the traded price band; a poisoned one clusters high.
+            # Shape test, not a threshold. p_view is on the EFFECTIVE-SIDE frame:
+            # a sell at 0.02 legitimately contributes ~0.98, and with taker+maker
+            # legs the population is ~50/50, so the MEAN is uninformative -- an
+            # earlier >0.5 alarm read 0.4044 on a poisoned table and said nothing.
+            # Under smooth_prob the low mode tracks the traded price band and the
+            # high mode sits near its complement. Under p_true both modes shift
+            # up, because p_true >= price always and rises with bet size.
             if trade_count > 0 and getattr(state, 'agg', None) is not None:
                 _t = state.agg.tbl
                 _live = (_t.keys != 0) & (_t.keys != 1)
@@ -647,15 +648,18 @@ def main():
                     _w = _t.w[_live].astype('float64')
                     _ok = _w > 1e-12
                     if _ok.any():
-                        _mean_view = float((_t.wp[_live][_ok] / _w[_ok]).mean())
-                        log.info(f"🧮 Aggregate mean contributor view: {_mean_view:.4f} "
-                                 f"over {int(_ok.sum()):,} entries")
-                        if _mean_view > 0.5:
+                        _v = _t.wp[_live][_ok].astype('float64') / _w[_ok]
+                        _lo, _hi = _v[_v < 0.5], _v[_v >= 0.5]
+                        log.info(
+                            f"🧮 Aggregate view over {_ok.sum():,} entries: "
+                            f"mean {_v.mean():.4f} | below-0.5 share {(_v < 0.5).mean():.1%} | "
+                            f"median low {np.median(_lo) if _lo.size else float('nan'):.4f} | "
+                            f"median high {np.median(_hi) if _hi.size else float('nan'):.4f}")
+                        if _lo.size and np.median(_lo) > 0.25:
                             log.critical(
-                                f"🚨 Aggregate mean view {_mean_view:.4f} > 0.5. "
-                                f"Expected near the traded price band. This is the "
-                                f"signature of observe() being fed p_true instead "
-                                f"of smooth_prob (N1).")
+                                f"🚨 Low-mode median {np.median(_lo):.4f} is above the "
+                                f"traded price band. Consistent with p_true votes (N1) "
+                                f"or a stale aggregator that was never re-forked.")
                 
             ingestion_success = True
 
