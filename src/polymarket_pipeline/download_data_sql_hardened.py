@@ -180,7 +180,7 @@ def parse_log_to_row(l, ts):
     log_id = tx + "-" + str(int(li, 16))
     # (id, ts, usdc, tokens, taker, cid, price, size, mult, maker, anomaly)
     return (log_id, ts, d["usdc"], d["tokens"], taker, d["cid"], d["price"],
-            d["size"], d["mult"], maker, d["anomaly"])
+            d["size"], d["mult"], maker, d["anomaly"], mk_asset, tk_asset)
 
 
 # ─────────────────────── strict range fetch (into DB) ───────────────────────
@@ -292,11 +292,13 @@ def write_rows(conn, wallets, rows, bad_log):
                     bad_log.write(f"{a!r}\t{e}\n")
                 ids.append(None)
     n = len(pre)
-    out = [(r[0], r[1], r[2], r[3], ids[i], r[5], r[6], r[7], r[8], ids[n + i])
+    out = [(r[0], r[1], r[2], r[3], ids[i], r[5], r[6], r[7], r[8], ids[n + i],
+            r[11], r[12])
            for i, r in enumerate(pre)]
     conn.executemany("""INSERT OR IGNORE INTO trades
         (id, timestamp, tradeAmount, outcomeTokensAmount, user_id, contract_id,
-         price, size, side_mult, maker_id) VALUES (?,?,?,?,?,?,?,?,?,?)""", out)
+         price, size, side_mult, maker_id, maker_asset_id, taker_asset_id)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", out)
     conn.commit()
     return len(out)
 
