@@ -417,9 +417,28 @@ def main():
     ingestion_success = False
     
     if db_attached:
+        _exch = """(SELECT wallet_id FROM source_db.wallets WHERE lower(address) IN (
+                      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                      '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                      '0xe111180000d2663c0091e4f400237545b87b996b',
+                      '0xe2222d279d744050d28e00520010520000310f59'))"""
+        _ok_coll = """AND NOT (COALESCE(CAST(t.maker_asset_id AS VARCHAR), '0') NOT IN ('0','1')
+                           AND COALESCE(CAST(t.taker_asset_id AS VARCHAR), '0') NOT IN ('0','1'))"""
+
+        _mkt_join = f"""INNER JOIN (
+                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
+                    FROM read_parquet('{MARKETS_PATH}')
+                ) m ON t.contract_id = m.clean_cid"""
+
+        _ts_expr = """EPOCH(COALESCE(
+                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
+                        TRY_CAST(t.timestamp AS TIMESTAMP)
+                    ))"""
+        
         query = f"""
             WITH parsed_trades AS (
                 SELECT
+                    t.id,
                     t.contract_id,
                     -- CAST, not raw: sys.intern() below needs a str, and this
                     -- makes the user_map key identical to the one sim_strat_5
@@ -429,34 +448,45 @@ def main():
                     t.tradeAmount,
                     t.outcomeTokensAmount,
                     t.price,
-                    EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
-                        TRY_CAST(t.timestamp AS TIMESTAMP)
-                    )) AS ts
+                    {_ts_expr} AS ts
                 FROM source_db.trades t
-                INNER JOIN (
-                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
-                    FROM read_parquet('{MARKETS_PATH}')
-                ) m ON t.contract_id = m.clean_cid
+                {_mkt_join}
                 WHERE t.timestamp IS NOT NULL
                   AND t.price >= 0.0
                   AND t.price <= 1.0
                   AND t.user_id IS NOT NULL
-                  -- exchange wallets resolved through the wallets table, the
-                  -- same construction sim_strat_5 uses. Comparing addresses to
-                  -- an integer column silently excluded nothing.
-                  AND t.user_id NOT IN (
-                      SELECT wallet_id FROM source_db.wallets
-                      WHERE lower(address) IN (
-                          '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-                          '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-                          '0xe111180000d2663c0091e4f400237545b87b996b',
-                          '0xe2222d279d744050d28e00520010520000310f59'
-                      ))
+                  AND t.user_id NOT IN {_exch}
+                  {_ok_coll}
+
+                UNION ALL
+
+                -- N7: the MAKER leg, matching sim_strat_5's UNION ALL. Its side
+                -- is the exact negation of the taker's, since
+                -- outcomeTokensAmount is taker-signed. Without it every wallet
+                -- history here is built from half the trades the sim sees.
+                -- '-m' keeps the primary key distinct so ORDER BY ts, id is
+                -- deterministic.
+                SELECT
+                    t.id || '-m' AS id,
+                    t.contract_id,
+                    CAST(t.maker_id AS VARCHAR) AS user,
+                    t.tradeAmount,
+                    -t.outcomeTokensAmount AS outcomeTokensAmount,
+                    t.price,
+                    {_ts_expr} AS ts
+                FROM source_db.trades t
+                {_mkt_join}
+                WHERE t.timestamp IS NOT NULL
+                  AND t.price >= 0.0
+                  AND t.price <= 1.0
+                  AND t.maker_id IS NOT NULL
+                  AND t.maker_id NOT IN {_exch}
+                  {_ok_coll}
             )
-            SELECT * FROM parsed_trades
+            SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
+            FROM parsed_trades
             WHERE ts IS NOT NULL AND ts > {float(state.last_processed_timestamp)}
-            ORDER BY ts ASC
+            ORDER BY ts ASC, id ASC
         """
         
         trade_count = 0
@@ -472,7 +502,7 @@ def main():
                 if not rows: break
                 
                 for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts = row
+                    raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
                     if ts is None: continue
                     
                     # --- Day-level progress (rows arrive ordered by ts ASC) ---
