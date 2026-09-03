@@ -311,86 +311,19 @@ def main():
     log.info("🚀 Starting Daily Bayesian State Updater...")
     state = load_state()
     market_map = load_markets()
-    
-    current_day_ts = datetime.now(timezone.utc).timestamp()
-    
-    # ==========================================
-    # 1. RESOLVE FINISHED MARKETS
-    # ==========================================
-    log.info("⚖️ Checking for newly resolved and orphaned markets...")
-    
-    # 1. Gather all unique tracked contract IDs efficiently using sets (Zero list concatenation)
-    tracked_cids = set(state.contract_positions.keys())
-    tracked_cids.update(state.first_bets_pending.keys())
-    
-    cids_to_resolve = []
-    orphan_cids = []
-    orphan_cutoff_ts = current_day_ts - 864000.0  # 10 days
-    
-    # 2. Single pass through tracked contracts
-    for cid in tracked_cids:
-        m = market_map.get(cid)
-        
-        if m is not None:
-            outcome = m['outcome']
-            # Safe check: Must not be None, and must not be NaN
-            if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
-                cids_to_resolve.append(cid)
-            else:
-                _ref = m['end'] if m['end'] is not None else m['sched_end']
-                if _ref is not None and _ref < orphan_cutoff_ts:
-                    orphan_cids.append(cid)
-        else:
-            # If it is completely missing from market_map, it is dead/orphaned
-            orphan_cids.append(cid)
-            
-    # 3. Process Resolutions
-    day_yes_updates = defaultdict(list)
-    day_no_updates = defaultdict(list)
-    for r_cid in cids_to_resolve:
-        m = market_map[r_cid]
-        # Note: resolve_market uses .pop() internally, making it idempotent
-        resolve_market(r_cid, m['outcome'], m['outcome_label'], current_day_ts, state, day_yes_updates, day_no_updates)
-        
-    if cids_to_resolve:
-        process_daily_history_merges(state, day_yes_updates, day_no_updates)
-        log.info(f"✅ Resolved {len(cids_to_resolve)} markets and updated Brier scores.")
-        
-    # 4. Process Orphans -- F3: through resolve_market, NOT pop().
-    #
-    # pop() discarded the position without decrementing user_exposure or
-    # user_peak, so exposure ratcheted upward forever for every wallet in a
-    # market that never resolved. global_total_peak inflates ->
-    # current_global_avg inflates -> w_shrunk rises -> fraction falls ->
-    # p_true collapses toward the price for EVERY wallet. Silent global decay.
-    #
-    # sim_strat_5 coerces an unknown outcome to 0.5 with
-    # outcome_confirmed=False, which releases exposure while keeping the
-    # unscoreable outcome out of the Brier accumulators. Same here.
-    _orphan_yes = defaultdict(list)
-    _orphan_no = defaultdict(list)
-    for o_cid in orphan_cids:
-        try:
-            resolve_market(o_cid, 0.5, "unknown", current_day_ts, state,
-                           _orphan_yes, _orphan_no, outcome_confirmed=False)
-        except Exception as e:
-            log.warning(f"orphan {o_cid} could not be resolved cleanly ({e}); "
-                        f"falling back to pop()")
-            state.contract_positions.pop(o_cid, None)
-        state.first_bets_pending.pop(o_cid, None)
 
-    if orphan_cids:
-        log.info(f"🗑️ Released {len(orphan_cids)} orphaned markets "
-                 f"(exposure returned, outcomes unscored).")
-        
+    # Midnight-aligned, matching sim_strat_5's trade_day_int * 86400 boundaries.
+    # A partial final chunk would calibrate on a fraction of a day's data and
+    # leave the watermark mid-day, so the next run's first chunk is short too.
+    # Today's trades are picked up by tomorrow's run -- the sim behaves the same.
+    current_day_ts = (datetime.now(timezone.utc).timestamp() // 86400) * 86400
+
     # ==========================================
-    # 2. INGEST NEW TRADES (DELTA)
+    # 0. SETUP DUCKDB (Once outside the loop)
     # ==========================================
-    log.info(f"🔍 Fetching delta trades since timestamp {state.last_processed_timestamp}...")
-    
     duck_tmp = CACHE_DIR / "duckdb_update_tmp"
     duck_tmp.mkdir(parents=True, exist_ok=True)
-    
+
     con = duckdb.connect(database=':memory:')
     con.execute("SET memory_limit='12GB';")
     con.execute("SET max_temp_directory_size = '900GB';")
@@ -398,8 +331,7 @@ def main():
     con.execute("SET preserve_insertion_order=false;")
     con.execute(f"SET temp_directory='{duck_tmp}';")
     con.execute("INSTALL sqlite; LOAD sqlite;")
-    
-    # Retry logic for SQLite attachment
+
     max_retries = 3
     db_attached = False
     for attempt in range(max_retries):
@@ -413,306 +345,326 @@ def main():
                 time.sleep(5)
             else:
                 log.error(f"Failed to attach SQLite DB after multiple attempts: {e}")
-                
+
     ingestion_success = False
-    
+
+    # Query constants, built once. Two copies of this query is how the maker leg
+    # and the collateral guard were lost here while sim_strat_5 kept both.
+    _exch = """(SELECT wallet_id FROM source_db.wallets WHERE lower(address) IN (
+                  '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                  '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                  '0xe111180000d2663c0091e4f400237545b87b996b',
+                  '0xe2222d279d744050d28e00520010520000310f59'))"""
+
+    # NO_COLLATERAL_SIDE guard (~0.97%): with neither leg collateral the contract
+    # choice is arbitrary and the sign of outcomeTokensAmount is undefined.
+    #
+    # COALESCE is REQUIRED. A downloader bug wrote NULL into both columns for
+    # every trade after 2026-07-27 08:26:06. The bare form then evaluates to
+    # NOT(NULL AND NULL) = NULL, and a NULL WHERE predicate DROPS the row -- so
+    # without this the whole post-July window is silently excluded, with no error.
+    _ok_coll = """AND NOT (COALESCE(CAST(t.maker_asset_id AS VARCHAR), '0') NOT IN ('0','1')
+                       AND COALESCE(CAST(t.taker_asset_id AS VARCHAR), '0') NOT IN ('0','1'))"""
+
+    _ts_expr = """EPOCH(COALESCE(
+                    to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
+                    TRY_CAST(t.timestamp AS TIMESTAMP)
+                ))"""
+
     if db_attached:
-        _exch = """(SELECT wallet_id FROM source_db.wallets WHERE lower(address) IN (
-                      '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-                      '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-                      '0xe111180000d2663c0091e4f400237545b87b996b',
-                      '0xe2222d279d744050d28e00520010520000310f59'))"""
-        _ok_coll = """AND NOT (COALESCE(CAST(t.maker_asset_id AS VARCHAR), '0') NOT IN ('0','1')
-                           AND COALESCE(CAST(t.taker_asset_id AS VARCHAR), '0') NOT IN ('0','1'))"""
-
-        _mkt_join = f"""INNER JOIN (
-                    SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
-                    FROM read_parquet('{MARKETS_PATH}')
-                ) m ON t.contract_id = m.clean_cid"""
-
-        _ts_expr = """EPOCH(COALESCE(
-                        to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
-                        TRY_CAST(t.timestamp AS TIMESTAMP)
-                    ))"""
-        
-        query = f"""
-            WITH parsed_trades AS (
-                SELECT
-                    t.id,
-                    t.contract_id,
-                    -- CAST, not raw: sys.intern() below needs a str, and this
-                    -- makes the user_map key identical to the one sim_strat_5
-                    -- writes (CAST(t.user_id AS VARCHAR)), so the persisted map
-                    -- is shared rather than two half-populated maps.
-                    CAST(t.user_id AS VARCHAR) AS user,
-                    t.tradeAmount,
-                    t.outcomeTokensAmount,
-                    t.price,
-                    {_ts_expr} AS ts
-                FROM source_db.trades t
-                {_mkt_join}
-                WHERE t.timestamp IS NOT NULL
-                  AND t.price >= 0.0
-                  AND t.price <= 1.0
-                  AND t.user_id IS NOT NULL
-                  AND t.user_id NOT IN {_exch}
-                  {_ok_coll}
-
-                UNION ALL
-
-                -- N7: the MAKER leg, matching sim_strat_5's UNION ALL. Its side
-                -- is the exact negation of the taker's, since
-                -- outcomeTokensAmount is taker-signed. Without it every wallet
-                -- history here is built from half the trades the sim sees.
-                -- '-m' keeps the primary key distinct so ORDER BY ts, id is
-                -- deterministic.
-                SELECT
-                    t.id || '-m' AS id,
-                    t.contract_id,
-                    CAST(t.maker_id AS VARCHAR) AS user,
-                    t.tradeAmount,
-                    -t.outcomeTokensAmount AS outcomeTokensAmount,
-                    t.price,
-                    {_ts_expr} AS ts
-                FROM source_db.trades t
-                {_mkt_join}
-                WHERE t.timestamp IS NOT NULL
-                  AND t.price >= 0.0
-                  AND t.price <= 1.0
-                  AND t.maker_id IS NOT NULL
-                  AND t.maker_id NOT IN {_exch}
-                  {_ok_coll}
-            )
-            SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
-            FROM parsed_trades
-            WHERE ts IS NOT NULL AND ts > {float(state.last_processed_timestamp)}
-            ORDER BY ts ASC, id ASC
-        """
-        
-        trade_count = 0
-        max_ts = state.last_processed_timestamp
-        cur_day_bucket = None    # UTC days-since-epoch of the trade being processed
-        day_trade_count = 0      # trades ingested within the current day
-        
         try:
-            cursor = con.execute(query)
-            
-            while True:
-                rows = cursor.fetchmany(10000)
-                if not rows: break
-                
-                for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
-                    if ts is None: continue
-                    
-                    # --- Day-level progress (rows arrive ordered by ts ASC) ---
-                    # int day-bucket is O(1); the date format only runs on rollover.
-                    day_bucket = int(ts // 86400)
-                    if day_bucket != cur_day_bucket:
-                        if cur_day_bucket is not None:
-                            log.info(f"   ↳ {day_trade_count} trades ingested.")
-                        day_str = datetime.fromtimestamp(
-                            day_bucket * 86400, tz=timezone.utc).strftime('%Y-%m-%d')
-                        log.info(f"📅 Processing trades for {day_str}...")
-                        cur_day_bucket = day_bucket
-                        day_trade_count = 0
-                    
-                    cid = sys.intern(str(raw_cid))
-                    user = sys.intern(str(raw_user))
-                        
+            # Materialise the market key set ONCE. Inlining read_parquet into the
+            # join re-scans ~5.6M parquet rows twice per chunk (both UNION legs);
+            # over a six-week catch-up that is ~84 redundant scans.
+            con.execute(f"""CREATE TEMP TABLE mkt AS
+                SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
+                FROM read_parquet('{MARKETS_PATH}')""")
+            _mkt_join = "INNER JOIN mkt m ON t.contract_id = m.clean_cid"
+
+            chunk_start_ts = float(state.last_processed_timestamp)
+            n_chunks = 0
+
+            # One simulated DAY per iteration. sim_strat_5 resolves, merges and
+            # recalibrates on every day boundary (:1930-1982); a single catch-up
+            # pass over six weeks would do all three ONCE and produce a different
+            # coefficient trajectory and different merge boundaries from the
+            # reference. Looping day by day keeps the cadence identical however
+            # long the gap.
+            while chunk_start_ts < current_day_ts:
+                chunk_end_ts = min(chunk_start_ts + 86400.0, current_day_ts)
+                n_chunks += 1
+
+                log.info(f"⏳ Processing chunk: "
+                         f"{datetime.fromtimestamp(chunk_start_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')} to "
+                         f"{datetime.fromtimestamp(chunk_end_ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}")
+
+                # ==========================================
+                # 1. RESOLVE FINISHED MARKETS (For this chunk)
+                # ==========================================
+                tracked_cids = set(state.contract_positions.keys())
+                tracked_cids.update(state.first_bets_pending.keys())
+
+                cids_to_resolve = []
+                orphan_cids = []
+                # Chunk-relative, not wall-clock: during a long catch-up a
+                # wall-clock cutoff would orphan markets that were perfectly
+                # live at the simulated time being processed.
+                orphan_cutoff_ts = chunk_end_ts - 864000.0
+
+                for cid in tracked_cids:
                     m = market_map.get(cid)
-                    if not m: continue
-                    # N5: end=None means OPEN -> no upper bound. The old
-                    # `ts > resolution_timestamp` gate discarded the entire
-                    # in-game window (sim_strat_5:1416-1432).
-                    if not in_window(ts, m['start'], m['end']): continue
-
-                    qty = abs(tokens)
-                    is_buying = (tokens > 0)
-                    bet_on = m['outcome_label']
-                    is_yes = (bet_on == "yes")
-
-                    # 1. Invested Amount & Bit-Packing
-                    invested = price * qty if is_buying else (1.0 - price) * qty
-                    # expected_p, NOT the raw price. process_trade queries at
-                    # int(expected_p*1000); packing the raw price put every SELL
-                    # ~0.8 away from its own query window (P_RANGE = 100).
-                    expected_p = price if is_buying else (1.0 - price)
-                    price_int = max(0, min(1000, int(expected_p * 1000)))
-                    # N5: end -> sched_end -> 25.9h measured median, matching
-                    # sim_strat_5:1854-1859. The old flat `ts + 86400` guess was
-                    # wrong for 61% of markets, and ttr sets BOTH the packed
-                    # history bucket and process_trade's scan window -- at
-                    # TIME_HALF_LIFE=91 a 2x ttr error is ~7 half-lives, so the
-                    # scan weight collapses to ~0.008 and the wallet's own
-                    # evidence becomes invisible.
-                    ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
-                    log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
-                    packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
-                    
-                    # 2. Setup Directionals
-                    eff_dir = 1.0 if is_buying else -1.0
-                    if not is_yes: eff_dir *= -1.0
-                    is_effective_yes = bool(eff_dir > 0)
-                    yes_price = price if is_yes else 1.0 - price
-                    
-                    # 3. String-to-Int Dictionary Mapping
-                    uid = state.user_map.get(user)
-                    if uid is None:
-                        uid = state.next_user_id
-                        state.user_map[user] = uid
-                        state.next_user_id += 1
-                        state.user_history_yes.append(_EMPTY_U32)
-                        state.user_history_no.append(_EMPTY_U32)
-                        
-                    u_trades = state.user_total_trades[uid]
-                    if u_trades == 0:
-                        state.global_user_count += 1
-                    else:
-                        state.global_total_peak -= state.user_peak[uid]
-                        
-                    current_global_avg = (state.global_total_peak / state.global_user_count) if state.global_user_count > 0 else 100.0
-                    
-                    # 4. Math execution (via Numba)
-                    new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
-                        yes_price, invested, 
-                        state.user_exposure[uid], 
-                        state.user_peak[uid],
-                        u_trades, current_global_avg, is_effective_yes
-                    )
-                    
-                    # 5. Direct Write-Back to NumPy Arrays
-                    state.user_exposure[uid] = new_exp
-                    state.user_peak[uid] = new_peak
-                    state.user_total_trades[uid] = new_n
-                    state.global_total_peak += new_peak
-                    
-                    # F2: cast this wallet's vote into the market aggregate.
-                    # resolve_market already calls state.agg.release(); without
-                    # a matching observe() the aggregator is drained every cycle
-                    # and converges to empty, at which point estimate() returns
-                    # the price, margin is 0 and the bot stops firing silently.
-                    #
-                    # The vote MUST be smooth_prob, matching sim_strat_5:2184.
-                    # p_true = price + fraction*(1-price) is the reverse-Kelly
-                    # probability implied by BET SIZE relative to bankroll -- a
-                    # monotone function of how much a wallet staked, carrying no
-                    # information about whether it was right, and on the P(YES)
-                    # frame rather than the effective-side frame the estimate is
-                    # judged on. observe() is one-vote-per-wallet WITH
-                    # REPLACEMENT, so this nightly pass overwrites every correct
-                    # vote main_2 wrote, and the trigger reads the result
-                    # (sim_strat_5:2189-2194 overwrites perc_marg with
-                    # agg.estimate before the entry gate).
-                    #
-                    # process_trade BEFORE the m_pos append, matching the sim:
-                    # the wallet's own current trade must not be in its own
-                    # history when the scan runs.
-                    direction = 1.0 if is_effective_yes else -1.0
-                    smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
-                        uid=uid, price=price, stake=invested,
-                        direction=direction, is_buying=is_buying,
-                        ttr_hours=ttr_hours, state=state,
-                        price_lut=PRICE_LUT, time_lut=TIME_LUT)
-
-                    _agg = getattr(state, 'agg', None)
-                    if _agg is not None:
-                        _bc = float(state.user_brier_count[uid])
-                        if _bc > 0.0:
-                            _bx = float(state.user_brier_price_sum[uid])
-                            _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
-                                if _bx > 1e-12 else 0.0
-                            _bss *= _bc / (_bc + AGG_K0)
-                            _ratio = _skill_ratio(
-                                float(state.user_brier_sum[uid]), _bx,
-                                float(state.user_brier_out_sum[uid]), _bc)
+                    if m is not None:
+                        outcome = m['outcome']
+                        if outcome is not None and not (isinstance(outcome, float) and math.isnan(outcome)):
+                            cids_to_resolve.append(cid)
                         else:
-                            _bss, _ratio = 0.0, 1.0
-                        _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
-                        _agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
-                                     ratio=_ratio, k0=AGG_K0,
-                                     conviction=float(fraction),
-                                     trades_per_market=_tpm)
+                            # N5: 'end' is None while OPEN, so it cannot stand
+                            # alone here or an open market would never age out.
+                            _ref = m['end'] if m['end'] is not None else m['sched_end']
+                            if _ref is not None and _ref < orphan_cutoff_ts:
+                                orphan_cids.append(cid)
+                    else:
+                        orphan_cids.append(cid)
 
-                    # 6. Contract Trackers Updates
-                    m_pos = state.contract_positions[cid]
-                    m_pos.user_ids.append(uid)
-                    m_pos.is_yes.append(1 if is_effective_yes else 0)
-                    m_pos.packed_data.append(packed)
-                    m_pos.p_trues.append(p_true)
-                    m_pos.stakes.append(invested)
-                    
-                    # 7. Flattened First Bet Pending Tracker
-                    if u_trades == 0:
-                        risk_vol = amount if is_buying else qty * (1.0 - price)
-                        if risk_vol >= 1.0: 
-                            state.first_bets_pending[cid].append(
-                                (uid, math.log1p(risk_vol), max(1e-6, min(1.0 - 1e-6, price)), is_buying, math.log1p(ttr_hours))
-                            )
-                    
-                    if ts > max_ts: max_ts = ts
-                    trade_count += 1
-                    day_trade_count += 1
-                    
-            # Flush the final day's tally (no rollover fires after the last row)
-            if cur_day_bucket is not None:
-                log.info(f"   ↳ {day_trade_count} trades ingested.")
-            
-            if trade_count > 0:
-                state.last_processed_timestamp = max_ts
-                log.info(f"✅ Successfully ingested {trade_count} new trades into the Bayesian state.")
-            else:
-                log.info("💤 No new trades found since last run.")
+                day_yes_updates = defaultdict(list)
+                day_no_updates = defaultdict(list)
+                for r_cid in cids_to_resolve:
+                    m = market_map[r_cid]
+                    resolve_market(r_cid, m['outcome'], m['outcome_label'],
+                                   chunk_end_ts, state, day_yes_updates, day_no_updates)
 
-            # Shape test, not a threshold. p_view is on the EFFECTIVE-SIDE frame:
-            # a sell at 0.02 legitimately contributes ~0.98, and with taker+maker
-            # legs the population is ~50/50, so the MEAN is uninformative -- an
-            # earlier >0.5 alarm read 0.4044 on a poisoned table and said nothing.
-            # Under smooth_prob the low mode tracks the traded price band and the
-            # high mode sits near its complement. Under p_true both modes shift
-            # up, because p_true >= price always and rises with bet size.
-            if trade_count > 0 and getattr(state, 'agg', None) is not None:
-                _t = state.agg.tbl
-                _live = (_t.keys != 0) & (_t.keys != 1)
-                if _live.any():
-                    _w = _t.w[_live].astype('float64')
-                    _ok = _w > 1e-12
-                    if _ok.any():
-                        _v = _t.wp[_live][_ok].astype('float64') / _w[_ok]
-                        _lo, _hi = _v[_v < 0.5], _v[_v >= 0.5]
-                        log.info(
-                            f"🧮 Aggregate view over {_ok.sum():,} entries: "
-                            f"mean {_v.mean():.4f} | below-0.5 share {(_v < 0.5).mean():.1%} | "
-                            f"median low {np.median(_lo) if _lo.size else float('nan'):.4f} | "
-                            f"median high {np.median(_hi) if _hi.size else float('nan'):.4f}")
-                        if _lo.size and np.median(_lo) > 0.25:
-                            log.critical(
-                                f"🚨 Low-mode median {np.median(_lo):.4f} is above the "
-                                f"traded price band. Consistent with p_true votes (N1) "
-                                f"or a stale aggregator that was never re-forked.")
-                
+                if cids_to_resolve:
+                    process_daily_history_merges(state, day_yes_updates, day_no_updates)
+
+                _orphan_yes = defaultdict(list)
+                _orphan_no = defaultdict(list)
+                for o_cid in orphan_cids:
+                    try:
+                        resolve_market(o_cid, 0.5, "unknown", chunk_end_ts, state,
+                                       _orphan_yes, _orphan_no, outcome_confirmed=False)
+                    except Exception:
+                        state.contract_positions.pop(o_cid, None)
+                    state.first_bets_pending.pop(o_cid, None)
+
+                # ==========================================
+                # 2. INGEST NEW TRADES (DELTA for this chunk)
+                # ==========================================
+                query = f"""
+                    WITH parsed_trades AS (
+                        SELECT
+                            t.id, t.contract_id, CAST(t.user_id AS VARCHAR) AS user,
+                            t.tradeAmount, t.outcomeTokensAmount, t.price, {_ts_expr} AS ts
+                        FROM source_db.trades t
+                        {_mkt_join}
+                        WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
+                          AND t.user_id IS NOT NULL AND t.user_id NOT IN {_exch} {_ok_coll}
+
+                        UNION ALL
+
+                        -- N7: the MAKER leg, matching sim_strat_5's UNION ALL.
+                        -- outcomeTokensAmount is taker-signed, so the maker's
+                        -- side is its exact negation. Without it every wallet
+                        -- history here is built from half the trades the sim
+                        -- sees. '-m' keeps the key distinct for ORDER BY id.
+                        SELECT
+                            t.id || '-m' AS id, t.contract_id, CAST(t.maker_id AS VARCHAR) AS user,
+                            t.tradeAmount, -t.outcomeTokensAmount AS outcomeTokensAmount,
+                            t.price, {_ts_expr} AS ts
+                        FROM source_db.trades t
+                        {_mkt_join}
+                        WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
+                          AND t.maker_id IS NOT NULL AND t.maker_id NOT IN {_exch} {_ok_coll}
+                    )
+                    SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
+                    FROM parsed_trades
+                    WHERE ts IS NOT NULL AND ts > {chunk_start_ts} AND ts <= {chunk_end_ts}
+                    ORDER BY ts ASC, id ASC
+                """
+
+                trade_count = 0
+                cursor = con.execute(query)
+
+                while True:
+                    rows = cursor.fetchmany(10000)
+                    if not rows:
+                        break
+
+                    for row in rows:
+                        raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
+                        if ts is None:
+                            continue
+
+                        cid = sys.intern(str(raw_cid))
+                        user = sys.intern(str(raw_user))
+
+                        m = market_map.get(cid)
+                        if not m:
+                            continue
+                        # N5: end=None means OPEN -> no upper bound. The old
+                        # `ts > resolution_timestamp` gate discarded the entire
+                        # in-game window (sim_strat_5:1416-1432).
+                        if not in_window(ts, m['start'], m['end']):
+                            continue
+
+                        qty = abs(tokens)
+                        is_buying = (tokens > 0)
+                        bet_on = m['outcome_label']
+                        is_yes = (bet_on == "yes")
+
+                        invested = price * qty if is_buying else (1.0 - price) * qty
+                        # expected_p, NOT the raw price: process_trade queries at
+                        # int(expected_p*1000), so packing the raw price puts
+                        # every SELL outside its own P_RANGE window.
+                        expected_p = price if is_buying else (1.0 - price)
+                        price_int = max(0, min(1000, int(expected_p * 1000)))
+
+                        # N5: end -> sched_end -> 25.9h measured median, matching
+                        # sim_strat_5:1854-1859. ttr sets BOTH the packed history
+                        # bucket and process_trade's scan window; at
+                        # TIME_HALF_LIFE=91 a 2x error is ~7 half-lives, so the
+                        # scan weight collapses to ~0.008.
+                        ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
+                        log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+                        packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+
+                        eff_dir = 1.0 if is_buying else -1.0
+                        if not is_yes:
+                            eff_dir *= -1.0
+                        is_effective_yes = bool(eff_dir > 0)
+                        yes_price = price if is_yes else 1.0 - price
+
+                        uid = state.user_map.get(user)
+                        if uid is None:
+                            uid = state.next_user_id
+                            state.user_map[user] = uid
+                            state.next_user_id += 1
+                            state.user_history_yes.append(_EMPTY_U32)
+                            state.user_history_no.append(_EMPTY_U32)
+
+                        u_trades = state.user_total_trades[uid]
+                        if u_trades == 0:
+                            state.global_user_count += 1
+                        else:
+                            state.global_total_peak -= state.user_peak[uid]
+
+                        current_global_avg = (state.global_total_peak / state.global_user_count) \
+                            if state.global_user_count > 0 else 100.0
+
+                        new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
+                            yes_price, invested, state.user_exposure[uid],
+                            state.user_peak[uid], u_trades, current_global_avg, is_effective_yes
+                        )
+
+                        state.user_exposure[uid] = new_exp
+                        state.user_peak[uid] = new_peak
+                        state.user_total_trades[uid] = new_n
+                        state.global_total_peak += new_peak
+
+                        # N1: the aggregate vote MUST be smooth_prob, matching
+                        # sim_strat_5:2184. p_true = price + fraction*(1-price)
+                        # is the reverse-Kelly probability implied by BET SIZE --
+                        # a monotone function of stake, carrying no information
+                        # about whether the wallet was right, and on the P(YES)
+                        # frame rather than the effective-side frame the estimate
+                        # is judged on. observe() is one-vote-per-wallet WITH
+                        # REPLACEMENT, so this pass overwrites every correct vote
+                        # main_2 wrote, and the trigger reads the result.
+                        #
+                        # process_trade BEFORE the m_pos append: the wallet's own
+                        # current trade must not be in its own history.
+                        direction = 1.0 if is_effective_yes else -1.0
+                        smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
+                            uid=uid, price=price, stake=invested, direction=direction,
+                            is_buying=is_buying, ttr_hours=ttr_hours, state=state,
+                            price_lut=PRICE_LUT, time_lut=TIME_LUT)
+
+                        _agg = getattr(state, 'agg', None)
+                        if _agg is not None:
+                            _bc = float(state.user_brier_count[uid])
+                            if _bc > 0.0:
+                                _bx = float(state.user_brier_price_sum[uid])
+                                _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
+                                    if _bx > 1e-12 else 0.0
+                                _bss *= _bc / (_bc + AGG_K0)
+                                _ratio = _skill_ratio(float(state.user_brier_sum[uid]), _bx,
+                                                      float(state.user_brier_out_sum[uid]), _bc)
+                            else:
+                                _bss, _ratio = 0.0, 1.0
+                            _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
+                            _agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
+                                         ratio=_ratio, k0=AGG_K0,
+                                         conviction=float(fraction),
+                                         trades_per_market=_tpm)
+
+                        m_pos = state.contract_positions[cid]
+                        m_pos.user_ids.append(uid)
+                        m_pos.is_yes.append(1 if is_effective_yes else 0)
+                        m_pos.packed_data.append(packed)
+                        m_pos.p_trues.append(p_true)
+                        m_pos.stakes.append(invested)
+
+                        if u_trades == 0:
+                            # sim_strat_5:2077 uses `amount` (tradeAmount) on the
+                            # buy side, NOT invested. Preserved deliberately.
+                            risk_vol = amount if is_buying else qty * (1.0 - price)
+                            if risk_vol >= 1.0:
+                                state.first_bets_pending[cid].append(
+                                    (uid, math.log1p(risk_vol),
+                                     max(1e-6, min(1.0 - 1e-6, price)),
+                                     is_buying, math.log1p(ttr_hours)))
+
+                        trade_count += 1
+
+                # ==========================================
+                # 3. RECALIBRATE MODELS (For this chunk)
+                # ==========================================
+                if trade_count > 0:
+                    log.info(f"   ↳ Ingested {trade_count:,} trades. Calibrating models...")
+                    calibrate_models(chunk_end_ts, state)
+                else:
+                    log.info("   ↳ No trades found in this chunk. Advancing timestamp.")
+
+                # The cursor and the persisted watermark MUST agree. Setting the
+                # watermark to max_ts_in_chunk while the loop advances to
+                # chunk_end_ts leaves them out of step, so a crash mid-run makes
+                # the next run re-ingest a chunk already applied -- and m_pos
+                # appends and exposure/peak accumulation are NOT idempotent.
+                state.last_processed_timestamp = chunk_end_ts
+
+                # Interim save. A six-week catch-up is hours of work; without
+                # this a failure near the end discards all of it. Safe because
+                # the watermark now matches the cursor exactly.
+                if n_chunks % 7 == 0:
+                    log.info("   💾 Interim checkpoint...")
+                    save_state(state)
+
+                chunk_start_ts = chunk_end_ts
+
             ingestion_success = True
 
+        except (NameError, AttributeError, ImportError) as e:
+            # A programming error must not be swallowed as a transient fault --
+            # that is how the N1 revert survived a full overnight run unnoticed.
+            log.critical(f"❌ Aborted on a programming error: {e}")
+            raise
         except Exception as e:
-            log.error(f"❌ Trade ingestion pipeline failed: {e}")
-            
+            log.error(f"❌ Pipeline failed during chunk processing: {e}")
+
         finally:
             con.close()
-            # Guarantee cleanup of temporary files
             if duck_tmp.exists():
                 shutil.rmtree(duck_tmp, ignore_errors=True)
 
     # ==========================================
-    # 3. RECALIBRATE MODELS & SAVE
+    # 4. SAVE FINAL STATE
     # ==========================================
     if ingestion_success:
-        log.info("🧮 Running daily model recalibration...")
-        calibrate_models(current_day_ts, state)
+        log.info(f"🗂️ Chunking complete ({n_chunks} day-chunks). Saving final state...")
         save_state(state)
         export_dashboard_scores(state)
-        log.info("🏁 Daily update complete. The live bot is ready.")
+        log.info("🏁 Catch-up process complete. The live bot is ready.")
     else:
-        log.warning("⚠️ Skipping calibration and state save due to ingestion failure.")
+        log.warning("⚠️ Skipping final state save due to a pipeline failure.")
 
 if __name__ == "__main__":
     main()
