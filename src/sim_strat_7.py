@@ -1721,8 +1721,8 @@ def main():
                       '0xc5d563a36ae78145c45a50134d48a1215220f80a',
                       '0xe111180000d2663c0091e4f400237545b87b996b',
                       '0xe2222d279d744050d28e00520010520000310f59'))"""
-        _ok_coll = """AND NOT (CAST(t.maker_asset_id AS VARCHAR) NOT IN ('0','1')
-                           AND CAST(t.taker_asset_id AS VARCHAR) NOT IN ('0','1'))"""
+        _ok_coll = """AND NOT (COALESCE(CAST(t.maker_asset_id AS VARCHAR), '0') NOT IN ('0','1')
+                           AND COALESCE(CAST(t.taker_asset_id AS VARCHAR), '0') NOT IN ('0','1'))"""
         _mkt_join = f"""INNER JOIN (
                     SELECT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
                     FROM read_parquet('{MARKETS_PATH}')
