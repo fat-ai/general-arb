@@ -275,7 +275,7 @@ def write_rows(conn, wallets, rows, bad_log):
     Malformed address -> row kept, id NULL, logged (never drop a trade)."""
     if not rows:
         return 0
-    pre = [r[:10] for r in rows]                      # drop anomaly (col 10)
+    pre = [r[:10] + r[11:13] for r in rows]                      # drop anomaly (col 10)
     for r in rows:
         if r[10] and bad_log is not None:
             bad_log.write(f"{r[10]}\t{r[0]}\tmk={r[9]}\ttk={r[5]}\n")
@@ -293,7 +293,7 @@ def write_rows(conn, wallets, rows, bad_log):
                 ids.append(None)
     n = len(pre)
     out = [(r[0], r[1], r[2], r[3], ids[i], r[5], r[6], r[7], r[8], ids[n + i],
-            r[11], r[12])
+            r[10], r[11])
            for i, r in enumerate(pre)]
     conn.executemany("""INSERT OR IGNORE INTO trades
         (id, timestamp, tradeAmount, outcomeTokensAmount, user_id, contract_id,
