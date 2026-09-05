@@ -457,6 +457,14 @@ def main():
                         FROM source_db.trades t
                         {_mkt_join}
                         WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
+                          -- Bound the scan on the RAW indexed column. The ts
+                          -- filter below is on a COMPUTED expression, which no
+                          -- index can serve, so each chunk full-scanned ~1.19B
+                          -- rows per UNION leg -- 5-7 hours per simulated day,
+                          -- flat across chunks. idx_trades_ts makes this a range
+                          -- seek. The computed filter stays as the correctness
+                          -- guard; this one exists purely to bound the read.
+                          AND t.timestamp > {chunk_start_ts} AND t.timestamp <= {chunk_end_ts}
                           AND t.user_id IS NOT NULL AND t.user_id NOT IN {_exch} {_ok_coll}
 
                         UNION ALL
@@ -473,6 +481,7 @@ def main():
                         FROM source_db.trades t
                         {_mkt_join}
                         WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
+                          AND t.timestamp > {chunk_start_ts} AND t.timestamp <= {chunk_end_ts}
                           AND t.maker_id IS NOT NULL AND t.maker_id NOT IN {_exch} {_ok_coll}
                     )
                     SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
