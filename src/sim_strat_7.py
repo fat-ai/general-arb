@@ -174,7 +174,7 @@ def compute_signals_parallel(
         expected_p, price, stake, ttr_hours, V, brier_s, brier_c, brier_px, k0,
         yes_flat, no_flat, yes_start, yes_end, no_start, no_end,
         logit, price_lut, time_lut, p_range,
-        out_prob, out_marg, out_perc, out_trust):
+        out_prob, out_marg, out_perc, out_trust, out_N, out_W):
     # `order` is a permutation of [0, n) (uid-sorted). Processing in this order makes
     # each prange chunk sweep a contiguous, uid-ordered region of the flat
     # (cache/prefetch-friendly). Results are written to the ORIGINAL index out_*[i],
@@ -190,12 +190,13 @@ def compute_signals_parallel(
         else:
             primary  = no_flat[ns:ne]
             opposing = yes_flat[ys:ye]
-        sp, mg, pm, tm = _process_trade_core(
+        sp, mg, pm, tm, ne, we = _process_trade_core(
             primary, opposing, primary_pi[i], opposing_pi[i], cur_log_ttr[i],
             expected_p[i], price[i], stake[i], ttr_hours[i], V[i],
             brier_s[i], brier_c[i], brier_px[i], k0,
             logit, price_lut, time_lut, p_range)
         out_prob[i] = sp; out_marg[i] = mg; out_perc[i] = pm; out_trust[i] = tm
+        out_N[i] = ne; out_W[i] = we
 
 @njit(cache=True)
 def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
@@ -1124,7 +1125,8 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
 
     ys_l = []; ye_l = []; ns_l = []; ne_l = []
     uid_l = []; bx_l = []
-
+                                     
+    out_N = np.full(num_rows, np.nan); out_W = np.full(num_rows, np.nan)
     out_prob = np.zeros(num_rows); out_marg = np.zeros(num_rows)
     out_perc = np.zeros(num_rows); out_V = np.zeros(num_rows); out_trust = np.zeros(num_rows)
 
@@ -1218,15 +1220,15 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
     order = np.argsort(np.array(uid_l, np.int64), kind='stable').astype(np.int64)
 
     cp = np.zeros(n); cm = np.zeros(n); cpe = np.zeros(n); ct = np.zeros(n)
+    cn = np.zeros(n); cw = np.zeros(n)
     compute_signals_parallel(order,
                              isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
                              bx, AGG_K0,
                              yes_flat, no_flat, ys, ye, ns, ne,
-                             logit, price_lut, time_lut, p_range, cp, cm, cpe, ct)
+                             logit, price_lut, time_lut, p_range, cp, cm, cpe, ct, cn, cw))
 
-    eidx = np.array(elig_idx, np.int64)
-    out_prob[eidx] = cp; out_marg[eidx] = cm; out_perc[eidx] = cpe; out_trust[eidx] = ct
-    return out_prob, out_marg, out_perc, out_V, out_trust
+     out_N[eidx] = cn; out_W[eidx] = cw
+     return out_prob, out_marg, out_perc, out_V, out_trust, out_N, out_W
             
 def main():
     set_num_threads(len(os.sched_getaffinity(0)))
@@ -1658,7 +1660,7 @@ def main():
         _f1, _f1, _f1, _f1, _f1, _f1, np.zeros(1, np.uint32),
         _f1, np.float64(50.0),
         _df, _df, _i1, _i1, _i1, _i1,
-        _EMPTY_F64, PRICE_LUT, TIME_LUT, P_RANGE, _f1, _f1, _f1, _f1)
+        _EMPTY_F64, PRICE_LUT, TIME_LUT, P_RANGE, _f1, _f1, _f1, _f1, _f1, _f1)
   
     log.info("✅ Numba JIT warmed up and locked.")
 
@@ -2122,6 +2124,8 @@ def main():
                     perc_marg    = float(fast_signals[2][i])
                     variance_v   = float(fast_signals[3][i])
                     trust_weight = float(fast_signals[4][i])
+                    N_eff        = float(fast_signals[5][i])
+                    W_eff        = float(fast_signals[6][i])
                 else:
                     smooth_prob, marg, perc_marg, variance_v, trust_weight, N_eff, W_eff = process_trade(
                         uid=uid, price=price, stake=inv,
