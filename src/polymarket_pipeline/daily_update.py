@@ -11,7 +11,7 @@ import csv
 import shutil
 import sys
 import time
-
+import sqlite3
 import __main__
 from collections import defaultdict
 from market_time import derive_window, in_window, ttr_hours as mt_ttr_hours
@@ -371,57 +371,22 @@ def main():
     current_day_ts = (datetime.now(timezone.utc).timestamp() // 86400) * 86400
 
     # ==========================================
-    # 0. SETUP DUCKDB (Once outside the loop)
+    # 0. SETUP (Once outside the loop)
     # ==========================================
-    duck_tmp = CACHE_DIR / "duckdb_update_tmp"
-    duck_tmp.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(f"file:{TRADES_PATH}?mode=ro", uri=True)
+    src.execute("PRAGMA cache_size=-1000000")     # ~1 GB page cache
 
-    con = duckdb.connect(database=':memory:')
-    con.execute("SET memory_limit='12GB';")
-    con.execute("SET max_temp_directory_size = '900GB';")
-    con.execute("SET threads=2;")
-    con.execute("SET preserve_insertion_order=false;")
-    con.execute(f"SET temp_directory='{duck_tmp}';")
-    con.execute("INSTALL sqlite; LOAD sqlite;")
-
-    max_retries = 3
-    db_attached = False
-    for attempt in range(max_retries):
-        try:
-            con.execute(f"ATTACH '{TRADES_PATH}' AS source_db (TYPE SQLITE, READ_ONLY TRUE);")
-            db_attached = True
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                log.warning(f"SQLite DB locked or busy, retrying in 5s... ({attempt+1}/{max_retries})")
-                time.sleep(5)
-            else:
-                log.error(f"Failed to attach SQLite DB after multiple attempts: {e}")
+    EXCH_ADDRS = ('0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
+                  '0xc5d563a36ae78145c45a50134d48a1215220f80a',
+                  '0xe111180000d2663c0091e4f400237545b87b996b',
+                  '0xe2222d279d744050d28e00520010520000310f59')
+    exch_ids = {r[0] for r in src.execute(
+        "SELECT wallet_id FROM wallets WHERE lower(address) IN "
+        f"({','.join('?' * len(EXCH_ADDRS))})", EXCH_ADDRS)}
+    log.info(f"🚫 Exchange wallet ids excluded: {sorted(exch_ids)}")
 
     ingestion_success = False
 
-    # Query constants, built once. Two copies of this query is how the maker leg
-    # and the collateral guard were lost here while sim_strat_5 kept both.
-    _exch = """(SELECT wallet_id FROM source_db.wallets WHERE lower(address) IN (
-                  '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e',
-                  '0xc5d563a36ae78145c45a50134d48a1215220f80a',
-                  '0xe111180000d2663c0091e4f400237545b87b996b',
-                  '0xe2222d279d744050d28e00520010520000310f59'))"""
-
-    # NO_COLLATERAL_SIDE guard (~0.97%): with neither leg collateral the contract
-    # choice is arbitrary and the sign of outcomeTokensAmount is undefined.
-    #
-    # COALESCE is REQUIRED. A downloader bug wrote NULL into both columns for
-    # every trade after 2026-07-27 08:26:06. The bare form then evaluates to
-    # NOT(NULL AND NULL) = NULL, and a NULL WHERE predicate DROPS the row -- so
-    # without this the whole post-July window is silently excluded, with no error.
-    _ok_coll = """AND NOT (COALESCE(CAST(t.maker_asset_id AS VARCHAR), '0') NOT IN ('0','1')
-                       AND COALESCE(CAST(t.taker_asset_id AS VARCHAR), '0') NOT IN ('0','1'))"""
-
-    _ts_expr = """EPOCH(COALESCE(
-                    to_timestamp(TRY_CAST(t.timestamp AS DOUBLE)),
-                    TRY_CAST(t.timestamp AS TIMESTAMP)
-                ))"""
 
     if db_attached:
         try:
@@ -430,7 +395,6 @@ def main():
             con.execute(f"""CREATE TEMP TABLE mkt AS
                 SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
                 FROM read_parquet('{MARKETS_PATH}')""")
-            _mkt_join = "INNER JOIN mkt m ON t.contract_id = m.clean_cid"
 
             span_start = float(state.last_processed_timestamp)
 
@@ -440,86 +404,45 @@ def main():
             # ~1.19B rows per UNION leg, 5-7 hours per simulated day, flat across
             # chunks. Day boundaries are detected in the stream instead, exactly
             # as sim_strat_5:1930 does, so the daily cadence is unchanged.
-            query = f"""
-                WITH parsed_trades AS (
-                    SELECT
-                        t.id, t.contract_id, CAST(t.user_id AS VARCHAR) AS user,
-                        t.tradeAmount, t.outcomeTokensAmount, t.price, {_ts_expr} AS ts
-                    FROM source_db.trades t
-                    {_mkt_join}
-                    WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
-                      AND t.timestamp > {span_start} AND t.timestamp <= {current_day_ts}
-                      AND t.user_id IS NOT NULL AND t.user_id NOT IN {_exch} {_ok_coll}
-
-                    UNION ALL
-
-                    -- N7: the MAKER leg. outcomeTokensAmount is taker-signed, so
-                    -- the maker's side is its exact negation. '-m' keeps the key
-                    -- distinct for ORDER BY id.
-                    SELECT
-                        t.id || '-m' AS id, t.contract_id, CAST(t.maker_id AS VARCHAR) AS user,
-                        t.tradeAmount, -t.outcomeTokensAmount AS outcomeTokensAmount,
-                        t.price, {_ts_expr} AS ts
-                    FROM source_db.trades t
-                    {_mkt_join}
-                    WHERE t.timestamp IS NOT NULL AND t.price >= 0.0 AND t.price <= 1.0
-                      AND t.timestamp > {span_start} AND t.timestamp <= {current_day_ts}
-                      AND t.maker_id IS NOT NULL AND t.maker_id NOT IN {_exch} {_ok_coll}
-                )
-                SELECT contract_id, user, tradeAmount, outcomeTokensAmount, price, ts, id
-                FROM parsed_trades
-                WHERE ts IS NOT NULL AND ts > {span_start} AND ts <= {current_day_ts}
-                ORDER BY ts ASC, id ASC
-            """
-
-            log.info(f"🔎 Single-pass ingest: "
-                     f"{datetime.fromtimestamp(span_start, tz=timezone.utc).strftime('%Y-%m-%d')} to "
-                     f"{datetime.fromtimestamp(current_day_ts, tz=timezone.utc).strftime('%Y-%m-%d')} "
-                     f"({(current_day_ts - span_start) / 86400:.0f} days). "
-                     f"Sorting the span -- expect a long pause before the first day.")
-
-            day_end = (int(span_start // 86400) + 1) * 86400.0
-            nres, norph = _resolve_day(state, market_map, day_end)
-            log.info(f"⏳ Day {datetime.fromtimestamp(day_end - 86400, tz=timezone.utc).strftime('%Y-%m-%d')}"
-                     f" | resolved {nres:,} orphaned {norph:,}")
-
-            trade_count = 0
-            n_days = 0
-            total_trades = 0
-
-            def _close_day(d_end, n_tr):
-                """Calibrate, advance the watermark, checkpoint periodically."""
-                nonlocal n_days
-                if n_tr > 0:
-                    log.info(f"   ↳ Ingested {n_tr:,} trades. Calibrating models...")
-                    calibrate_models(d_end, state)
-                else:
-                    log.info("   ↳ No trades this day. Advancing timestamp.")
-                # The watermark advances only on a COMPLETED day, so an interrupted
-                # run resumes at a day boundary. m_pos appends and exposure/peak
-                # accumulation are NOT idempotent, so a mid-day resume would
-                # double-count.
-                state.last_processed_timestamp = d_end
-                n_days += 1
-                if n_days % 7 == 0:
-                    log.info("   💾 Interim checkpoint...")
-                    save_state(state)
-
-            cursor = con.execute(query)
+            sql = """SELECT contract_id, user_id, maker_id, tradeAmount,
+                            outcomeTokensAmount, price, timestamp,
+                            maker_asset_id, taker_asset_id
+                     FROM trades
+                     WHERE timestamp > ? AND timestamp <= ?"""
+            cursor = src.execute(sql, (span_start, current_day_ts))
 
             while True:
-                rows = cursor.fetchmany(10000)
-                if not rows:
+                raw = cursor.fetchmany(10000)
+                if not raw:
                     break
 
-                for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts, _row_id = row
-                    if ts is None:
+                # Expand each fill into its taker and maker legs, matching
+                # sim_strat_5's UNION ALL. outcomeTokensAmount is taker-signed,
+                # so the maker's side is its exact negation. Taker first, which
+                # is the order `ORDER BY ts, id` produced ('x' before 'x-m').
+                rows = []
+                for (c_id, u_id, mk_id, amt, tok, px, tstamp,
+                     mk_asset, tk_asset) in raw:
+                    if tstamp is None or px is None or px < 0.0 or px > 1.0:
                         continue
+                    # NO_COLLATERAL_SIDE (~0.97%): with neither leg collateral the
+                    # contract choice is arbitrary and the token sign undefined.
+                    # COALESCE-equivalent: a NULL asset id is treated as '0'.
+                    _mk = '0' if mk_asset is None or mk_asset == '' else str(mk_asset)
+                    _tk = '0' if tk_asset is None or tk_asset == '' else str(tk_asset)
+                    if _mk not in ('0', '1') and _tk not in ('0', '1'):
+                        continue
+                    ts_f = float(tstamp)
+                    if u_id is not None and u_id not in exch_ids:
+                        rows.append((c_id, str(u_id), amt, tok, px, ts_f))
+                    if mk_id is not None and mk_id not in exch_ids:
+                        rows.append((c_id, str(mk_id), amt, -tok, px, ts_f))
+
+                for row in rows:
+                    raw_cid, raw_user, amount, tokens, price, ts = row
 
                     # Close out every day the stream has passed, INCLUDING empty
-                    # ones, so resolution and calibration fire on every boundary
-                    # exactly as they would in a live nightly run.
+                    # ones, so resolution and calibration fire on every boundary.
                     while ts > day_end:
                         _close_day(day_end, trade_count)
                         trade_count = 0
@@ -655,7 +578,7 @@ def main():
             log.error(f"❌ Pipeline failed during chunk processing: {e}")
 
         finally:
-            con.close()
+            src.close()
             if duck_tmp.exists():
                 shutil.rmtree(duck_tmp, ignore_errors=True)
 
