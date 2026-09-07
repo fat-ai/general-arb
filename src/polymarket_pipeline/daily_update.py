@@ -365,14 +365,21 @@ def main():
     market_map = load_markets()
 
     # Midnight-aligned, matching sim_strat_5's trade_day_int * 86400 boundaries.
-    # A partial final chunk would calibrate on a fraction of a day's data and
-    # leave the watermark mid-day, so the next run's first chunk is short too.
-    # Today's trades are picked up by tomorrow's run -- the sim behaves the same.
+    # A partial final day would calibrate on a fraction of a day's data and leave
+    # the watermark mid-day. Today's trades are picked up by tomorrow's run --
+    # the sim behaves the same.
     current_day_ts = (datetime.now(timezone.utc).timestamp() // 86400) * 86400
 
     # ==========================================
-    # 0. SETUP (Once outside the loop)
+    # 0. SETUP
     # ==========================================
+    # DuckDB is gone. Its 12 GB memory_limit plus the ~11 GB Bayesian state plus
+    # an ORDER BY over 45 days of both legs exceeded the 31 GB container. The
+    # sort was never needed: idx_trades_ts already returns rows in timestamp
+    # order, so SQLite streams them with near-zero memory.
+    #
+    # The markets INNER JOIN is also redundant -- the trade loop already does
+    # `m = market_map.get(cid); if not m: continue`, the same filter.
     src = sqlite3.connect(f"file:{TRADES_PATH}?mode=ro", uri=True)
     src.execute("PRAGMA cache_size=-1000000")     # ~1 GB page cache
 
@@ -386,207 +393,236 @@ def main():
     log.info(f"🚫 Exchange wallet ids excluded: {sorted(exch_ids)}")
 
     ingestion_success = False
-    db_attached = True
-    
-    if db_attached:
-        try:
-            # Market key set materialised ONCE. Inlining read_parquet into the
-            # join re-scans ~5.6M rows per UNION leg.
-            con.execute(f"""CREATE TEMP TABLE mkt AS
-                SELECT DISTINCT TRIM(CAST(contract_id AS VARCHAR)) AS clean_cid
-                FROM read_parquet('{MARKETS_PATH}')""")
+    n_days = 0
+    total_trades = 0
 
-            span_start = float(state.last_processed_timestamp)
+    try:
+        span_start = float(state.last_processed_timestamp)
+        log.info(f"🔎 Single-pass ingest: "
+                 f"{datetime.fromtimestamp(span_start, tz=timezone.utc).strftime('%Y-%m-%d')} to "
+                 f"{datetime.fromtimestamp(current_day_ts, tz=timezone.utc).strftime('%Y-%m-%d')} "
+                 f"({(current_day_ts - span_start) / 86400:.0f} days).")
 
-            # ONE query over the WHOLE span, not one per day. The ts filter is on
-            # a COMPUTED expression, which no index can serve and which DuckDB's
-            # SQLite scanner will not push down -- so a per-day query full-scanned
-            # ~1.19B rows per UNION leg, 5-7 hours per simulated day, flat across
-            # chunks. Day boundaries are detected in the stream instead, exactly
-            # as sim_strat_5:1930 does, so the daily cadence is unchanged.
-            sql = """SELECT contract_id, user_id, maker_id, tradeAmount,
-                            outcomeTokensAmount, price, timestamp,
-                            maker_asset_id, taker_asset_id
-                     FROM trades
-                     WHERE timestamp > ? AND timestamp <= ?"""
-            cursor = src.execute(sql, (span_start, current_day_ts))
+        def _close_day(d_end, n_tr):
+            """Calibrate, advance the watermark, checkpoint periodically."""
+            nonlocal n_days
+            if n_tr > 0:
+                log.info(f"   ↳ Ingested {n_tr:,} trades. Calibrating models...")
+                calibrate_models(d_end, state)
+            else:
+                log.info("   ↳ No trades this day. Advancing timestamp.")
+            # The watermark advances only on a COMPLETED day, so an interrupted
+            # run resumes at a day boundary. m_pos appends and exposure/peak
+            # accumulation are NOT idempotent, so a mid-day resume double-counts.
+            state.last_processed_timestamp = d_end
+            n_days += 1
+            if n_days % 7 == 0:
+                log.info("   💾 Interim checkpoint...")
+                save_state(state)
 
-            while True:
-                raw = cursor.fetchmany(10000)
-                if not raw:
-                    break
+        day_end = (int(span_start // 86400) + 1) * 86400.0
+        nres, norph = _resolve_day(state, market_map, day_end)
+        log.info(f"⏳ Day {datetime.fromtimestamp(day_end - 86400, tz=timezone.utc).strftime('%Y-%m-%d')}"
+                 f" | resolved {nres:,} orphaned {norph:,}")
 
-                # Expand each fill into its taker and maker legs, matching
-                # sim_strat_5's UNION ALL. outcomeTokensAmount is taker-signed,
-                # so the maker's side is its exact negation. Taker first, which
-                # is the order `ORDER BY ts, id` produced ('x' before 'x-m').
-                rows = []
-                for (c_id, u_id, mk_id, amt, tok, px, tstamp,
-                     mk_asset, tk_asset) in raw:
-                    if tstamp is None or px is None or px < 0.0 or px > 1.0:
-                        continue
-                    # NO_COLLATERAL_SIDE (~0.97%): with neither leg collateral the
-                    # contract choice is arbitrary and the token sign undefined.
-                    # COALESCE-equivalent: a NULL asset id is treated as '0'.
-                    _mk = '0' if mk_asset is None or mk_asset == '' else str(mk_asset)
-                    _tk = '0' if tk_asset is None or tk_asset == '' else str(tk_asset)
-                    if _mk not in ('0', '1') and _tk not in ('0', '1'):
-                        continue
-                    ts_f = float(tstamp)
-                    if u_id is not None and u_id not in exch_ids:
-                        rows.append((c_id, str(u_id), amt, tok, px, ts_f))
-                    if mk_id is not None and mk_id not in exch_ids:
-                        rows.append((c_id, str(mk_id), amt, -tok, px, ts_f))
+        trade_count = 0
 
-                for row in rows:
-                    raw_cid, raw_user, amount, tokens, price, ts = row
+        # Indexed range walk. No ORDER BY: idx_trades_ts is already ordered and
+        # SQLite returns rows in index order for this predicate.
+        sql = """SELECT contract_id, user_id, maker_id, tradeAmount,
+                        outcomeTokensAmount, price, timestamp,
+                        maker_asset_id, taker_asset_id
+                 FROM trades
+                 WHERE timestamp > ? AND timestamp <= ?"""
+        cursor = src.execute(sql, (span_start, current_day_ts))
 
-                    # Close out every day the stream has passed, INCLUDING empty
-                    # ones, so resolution and calibration fire on every boundary.
-                    while ts > day_end:
-                        _close_day(day_end, trade_count)
-                        trade_count = 0
-                        day_end += 86400.0
-                        nres, norph = _resolve_day(state, market_map, day_end)
-                        log.info(f"⏳ Day {datetime.fromtimestamp(day_end - 86400, tz=timezone.utc).strftime('%Y-%m-%d')}"
-                                 f" | resolved {nres:,} orphaned {norph:,}")
+        while True:
+            raw = cursor.fetchmany(10000)
+            if not raw:
+                break
 
-                    cid = sys.intern(str(raw_cid))
-                    user = sys.intern(str(raw_user))
+            # Expand each fill into its taker and maker legs, matching
+            # sim_strat_5's UNION ALL. outcomeTokensAmount is taker-signed, so
+            # the maker's side is its exact negation. Taker first, which is the
+            # order `ORDER BY ts, id` produced ('x' before 'x-m').
+            rows = []
+            for (c_id, u_id, mk_id, amt, tok, px, tstamp,
+                 mk_asset, tk_asset) in raw:
+                if tstamp is None or px is None or px < 0.0 or px > 1.0:
+                    continue
+                # NO_COLLATERAL_SIDE (~0.97%): with neither leg collateral the
+                # contract choice is arbitrary and the token sign undefined.
+                # A NULL asset id is treated as '0' -- the downloader dropped
+                # both columns for every row after 2026-07-27 until it was fixed.
+                _mk = '0' if mk_asset is None or mk_asset == '' else str(mk_asset)
+                _tk = '0' if tk_asset is None or tk_asset == '' else str(tk_asset)
+                if _mk not in ('0', '1') and _tk not in ('0', '1'):
+                    continue
+                ts_f = float(tstamp)
+                if u_id is not None and u_id not in exch_ids:
+                    rows.append((c_id, str(u_id), amt, tok, px, ts_f))
+                if mk_id is not None and mk_id not in exch_ids:
+                    rows.append((c_id, str(mk_id), amt, -tok, px, ts_f))
 
-                    m = market_map.get(cid)
-                    if not m:
-                        continue
-                    if not in_window(ts, m['start'], m['end']):
-                        continue
+            for row in rows:
+                raw_cid, raw_user, amount, tokens, price, ts = row
 
-                    qty = abs(tokens)
-                    is_buying = (tokens > 0)
-                    bet_on = m['outcome_label']
-                    is_yes = (bet_on == "yes")
+                # Close out every day the stream has passed, INCLUDING empty
+                # ones, so resolution and calibration fire on every boundary
+                # exactly as a live nightly run would.
+                while ts > day_end:
+                    _close_day(day_end, trade_count)
+                    trade_count = 0
+                    day_end += 86400.0
+                    nres, norph = _resolve_day(state, market_map, day_end)
+                    log.info(f"⏳ Day {datetime.fromtimestamp(day_end - 86400, tz=timezone.utc).strftime('%Y-%m-%d')}"
+                             f" | resolved {nres:,} orphaned {norph:,}")
 
-                    invested = price * qty if is_buying else (1.0 - price) * qty
-                    expected_p = price if is_buying else (1.0 - price)
-                    price_int = max(0, min(1000, int(expected_p * 1000)))
+                cid = sys.intern(str(raw_cid))
+                user = sys.intern(str(raw_user))
 
-                    ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
-                    log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
-                    packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+                m = market_map.get(cid)
+                if not m:
+                    continue
+                # N5: end=None means OPEN -> no upper bound.
+                if not in_window(ts, m['start'], m['end']):
+                    continue
 
-                    eff_dir = 1.0 if is_buying else -1.0
-                    if not is_yes:
-                        eff_dir *= -1.0
-                    is_effective_yes = bool(eff_dir > 0)
-                    yes_price = price if is_yes else 1.0 - price
+                qty = abs(tokens)
+                is_buying = (tokens > 0)
+                bet_on = m['outcome_label']
+                is_yes = (bet_on == "yes")
 
-                    uid = state.user_map.get(user)
-                    if uid is None:
-                        uid = state.next_user_id
-                        state.user_map[user] = uid
-                        state.next_user_id += 1
-                        state.user_history_yes.append(_EMPTY_U32)
-                        state.user_history_no.append(_EMPTY_U32)
+                invested = price * qty if is_buying else (1.0 - price) * qty
+                # expected_p, NOT the raw price: process_trade queries at
+                # int(expected_p*1000), so packing the raw price puts every SELL
+                # outside its own P_RANGE window.
+                expected_p = price if is_buying else (1.0 - price)
+                price_int = max(0, min(1000, int(expected_p * 1000)))
 
-                    u_trades = state.user_total_trades[uid]
-                    if u_trades == 0:
-                        state.global_user_count += 1
+                # N5: end -> sched_end -> 25.9h median, matching
+                # sim_strat_5:1854-1859.
+                ttr_hours = mt_ttr_hours(ts, m['end'], m['sched_end'])
+                log_ttr_int = min(int(math.log(ttr_hours) * 1000), 2097151)
+                packed = (np.uint32(price_int) << 22) | (np.uint32(log_ttr_int) << 1)
+
+                eff_dir = 1.0 if is_buying else -1.0
+                if not is_yes:
+                    eff_dir *= -1.0
+                is_effective_yes = bool(eff_dir > 0)
+                yes_price = price if is_yes else 1.0 - price
+
+                uid = state.user_map.get(user)
+                if uid is None:
+                    uid = state.next_user_id
+                    state.user_map[user] = uid
+                    state.next_user_id += 1
+                    state.user_history_yes.append(_EMPTY_U32)
+                    state.user_history_no.append(_EMPTY_U32)
+
+                u_trades = state.user_total_trades[uid]
+                if u_trades == 0:
+                    state.global_user_count += 1
+                else:
+                    state.global_total_peak -= state.user_peak[uid]
+
+                current_global_avg = (state.global_total_peak / state.global_user_count) \
+                    if state.global_user_count > 0 else 100.0
+
+                new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
+                    yes_price, invested, state.user_exposure[uid],
+                    state.user_peak[uid], u_trades, current_global_avg, is_effective_yes
+                )
+
+                state.user_exposure[uid] = new_exp
+                state.user_peak[uid] = new_peak
+                state.user_total_trades[uid] = new_n
+                state.global_total_peak += new_peak
+
+                # N1: the aggregate vote MUST be smooth_prob (sim_strat_5:2184).
+                # p_true = price + fraction*(1-price) is the reverse-Kelly
+                # probability implied by BET SIZE -- a monotone function of stake,
+                # carrying no information about whether the wallet was right, and
+                # on the P(YES) frame rather than the effective-side frame the
+                # estimate is judged on. observe() is one-vote-per-wallet WITH
+                # REPLACEMENT, so this pass overwrites every correct vote main_2
+                # wrote, and the trigger reads the result.
+                #
+                # process_trade BEFORE the m_pos append: the wallet's own current
+                # trade must not be in its own history when the scan runs.
+                direction = 1.0 if is_effective_yes else -1.0
+                smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
+                    uid=uid, price=price, stake=invested, direction=direction,
+                    is_buying=is_buying, ttr_hours=ttr_hours, state=state,
+                    price_lut=PRICE_LUT, time_lut=TIME_LUT)
+
+                _agg = getattr(state, 'agg', None)
+                if _agg is not None:
+                    _bc = float(state.user_brier_count[uid])
+                    if _bc > 0.0:
+                        _bx = float(state.user_brier_price_sum[uid])
+                        _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
+                            if _bx > 1e-12 else 0.0
+                        _bss *= _bc / (_bc + AGG_K0)
+                        _ratio = _skill_ratio(float(state.user_brier_sum[uid]), _bx,
+                                              float(state.user_brier_out_sum[uid]), _bc)
                     else:
-                        state.global_total_peak -= state.user_peak[uid]
+                        _bss, _ratio = 0.0, 1.0
+                    _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
+                    _agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
+                                 ratio=_ratio, k0=AGG_K0,
+                                 conviction=float(fraction),
+                                 trades_per_market=_tpm)
 
-                    current_global_avg = (state.global_total_peak / state.global_user_count) \
-                        if state.global_user_count > 0 else 100.0
+                m_pos = state.contract_positions[cid]
+                m_pos.user_ids.append(uid)
+                m_pos.is_yes.append(1 if is_effective_yes else 0)
+                m_pos.packed_data.append(packed)
+                m_pos.p_trues.append(p_true)
+                m_pos.stakes.append(invested)
 
-                    new_exp, new_peak, new_n, fraction, p_true = compute_wager_and_p_true(
-                        yes_price, invested, state.user_exposure[uid],
-                        state.user_peak[uid], u_trades, current_global_avg, is_effective_yes
-                    )
+                if u_trades == 0:
+                    # sim_strat_5:2077 uses `amount` (tradeAmount) on the buy
+                    # side, NOT invested. Preserved deliberately.
+                    risk_vol = amount if is_buying else qty * (1.0 - price)
+                    if risk_vol >= 1.0:
+                        state.first_bets_pending[cid].append(
+                            (uid, math.log1p(risk_vol),
+                             max(1e-6, min(1.0 - 1e-6, price)),
+                             is_buying, math.log1p(ttr_hours)))
 
-                    state.user_exposure[uid] = new_exp
-                    state.user_peak[uid] = new_peak
-                    state.user_total_trades[uid] = new_n
-                    state.global_total_peak += new_peak
+                trade_count += 1
+                total_trades += 1
 
-                    # N1: the aggregate vote MUST be smooth_prob (sim_strat_5:2184).
-                    # p_true is the reverse-Kelly probability implied by BET SIZE,
-                    # carrying no information about whether the wallet was right.
-                    # process_trade BEFORE the m_pos append: the wallet's own
-                    # current trade must not be in its own history.
-                    direction = 1.0 if is_effective_yes else -1.0
-                    smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
-                        uid=uid, price=price, stake=invested, direction=direction,
-                        is_buying=is_buying, ttr_hours=ttr_hours, state=state,
-                        price_lut=PRICE_LUT, time_lut=TIME_LUT)
+        # Drain the remaining days, including any with no trades at all, so the
+        # watermark reaches current_day_ts and no market is left unresolved.
+        while day_end <= current_day_ts:
+            _close_day(day_end, trade_count)
+            trade_count = 0
+            day_end += 86400.0
+            if day_end <= current_day_ts:
+                _resolve_day(state, market_map, day_end)
 
-                    _agg = getattr(state, 'agg', None)
-                    if _agg is not None:
-                        _bc = float(state.user_brier_count[uid])
-                        if _bc > 0.0:
-                            _bx = float(state.user_brier_price_sum[uid])
-                            _bss = (1.0 - float(state.user_brier_sum[uid]) / _bx) \
-                                if _bx > 1e-12 else 0.0
-                            _bss *= _bc / (_bc + AGG_K0)
-                            _ratio = _skill_ratio(float(state.user_brier_sum[uid]), _bx,
-                                                  float(state.user_brier_out_sum[uid]), _bc)
-                        else:
-                            _bss, _ratio = 0.0, 1.0
-                        _tpm = (float(state.user_total_trades[uid]) / _bc) if _bc > 0 else 0.0
-                        _agg.observe(cid, uid, float(smooth_prob), _bc, _bss,
-                                     ratio=_ratio, k0=AGG_K0,
-                                     conviction=float(fraction),
-                                     trades_per_market=_tpm)
+        state.last_processed_timestamp = current_day_ts
+        log.info(f"✅ Single-pass complete: {total_trades:,} trades over {n_days} days.")
+        ingestion_success = True
 
-                    m_pos = state.contract_positions[cid]
-                    m_pos.user_ids.append(uid)
-                    m_pos.is_yes.append(1 if is_effective_yes else 0)
-                    m_pos.packed_data.append(packed)
-                    m_pos.p_trues.append(p_true)
-                    m_pos.stakes.append(invested)
+    except (NameError, AttributeError, ImportError) as e:
+        # A programming error must not be swallowed as a transient fault -- that
+        # is how the N1 revert survived a full overnight run unnoticed.
+        log.critical(f"❌ Aborted on a programming error: {e}")
+        raise
+    except Exception as e:
+        log.error(f"❌ Pipeline failed during ingestion: {e}")
 
-                    if u_trades == 0:
-                        # sim_strat_5:2077 uses `amount` (tradeAmount) on the buy
-                        # side, NOT invested. Preserved deliberately.
-                        risk_vol = amount if is_buying else qty * (1.0 - price)
-                        if risk_vol >= 1.0:
-                            state.first_bets_pending[cid].append(
-                                (uid, math.log1p(risk_vol),
-                                 max(1e-6, min(1.0 - 1e-6, price)),
-                                 is_buying, math.log1p(ttr_hours)))
-
-                    trade_count += 1
-                    total_trades += 1
-
-            # Drain the remaining days, including any with no trades at all, so
-            # the watermark reaches current_day_ts and no market is left
-            # unresolved past its day.
-            while day_end <= current_day_ts:
-                _close_day(day_end, trade_count)
-                trade_count = 0
-                day_end += 86400.0
-                if day_end <= current_day_ts:
-                    _resolve_day(state, market_map, day_end)
-
-            state.last_processed_timestamp = current_day_ts
-            log.info(f"✅ Single-pass complete: {total_trades:,} trades over {n_days} days.")
-            ingestion_success = True
-            
-        except (NameError, AttributeError, ImportError) as e:
-            # A programming error must not be swallowed as a transient fault --
-            # that is how the N1 revert survived a full overnight run unnoticed.
-            log.critical(f"❌ Aborted on a programming error: {e}")
-            raise
-        except Exception as e:
-            log.error(f"❌ Pipeline failed during chunk processing: {e}")
-
-        finally:
-            src.close()
-            if duck_tmp.exists():
-                shutil.rmtree(duck_tmp, ignore_errors=True)
+    finally:
+        src.close()
 
     # ==========================================
-    # 4. SAVE FINAL STATE
+    # SAVE FINAL STATE
     # ==========================================
     if ingestion_success:
-        log.info(f"🗂️ Chunking complete ({n_chunks} day-chunks). Saving final state...")
+        log.info(f"🗂️ Ingest complete ({n_days} days). Saving final state...")
         save_state(state)
         export_dashboard_scores(state)
         log.info("🏁 Catch-up process complete. The live bot is ready.")
