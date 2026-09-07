@@ -2,7 +2,6 @@ import os
 import pickle
 import logging
 import math
-import duckdb
 import polars as pl
 import pandas as pd
 import numpy as np
