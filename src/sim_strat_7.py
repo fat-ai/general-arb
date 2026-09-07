@@ -589,7 +589,7 @@ def _process_trade_core(
         perc_margin = margin / expected_p
     else:
         perc_margin = 0.0
-    return smoothed_win_rate, margin, perc_margin, trust_multiplier
+    return smoothed_win_rate, margin, perc_margin, trust_multiplier, N_eff, W_eff
 
 def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
                   state, price_lut, time_lut):
@@ -622,7 +622,7 @@ def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
 
     logit_params = state.logit_model_params if state.logit_model_params is not None else _EMPTY_F64
 
-    smoothed_win_rate, margin, perc_margin, trust_multiplier = _process_trade_core(
+    smoothed_win_rate, margin, perc_margin, trust_multiplier, N_eff, W_eff = _process_trade_core(
         primary_np, opposing_np,
         primary_price_int, opposing_price_int, current_log_ttr,
         expected_p, price, stake, ttr_hours,
@@ -632,7 +632,7 @@ def process_trade(uid, price, stake, direction, is_buying, ttr_hours,
         logit_params,
         price_lut, time_lut, P_RANGE
     )
-    return smoothed_win_rate, margin, perc_margin, V, trust_multiplier
+    return smoothed_win_rate, margin, perc_margin, V, trust_multiplier, N_eff, W_eff
         
 
 def train_cold_start_logit(calib_X: list, calib_y: list) -> np.ndarray:
@@ -1254,7 +1254,7 @@ def main():
             #             CHURN, which contrib_med_trades conflates: 20,000
             #             trades over 20,000 markets is a broad bettor, 20,000
             #             over 200 is churning, and those are opposite.
-            "c_n", "c_conv", "c_tpm"
+            "c_n", "c_conv", "c_tpm", "N_eff", "W_eff"
         ]
         with open(OUTPUT_PATH, mode='w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
@@ -2123,7 +2123,7 @@ def main():
                     variance_v   = float(fast_signals[3][i])
                     trust_weight = float(fast_signals[4][i])
                 else:
-                    smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
+                    smooth_prob, marg, perc_marg, variance_v, trust_weight, N_eff, W_eff = process_trade(
                         uid=uid, price=price, stake=inv,
                         direction=direction, is_buying=is_buy,
                         ttr_hours=ttr_hours, state=state,
@@ -2264,7 +2264,7 @@ def main():
                         smooth_prob, marg, perc_marg, variance_v, m['volume'],
                         user, user_brier_count[uid], trust_weight,
                         m_end, m['outcome'],
-                        _c_n, round(_c_conv, 5), round(_c_tpm, 2)
+                        _c_n, round(_c_conv, 5), round(_c_tpm, 2), N_eff, W_eff
                     ])
 
                     if len(results_buffer) >= 10000:
