@@ -1225,7 +1225,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              isyes, ppi, opi, clt, ep, pr, st, ttr, Vv, bs, bc,
                              bx, AGG_K0,
                              yes_flat, no_flat, ys, ye, ns, ne,
-                             logit, price_lut, time_lut, p_range, cp, cm, cpe, ct, cn, cw))
+                             logit, price_lut, time_lut, p_range, cp, cm, cpe, ct, cn, cw)
 
      out_N[eidx] = cn; out_W[eidx] = cw
      return out_prob, out_marg, out_perc, out_V, out_trust, out_N, out_W
