@@ -386,8 +386,8 @@ def main():
     log.info(f"🚫 Exchange wallet ids excluded: {sorted(exch_ids)}")
 
     ingestion_success = False
-
-
+    db_attached = True
+    
     if db_attached:
         try:
             # Market key set materialised ONCE. Inlining read_parquet into the
