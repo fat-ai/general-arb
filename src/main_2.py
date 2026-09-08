@@ -12,6 +12,9 @@ import aiohttp
 import copy
 import pickle
 import traceback
+import numpy as np
+import tc
+import floor_to_tick
 from datetime import datetime, timezone
 from collections import Counter
 from clob_rest import ClobRest
