@@ -550,7 +550,7 @@ def main():
                 # process_trade BEFORE the m_pos append: the wallet's own current
                 # trade must not be in its own history when the scan runs.
                 direction = 1.0 if is_effective_yes else -1.0
-                smooth_prob, _marg, _pmarg, _vv, _tw = process_trade(
+                smooth_prob, _marg, _pmarg, _vv, _tw, N_eff, W_eff = process_trade(
                     uid=uid, price=price, stake=invested, direction=direction,
                     is_buying=is_buying, ttr_hours=ttr_hours, state=state,
                     price_lut=PRICE_LUT, time_lut=TIME_LUT)
