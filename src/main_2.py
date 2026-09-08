@@ -11,6 +11,7 @@ from typing import Dict, List, Set
 import aiohttp
 import copy
 import pickle
+import traceback
 from datetime import datetime, timezone
 from collections import Counter
 from clob_rest import ClobRest
