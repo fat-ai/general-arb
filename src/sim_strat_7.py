@@ -190,13 +190,13 @@ def compute_signals_parallel(
         else:
             primary  = no_flat[ns:ne]
             opposing = yes_flat[ys:ye]
-        sp, mg, pm, tm, ne, we = _process_trade_core(
+        sp, mg, pm, tm, n_eff, w_eff = _process_trade_core(
             primary, opposing, primary_pi[i], opposing_pi[i], cur_log_ttr[i],
             expected_p[i], price[i], stake[i], ttr_hours[i], V[i],
             brier_s[i], brier_c[i], brier_px[i], k0,
             logit, price_lut, time_lut, p_range)
         out_prob[i] = sp; out_marg[i] = mg; out_perc[i] = pm; out_trust[i] = tm
-        out_N[i] = ne; out_W[i] = we
+        out_N[i] = n_eff; out_W[i] = w_eff
 
 @njit(cache=True)
 def fast_numba_scan(history_array, center_p_int, target_outcome, current_log_ttr, price_lut, time_lut, p_range):
@@ -1228,6 +1228,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              logit, price_lut, time_lut, p_range, cp, cm, cpe, ct, cn, cw)
                                      
     eidx = np.array(elig_idx, np.int64)
+    out_prob[eidx] = cp; out_marg[eidx] = cm; out_perc[eidx] = cpe; out_trust[eidx] = ct
     out_N[eidx] = cn
     out_W[eidx] = cw
     return out_prob, out_marg, out_perc, out_V, out_trust, out_N, out_W
