@@ -1204,7 +1204,7 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
 
     n = len(elig_idx)
     if n == 0:
-        return out_prob, out_marg, out_perc, out_V, out_trust
+        return out_prob, out_marg, out_perc, out_V, out_trust, out_N, out_W
 
     isyes = np.array(isyes_l, np.bool_)
     ppi = np.array(ppi_l, np.int64); opi = np.array(opi_l, np.int64); clt = np.array(clt_l, np.int64)
@@ -1226,7 +1226,8 @@ def precompute_batch_signals(num_rows, valid_list, m_refs, ts_list, prices_list,
                              bx, AGG_K0,
                              yes_flat, no_flat, ys, ye, ns, ne,
                              logit, price_lut, time_lut, p_range, cp, cm, cpe, ct, cn, cw)
-
+                                     
+    eidx = np.array(elig_idx, np.int64)
     out_N[eidx] = cn
     out_W[eidx] = cw
     return out_prob, out_marg, out_perc, out_V, out_trust, out_N, out_W
