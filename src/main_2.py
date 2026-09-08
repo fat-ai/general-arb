@@ -1417,7 +1417,7 @@ class LiveTrader:
             # ---------------------------------------------------------
             # C1. EXTRACT BAYESIAN EDGE
             # ---------------------------------------------------------
-            smooth_prob, marg, perc_marg, variance_v, trust_weight = process_trade(
+            smooth_prob, marg, perc_marg, variance_v, trust_weight, N_eff, W_eff = process_trade(
                 uid=uid, price=price, stake=_inv,
                 direction=direction, is_buying=is_buy,
                 ttr_hours=ttr_hours, state=self.state,
