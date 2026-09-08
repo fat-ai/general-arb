@@ -13,7 +13,6 @@ import copy
 import pickle
 import traceback
 import numpy as np
-import tc
 
 from datetime import datetime, timezone
 from collections import Counter
