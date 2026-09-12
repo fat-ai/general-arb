@@ -624,6 +624,8 @@ class LiveTrader:
                     f"limits: {len(getattr(self.broker, 'open_limits', {}))} live, "
                     f"{self.stats.get('limits_placed', 0)} placed, "
                     f"{self.stats.get('sweep_fills', 0)} swept | "
+                    f"blk: {getattr(self, '_last_block', 0):,} "
+                    f"stall {getattr(self, '_tip_stall', 0)} | "
                     )
             else:
                 log.info(f"💤 REPORT (30s): No market activity. Waiting for trades...| Queue Size: {q_size}")
@@ -762,12 +764,13 @@ class LiveTrader:
                                 for log_item in logs:
                                     res = await self._parse_log(log_item)
                                     if res == "TRADE": trade_count += 1
-                                
-                                if trade_count > 0:
-                                    log.info(f"⛓️ Blocks {current_block_num}-{end_block}: ✅ {trade_count} TRADES PROCESSED")
+                                log.info(f"⛓️ Blocks {current_block_num}-{end_block}: "
+                                         f"✅ {trade_count}/{count} TRADES PROCESSED")
                             
                             # Move cursor and sprint
                             current_block_num = end_block + 1
+                            self._tip_stall = 0
+                            self._last_block = end_block
                             batch_size = min(max_batch_size, int(batch_size * 1.5) + 1)
                             
                         else:
@@ -801,6 +804,41 @@ class LiveTrader:
                             await asyncio.sleep(1.0) 
                     
                     else:
+                        # Cursor is AHEAD of this endpoint's tip. RPC_URLS holds
+                        # four providers at different heights: the cursor advances
+                        # against whichever answered, but this comparison is made
+                        # against whichever answers next. Once the cursor passes a
+                        # lagging provider's tip, that provider can never satisfy
+                        # the condition -- and since it returns valid data, none
+                        # of the rotation paths below are reached. The loop then
+                        # spins here forever, silently, with no log line and no
+                        # recovery. That is the silent stall.
+                        behind = current_block_num - chain_tip
+                        self._tip_stall = getattr(self, '_tip_stall', 0) + 1
+
+                        if self._tip_stall in (1, 5) or self._tip_stall % 30 == 0:
+                            log.warning(
+                                f"⏸️ Cursor {current_block_num} is {behind} block(s) "
+                                f"ahead of {current_rpc} (tip {chain_tip}) "
+                                f"[{self._tip_stall} consecutive]")
+
+                        # 5 blocks is ~10s of chain: normal catch-up, just wait.
+                        # More than that means this endpoint is genuinely behind,
+                        # so rotate rather than sit on it.
+                        if behind > 5:
+                            rpc_index = (rpc_index + 1) % len(RPC_URLS)
+                            log.warning(f"🔄 Endpoint lagging by {behind} blocks, "
+                                        f"rotating -> {get_rpc()}")
+
+                        # Every provider is behind the cursor -- it was advanced
+                        # against a tip no one else agrees with. Rewind to the
+                        # best tip we can see and carry on.
+                        if self._tip_stall > len(RPC_URLS) * 15:
+                            log.error(f"🚨 Cursor {current_block_num} ahead of ALL "
+                                      f"endpoints. Rewinding to {chain_tip - 10}.")
+                            current_block_num = max(0, chain_tip - 10)
+                            self._tip_stall = 0
+
                         await asyncio.sleep(2.0)
                         
                 except Exception as e:
